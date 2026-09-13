@@ -11,6 +11,7 @@ import { deleteSeries, restoreSeries, mergeSeries, getSeriesRow, deleteSeriesFil
 import { runFingerprintBackfill, fingerprintRemaining, fpState } from '../lib/fingerprintJob';
 import { runPageHashBackfill, pageHashRemaining, phState } from '../lib/pageHashJob';
 import { runBackup } from '../lib/backup';
+import { runReadCleanup, cleanupPending, cleanupState } from '../lib/cleanupJob';
 import { runUpdateAll, updateSeries, runSweep } from '../lib/updater';
 import { authenticate, requireAdmin, userIdOf, revokeAllSessions, revokeRefreshTokenById, passwordError } from '../lib/auth';
 import { logAudit, recentAudit } from '../lib/audit';
@@ -90,7 +91,7 @@ export default async function adminRoutes(app: FastifyInstance) {
 
   // ---- server settings ----
   const SETTINGS_COLS = 'server_name, allow_registration, updater_hours, extension_hours, extension_auto_update, '
-    + 'update_check, install_ping, install_ping_last';
+    + 'update_check, install_ping, install_ping_last, cleanup_read, cleanup_read_days';
   // `extensions_configured` is not a column: extension_hours has a NOT NULL default, so its presence says
   // nothing about whether there is an engine to check. The settings page needs to know, or it offers two
   // controls for a job that can never run.
@@ -153,6 +154,10 @@ export default async function adminRoutes(app: FastifyInstance) {
       extensionAutoUpdate: z.boolean().optional(),
       updateCheck: z.boolean().optional(),
       installPing: z.boolean().optional(),
+      cleanupRead: z.boolean().optional(),
+      // Capped low at 1 rather than 0: "delete chapters the moment they are read" is a footgun, not a
+      // setting, and the reader marks the last page read before the user has left the chapter.
+      cleanupReadDays: z.number().int().min(1).max(3650).optional(),
     }).parse(req.body);
     if (b.serverName !== undefined) await q('UPDATE server_settings SET server_name = $1, updated_at = now() WHERE id = 1', [b.serverName]);
     if (b.allowRegistration !== undefined) await q('UPDATE server_settings SET allow_registration = $1, updated_at = now() WHERE id = 1', [b.allowRegistration]);
@@ -161,15 +166,18 @@ export default async function adminRoutes(app: FastifyInstance) {
     if (b.extensionAutoUpdate !== undefined) await q('UPDATE server_settings SET extension_auto_update = $1, updated_at = now() WHERE id = 1', [b.extensionAutoUpdate]);
     if (b.updateCheck !== undefined) await q('UPDATE server_settings SET update_check = $1, updated_at = now() WHERE id = 1', [b.updateCheck]);
     if (b.installPing !== undefined) await setInstallPing(b.installPing);
+    if (b.cleanupRead !== undefined) await q('UPDATE server_settings SET cleanup_read = $1, updated_at = now() WHERE id = 1', [b.cleanupRead]);
+    if (b.cleanupReadDays !== undefined) await q('UPDATE server_settings SET cleanup_read_days = $1, updated_at = now() WHERE id = 1', [b.cleanupReadDays]);
     await logAudit('settings.update', { userId: userIdOf(req), detail: b, req });
     return settingsRow();
   });
 
   // ---- scheduled tasks ----
   app.get('/api/admin/tasks', async () => {
-    const s = await one<{ updater_hours: number; backup_hour: number; backup_last_run: string | null; backup_last_result: any; extension_hours: number; extension_auto_update: boolean; extension_last_run: string | null; extension_last_result: any }>(
+    const s = await one<{ updater_hours: number; backup_hour: number; backup_last_run: string | null; backup_last_result: any; extension_hours: number; extension_auto_update: boolean; extension_last_run: string | null; extension_last_result: any; cleanup_read: boolean; cleanup_read_days: number; cleanup_last_run: string | null; cleanup_last_result: any }>(
       `SELECT updater_hours, backup_hour, backup_last_run, backup_last_result,
-              extension_hours, extension_auto_update, extension_last_run, extension_last_result
+              extension_hours, extension_auto_update, extension_last_run, extension_last_result,
+              cleanup_read, cleanup_read_days, cleanup_last_run, cleanup_last_result
          FROM server_settings WHERE id = 1`,
     );
     // the backup's last run is persisted, so prefer the DB value over the in-memory one (which resets on restart)
@@ -197,6 +205,20 @@ export default async function adminRoutes(app: FastifyInstance) {
           : null,
         running: phState.running,
         remaining: await pageHashRemaining().catch(() => null),
+      },
+      // Listed even while switched off, unlike the extension task: this one deletes files, so "it is off"
+      // is exactly the thing an admin needs to be able to confirm at a glance. `remaining` is how many
+      // files it would delete right now, which is also the honest preview before anyone enables it.
+      {
+        id: 'cleanup',
+        name: 'Delete read chapters',
+        schedule: s?.cleanup_read ? `daily \u00b7 read over ${s?.cleanup_read_days ?? 30}d ago` : 'off',
+        lastRun: cleanupState.finishedAt || (s?.cleanup_last_run ? new Date(s.cleanup_last_run).getTime() : null),
+        lastResult: (cleanupState.finishedAt
+          ? { deleted: cleanupState.deleted, bytes: cleanupState.bytes, ms: cleanupState.ms, skipped: cleanupState.skipped }
+          : null) ?? s?.cleanup_last_result ?? null,
+        running: cleanupState.running,
+        remaining: await cleanupPending(Math.max(1, s?.cleanup_read_days ?? 30)).catch(() => null),
       },
       // Only when there is an extension server to check. Listing a task that cannot run reads as a broken
       // one, and every install without the optional engine would show it permanently "never run".
@@ -238,6 +260,18 @@ export default async function adminRoutes(app: FastifyInstance) {
       if (fpState.running) return { ok: false, error: 'busy' };
       // never awaited: on a large library this is minutes, and the caller is an admin clicking a button
       runFingerprintBackfill().catch(() => {});
+      return { ok: true, started: true };
+    }
+    if (id === 'cleanup') {
+      // The opt-in gate is enforced here too, not just in the scheduler. "Run now" on a task the admin has
+      // switched off must not be a way to delete files anyway.
+      const s = await one<{ cleanup_read: boolean; cleanup_read_days: number }>(
+        'SELECT cleanup_read, cleanup_read_days FROM server_settings WHERE id = 1',
+      );
+      if (s?.cleanup_read !== true) return { ok: false, error: 'disabled' };
+      if (cleanupState.running) return { ok: false, error: 'busy' };
+      // Never awaited: this stats and unlinks a file per chapter, which is minutes on a large library.
+      runReadCleanup(Math.min(3650, Math.max(1, s.cleanup_read_days || 30)), app.log).catch((e) => app.log.error(e));
       return { ok: true, started: true };
     }
     if (id === 'backup') {

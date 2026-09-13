@@ -21,6 +21,7 @@ import { runSweep } from './lib/updater';
 import { runExtensionMonitor } from './lib/extensionMonitor';
 import { startSweeper } from './lib/imageCache';
 import { runBackup, msUntilHour } from './lib/backup';
+import { runReadCleanup } from './lib/cleanupJob';
 import { KomgaError } from './lib/komga';
 import { ZodError } from 'zod';
 import { registerWebRoot, webRootConfigured } from './lib/webRoot';
@@ -360,6 +361,28 @@ async function main() {
       return msUntilHour(hour);
     };
     void (async () => { setTimeout(backupTick, await nextBackupDelay()).unref(); })();
+  }
+
+  // Read-chapter cleanup: opt-in, daily. The flag is re-read on every tick rather than captured at boot, so
+  // an admin switching it off stops the next run without a restart -- the same rule the install ping follows,
+  // and a hard requirement for the one task that deletes files nobody asked it to delete.
+  if (process.env.LIBRARY_BACKEND !== 'komga') {
+    const cleanupTick = async () => {
+      try {
+        const s = await pool.query('SELECT cleanup_read, cleanup_read_days FROM server_settings WHERE id = 1');
+        if (s.rows[0]?.cleanup_read === true) {
+          const days = Math.min(3650, Math.max(1, s.rows[0]?.cleanup_read_days || 30));
+          const r = await runReadCleanup(days, app.log);
+          if (!r) app.log.info('cleanup: the previous run is still going, skipping this tick');
+        }
+      } catch (e) {
+        app.log.error(e as any);
+      }
+      setTimeout(cleanupTick, 24 * 60 * 60 * 1000).unref();
+    };
+    // An hour after boot, not immediately: a restart loop must not turn into a delete loop, and a booting
+    // server should be answering readers before it starts removing their files.
+    setTimeout(cleanupTick, 60 * 60 * 1000).unref();
   }
 
   // Abandoned half-writes from a previous life: a chapter or cache file whose rename never happened.
