@@ -128,13 +128,14 @@ export async function mergeSeries(fromId: string, intoId: string): Promise<Merge
     // The survivor's rollups are now wrong
     await qq(
       `UPDATE lib_series s SET books_count = c.n, latest_mtime = COALESCE(c.mt, 0)
-         FROM (SELECT count(*) n, max(mtime) mt FROM lib_books WHERE series_id = $1) c
+         FROM (SELECT count(*) n, max(mtime) mt FROM lib_books WHERE series_id = $1 AND pruned_at IS NULL) c
         WHERE s.id = $1`,
       [intoId],
     );
     await qq(
       `UPDATE lib_series SET cover_book_id = (
-         SELECT id FROM lib_books WHERE series_id = $1 ORDER BY number ASC, file ASC LIMIT 1
+         SELECT id FROM lib_books WHERE series_id = $1 AND pruned_at IS NULL
+          ORDER BY number ASC, file ASC LIMIT 1
        ) WHERE id = $1`,
       [intoId],
     );

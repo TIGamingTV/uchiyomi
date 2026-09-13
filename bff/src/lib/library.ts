@@ -549,7 +549,11 @@ export async function persistScan(): Promise<{ series: number; books: number; ms
           await qq(
             `INSERT INTO lib_books (id, series_id, source, file, number, title, mtime, root) VALUES ${tuples.join(',')}
              ON CONFLICT (root, file) DO UPDATE SET series_id=EXCLUDED.series_id, number=EXCLUDED.number,
-               title=EXCLUDED.title, mtime=EXCLUDED.mtime, updated_at=now()`,
+               title=EXCLUDED.title, mtime=EXCLUDED.mtime, updated_at=now(),
+               -- The file is on disk again, so it is a chapter again. Without this a chapter the read-cleanup
+               -- pruned and the user then re-downloaded would stay invisible for ever: the row is matched by
+               -- (root, file) and kept, so nothing else would ever clear the flag.
+               pruned_at=NULL`,
             params,
           );
 
@@ -558,7 +562,8 @@ export async function persistScan(): Promise<{ series: number; books: number; ms
           // dangling cover_book_id takes out every cover and backdrop in the product.
           await qq(
             `UPDATE lib_series SET cover_book_id = (
-               SELECT id FROM lib_books WHERE series_id = $1 ORDER BY number ASC, file ASC LIMIT 1
+               SELECT id FROM lib_books WHERE series_id = $1 AND pruned_at IS NULL
+                ORDER BY number ASC, file ASC LIMIT 1
              ) WHERE id = $1`,
             [id],
           );
@@ -568,7 +573,8 @@ export async function persistScan(): Promise<{ series: number; books: number; ms
     }
   }
   await q(`UPDATE lib_series s SET books_count = c.n, latest_mtime = COALESCE(c.mt, 0)
-           FROM (SELECT series_id, count(*) AS n, max(mtime) AS mt FROM lib_books GROUP BY series_id) c WHERE c.series_id = s.id`);
+           FROM (SELECT series_id, count(*) AS n, max(mtime) AS mt FROM lib_books
+                  WHERE pruned_at IS NULL GROUP BY series_id) c WHERE c.series_id = s.id`);
   // A chapter that has landed is no longer a failure. Cheap: the ledger only ever holds what is still missing.
   await q(`DELETE FROM chapter_failures f USING lib_books b WHERE b.series_id = f.series_id AND b.number = f.number`).catch(() => {});
   return { series: seenFolders.size, books: nBooks, ms: Date.now() - t0 };

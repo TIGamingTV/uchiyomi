@@ -1100,6 +1100,7 @@ function Settings() {
   const [name, setName] = useState<string | null>(null);
   const [hours, setHours] = useState<number | null>(null);
   const [extHours, setExtHours] = useState<number | null>(null);
+  const [cleanDays, setCleanDays] = useState<number | null>(null);
   const save = async (body: any, ok: string) => { try { await api('/api/admin/settings', { method: 'PATCH', json: body }); toast(ok, 'success'); qc.invalidateQueries({ queryKey: ['admin-settings'] }); } catch { toast('Failed', 'error'); } };
   if (!data) return <div className="board"><div className="card grad-border p-6 text-center text-sm text-fog-500">{tr('Loading…')}</div></div>;
   // A handful of settings look like a handful of settings. Padding a sparse panel out with a chart is the
@@ -1127,6 +1128,24 @@ function Settings() {
         <button onClick={() => save({ updaterHours: hours ?? data.updater_hours }, 'Saved')} className="btn-accent mt-2 w-full py-2 text-sm">{tr('Save interval')}</button>
       </div>
       <UpdateAndCount data={data} save={save} />
+      {/* Off by default and described in full, because this is the only setting on the page that deletes
+          somebody's files. The number input stays visible while it is off so the interval can be chosen
+          before the switch is thrown, rather than the switch taking effect against whatever was left. */}
+      <div className="card grad-border flex items-center justify-between gap-3 p-4">
+        <div className="min-w-0">
+          <p className="text-sm text-fog-100">{tr('Delete chapters after everyone has read them')}</p>
+          <p className="max-w-prose text-[11px] text-fog-500">
+            {tr('Once a day, delete the file for any chapter that every reader who opened it has finished, and that nobody has touched for the number of days below. Reading history is kept, and the chapter is not downloaded again.')}
+          </p>
+        </div>
+        <Switch on={data.cleanup_read === true} label={tr('Delete chapters after everyone has read them')}
+          onChange={(next) => save({ cleanupRead: next }, next ? 'Read chapters will be deleted' : 'Read chapters are kept')} />
+      </div>
+      <div className="card grad-border p-4">
+        <label className="mb-1 block text-xs font-semibold uppercase tracking-wider text-fog-500">{tr('Delete read chapters after (days)')}</label>
+        <input type="number" min={1} max={3650} value={cleanDays ?? data.cleanup_read_days} onChange={(e) => setCleanDays(Number(e.target.value))} className="field" />
+        <button onClick={() => save({ cleanupReadDays: cleanDays ?? data.cleanup_read_days }, 'Saved')} className="btn-accent mt-2 w-full py-2 text-sm">{tr('Save')}</button>
+      </div>
       {data.extensions_configured && (
         <>
           <div className="card grad-border flex items-center justify-between gap-3 p-4">

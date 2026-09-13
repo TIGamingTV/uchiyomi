@@ -74,6 +74,10 @@ const booksSrc = (ctx: ViewCtx, p: Params, alias = 'bv') => `(
     -- soft delete, merge, and now library access -- reaches chapters only through here.
     JOIN lib_series s ON s.id = b.series_id AND ${visible('s', ctx, p)}
     LEFT JOIN book_overrides ov ON ov.book_id = b.id
+   -- The read-chapter cleanup deleted this file. Its row has to survive (read_progress is ON DELETE
+   -- RESTRICT, and the updater reads the rows to know what not to re-fetch), so this is the one place
+   -- that turns "row without a file" into "not a chapter" -- otherwise it lists and then 404s on open.
+   WHERE b.pruned_at IS NULL
 ) ${alias}`;
 
 /** The overridden title for one series, for the book DTOs that carry seriesTitle. */
