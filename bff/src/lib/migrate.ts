@@ -242,6 +242,15 @@ CREATE INDEX IF NOT EXISTS lib_books_fp_idx ON lib_books (fingerprint) WHERE fin
 -- breadcrumb for a series that gets rematched to a new folder, so a wrong match can be reversed
 ALTER TABLE lib_series ADD COLUMN IF NOT EXISTS folder_prev text;
 
+-- The read-chapter cleanup deleted this chapter's FILE. The row stays, and it stays for two reasons that
+-- both have to hold: read_progress.book_id is ON DELETE RESTRICT, so erasing the row would mean erasing
+-- what someone read of it; and the updater asks "which numbers do we already have" (updater.ts), so a
+-- surviving row is also what stops the sweep re-downloading the thing we just deliberately removed.
+-- Every chapter read path filters on this -- see booksSrc in lib/ownedCatalog.ts -- so a pruned chapter is
+-- invisible rather than a phantom that 404s when opened. persistScan clears it if the file ever comes back.
+ALTER TABLE lib_books ADD COLUMN IF NOT EXISTS pruned_at timestamptz;
+CREATE INDEX IF NOT EXISTS lib_books_live_idx ON lib_books (series_id, number) WHERE pruned_at IS NULL;
+
 -- Deleting a series HIDES it rather than erasing it. The id survives, so favourites, ratings, notes and --
 -- above all -- reading history stay attached to something real, and the delete is undoable. The scanner
 -- must not revive a hidden folder, or the next scan brings the series back under a brand-new id.
@@ -385,6 +394,14 @@ ALTER TABLE server_settings ADD COLUMN IF NOT EXISTS hidden_langs          jsonb
 -- the second group on a popular title runs. Read tolerantly by lib/scanlatorPrefs.ts, so a hand-edited row
 -- cannot stop the sweep.
 ALTER TABLE server_settings ADD COLUMN IF NOT EXISTS scanlator_prefs       jsonb   NOT NULL DEFAULT '{"priority":[],"blocked":[],"patienceDays":2}';
+
+-- Opt-in cleanup of chapters everybody has finished (lib/cleanupJob.ts). Off by default and it must stay
+-- that way: it is the only scheduled task that deletes a file the user did not ask it to delete, so it may
+-- never become something an admin discovers after the fact.
+ALTER TABLE server_settings ADD COLUMN IF NOT EXISTS cleanup_read         boolean NOT NULL DEFAULT false;
+ALTER TABLE server_settings ADD COLUMN IF NOT EXISTS cleanup_read_days    int     NOT NULL DEFAULT 30;
+ALTER TABLE server_settings ADD COLUMN IF NOT EXISTS cleanup_last_run     timestamptz;
+ALTER TABLE server_settings ADD COLUMN IF NOT EXISTS cleanup_last_result  jsonb;
 
 -- Update check: reads a public GitHub releases URL and sends nothing about this install, which is why it
 -- may default to on. See lib/githubRelease.ts.

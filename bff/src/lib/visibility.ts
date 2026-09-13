@@ -268,7 +268,9 @@ export async function visibleBookFile(bookId: string, ctx: ViewCtx): Promise<{ f
   return (await one<{ file: string; root: string }>(
     `SELECT b.file, b.root FROM lib_books b
        JOIN lib_series s ON s.id = b.series_id
-      WHERE b.id = ${id} AND ${visible('s', ctx, p)}`,
+      -- pruned_at for the same reason as the visibility join: a chapter whose file the read-cleanup deleted
+      -- must look like "no such chapter", not like a read error on a path that is no longer there.
+      WHERE b.id = ${id} AND b.pruned_at IS NULL AND ${visible('s', ctx, p)}`,
     p.values as any[],
   )) ?? null;
 }

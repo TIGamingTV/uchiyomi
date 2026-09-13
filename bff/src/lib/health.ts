@@ -306,7 +306,8 @@ async function sourceTrouble(): Promise<HealthCheck> {
       ? `${live.length} source${live.length === 1 ? ' is' : 's are'} failing or blocked`
       : 'All sources responding normally') + (off ? `; ${off} turned off by you` : ''),
     note: 'A blocked source usually means the site returned 403 or a Cloudflare challenge we could not solve. '
-        + 'If several fail at once and all of them mention the solver, check the solver rather than the sites.',
+        + 'If several fail at once and all of them mention the solver, check the solver rather than the sites. '
+        + 'Sources you turned off on purpose are listed but never make this warn.',
     items: rows.map((r) => {
       const until = r.blocked_until ? new Date(r.blocked_until).getTime() : 0;
       // A block whose deadline has passed is not actually holding anything back; say so rather than

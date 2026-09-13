@@ -11,6 +11,7 @@ import { deleteSeries, restoreSeries, mergeSeries, getSeriesRow, deleteSeriesFil
 import { runFingerprintBackfill, fingerprintRemaining, fpState } from '../lib/fingerprintJob';
 import { runPageHashBackfill, pageHashRemaining, phState } from '../lib/pageHashJob';
 import { runBackup } from '../lib/backup';
+import { runReadCleanup, cleanupPending, cleanupState } from '../lib/cleanupJob';
 import { runUpdateAll, updateSeries, runSweep } from '../lib/updater';
 import { authenticate, requireAdmin, userIdOf, revokeAllSessions, revokeRefreshTokenById, passwordError } from '../lib/auth';
 import { logAudit, recentAudit } from '../lib/audit';
@@ -176,9 +177,10 @@ export default async function adminRoutes(app: FastifyInstance) {
 
   // ---- scheduled tasks ----
   app.get('/api/admin/tasks', async () => {
-    const s = await one<{ updater_hours: number; backup_hour: number; backup_last_run: string | null; backup_last_result: any; extension_hours: number; extension_auto_update: boolean; extension_last_run: string | null; extension_last_result: any }>(
+    const s = await one<{ updater_hours: number; backup_hour: number; backup_last_run: string | null; backup_last_result: any; extension_hours: number; extension_auto_update: boolean; extension_last_run: string | null; extension_last_result: any; cleanup_read: boolean; cleanup_read_days: number; cleanup_last_run: string | null; cleanup_last_result: any }>(
       `SELECT updater_hours, backup_hour, backup_last_run, backup_last_result,
-              extension_hours, extension_auto_update, extension_last_run, extension_last_result
+              extension_hours, extension_auto_update, extension_last_run, extension_last_result,
+              cleanup_read, cleanup_read_days, cleanup_last_run, cleanup_last_result
          FROM server_settings WHERE id = 1`,
     );
     // the backup's last run is persisted, so prefer the DB value over the in-memory one (which resets on restart)
@@ -206,6 +208,20 @@ export default async function adminRoutes(app: FastifyInstance) {
           : null,
         running: phState.running,
         remaining: await pageHashRemaining().catch(() => null),
+      },
+      // Listed even while switched off, unlike the extension task: this one deletes files, so "it is off"
+      // is exactly the thing an admin needs to be able to confirm at a glance. `remaining` is how many
+      // files it would delete right now, which is also the honest preview before anyone enables it.
+      {
+        id: 'cleanup',
+        name: 'Delete read chapters',
+        schedule: s?.cleanup_read ? `daily \u00b7 read over ${s?.cleanup_read_days ?? 30}d ago` : 'off',
+        lastRun: cleanupState.finishedAt || (s?.cleanup_last_run ? new Date(s.cleanup_last_run).getTime() : null),
+        lastResult: (cleanupState.finishedAt
+          ? { deleted: cleanupState.deleted, bytes: cleanupState.bytes, ms: cleanupState.ms, skipped: cleanupState.skipped }
+          : null) ?? s?.cleanup_last_result ?? null,
+        running: cleanupState.running,
+        remaining: await cleanupPending(Math.max(1, s?.cleanup_read_days ?? 30)).catch(() => null),
       },
       // Only when there is an extension server to check. Listing a task that cannot run reads as a broken
       // one, and every install without the optional engine would show it permanently "never run".
@@ -247,6 +263,18 @@ export default async function adminRoutes(app: FastifyInstance) {
       if (fpState.running) return { ok: false, error: 'busy' };
       // never awaited: on a large library this is minutes, and the caller is an admin clicking a button
       runFingerprintBackfill().catch(() => {});
+      return { ok: true, started: true };
+    }
+    if (id === 'cleanup') {
+      // The opt-in gate is enforced here too, not just in the scheduler. "Run now" on a task the admin has
+      // switched off must not be a way to delete files anyway.
+      const s = await one<{ cleanup_read: boolean; cleanup_read_days: number }>(
+        'SELECT cleanup_read, cleanup_read_days FROM server_settings WHERE id = 1',
+      );
+      if (s?.cleanup_read !== true) return { ok: false, error: 'disabled' };
+      if (cleanupState.running) return { ok: false, error: 'busy' };
+      // Never awaited: this stats and unlinks a file per chapter, which is minutes on a large library.
+      runReadCleanup(Math.min(3650, Math.max(1, s.cleanup_read_days || 30)), app.log).catch((e) => app.log.error(e));
       return { ok: true, started: true };
     }
     if (id === 'backup') {

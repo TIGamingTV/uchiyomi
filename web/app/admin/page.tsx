@@ -1194,6 +1194,7 @@ function Settings() {
   const [name, setName] = useState<string | null>(null);
   const [hours, setHours] = useState<number | null>(null);
   const [extHours, setExtHours] = useState<number | null>(null);
+  const [cleanDays, setCleanDays] = useState<number | null>(null);
   const save = async (body: any, ok: string) => { try { await api('/api/admin/settings', { method: 'PATCH', json: body }); toast(ok, 'success'); qc.invalidateQueries({ queryKey: ['admin-settings'] }); } catch { toast('Failed', 'error'); } };
   if (!data) return <div className="board"><div className="card grad-border p-6 text-center text-sm text-fog-500">{tr('Loading…')}</div></div>;
   // A handful of settings look like a handful of settings. Padding a sparse panel out with a chart is the
@@ -1970,6 +1971,40 @@ function Extensions({ span = '' }: { span?: string }) {
     queryFn: () => api<Catalog>(`/api/admin/extensions/catalog?q=${encodeURIComponent(q2)}&lang=${encodeURIComponent(lang)}${onlyInstalled ? '&installed=true' : ''}${showAdult ? '&nsfw=true' : ''}`),
     enabled: !!status?.configured && !!status?.reachable,
   });
+
+  // Every language an installed extension offers, with how many of its sources are switched on. Installing
+  // an extension turns all of them on at once (see admin.ts's catalog route) -- one extension can be twenty
+  // languages, most of which nobody reading this install wants, and turning each off by hand one card at a
+  // time in Providers is the "clutters the page" complaint this exists to fix.
+  type ExtSourceRow = { id: string; name: string; lang: string | null; nsfw: boolean; supportsLatest: boolean; enabled: boolean };
+  const { data: extSources } = useQuery({
+    queryKey: ['ext-sources-all'],
+    queryFn: () => api<{ content: ExtSourceRow[] }>('/api/admin/extensions/sources'),
+    enabled: !!status?.configured && !!status?.reachable,
+  });
+  const [showLangs, setShowLangs] = useState(false);
+  const [busyLang, setBusyLang] = useState<string | null>(null);
+  const langGroups = (() => {
+    const m = new Map<string, { total: number; enabled: number; ids: string[] }>();
+    for (const r of extSources?.content || []) {
+      const key = r.lang || 'other';
+      const g = m.get(key) || { total: 0, enabled: 0, ids: [] };
+      g.total++; if (r.enabled) g.enabled++; g.ids.push(r.id);
+      m.set(key, g);
+    }
+    return [...m.entries()].sort((a, b) => a[0].localeCompare(b[0]));
+  })();
+  const setLangEnabled = async (langKey: string, ids: string[], en: boolean) => {
+    setBusyLang(langKey);
+    try {
+      await Promise.all(ids.map((id) => api(`/api/admin/extensions/sources/${encodeURIComponent(id)}`, { method: 'POST', json: { enabled: en } })));
+      qc.invalidateQueries({ queryKey: ['ext-sources-all'] });
+      qc.invalidateQueries({ queryKey: ['sources'] });
+      qc.invalidateQueries({ queryKey: ['admin-sources'] });
+      toast(en ? `Showing ${ids.length} ${langKey} source${ids.length === 1 ? '' : 's'}` : `Hid ${ids.length} ${langKey} source${ids.length === 1 ? '' : 's'}`, 'success');
+    } catch { toast('Could not update that language', 'error'); }
+    setBusyLang(null);
+  };
 
   if (!status) return null;
 

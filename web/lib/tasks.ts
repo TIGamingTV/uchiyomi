@@ -23,6 +23,13 @@ export function taskResult(r: any): string {
     }
     return base;
   }
+  // Before the `bytes` branch on purpose: the read-cleanup result carries a byte count too, and duck-typing
+  // in the other order rendered a run that deleted chapters as though it were a backup of that size.
+  if (typeof r.deleted === 'number') {
+    if (r.skipped) return ` \u00b7 did not run: ${r.skipped}`;
+    if (!r.deleted) return ' \u00b7 nothing old enough';
+    return ` \u00b7 ${r.deleted} chapters deleted \u00b7 ${bytes(r.bytes ?? 0)} freed`;
+  }
   if (typeof r.bytes === 'number') {
     // Both of these used to be invisible: the archive could be missing every config file, or its size could
     // have failed to measure, and the panel showed a contented size either way.

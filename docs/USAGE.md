@@ -528,6 +528,14 @@ server-wide defaults for choosing between scanlation groups — **Blocked groups
 series, a **Default priority** for series that have no ranking of their own, and the **Patience (days)**
 before a chapter is taken from a group lower down the list; see *Choosing a scanlation group* in section 4.
 
+**Delete chapters after everyone has read them** is off by default, and is the only setting here that
+removes files. With it on, once a day Uchiyomi deletes the file for any chapter that *every* reader who
+opened it has finished and that nobody has touched for the number of days you set. A chapter someone is
+part-way through is never deleted, and neither is one nobody has opened. Reading history is kept, the
+chapter disappears from the series rather than becoming a broken entry, and the updater will not download
+it again — put the file back and the next library scan restores it. **Admin → Tasks → Delete read
+chapters** shows how many files it would delete right now, so you can check before switching it on.
+
 ---
 
 ## 9. Security: 2FA, sessions, password
