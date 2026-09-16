@@ -26,6 +26,7 @@ from marking chapters 30-49 read when the user skipped them.
 
 Marking something **unread** does not cross, in either direction: both apps spell unread as the absence of
 a row, which has no timestamp, so a missing row loses to a present one.
+
 ## v0.34.0 — 2026-09-15
 
 The owner's verdict on v0.33.0, the evening it went live: the *Who scanlates this* card sitting open by
