@@ -1,8 +1,9 @@
 // Owned catalog backend: a drop-in for the `komga` client, returning Komga-shaped series/book DTOs from
 // the lib_* tables. enrichSeries/booksForUser in catalog.ts then add per-user state exactly as before.
 import { q, one } from './db';
-import { cbzPageDims, LIBRARY_ROOT, persistScan } from './library';
+import { cbzPageDims, DL_ROOT, LIBRARY_ROOT, persistScan } from './library';
 import { ViewCtx, Params, visible, browsable, ADULT_RATING } from './visibility';
+import { cleanDescription } from './htmlText';
 
 interface Page<T> { content: T[]; totalElements: number; totalPages: number; number: number; size: number; first: boolean; last: boolean }
 function page<T>(content: T[], total: number, p: number, size: number): Page<T> {
@@ -82,7 +83,14 @@ const SERIES_TITLE_JOIN = 'JOIN lib_series s ON s.id = %col% LEFT JOIN series_ov
 
 function seriesDto(r: any) {
   const genres: string[] = r.genres ?? [];
-  const summary: string = r.summary ?? '';
+  // Cleaned on the way OUT, whatever wrote the column. The add path has stripped Markdown since v0.34.0,
+  // but every MangaDex series added before it still holds `**Year:** 1997 ---` in lib_series.summary
+  // (the scanner copied the ComicInfo Summary verbatim, and the ComicInfo was written from the raw
+  // description), and a migration over free text would have to guess which rows were Markdown. The
+  // strip is idempotent, so a clean row costs a regex pass and changes nothing. Reintroduce by reading
+  // `r.summary ?? ''` here: "a summary stored with Markdown is answered as plain text" in
+  // addSeries.int.test.ts sees the asterisks.
+  const summary: string = cleanDescription(r.summary);
   const count: number = r.books_count ?? 0;
   return {
     id: r.id,
@@ -153,6 +161,11 @@ function bookDto(r: any) {
     // it any more. A client that ignores this gets a 404 from the image server, which is the honest failure
     // but a poor thing to find out by tapping.
     pruned: !!r.pruned_at,
+    // Downloaded by this server, as opposed to found in somebody's read library. Only such a chapter may be
+    // deleted from the server or fetched again: we put those bytes there and can put them back; a file under
+    // LIBRARY_ROOT is a collection we did not assemble and do not get to remove. The web greys out Delete and
+    // Fetch again per row from this rather than asking the server and being told no.
+    owned: !!r.root && r.root === DL_ROOT,
   };
 }
 
@@ -296,6 +309,10 @@ async function adjacentBook(ctx: ViewCtx, id: string, dir: 'next' | 'prev') {
   const n = await one(
     `SELECT bk.*, ${SERIES_TITLE_SQL} AS series_title FROM ${bsrc} ${SERIES_TITLE_JOIN.replace('%col%', 'bk.series_id')}
       WHERE bk.series_id = ${p.add(b.series_id)} AND (bk.number, bk.file) ${cmp} (${p.add(b.number)}, ${p.add(b.file)})
+        -- A tombstone (lib/chapterCleanup.ts) is listed, but it is not a place to go: a reader pressing
+        -- "next" must not land on a chapter whose pages were deleted. The current chapter itself may be one
+        -- (its neighbours are still meaningful); only the candidates are filtered.
+        AND bk.pruned_at IS NULL
       ORDER BY bk.number ${order}, bk.file ${order} LIMIT 1`,
     p.values as any[],
   );

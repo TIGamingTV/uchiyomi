@@ -6,7 +6,7 @@
 openapi: 3.1.0
 info:
   title: Uchiyomi API
-  version: 0.31.0
+  version: 0.34.0
   description: "Everything the web app does, it does over this API. Session JWTs are for the browser; scripts
     use a personal API token (Profile -> Account -> API tokens), sent as `Authorization: Bearer uy_...`.
     Scopes: read (every token; GET plus the library search POST, which is a query), write (anything that changes data), admin (the /api/admin surface, which also
@@ -108,6 +108,105 @@ components:
         checkedAt: { type: [string, "null"], format: date-time, description: When the updater last listed it. }
         chapters: { type: [integer, "null"], description: "For a follower, the distinct chapter numbers it listed then; for the primary, the merged count across every followed source after the release preferences (the same figure as the series' source.chapters)." }
         registered: { type: boolean, description: Whether the adapter is loaded right now; a follower whose extension was removed keeps its row so it can still be unfollowed. }
+    Ghost:
+      type: object
+      description: A chapter number the sources listed at the last check that this server has no row for.
+      required: [number, title, publishedAt, scanlator, groups, sourceId, sourceName, why]
+      properties:
+        number: { type: number }
+        title: { type: [string, "null"] }
+        publishedAt: { type: [string, "null"], format: date-time }
+        scanlator: { type: [string, "null"], description: The group on the copy the release rules chose, as the source shows it. }
+        groups: { type: array, items: { type: string }, description: Every group that released any copy of the number. }
+        sourceId: { type: string, description: The adapter the chosen copy would be fetched through. }
+        sourceName: { type: string }
+        why:
+          type: string
+          enum: [missing, held, blocked, failed, floor]
+        attempts: { type: integer, description: Only when the chapter has failed at least once. }
+        reason: { type: string, description: The downloader's last error text. Admins only. }
+        waitingFor: { type: string, description: "Only when why is held, and only when a priority group survives the blocklist: the effective first-choice group (the series' own priority over the global one) the chapter is being held for, spelt as the preference names it." }
+        waitDaysLeft: { type: integer, minimum: 0, description: "Only with waitingFor: whole days until the patience window closes, counted as the sweep counts it -- from the oldest hosted copy that is not from a blocked group, under today's preferences (so 0 when the window has closed since the last check)." }
+    SkippedNumber:
+      type: object
+      required: [number, reason]
+      properties:
+        number: { type: number }
+        reason:
+          type: string
+          enum: [not_listed, blocked_group, already_here, source_unavailable, cooldown, duplicate]
+          description: >-
+            `duplicate` is a second pick for a number already picked in the same body: the first pick was
+            handled, this one was not.
+        source: { type: string, description: Present when the skipped entry was a pick, naming the copy asked for. }
+        sourceId: { type: string, description: Present when the skipped entry was a pick. }
+    Pick:
+      type: object
+      description: >-
+        One specific copy of a chapter number, as GET /api/series/{id}/versions lists it. A pick is
+        authorised by a matching entry in the number's stored copies (`not_listed` otherwise) and ignores
+        the group rules including the blocklist -- an explicit choice of one copy -- but never `already_here`.
+      required: [number, source, sourceId]
+      properties:
+        number: { type: number, minimum: 0, maximum: 1000000 }
+        source: { type: string, minLength: 1, maxLength: 200, description: The adapter id the copy is listed on. }
+        sourceId: { type: string, minLength: 1, maxLength: 200, description: The chapter id within that source. }
+    Cadence:
+      type: object
+      description: >-
+        A group's release rhythm, from the median gap between its last ten release DAYS (a day with several
+        chapters is one release day, so a group that ships two at a time is not "daily"): `daily` (at most
+        1.5 days), `weekly` (at most 9), `monthly` (at most 40), `irregular` (longer); `unknown` with fewer
+        than two distinct dated days. `quiet` when the silence since the last release exceeds three
+        intervals (never less than 14 days), or 45 days when the rhythm is unknown.
+      required: [kind, intervalDays, daysSince, quiet]
+      properties:
+        kind:
+          type: string
+          enum: [daily, weekly, monthly, irregular, unknown]
+        intervalDays: { type: [number, "null"], description: The median gap in days, one decimal; null when unknown. }
+        daysSince: { type: [integer, "null"], description: Whole days since the last dated release; null when none is dated. }
+        quiet: { type: boolean }
+    GroupStat:
+      type: object
+      description: >-
+        One scanlation group's figures for a series. Groups are merged by the same equality the release
+        rules use (case, spaces and punctuation ignored); the name is the first spelling seen on disk, else
+        the first listed. A joint release counts once for each of its groups.
+      required: [name, releases, first, last, lastReleaseAt, cadence, onDisk, chapters, langs, weeks]
+      properties:
+        name: { type: string }
+        releases: { type: integer, description: Chapters the group released -- distinct numbers across every followed source; a second copy of a number is not a second release. }
+        first: { type: [number, "null"], description: The lowest chapter number it released. }
+        last: { type: [number, "null"], description: The highest chapter number it released. }
+        lastReleaseAt: { type: [string, "null"], format: date-time }
+        cadence:
+          $ref: "#/components/schemas/Cadence"
+        onDisk: { type: integer, description: Live chapters on this server stamped with the group. }
+        chapters: { type: array, items: { type: number }, description: The numbers it released, ascending, each once. }
+        langs: { type: array, items: { type: string }, description: The languages its copies are in, sorted. }
+        weeks:
+          type: array
+          minItems: 12
+          maxItems: 12
+          items: { type: boolean }
+          description: "One flag per week for the last twelve, oldest first, newest last (index 11 is the seven days ending now): true when the group released in that week, from the same per-number release dates the cadence is judged on. A release dated ahead of the server's clock counts as this week."
+    Copy:
+      type: object
+      description: One version of a listed chapter number, as the sources list it.
+      required: [key, source, sourceName, groups, scanlator, lang, pages, publishedAt, chosen, blocked, onDisk]
+      properties:
+        key: { type: string, description: "`<source>:<sourceId>`, unique within the number." }
+        source: { type: string, description: The adapter id; with `sourceId` this is what a Pick names. }
+        sourceName: { type: string }
+        groups: { type: array, items: { type: string } }
+        scanlator: { type: [string, "null"], description: The group string as the source shows it (a joint release reads "A & B"). }
+        lang: { type: [string, "null"] }
+        pages: { type: [integer, "null"], description: 0 is an external link (not downloadable); null when the source does not say. }
+        publishedAt: { type: [string, "null"], format: date-time }
+        chosen: { type: boolean, description: The copy the release rules chose at the last check. }
+        blocked: { type: boolean, description: Every group on the copy is blocked by the effective preferences. A copy with no groups is never blocked. }
+        onDisk: { type: boolean, description: "Best effort: a live chapter for the number came from the same source with the same group stamp (or, for a file with no stamp, this is the chosen copy)." }
 paths:
   /livez:
     get:
@@ -803,6 +902,135 @@ paths:
           description: Not authenticated
         "404":
           description: Not found, or not visible to this account
+  /api/series/{id}/listing:
+    get:
+      tags:
+        - library
+      summary: The chapters the sources list that this server does not hold, with the reason each is absent.
+      operationId: getApiSeriesIdListing
+      description: >-
+        Read from the listing the updater persisted at the last check (the sweep, Check now), never from the
+        sources themselves, so `checkedAt` is how old the answer is. Only numbers with NO chapter row are
+        ghosts: a chapter the read-chapter cleanup deleted keeps its row (`pruned` on the Book) and is not
+        listed here. `why` is one of `missing` (not fetched yet), `held` (waiting for a preferred group),
+        `failed` (the sweep gave up after the retry cap; `attempts` says how many), `blocked` (only blocked
+        groups released it; unblock the group to fetch it), `floor` (below the series' Latest-N floor). `reason`,
+        the downloader's last error text, is present for admins only.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      security:
+        - bearer: []
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [checkedAt, content]
+                properties:
+                  checkedAt:
+                    type: [string, "null"]
+                    format: date-time
+                  content:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Ghost"
+        "401":
+          description: Not authenticated
+        "404":
+          description: Not found, or not visible to this account
+  /api/series/{id}/groups:
+    get:
+      tags:
+        - library
+      summary: Who translates this series, with releases, chapter range, last release, rhythm, weekly activity and how much is on this server.
+      operationId: getApiSeriesIdGroups
+      description: >-
+        From the copies persisted at the last check (every version the sources listed, not only the chosen
+        one) and the group stamps on the files, never from the sources on a page open; `checkedAt` is how
+        old the answer is. Any account that can open the series may read it. Sorted by releases descending.
+        Ranking and blocking the groups is GET /api/admin/series/{id}/scanlators, which carries these same
+        figures with the preferences.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      security:
+        - bearer: []
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [checkedAt, content]
+                properties:
+                  checkedAt:
+                    type: [string, "null"]
+                    format: date-time
+                  content:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/GroupStat"
+        "401":
+          description: Not authenticated
+        "404":
+          description: Not found, or not visible to this account
+  /api/series/{id}/versions:
+    get:
+      tags:
+        - library
+      summary: Every version of every listed chapter, with which copy was chosen, which is blocked, and which is on disk.
+      operationId: getApiSeriesIdVersions
+      description: >-
+        One entry per chapter number the sources listed at the last check, each with every copy they list
+        (group, language, page count, date, source) flagged `chosen`, `blocked` and `onDisk`. A `source` and
+        `sourceId` from here make a Pick for POST /api/sources/fetch or the admin refetch. A number listed
+        before v0.33.0 has an empty `copies` until its next check. Any account that can open the series may
+        read it.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      security:
+        - bearer: []
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [checkedAt, content]
+                properties:
+                  checkedAt:
+                    type: [string, "null"]
+                    format: date-time
+                  content:
+                    type: array
+                    items:
+                      type: object
+                      required: [number, copies]
+                      properties:
+                        number: { type: number }
+                        copies:
+                          type: array
+                          items:
+                            $ref: "#/components/schemas/Copy"
+        "401":
+          description: Not authenticated
+        "404":
+          description: Not found, or not visible to this account
   /api/books/{id}:
     get:
       tags:
@@ -820,10 +1048,10 @@ paths:
       responses:
         "200":
           description: >-
-            The chapter. Only the fields added in v0.31.0 are described here; the rest of the shape follows
-            Komga's book DTO (id, seriesId, number, media, metadata, readProgress, ...). The same object is
-            what every other route that returns a chapter answers with (the series' chapter list, next,
-            the home shelves).
+            The chapter. Only the fields added in v0.31.0 and v0.32.0 are described here; the rest of the
+            shape follows Komga's book DTO (id, seriesId, number, media, metadata, readProgress, ...). The
+            same object is what every other route that returns a chapter answers with (the series' chapter
+            list, next, the home shelves).
           content:
             application/json:
               schema:
@@ -839,6 +1067,19 @@ paths:
                   sourceId:
                     type: [string, "null"]
                     description: The adapter the file was downloaded from; null when the scanner found it.
+                  pruned:
+                    type: boolean
+                    description: >-
+                      The file was deleted by the read-chapter cleanup or an admin; the row stays so progress
+                      survives; no pages behind it. The chapter is still listed and still counts as read, but
+                      the page list is empty, next/previous step over it, and the download manifest answers
+                      410.
+                  owned:
+                    type: boolean
+                    description: >-
+                      Downloaded by this server (the file sits under the download directory); only such
+                      chapters can be deleted or fetched again. False for a chapter the scanner found in the
+                      read library.
         "401":
           description: Not authenticated
         "404":
@@ -986,7 +1227,37 @@ paths:
         - bearer: []
       responses:
         "200":
-          description: OK
+          description: >-
+            { content: [Source] }. Only the field added in v0.33.0 is described here; the rest of the shape
+            is the registry entry (id, name, lang, latest, popular, used, status, blockedUntil, note).
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  content:
+                    type: array
+                    items:
+                      type: object
+                      additionalProperties: true
+                      properties:
+                        extension:
+                          description: >-
+                            For an extension source (`sw:` id): the installed extension package it came
+                            out of, so one multi-language extension's variants can be shown as one
+                            provider. `pkgName` is the APK package name as the engine reports it; when the
+                            engine did not say, `pkgName` is null and `name` is the display name with its
+                            trailing language tag (` (EN)`, ` (PT-BR)`, ` (ALL)`) stripped. Null for
+                            built-in, pack and custom-site sources.
+                          oneOf:
+                            - type: object
+                              required: [pkgName, name]
+                              properties:
+                                pkgName:
+                                  type: [string, "null"]
+                                name:
+                                  type: string
+                            - type: "null"
         "401":
           description: Not authenticated
         "403":
@@ -1105,6 +1376,82 @@ paths:
           description: Not found, or not visible to this account
         "409":
           description: "Conflict: already exists, already running, or duplicate"
+  /api/sources/fetch:
+    post:
+      tags:
+        - sources
+      summary: Fetch chapters the sources list but this server lacks, by number, from the last listing.
+      operationId: postApiSourcesFetch
+      description: >-
+        The listing (GET /api/series/{id}/listing) is the authorisation: only a number the sources list can
+        be asked for, and what is fetched is the copy the release rules choose now -- the listing is refreshed
+        first (a check with no downloads); a source that does not answer leaves the last listing standing.
+        A listing row from a source the series no longer follows is `source_unavailable`. A held number is
+        fetched regardless of patience; a number only blocked groups released is refused (`blocked_group`)
+        -- unblock the group and check again. A manual fetch resets the chapter's retry cap. Same permission
+        as the fill: an account with `canDownload: false` is refused by the plugin, and a source outside the
+        account's age cap answers 403. Progress is on GET /api/sources/jobs under `folder`.
+        `picks` names specific copies instead (from GET /api/series/{id}/versions): a pick is authorised by a
+        matching entry among the number's stored copies (`not_listed` otherwise; the skipped entry then
+        carries `source` and `sourceId`), its source must be followed and available, and it IGNORES the group
+        rules including the blocklist -- an explicit choice of one copy -- but never `already_here`. A number
+        named in both lists is fetched as its pick; a second pick for the same number is skipped as
+        `duplicate`. At least one of `numbers` / `picks`, at most 300 combined.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [seriesId]
+              properties:
+                seriesId:
+                  type: string
+                numbers:
+                  type: array
+                  maxItems: 300
+                  items:
+                    type: number
+                    minimum: 0
+                    maximum: 1000000
+                picks:
+                  type: array
+                  maxItems: 300
+                  items:
+                    $ref: "#/components/schemas/Pick"
+      security:
+        - bearer: []
+      responses:
+        "200":
+          description: "Started. `skipped` lists the numbers that were not fetchable and why."
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok, started, folder, total, skipped]
+                properties:
+                  ok:
+                    type: boolean
+                  started:
+                    type: boolean
+                  folder:
+                    type: string
+                  total:
+                    type: integer
+                  skipped:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/SkippedNumber"
+        "400":
+          description: Malformed body or parameter
+        "401":
+          description: Not authenticated
+        "403":
+          description: "Forbidden: token scope, account permission or age limit"
+        "404":
+          description: Not found, or not visible to this account
+        "409":
+          description: "`nothing_to_fetch` (every number was skipped; `skipped` says why) or `busy` (a download for the series is running)"
   /api/sources/search-all:
     get:
       tags:
@@ -1256,8 +1603,13 @@ paths:
     get:
       tags:
         - sources
-      summary: A series as one source describes it, before adding.
+      summary: A series as one source describes it, before adding, with who scanlates it.
       operationId: getApiSourcesDetail
+      description: >-
+        `count`, `first` and `last` describe one copy per chapter number under the server-wide release
+        preferences (what the add would land). `groups` is the who-scanlates-this panel built from the same
+        chapter list (no second source call), with `onDisk` 0 since nothing is on disk yet; `versions` is how
+        many numbers the source lists in more than one copy.
       parameters:
         - name: source
           in: query
@@ -1274,6 +1626,27 @@ paths:
       responses:
         "200":
           description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [source, sourceId, title, summary, coverUrl, genres, status, count, first, last, groups, versions]
+                properties:
+                  source: { type: string }
+                  sourceId: { type: string }
+                  title: { type: string }
+                  summary: { type: string, description: "Plain text: HTML and Markdown (MangaDex describes in Markdown) are stripped, link text kept." }
+                  coverUrl: { type: [string, "null"] }
+                  genres: { type: array, items: { type: string } }
+                  status: { type: string }
+                  count: { type: integer, description: Chapter numbers, one copy each, under the server-wide preferences. }
+                  first: { type: [number, "null"] }
+                  last: { type: [number, "null"] }
+                  groups:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/GroupStat"
+                  versions: { type: integer, description: Numbers the source lists in more than one copy. }
         "401":
           description: Not authenticated
         "403":
@@ -1304,10 +1677,19 @@ paths:
                   description: How many chapters to take; omit for all.
                 chapterFrom:
                   type: string
-                  enum: [oldest, newest]
+                  enum: [oldest, newest, none]
                   default: oldest
-                  description: Which end chapterCount counts from. Either way the selection is downloaded
-                    ascending. With newest, a chapter floor is set so auto-update fetches new releases only.
+                  description: >-
+                    Which end chapterCount counts from. Either way the selection is downloaded ascending.
+                    With newest, a chapter floor is set so auto-update fetches new releases only. `none`
+                    adds the series with no chapters at all: the row is created and followed, the listing
+                    is written, no download starts, and a chapter floor is set just above the newest listed
+                    number (max + 0.001, so every number listed today is below it and the next release is
+                    not; null when the source lists nothing) so auto-update follows new releases only --
+                    older chapters can be fetched from the series page. The row is stamped as checked (the
+                    add just asked the source), so `checkedAt` and the source's chapter count are set from
+                    the start; a series removed from the library and added back this way is revived under
+                    its old id. `chapterCount` is ignored, and an empty listing is not `no_chapters`.
                 autoUpdate:
                   type: boolean
                 force:
@@ -1317,6 +1699,18 @@ paths:
       responses:
         "200":
           description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok, title, folder, chapters, started, nothing]
+                properties:
+                  ok: { type: boolean }
+                  title: { type: string }
+                  folder: { type: string }
+                  chapters: { type: integer, description: How many chapters the add will fetch; 0 when already in the library or for a `none` add. }
+                  started: { type: boolean, description: The download is running now. }
+                  nothing: { type: boolean, description: "A `none` add: the series was created and floored and nothing was fetched or queued. Tells that outcome from `already in library`, which also answers chapters 0 and started false." }
         "400":
           description: Malformed body or parameter
         "401":
@@ -3045,7 +3439,30 @@ paths:
         - bearer: []
       responses:
         "200":
-          description: OK
+          description: >-
+            The settings row. Only the read-chapter cleanup fields are described here; the rest are the
+            snake_case columns PATCH sets (server_name, allow_registration, updater_hours, ...).
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+                properties:
+                  cleanup_read:
+                    type: boolean
+                    description: Whether the opt-in read-chapter cleanup is on. Off by default.
+                  cleanup_read_days:
+                    type: integer
+                    minimum: 0
+                    maximum: 3650
+                    description: >-
+                      Days after the last reader finishes before the file goes. 0 deletes at the next run.
+                  cleanup_read_due:
+                    type: [integer, "null"]
+                    description: >-
+                      How many chapters the cleanup would delete if it ran now, at the current day setting,
+                      whether or not it is switched on -- so the number can be seen before consenting. Memoised
+                      for half a minute; null when it could not be counted.
         "401":
           description: Not authenticated
         "403":
@@ -3144,8 +3561,12 @@ paths:
         - name: id
           in: path
           required: true
+          description: >-
+            The task. `cleanup` is the opt-in read-chapter cleanup and answers not_enabled while cleanup_read
+            is off; its run is subject to the same consent and the same vetoes as the hourly one.
           schema:
             type: string
+            enum: [scan, update, backup, fingerprint, pagehash, cleanup, extensions]
       security:
         - bearer: []
       responses:
@@ -3371,6 +3792,46 @@ paths:
           description: "Forbidden: token scope, account permission or age limit"
         "404":
           description: Not found, or not visible to this account
+  /api/admin/scanlators:
+    get:
+      tags:
+        - admin
+      summary: Every scanlation group this server knows of, busiest first, for the preferences picker.
+      operationId: getApiAdminScanlators
+      description: >-
+        Requires an admin account and a token carrying the admin scope. Scopes only ever restrict. Names come
+        from the files on disk and from the persisted listings of every source (not from the sources
+        themselves), merged by the same group equality the release rules use; `series` is how many series the
+        group appears on. Memoised for 30 seconds.
+      security:
+        - bearer: []
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [content]
+                properties:
+                  content:
+                    type: array
+                    items:
+                      type: object
+                      required: [name, onDisk, listed, series]
+                      properties:
+                        name:
+                          type: string
+                        onDisk:
+                          type: integer
+                        listed:
+                          type: integer
+                        series:
+                          type: integer
+        "401":
+          description: Not authenticated
+        "403":
+          description: "Forbidden: token scope, account permission or age limit"
   /api/admin/series/{id}/scanlators:
     get:
       tags:
@@ -3379,10 +3840,11 @@ paths:
       operationId: getApiAdminSeriesIdScanlators
       description: >-
         Requires an admin account and a token carrying the admin scope. Scopes only ever restrict. Groups are
-        gathered from the files on disk (what each chapter was stamped with as it landed), from the current
-        chapter listings of the primary and every followed source, and from the names already in the
-        effective preferences, so a blocked group that has vanished from the listing stays visible to be
-        unblocked. A source that fails to list counts as listing nothing rather than failing the answer.
+        gathered from the live files on disk (what each chapter was stamped with as it landed), from every
+        copy in the listing the updater persisted at the last check -- primary and followed sources alike,
+        never the sources themselves on a page open -- and from the names already in the effective
+        preferences, so a blocked group that has vanished from the listing stays visible to be unblocked.
+        `checkedAt` says how old the figures are.
       parameters:
         - name: id
           in: path
@@ -3398,8 +3860,12 @@ paths:
             application/json:
               schema:
                 type: object
-                required: [prefs, global, effective, groups]
+                required: [checkedAt, prefs, global, effective, groups]
                 properties:
+                  checkedAt:
+                    type: [string, "null"]
+                    format: date-time
+                    description: When the series' sources were last listed; null for a series never checked.
                   prefs:
                     description: The series' own preferences, or null when it has none.
                     oneOf:
@@ -3417,14 +3883,18 @@ paths:
                       patienceDays: { type: integer }
                   groups:
                     type: array
-                    description: Sorted by onDisk + listed descending, then by name.
+                    description: >-
+                      Sorted by onDisk + listed descending, then by name. Each entry is a GroupStat (the same
+                      figures GET /api/series/{id}/groups answers, from the same persisted copies and live
+                      files) plus `listed`, kept equal to `releases`. A name in the preferences that nothing
+                      lists or holds is a row of zeros.
                     items:
-                      type: object
-                      required: [name, onDisk, listed]
-                      properties:
-                        name: { type: string, description: The first spelling seen, the source's over the disk's over the preferences'. }
-                        onDisk: { type: integer, description: Chapters on disk this group released. }
-                        listed: { type: integer, description: Copies this group has in the sources' current listings. }
+                      allOf:
+                        - $ref: "#/components/schemas/GroupStat"
+                        - type: object
+                          required: [listed]
+                          properties:
+                            listed: { type: integer, description: Kept for clients written against the v0.31.0 shape; equals releases. }
         "401":
           description: Not authenticated
         "403":
@@ -3507,7 +3977,9 @@ paths:
       operationId: deleteApiAdminSeriesIdSourcesSourceId
       description: >-
         Requires an admin account and a token carrying the admin scope. Scopes only ever restrict. Chapters
-        already downloaded from it stay. The primary cannot be removed this way; it is not a followed source.
+        already downloaded from it stay; the listing rows it carried are dropped at once, so nothing can be
+        fetched through it before the next check. The primary cannot be removed this way; it is not a
+        followed source.
       parameters:
         - name: id
           in: path
@@ -3805,6 +4277,173 @@ paths:
           description: "Forbidden: token scope, account permission or age limit"
         "404":
           description: Not found, or not visible to this account
+  /api/admin/series/{id}/chapters/delete:
+    post:
+      tags:
+        - admin
+      summary: Delete chosen chapters' files from the download directory, keeping their rows as tombstones.
+      operationId: postApiAdminSeriesIdChaptersDelete
+      description: >-
+        Requires an admin account and a token carrying the admin scope. Scopes only ever restrict. Touches
+        DL_ROOT only: a chapter the scanner found in the read library is skipped (`not_owned`), on the same
+        footing as the read-chapter cleanup, and so is one somebody has a bookmark in (`bookmarked`) -- a
+        bookmark names a page inside the file. A chapter whose file AND folder are missing is skipped
+        (`unlink_failed`) rather than marked: that is the download volume not being mounted. The row survives
+        with `pruned` set so reading progress and the updater's have-set do; the cover moves to the lowest
+        live chapter. No typed confirmation -- the client confirms with the count.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [bookIds]
+              properties:
+                bookIds:
+                  type: array
+                  minItems: 1
+                  maxItems: 500
+                  items:
+                    type: string
+      security:
+        - bearer: []
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok, applied, bytes, skipped]
+                properties:
+                  ok:
+                    type: boolean
+                  applied:
+                    type: integer
+                    description: Chapters whose file is gone and whose row is now a tombstone.
+                  bytes:
+                    type: integer
+                  skipped:
+                    type: array
+                    items:
+                      type: object
+                      required: [id, reason]
+                      properties:
+                        id:
+                          type: string
+                        reason:
+                          type: string
+                          enum: [not_found, not_owned, already_pruned, bookmarked, outside_root, unlink_failed]
+        "400":
+          description: Malformed body or parameter
+        "401":
+          description: Not authenticated
+        "403":
+          description: "Forbidden: token scope, account permission or age limit"
+        "404":
+          description: Not found, or not visible to this account
+        "409":
+          description: "`refused`: the download directory is not writable; `message` and `fix` say what to do"
+  /api/admin/series/{id}/chapters/refetch:
+    post:
+      tags:
+        - admin
+      summary: Download chosen chapters again, as the copy the release rules choose now, onto the same rows.
+      operationId: postApiAdminSeriesIdChaptersRefetch
+      description: >-
+        Requires an admin account and a token carrying the admin scope. Scopes only ever restrict. Eligible
+        only for a file this server downloaded (`not_owned` otherwise) at exactly the path the downloader
+        writes, `Chapter <n>.cbz` (`not_ours` otherwise): only that path lands back on the same row, which is
+        what keeps reading progress attached. The listing is refreshed first (a check with no downloads),
+        so the copy is the one the release rules choose now; a source that does not answer leaves the last
+        listing standing, and a listing row from a source the series no longer follows is `source_unavailable`.
+        The old file is set aside until the new one lands and put back if the download fails. A chapter the
+        cleanup deleted (`pruned`) is eligible: this is how it comes back.
+        `picks` replaces a row's file with ONE named copy (`{bookId, source, sourceId}` from GET
+        /api/series/{id}/versions) instead of the rules' choice: the row's number selects the listing row,
+        the pick the copy in it (`not_listed` when none matches). A pick ignores the group rules including
+        the blocklist -- an explicit choice. At least one of `bookIds` / `picks`, at most 300 combined; a row
+        named in both is fetched as its pick, and a second pick for the same row is skipped as `duplicate`.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                bookIds:
+                  type: array
+                  maxItems: 300
+                  items:
+                    type: string
+                picks:
+                  type: array
+                  maxItems: 300
+                  items:
+                    type: object
+                    required: [bookId, source, sourceId]
+                    properties:
+                      bookId: { type: string }
+                      source: { type: string, minLength: 1, maxLength: 200 }
+                      sourceId: { type: string, minLength: 1, maxLength: 200 }
+      security:
+        - bearer: []
+      responses:
+        "200":
+          description: Started. Progress is on GET /api/sources/jobs under `folder`.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok, started, folder, total, skipped]
+                properties:
+                  ok:
+                    type: boolean
+                  started:
+                    type: boolean
+                  folder:
+                    type: string
+                  total:
+                    type: integer
+                  skipped:
+                    type: array
+                    items:
+                      type: object
+                      required: [id, reason]
+                      properties:
+                        id:
+                          type: string
+                        reason:
+                          type: string
+                          enum: [not_found, not_owned, not_ours, not_listed, blocked_group, source_unavailable, cooldown, duplicate]
+                        source:
+                          type: string
+                          description: "On a `duplicate` entry: the adapter of the pick that was ignored."
+                        sourceId:
+                          type: string
+                          description: "On a `duplicate` entry: the chapter id of the pick that was ignored."
+        "400":
+          description: Malformed body or parameter
+        "401":
+          description: Not authenticated
+        "403":
+          description: "Forbidden: token scope, account permission or age limit"
+        "404":
+          description: Not found, or not visible to this account
+        "409":
+          description: "`nothing_to_fetch` (every chapter was skipped; `skipped` says why), `busy` (a download for the series is running), or `refused` (the download directory is not writable)"
   /api/admin/series/{id}/library:
     post:
       tags:

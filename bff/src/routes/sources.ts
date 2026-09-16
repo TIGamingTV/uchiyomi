@@ -5,7 +5,7 @@ import { z } from 'zod';
 import { authenticate, userIdOf, roleOf } from '../lib/auth';
 import { getSource, listSources, isSwAdapterId, SW_PREFIX, withTimeout } from '../lib/sources';
 import type { SourceAdapter, SourceSeries, SourceChapter } from '../lib/sources/types';
-import { downloadChapter, sanitize } from '../lib/downloader';
+import { downloadChapter, sanitize, type DownloadInput } from '../lib/downloader';
 import { selectChapters, type ChapterFrom } from '../lib/selectChapters';
 import { noteChapterFailure } from '../lib/chapterFailures';
 import { scanOrder } from '../lib/scanOrder';
@@ -24,9 +24,14 @@ import { SOLVER_CONCURRENCY } from '../lib/sources/flaresolverr';
 const SCAN_CONCURRENCY = Math.max(1, Number(process.env.SCAN_CONCURRENCY || SOLVER_CONCURRENCY));
 const SCAN_ENOUGH = Math.max(1, Number(process.env.SCAN_ENOUGH || 3));
 const SCAN_SEARCH_MS = Number(process.env.SCAN_SEARCH_MS) || 45_000;
-import { persistScan, setBookDates, setBookMeta } from '../lib/library';
-import { chooseReleases } from '../lib/releases';
+import { persistScan, setBookDates, setBookMeta, libraryIdFor, type LibraryRow } from '../lib/library';
+import { newSeriesId } from '../lib/ids';
+import { cleanDescription } from '../lib/htmlText';
+import { updateSeries } from '../lib/updater';
+import { chooseReleases, groupsOf, releaseOrder } from '../lib/releases';
 import { effectivePrefsFor, readSeriesPrefs } from '../lib/scanlatorPrefs';
+import { copyToChapter, listingRows, replaceListing, type ListingCopy } from '../lib/seriesListing';
+import { groupStats } from '../lib/groupStats';
 import { fetchAniListArt, fetchTrendingManhwa, TrendingItem } from '../lib/anilist';
 import { q, one } from '../lib/db';
 import { healthAll, isDisabled, blockedNow, reportLatest, reportFail, reportSlow, classify } from '../lib/sourceHealth';
@@ -42,9 +47,12 @@ import {
  * At the download gate's 1200ms minimum spacing plus fetch time, 300 chapters is several hours of background
  * work. A bound, not a policy: it exists so a mis-click cannot start something that runs all week.
  */
-const FILL_MAX_CHAPTERS = 300;
+export const FILL_MAX_CHAPTERS = 300;
+/** How long a Fetch waits for the listing refresh before the stale listing serves (see /api/sources/fetch). */
+export const REFRESH_BUDGET_MS = 10_000;
 import { logAudit } from '../lib/audit';
 import { env } from '../env';
+import { runtime } from '../lib/runtime';
 // The "already in library" annotation is deliberately library-wide: it answers "would adding this be a
 // duplicate on this server", which is a property of the server, not of the person asking.
 //
@@ -69,6 +77,116 @@ function sweepJobs(now = Date.now()): void {
   for (const [folder, j] of jobs) {
     if (j.status === 'done' && j.finishedAt && now - j.finishedAt > DONE_TTL) jobs.delete(folder);
   }
+}
+
+/** Is a download running for this series folder right now. Jobs are keyed by folder, as lib_series.folder is. */
+export function jobBusy(folder: string): boolean {
+  return jobs.get(folder)?.status === 'downloading';
+}
+
+export interface DownloadJobInput {
+  folder: string;
+  title: string;
+  seriesId: string;
+  /** Ascending. Every copy carries `source`: the adapter it is fetched through. */
+  chapters: SourceChapter[];
+  /** OUR series row's metadata, never a candidate's -- see the note on `meta` inside the loop. */
+  meta: DownloadInput['meta'];
+  /**
+   * Called once per chapter with whether it landed: right after its attempt, or at the end of the job for
+   * a chapter the job never reached (a full disk, a refusing source, a shutdown). The refetch route uses it
+   * to drop or put back the copy it set aside; a job that ends must settle every chapter it was given, or
+   * a chapter skipped by a refusal would leave its old file renamed away for good.
+   */
+  onSettled?: (ch: SourceChapter, landed: boolean) => Promise<void>;
+}
+
+/**
+ * Fetch a list of chapters into a series folder as one job card, detached from the request.
+ *
+ * This is the fill's loop, lifted out so a manual fetch of ghost chapters and an admin's "fetch again"
+ * run the same code rather than three copies of it. The job answers `total` at once; the work happens
+ * after, and the client polls GET /api/sources/jobs. The three generalisations over the fill's original,
+ * and only these: each copy names its own source (the fill's chapters all name one, so it behaves as
+ * before), a source that refuses is not asked again but the others still are -- the loop ends when every
+ * source in the job is refusing, which for one source is the first refusal, exactly as before -- and the
+ * loop checks `runtime.stopping` between chapters, as the updater's does, so a `docker compose up -d`
+ * mid-fetch ends at a chapter boundary instead of mid-write.
+ *
+ * The caller has already authorised the chapters and recorded the audit line; this function does neither.
+ */
+export function startDownloadJob(input: DownloadJobInput): { total: number } {
+  const { folder, title, seriesId, chapters, meta } = input;
+  jobs.set(folder, { title, total: chapters.length, done: 0, status: 'downloading' });
+  const settle = async (ch: SourceChapter, landed: boolean) => {
+    if (!input.onSettled) return;
+    // A hook that throws must not take the job's tail with it: the scan and the stamps still have to run.
+    await input.onSettled(ch, landed).catch((e) => console.warn(`[download] settle hook failed for ${folder} ch ${ch.number}: ${(e as Error)?.message || e}`));
+  };
+
+  void (async () => {
+    let failures = 0;
+    // What this job wrote, for the provenance stamp; a skipped copy was already on disk and is not ours.
+    const landed: Array<{ number: number; scanlator?: string; source?: string }> = [];
+    const settled = new Set<SourceChapter>();
+    // A source that has refused once this job is not asked again, but the others still are: a rate-limited
+    // primary must not stop the follower's chapters. Each source costs at most one strike per job.
+    const refusing = new Set<string>();
+    const sources = new Set(chapters.map((c) => c.source ?? ''));
+    for (const ch of chapters) {
+      if (runtime.stopping) break; // between chapters, never mid-write
+      const via = ch.source ?? '';
+      if (refusing.has(via)) continue;
+      settled.add(ch);
+      try {
+        /**
+         * `meta` comes from OUR series row, never from the candidate.
+         *
+         * `downloadChapter` writes meta.series into the CBZ's ComicInfo <Series>, and every persistScan
+         * re-reads the FIRST chapter's ComicInfo and overwrites the series row's title, summary, author,
+         * status, genres and web from it (lib/library.ts, ON CONFLICT DO UPDATE). Filling a gap at the
+         * START of a series writes the new first chapter -- so passing the candidate's title here would
+         * silently rename the series, for everyone, on the next scan. It fires even when the match is
+         * RIGHT, because a right match is often under a different English title.
+         */
+        const res = await downloadChapter({ sourceId: via, seriesFolder: folder, chapter: ch, meta });
+        if (!res.skipped) landed.push({ number: ch.number, scanlator: ch.scanlator, source: via });
+        const j = jobs.get(folder);
+        if (j && !res.skipped) { j.done++; if (j.done % 5 === 0) await persistScan().catch(() => {}); }
+        await settle(ch, !res.skipped);
+      } catch (e: any) {
+        const j = jobs.get(folder);
+        if (e?.diskFull) {
+          if (j) { j.status = 'error'; j.reason = `Not enough free space: ${String(e.message)}. ${j.done} of ${j.total} chapters saved.`; j.finishedAt = Date.now(); }
+          await settle(ch, false);
+          break;
+        }
+        failures++;
+        await noteChapterFailure({ seriesId, title, number: ch.number, sourceId: via, err: e });
+        await settle(ch, false);
+        if (e?.blockStatus) {
+          refusing.add(via);
+          if (j) {
+            j.reason = `${getSource(via)?.name ?? via} stopped part-way. ${j.done} of ${j.total} chapters saved.`;
+            if ([...sources].every((sid) => refusing.has(sid))) { j.status = 'error'; j.finishedAt = Date.now(); }
+          }
+          if ([...sources].every((sid) => refusing.has(sid))) break;
+          continue;
+        }
+        if (j) j.reason = `${failures} chapter${failures === 1 ? '' : 's'} could not be saved: ${String(e?.message || e).slice(0, 120)}`;
+        // NOT counted: a chapter that was not written must never advance the bar.
+      }
+    }
+    // Settled BEFORE the scan, so a copy the hook puts back is on disk when the scanner looks.
+    for (const ch of chapters) if (!settled.has(ch)) await settle(ch, false);
+    await persistScan().catch(() => {});
+    await setBookDates(folder, chapters).catch(() => {});
+    await setBookMeta(folder, landed).catch(() => {});
+    const j = jobs.get(folder);
+    if (j && j.status !== 'error') { j.status = failures ? 'error' : 'done'; j.finishedAt = Date.now(); }
+  })();
+
+  return { total: chapters.length };
 }
 
 // Trending recommendations are global + slow-moving; cache the AniList pull for a few hours.
@@ -278,6 +396,8 @@ export interface AddResult {
   existing?: { title: string; source: string }; blockStatus?: string;
   /** The download was started rather than completed. Absent when the series was already in the library. */
   started?: boolean;
+  /** A "nothing yet" add: the series was created and floored, and no chapter was fetched or queued. */
+  nothing?: boolean;
 }
 
 /** Add one series from a source to the library (downloads chapter 1 synchronously, the rest in background).
@@ -345,9 +465,86 @@ export async function addSeriesFromSource(opts: {
   // often the group nobody wanted as the one they did -- would be locked in for the life of the series.
   const prefs = await effectivePrefsFor(null, 0);
   const { releases: chosen } = chooseReleases(chapters, prefs);
+  // The description as the page will show it: MangaDex writes Markdown, and this is what goes into every
+  // ComicInfo the downloader writes and, through the scanner, into lib_series.summary.
+  const meta = { series: title, summary: cleanDescription(series?.summary), author: series?.author, genres: series?.genres, url: series?.url, status: series?.status };
+
+  /**
+   * "Nothing yet": the series is created and followed, and no chapter is fetched.
+   *
+   * ⚠️ The row has to be written HERE. Every other add lets persistScan mint it from the first chapter's
+   * folder, but findSeriesDirs only registers a directory that directly holds chapters (library.ts), so a
+   * folder with nothing in it -- there is not even a folder yet -- would never become a row, and the add
+   * would have created nothing to follow. The columns are the ones persistScan writes plus the routing
+   * stamps the normal path adds afterwards; `library_id` is the same `libraryIdFor` answer persistScan would
+   * pick for a brand-new folder, so when the first chapter arrives its `ON CONFLICT (library_id, folder)`
+   * lands on THIS row and updates it in place rather than minting a second id -- and so the row sits in
+   * the library its folder says it is in, as every scanned row does.
+   *
+   * The floor is a hair ABOVE the newest listed number, not at it: `chapter_floor` is inclusive from below
+   * (`number < floor` is below, seriesListing.ts; `number >= floor` is wanted, updater.ts), so a floor of
+   * `max + 0.001` puts every number the source lists today below the sweep's scope and the next release --
+   * `max + 0.5`, `max + 1` -- inside it. A chapter numbered between `max` and `max + 0.001` would read as
+   * older; no real numbering does that, and the openapi description says so. NULL when the source lists
+   * nothing: there is nothing to be above, and every future chapter is wanted. An empty listing is not
+   * `no_chapters` here -- an announced title with no chapters yet is the one this add exists for.
+   *
+   * No job, no download, no persistScan: the listing and the cover are written as the normal path writes
+   * them, and the AniList art call runs as it does for every add. Re-adding hits the `existing` check above.
+   * The next sweep (or a person fetching from the series page) creates the folder through the downloader's
+   * mkdir, and persistScan then finds the row by folder.
+   *
+   * ⚠️ A row this folder already has is REVIVED, not shadowed. `existing` reaches this point only when the
+   * row was deleted and the check above has just un-deleted it -- and the unique index is (library_id,
+   * folder), so a plain INSERT answered 23505 for a series removed from the library and added back as
+   * "nothing yet", AFTER the un-delete had already put it back: the dialog read "Add failed. Try another
+   * source." for a series that was in the library again, and the next tap read "already in library". The
+   * conflict lands on that row and refreshes its routing in place, so its id -- and every favourite, note
+   * and read mark hung on it -- survives, as persistScan's own upsert keeps them across a rescan. The
+   * library has to be the row's OWN for the conflict to find it: an admin can move a series to a library
+   * its path would not pick (a deliberate UPDATE, library.ts), and `libraryIdFor` would then mint a second
+   * row of the same folder one library over, which is exactly the stranding the index exists to stop.
+   * Only a brand-new folder is assigned by path, as persistScan assigns one.
+   *
+   * Stamped as CHECKED, as stampChecked in updater.ts stamps a row after every sweep: this add has just
+   * asked the source. Left NULL, the series page read `not checked yet` above a run row that listed the
+   * very chapters this check had found, and the sources sheet showed no count and no "checked {ago}",
+   * until the first sweep reached the row. `source_chapters` is the chooser's count -- one per number,
+   * what the sweep stamps -- and `source_missing` is 0: every listed number is below the floor, so the
+   * sweep wants none of them.
+   */
+  if (chapterFrom === 'none') {
+    const floor = chosen.length ? Math.max(...chosen.map((c) => c.number)) + 0.001 : null;
+    const libs = await q<LibraryRow>('SELECT id, path FROM libraries ORDER BY length(path) DESC');
+    const libraryId = existing
+      ? (await one<{ library_id: string }>('SELECT library_id FROM lib_series WHERE id = $1', [existing.id]))?.library_id ?? libraryIdFor(folder, libs)
+      : libraryIdFor(folder, libs);
+    const { id } = (await q<{ id: string }>(
+      `INSERT INTO lib_series (id, source, title, summary, author, status, genres, web, folder, books_count, library_id, scanned_at,
+                               auto_update, source_id, source_series_id, chapter_floor, source_checked_at, source_chapters, source_missing)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,0,$10,now(),$11,$12,$13,$14,now(),$15,0)
+       ON CONFLICT (library_id, folder) DO UPDATE SET
+         auto_update = EXCLUDED.auto_update, source_id = EXCLUDED.source_id, source_series_id = EXCLUDED.source_series_id,
+         chapter_floor = EXCLUDED.chapter_floor, scanned_at = now(), deleted_at = NULL,
+         source_checked_at = now(), source_chapters = EXCLUDED.source_chapters, source_missing = EXCLUDED.source_missing
+       RETURNING id`,
+      [newSeriesId(), src.name, title, meta.summary || null, meta.author ?? null, meta.status ?? null, meta.genres ?? [], meta.url ?? null,
+       folder, libraryId, autoUpdate !== false, source, sourceId, floor, chosen.length],
+    ))[0];
+    await replaceListing(id, listingRows(chapters.map((c) => ({ ...c, source: source! })), chosen, new Set(), source!, releaseOrder(prefs))).catch(() => {});
+    if (series?.coverUrl) {
+      await q(`INSERT INTO series_art (series_id, cover) VALUES ($1, $2)
+        ON CONFLICT (series_id) DO UPDATE SET cover = COALESCE(series_art.cover, EXCLUDED.cover)`, [id, series.coverUrl]).catch(() => {});
+    }
+    fetchAniListArt(title)
+      .then((a) => q(`INSERT INTO series_art (series_id, banner, cover) VALUES ($1, $2, $3)
+        ON CONFLICT (series_id) DO UPDATE SET banner = COALESCE(series_art.banner, EXCLUDED.banner), cover = COALESCE(series_art.cover, EXCLUDED.cover)`, [id, a.banner, a.cover]))
+      .catch(() => {});
+    return { ok: true, status: 200, title, folder, chapters: 0, started: false, nothing: true };
+  }
+
   if (!chosen.length) return { ok: false, status: 404, error: 'no_chapters', message: 'No readable chapters for this title on this source. Try a different source.' };
   const selected = selectChapters(chosen, chapterCount, chapterFrom);
-  const meta = { series: title, summary: series?.summary, author: series?.author, genres: series?.genres, url: series?.url, status: series?.status };
   jobs.set(folder, { title, total: selected.length, done: 0, status: 'downloading' });
 
   /**
@@ -408,6 +605,13 @@ export async function addSeriesFromSource(opts: {
       ? Math.min(...selected.map((c) => c.number)) : null;
     await q('UPDATE lib_series SET auto_update = $1, source_id = $2, source_series_id = $3, chapter_floor = $5 WHERE folder = $4',
       [autoUpdate !== false, source, sourceId, folder, floor]).catch(() => {});
+    // The listing the series page and "Who scanlates this" read is written here from the chapters this add
+    // already fetched -- no second call to the source -- so a title opened straight from Discover shows
+    // its groups and versions at once instead of only what is on disk until the sweep reaches it. Held is
+    // empty on purpose: the add ran with patience 0. Best effort, like every stamp above.
+    await q<{ id: string }>('SELECT id FROM lib_series WHERE folder = $1', [folder])
+      .then((rows) => rows[0] && replaceListing(rows[0].id, listingRows(chapters.map((c) => ({ ...c, source: source! })), chosen, new Set(), source!, releaseOrder(prefs))))
+      .catch(() => {});
     if (series?.coverUrl) {
       await q(`INSERT INTO series_art (series_id, cover) SELECT id, $1 FROM lib_series WHERE folder = $2
         ON CONFLICT (series_id) DO UPDATE SET cover = COALESCE(series_art.cover, EXCLUDED.cover)`, [series.coverUrl, folder]).catch(() => {});
@@ -518,12 +722,30 @@ export default async function sourceRoutes(app: FastifyInstance) {
     // Which language a source serves is an operator's choice recorded per source, not a property of the
     // adapter (adapters are code), so it lives only in suwayomi_sources. Discover groups by it: forty-five
     // sources across thirty languages is a list nobody can use, and most of them are the same site repeated.
-    // A 45-row read on a route the client already polls.
-    const langs = new Map(
-      (await q<{ source_id: string; lang: string | null }>(
-        'SELECT source_id, lang FROM suwayomi_sources WHERE enabled = true',
-      ).catch(() => [])).map((r) => [r.source_id, r.lang]),
+    // A 45-row read on a route the client already polls. `pkg_name`/`ext_name` ride along on the same read:
+    // which extension package a source came out of is likewise something only the engine told us at
+    // registration, and the Providers page folds one package's language variants into one card by it.
+    const swRows = new Map(
+      (await q<{ source_id: string; lang: string | null; pkg_name: string | null; ext_name: string | null }>(
+        'SELECT source_id, lang, pkg_name, ext_name FROM suwayomi_sources WHERE enabled = true',
+      ).catch(() => [])).map((r) => [r.source_id, r]),
     );
+    /**
+     * The extension behind an `sw:` source, or null for every other kind of source. When the engine gave
+     * no package name -- rows remembered before the columns existed and not re-listed since -- the display
+     * name minus its trailing ` (EN)` / ` (PT-BR)` / ` (ALL)` stands in as the name, with `pkgName` null so
+     * the client knows it is grouping on a guess. The suffix is what Suwayomi appends to a multi-language
+     * extension's variants, so stripping it is what makes "3Hentai (EN)" and "3Hentai (JA)" fold together.
+     */
+    // Only a SHORT, upper-case, letters-and-hyphens tag in the last bracket is a language suffix. Anything
+    // else in brackets is part of the name: a site called "Manga (Reader)" must stay one word, not fold.
+    const stripLangSuffix = (name: string): string => name.replace(/\s\((?:[A-Z]{2,3}(?:-[A-Z]{2,4})?|ALL)\)$/, '').trim() || name;
+    const extensionOf = (s: SourceAdapter): { pkgName: string | null; name: string } | null => {
+      if (!isSwAdapterId(s.id)) return null;
+      const row = swRows.get(s.id.slice(SW_PREFIX.length));
+      if (row?.pkg_name || row?.ext_name) return { pkgName: row.pkg_name ?? null, name: row.ext_name || stripLangSuffix(s.name) };
+      return { pkgName: null, name: stripLangSuffix(s.name) };
+    };
     // How many series the library actually holds from each source, keyed on the ADAPTER ID rather than the
     // display name. `lib_series.source` is the folder's parent, which is the name the source had when the
     // series was added, so renaming a source orphans its history: on this install the same adapter reads as
@@ -558,7 +780,11 @@ export default async function sourceRoutes(app: FastifyInstance) {
           // null means "declares no single language", which is not the same as "serves none": a source
           // like MangaDex belongs in every group rather than in an orphan bucket. An adapter may now declare
           // one itself, which is how MangaDex -- hardcoded to ask for English -- stops joining all thirty.
-          lang: s.lang ?? (isSwAdapterId(s.id) ? (langs.get(s.id.slice(SW_PREFIX.length)) ?? null) : null),
+          lang: s.lang ?? (isSwAdapterId(s.id) ? (swRows.get(s.id.slice(SW_PREFIX.length))?.lang ?? null) : null),
+          // Which extension package an `sw:` source came out of; null for built-ins, packs and custom sites.
+          // Providers groups by `pkgName` (or by `name` when that is null) so 3Hentai's twenty-nine language
+          // variants are one card rather than twenty-nine.
+          extension: extensionOf(s),
           latest: typeof s.latest === 'function',
           // Reported from the method's presence, exactly as `latest` is. A source without it simply
           // drops out of the wall while Popular is selected, the same way one without `latest` does.
@@ -794,68 +1020,202 @@ export default async function sourceRoutes(app: FastifyInstance) {
       `SELECT id, title, folder, summary, author, genres, web, status FROM lib_series WHERE id = $1`, [plan.seriesId]);
     if (!s) return reply.code(404).send({ error: 'not_found' });
 
-    const running = jobs.get(s.folder);
-    if (running && running.status === 'downloading') return reply.code(409).send({ error: 'busy' });
+    if (jobBusy(s.folder)) return reply.code(409).send({ error: 'busy' });
 
     const picked = auth.chapters;
-    jobs.set(s.folder, { title: s.title, total: picked.length, done: 0, status: 'downloading' });
     await logAudit('series.fill', {
       userId: userIdOf(req),
       detail: { seriesId: plan.seriesId, title: s.title, source, sourceSeriesId, numbers: picked.map((c) => c.number) },
       req,
     });
+    // Every copy stamped with the source the person picked: the shared loop routes each chapter by its own.
+    const { total } = startDownloadJob({
+      folder: s.folder, title: s.title, seriesId: plan.seriesId,
+      chapters: picked.map((c) => ({ ...c, source })),
+      meta: { series: s.title, summary: s.summary, author: s.author, genres: s.genres, url: s.web, status: s.status },
+    });
+    return { ok: true, started: true, folder: s.folder, total };
+  });
 
-    void (async () => {
-      let failures = 0;
-      // What this fill wrote, for the provenance stamp; a skipped copy was already on disk and is not ours.
-      const landed: Array<{ number: number; scanlator?: string; source?: string }> = [];
-      for (const ch of picked) {
-        try {
-          /**
-           * `meta` comes from OUR series row, never from the candidate.
-           *
-           * `downloadChapter` writes meta.series into the CBZ's ComicInfo <Series>, and every persistScan
-           * re-reads the FIRST chapter's ComicInfo and overwrites the series row's title, summary, author,
-           * status, genres and web from it (lib/library.ts, ON CONFLICT DO UPDATE). Filling a gap at the
-           * START of a series writes the new first chapter -- so passing the candidate's title here would
-           * silently rename the series, for everyone, on the next scan. It fires even when the match is
-           * RIGHT, because a right match is often under a different English title.
-           */
-          const res = await downloadChapter({
-            sourceId: source, seriesFolder: s.folder, chapter: ch,
-            meta: { series: s.title, summary: s.summary, author: s.author, genres: s.genres, url: s.web, status: s.status },
-          });
-          if (!res.skipped) landed.push({ number: ch.number, scanlator: ch.scanlator, source });
-          const j = jobs.get(s.folder);
-          if (j && !res.skipped) { j.done++; if (j.done % 5 === 0) await persistScan().catch(() => {}); }
-        } catch (e: any) {
-          const j = jobs.get(s.folder);
-          if (e?.diskFull) {
-            if (j) { j.status = 'error'; j.reason = `Not enough free space: ${String(e.message)}. ${j.done} of ${j.total} chapters saved.`; j.finishedAt = Date.now(); }
-            break;
-          }
-          failures++;
-          await noteChapterFailure({ seriesId: plan.seriesId, title: s.title, number: ch.number, sourceId: source, err: e });
-          if (e?.blockStatus) {
-            if (j) {
-              j.status = 'error';
-              j.reason = `${src.name} stopped part-way. ${j.done} of ${j.total} chapters saved.`;
-              j.finishedAt = Date.now();
-            }
-            break;
-          }
-          if (j) j.reason = `${failures} chapter${failures === 1 ? '' : 's'} could not be saved: ${String(e?.message || e).slice(0, 120)}`;
-          // NOT counted: a chapter that was not written must never advance the bar.
-        }
+  /**
+   * Fetch chapters the sources list but this server lacks -- the ghost rows on the series page.
+   *
+   * The last listing (lib/seriesListing.ts) IS the authorisation: a client names chapter NUMBERS, and only
+   * a number the sources listed at the last check has a row to fetch from. The same footing as the fill
+   * plan, for the same reason: no chapter URL crosses the wire, and a number nobody listed cannot be asked
+   * for from anywhere. What is fetched is the copy the release rules chose at that check.
+   *
+   * Patience is ignored by construction: the chosen copy of a held number is the best copy on offer, and
+   * a person clicking Fetch on a "waiting for group B" row is saying they will take it. The BLOCKLIST is
+   * never ignored for a NUMBER: a number only blocked groups released has no chosen copy at all
+   * (`blocked_group`), and the way to fetch it is to unblock the group and check again. A manual fetch also
+   * resets the retry cap -- the ledger row goes, and a failure re-creates it at one attempt -- because "try
+   * it again on purpose" is exactly what the cap was designed to leave room for.
+   *
+   * A PICK names one specific copy -- `{ number, source, sourceId }` out of the versions list -- and is
+   * authorised by finding exactly that copy among the number's stored `copies` (`not_listed` otherwise):
+   * still no chapter URL crosses the wire, and still only what a source has been seen to list can be asked
+   * for. A pick ignores the group rules INCLUDING the blocklist. The blocklist governs what the sweep takes
+   * on its own; the versions list labels a copy "blocked" and a person who taps Fetch on it anyway has made
+   * an explicit choice of that one copy, which is a different act from asking for "the number". What a pick
+   * never overrides is `already_here`: a live row for the number means the action is "fetch again", the
+   * admin's, and a member must not be able to replace a file by naming another copy of it.
+   */
+  app.post('/api/sources/fetch', async (req, reply) => {
+    // Bounded, not merely finite: the numbers are cast to `real[]` below, and a value past float4 range
+    // (1e308 passes `finite()`) made Postgres throw 22003 -- a 500 carrying the driver's message, logged
+    // as a server error, for what is a client mistake. No chapter is numbered negative or past a million.
+    // Reintroduce by dropping `.min(0).max(1e6)`: "a chapter number outside float range is a bad request,
+    // not a server error" in chapterActions.int.test.ts reads 500.
+    const chapterNumber = z.number().finite().min(0).max(1e6);
+    const b = z.object({
+      seriesId: z.string().min(1).max(64),
+      numbers: z.array(chapterNumber).max(FILL_MAX_CHAPTERS).optional(),
+      picks: z.array(z.object({
+        number: chapterNumber,
+        source: z.string().min(1).max(200),
+        sourceId: z.string().min(1).max(200),
+      })).max(FILL_MAX_CHAPTERS).optional(),
+    })
+      // One cap over both lists: the job is one job whichever way its chapters were named, and 300 numbers
+      // plus 300 picks would be a 600-chapter job through a route documented as 300.
+      // Reintroduce by dropping this refine: "picks and numbers together stay under the cap" in
+      // chapterActions.int.test.ts reads 200.
+      .refine((v) => (v.numbers?.length ?? 0) + (v.picks?.length ?? 0) >= 1, { message: 'nothing named' })
+      .refine((v) => (v.numbers?.length ?? 0) + (v.picks?.length ?? 0) <= FILL_MAX_CHAPTERS, { message: 'too many' })
+      .safeParse(req.body);
+    if (!b.success) return reply.code(400).send({ error: 'bad_request' });
+    const { seriesId } = b.data;
+    // First pick per number wins, and a number with a pick leaves `numbers`: the explicit choice is the
+    // more specific ask, and fetching the number's chosen copy beside it would land two files on one path.
+    // A second pick for the same number is reported, not dropped: the web client never sends two, but a
+    // scripted caller that does would otherwise see one copy fetched and hear nothing about the other.
+    // Reintroduce by dropping the `else` branch: "a second pick for the same number is skipped as a
+    // duplicate" in chapterActions.int.test.ts finds `skipped` empty.
+    const skipped: Array<{ number: number; reason: string; source?: string; sourceId?: string }> = [];
+    const pickOf = new Map<number, { number: number; source: string; sourceId: string }>();
+    for (const pk of b.data.picks ?? []) {
+      if (!pickOf.has(pk.number)) pickOf.set(pk.number, pk);
+      else skipped.push({ number: pk.number, reason: 'duplicate', source: pk.source, sourceId: pk.sourceId });
+    }
+    const plain = [...new Set(b.data.numbers ?? [])].filter((n) => !pickOf.has(n)).sort((x, y) => x - y);
+    const numbers = [...new Set([...plain, ...pickOf.keys()])].sort((x, y) => x - y);
+
+    // Browsable by THIS viewer, as the fill scan requires: a capped member must not be able to write into a
+    // series they are walled off from, or learn which of its numbers are listed. Fails closed.
+    const p = new Params();
+    const rows = await q<any>(
+      `SELECT s.id, s.title, s.folder, s.summary, s.author, s.genres, s.web, s.status, s.source_id
+         FROM lib_series s WHERE s.id = ${p.add(seriesId)} AND ${browsable('s', vc(req), p)}`, p.values,
+    ).then((r) => r, () => null);
+    if (rows === null) return reply.code(503).send({ error: 'unavailable' });
+    const s = rows[0];
+    if (!s) return reply.code(404).send({ error: 'not_found' });
+    if (jobBusy(s.folder)) return reply.code(409).send({ error: 'busy', message: 'A download for that series is already running.' });
+
+    // The listing is refreshed first, so what is fetched is the copy the release rules choose NOW rather
+    // than the one the last sweep chose: a preferences save never touches series_listing, and a person who
+    // has just ranked a group expects the next Fetch to honour it. maxNew 0 lists and persists and breaks
+    // before any download; a source that does not answer leaves the previous listing standing (stale beats
+    // empty, lib/updater.ts), and the not_listed / source_unavailable paths below handle that. Best effort:
+    // the refresh must never be the thing that stops a fetch, and it runs only after the viewer's gate, so
+    // a walled-off member cannot make this server ask a source about a series they cannot see.
+    // Reintroduce by dropping this call: "fetch again takes the copy the rules choose now, not the one the
+    // last check chose" in chapterActions.int.test.ts downloads the old group's copy.
+    // ⚠️ Bounded on its own, not by the source's listing budget: a Cloudflare-fronted source may take 90 s
+    // to answer (SOLVER_BUDGET_MS), and a Fetch button that holds the request that long meets the reverse
+    // proxy's timeout first while the job starts anyway. Ten seconds covers every direct source; past that
+    // the stale listing serves and the refresh finishes in the background for the next click.
+    await withTimeout(updateSeries(seriesId, 0), REFRESH_BUDGET_MS).catch(() => {});
+    const listed = new Map((await q<{ number: number; title: string | null; source_id: string; status: string; chosen: SourceChapter; copies: ListingCopy[] }>(
+      'SELECT number, title, source_id, status, chosen, copies FROM series_listing WHERE series_id = $1 AND number = ANY($2::real[])',
+      [seriesId, numbers],
+    )).map((r) => [Number(r.number), r]));
+    // A listing row's source_id is trusted only while the series still follows that source (the primary,
+    // or a series_sources row): an unfollow drops the rows it carried, but a stale row must never authorise
+    // a download from a source the admin removed. Same check as the admin's refetch.
+    // Reintroduce by dropping the `followed` check in stateOf: "a stale listing row never authorises a
+    // source the series does not follow" in chapterActions.int.test.ts starts a download from it.
+    const followed = new Set([
+      ...(s.source_id ? [s.source_id as string] : []),
+      ...(await q<{ source_id: string }>('SELECT source_id FROM series_sources WHERE series_id = $1', [seriesId]).catch(() => [])).map((r) => r.source_id),
+    ]);
+    // A live row, not a tombstone: a chapter the cleanup let go is fetchable again, and "already here"
+    // would send the person to a row with no pages behind it.
+    const here = new Set((await q<{ number: number }>(
+      'SELECT number FROM lib_books WHERE series_id = $1 AND number = ANY($2::real[]) AND pruned_at IS NULL',
+      [seriesId, numbers],
+    )).map((r) => Number(r.number)));
+
+    const chapters: SourceChapter[] = [];
+    // Health is per source, asked once per source rather than once per number.
+    const sourceState = new Map<string, 'ok' | 'source_unavailable' | 'cooldown' | 'denied'>();
+    const stateOf = async (sid: string) => {
+      let st = sourceState.get(sid);
+      if (st) return st;
+      const src = getSource(sid);
+      if (!followed.has(sid) || !src || await isDisabled(sid).catch(() => false)) st = 'source_unavailable';
+      else if (!sourceAllowedFor(src, vc(req).maxAgeRating)) st = 'denied';
+      else if (await blockedNow(sid).catch(() => null)) st = 'cooldown';
+      else st = 'ok';
+      sourceState.set(sid, st);
+      return st;
+    };
+    for (const n of numbers) {
+      const row = listed.get(n);
+      const pick = pickOf.get(n);
+      if (pick) {
+        // A pick is authorised by the stored copy it names, and by nothing else: the row's status (the
+        // group rules' verdict on the NUMBER, blocklist included) is deliberately not consulted -- see the
+        // route comment. Same source gate as a plain fetch: the copy's source must still be followed,
+        // loaded, enabled, and out of cooldown.
+        // Reintroduce by adding `if (row.status === 'blocked') { skipped.push(...blocked_group); continue; }`
+        // ahead of this lookup: "a pick fetches that copy and no other, blocklist or not" in
+        // chapterActions.int.test.ts reads 409.
+        const copy = row?.copies?.find((c) => c.source === pick.source && c.sourceId === pick.sourceId);
+        if (!row || !copy) { skipped.push({ number: n, reason: 'not_listed', source: pick.source, sourceId: pick.sourceId }); continue; }
+        if (here.has(n)) { skipped.push({ number: n, reason: 'already_here', source: pick.source, sourceId: pick.sourceId }); continue; }
+        const st = await stateOf(copy.source);
+        if (st === 'denied') return denySource(reply);
+        if (st !== 'ok') { skipped.push({ number: n, reason: st, source: pick.source, sourceId: pick.sourceId }); continue; }
+        chapters.push(copyToChapter(copy, { number: n, title: row.title }));
+        continue;
       }
-      await persistScan().catch(() => {});
-      await setBookDates(s.folder, picked).catch(() => {});
-      await setBookMeta(s.folder, landed).catch(() => {});
-      const j = jobs.get(s.folder);
-      if (j && j.status !== 'error') { j.status = failures ? 'error' : 'done'; j.finishedAt = Date.now(); }
-    })();
+      if (!row) { skipped.push({ number: n, reason: 'not_listed' }); continue; }
+      if (row.status === 'blocked') { skipped.push({ number: n, reason: 'blocked_group' }); continue; }
+      if (here.has(n)) { skipped.push({ number: n, reason: 'already_here' }); continue; }
+      const st = await stateOf(row.source_id);
+      // The same by-id rejection the rest of this file gives, and it does not say what is being withheld.
+      if (st === 'denied') return denySource(reply);
+      if (st !== 'ok') { skipped.push({ number: n, reason: st }); continue; }
+      chapters.push({ ...row.chosen, source: row.source_id });
+    }
+    chapters.sort((a, b) => a.number - b.number);
+    if (!chapters.length) {
+      // The first reason that is about a chapter, not about the body: a duplicate pick is never why
+      // nothing was fetched, since its number was handled once through its first pick.
+      const first = skipped.find((x) => x.reason !== 'duplicate')?.reason ?? skipped[0]?.reason;
+      const message = first === 'not_listed' ? 'Not in the last listing -- run Check for new chapters first.'
+        : first === 'blocked_group' ? 'Only blocked groups released that chapter. Unblock the group and check again.'
+        : first === 'already_here' ? 'That chapter is already here.'
+        : first === 'cooldown' ? 'That source is in a cooldown. Try again later.'
+        : 'That source is not available right now.';
+      return reply.code(409).send({ error: 'nothing_to_fetch', message, skipped });
+    }
 
-    return { ok: true, started: true, folder: s.folder, total: picked.length };
+    await q('DELETE FROM chapter_failures WHERE series_id = $1 AND number = ANY($2::real[])',
+      [seriesId, chapters.map((c) => c.number)]).catch(() => {});
+    const picks = chapters.filter((c) => pickOf.has(c.number)).map((c) => ({ number: c.number, source: c.source, sourceId: c.sourceId }));
+    await logAudit('series.chapters_fetch', {
+      userId: userIdOf(req),
+      detail: { seriesId, title: s.title, numbers: chapters.map((c) => c.number), ...(picks.length ? { picks } : {}), skipped },
+      req,
+    });
+    const { total } = startDownloadJob({
+      folder: s.folder, title: s.title, seriesId, chapters,
+      meta: { series: s.title, summary: s.summary, author: s.author, genres: s.genres, url: s.web, status: s.status },
+    });
+    return { ok: true, started: true, folder: s.folder, total, skipped };
   });
 
   app.get('/api/sources/search-all', async (req) => {
@@ -1051,11 +1411,22 @@ export default async function sourceRoutes(app: FastifyInstance) {
     // the dialog's "120 chapters" is the 120 the add lands and not the 200 rows the source listed.
     const chosen = chooseReleases(chapters, await effectivePrefsFor(null, 0)).releases;
     const nums = chosen.map((c) => c.number);
+    // Who scanlates it and how many numbers come in more than one version, from the list already in hand
+    // -- no second source call. The dialog shows the top groups with their rhythm so a person can see,
+    // before adding, whether the title is still being worked on and by whom; `onDisk` is 0 by construction
+    // (nothing is on disk before the add) and `chapters` is present for the contract's sake.
+    const perNumber = new Map<number, number>();
+    for (const c of chapters) if (Number.isFinite(c.number)) perNumber.set(c.number, (perNumber.get(c.number) ?? 0) + 1);
+    let versions = 0;
+    for (const n of perNumber.values()) if (n > 1) versions++;
     return {
       source, sourceId,
-      title: series?.title || '', summary: series?.summary || '', coverUrl: series?.coverUrl || null,
+      // Plain text: MangaDex describes in Markdown, and the dialog shows this as prose.
+      title: series?.title || '', summary: cleanDescription(series?.summary), coverUrl: series?.coverUrl || null,
       genres: series?.genres || [], status: series?.status || '',
       count: chosen.length, first: nums.length ? Math.min(...nums) : null, last: nums.length ? Math.max(...nums) : null,
+      groups: groupStats(chapters.map((c) => ({ number: c.number, groups: groupsOf(c), scanlator: c.scanlator, publishedAt: c.publishedAt, lang: c.lang, source })), []),
+      versions,
     };
   });
 
@@ -1064,7 +1435,7 @@ export default async function sourceRoutes(app: FastifyInstance) {
     // misspelt `chapterFrom` would have meant "oldest". A missing source or sourceId is still the same 400.
     const b = z.object({
       source: z.string(), sourceId: z.string(), force: z.boolean().optional(),
-      chapterCount: z.number().int().positive().optional(), chapterFrom: z.enum(['oldest', 'newest']).optional(),
+      chapterCount: z.number().int().positive().optional(), chapterFrom: z.enum(['oldest', 'newest', 'none']).optional(),
       autoUpdate: z.boolean().optional(),
     }).safeParse(req.body ?? {});
     if (!b.success) return reply.code(400).send({ error: 'bad_request' });
@@ -1080,6 +1451,8 @@ export default async function sourceRoutes(app: FastifyInstance) {
     // Audited here rather than after the download, so a slow or failing download does not delay the record
     // of who asked for it. What actually landed is the job's business.
     logAudit('download.add', { userId: (req as any).user?.sub, detail: { title: r.title, source, chapters: r.chapters }, req });
-    return { ok: true, title: r.title, folder: r.folder, chapters: r.chapters, started: !!r.started };
+    // `nothing` is how the dialog tells "added, chapters will come" from "already in your library": both
+    // answer `chapters: 0, started: false`, and before this flag the second wording was the only one.
+    return { ok: true, title: r.title, folder: r.folder, chapters: r.chapters, started: !!r.started, nothing: !!r.nothing };
   });
 }

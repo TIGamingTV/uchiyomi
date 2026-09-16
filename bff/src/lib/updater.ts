@@ -12,8 +12,9 @@ import { budgetFor } from './sources/budget';
 import { notifyNewChapter } from './push';
 import { visibleToAll } from './visibility';
 import { runtime } from './runtime';
-import { chooseReleases } from './releases';
+import { chooseReleases, releaseOrder } from './releases';
 import { effectivePrefsFor, readSeriesPrefs } from './scanlatorPrefs';
+import { listingRows, replaceListing } from './seriesListing';
 
 /**
  * Why a series produced nothing this run.
@@ -149,7 +150,8 @@ export async function updateSeries(seriesId: string, maxNew = 10): Promise<Updat
   // has something of its own, which almost none do.
   const prefs = await effectivePrefsFor(s.scanlator_prefs == null ? null : await readSeriesPrefs(seriesId));
   const rank = new Map(followed.map((f, i) => [f.source, i]));
-  const { releases, waiting: held } = chooseReleases(tagged, prefs, { sourceRank: (id) => rank.get(id ?? '') ?? followed.length });
+  const chooseOpts = { sourceRank: (id?: string) => rank.get(id ?? '') ?? followed.length };
+  const { releases, waiting: held } = chooseReleases(tagged, prefs, chooseOpts);
 
   // A series added as "latest N" carries a floor, and what the source lists below it is not this job's
   // business: the sweep exists to fetch new releases, and the oldest-first loop below would otherwise spend
@@ -174,6 +176,27 @@ export async function updateSeries(seriesId: string, maxNew = 10): Promise<Updat
   const eligible = missing.filter((c) => !cappedNums.has(c.number) && !heldNums.has(c.number));
   const capped = missing.filter((c) => cappedNums.has(c.number)).length;
   const waiting = missing.filter((c) => heldNums.has(c.number)).length;
+
+  // What the sources listed, kept for the series page and for manual fetches (lib/seriesListing.ts).
+  // Persisted BEFORE the download loop so a listing survives a run the budget or the disk cuts short --
+  // the loop below can break out on the first chapter, and a series page that says "as of tonight" over
+  // last week's rows would be lying. It sits AFTER the unrouted / blocked / source_error early returns on
+  // purpose: a source that did not answer leaves the previous listing standing, because stale beats empty
+  // -- the same rule as the latestPage cache in routes/sources.ts. Best effort, like the stamps: a ledger
+  // must never be the thing that stops a download.
+  //
+  // ⚠️ An EMPTY list is not an answer either. A moved domain serving a 404 page, a parser regression, a
+  // site that has hidden its chapter list behind a challenge -- every one of these resolves listChapters
+  // to `[]` rather than throwing (the moved-domain trap this install has already been through), and
+  // `answered` counts it as a source that spoke. Writing that through would replace a two-hundred-row
+  // listing with nothing: every ghost row gone from the series page, every manual fetch `not_listed`,
+  // the known-group picker blind to the series -- silently, for as long as the source stays broken. So
+  // a source that lists nothing leaves the previous listing standing, exactly like one that did not answer.
+  // Reintroduce by dropping the `tagged.length` guard: "a source that answered with nothing leaves the
+  // previous listing standing" in seriesListing.int.test.ts reads 0 rows.
+  // The copies of each number are stored in the same order the chooser ranked them (releaseOrder with
+  // the same source ranks), so the listing's "best first" is the sweep's, not a second opinion.
+  if (tagged.length) await replaceListing(seriesId, listingRows(tagged, releases, heldNums, s.source_id, releaseOrder(prefs, chooseOpts))).catch(() => {});
 
   let added = 0;
   let failed = 0;

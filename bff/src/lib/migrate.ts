@@ -230,6 +230,47 @@ CREATE TABLE IF NOT EXISTS series_sources (
   PRIMARY KEY (series_id, source_id)
 );
 
+-- What every followed source listed for a series the last time it was asked (the sweep, Check now, or
+-- POST /api/admin/update/:id): one row per chapter NUMBER, whether or not the chapter is on disk. Written
+-- whole by lib/seriesListing.ts on every answered updateSeries and left standing when no source answered,
+-- because a stale listing beats an empty one -- the same rule the latest-page cache follows.
+-- Why it exists: until v0.32.0 the chapters a source had and this server lacked were visible nowhere but
+-- the sweep's own arithmetic. A chapter held for a preferred group, one that had failed three times, one
+-- released only by a blocked group, one below the Latest-N floor -- each was a quiet "0 added" on the
+-- series page. This table is what the series page reads to draw those as ghost rows with a reason, what a
+-- manual fetch is AUTHORISED against (a number never listed cannot be asked for, the same footing as the
+-- fill plan), and what the known-group picker counts.
+-- chosen is the full SourceChapter the release rules picked for the number (jsonb, so a manual fetch can
+-- hand it straight to the downloader); groups is every group that released ANY copy, deduped the way
+-- lib/releases.ts compares names; status is available, held (withheld for a preferred group this run) or
+-- blocked (every copy dropped because only blocked groups released it -- the row keeps the first copy so
+-- the page can still say who). number is real to match lib_books.number exactly, so the anti-join that
+-- turns a listing row into a ghost never misses on a float. The column is named chosen and not copy on
+-- purpose: COPY is a Postgres keyword.
+CREATE TABLE IF NOT EXISTS series_listing (
+  series_id    text NOT NULL REFERENCES lib_series(id) ON DELETE CASCADE,
+  number       real NOT NULL,
+  title        text,
+  published_at timestamptz,
+  scanlator    text,
+  groups       text[] NOT NULL DEFAULT '{}',
+  source_id    text NOT NULL,
+  chosen       jsonb NOT NULL,
+  status       text NOT NULL DEFAULT 'available',
+  updated_at   timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (series_id, number)
+);
+-- Every copy of the number the sources listed, not only the chosen one: v0.33.0's "who scanlates this"
+-- panel and the chapter-versions list need each copy's group, language, page count and date, and a
+-- specific-version fetch (picks on POST /api/sources/fetch and the admin refetch) is AUTHORISED against
+-- exactly these entries, the way a plain fetch is authorised against the row. Each entry is
+-- { sourceId, source, groups, scanlator, lang, pages, publishedAt }, ordered the way the release rules
+-- rank them, chosen copy first, so a client that reads copies[0] reads what the sweep would take.
+-- Size: a long MangaDex title lists about three copies for each of about a thousand numbers at about
+-- two hundred bytes each -- under a megabyte per series, rewritten whole at every check like the rest
+-- of the row. Rows written before v0.33.0 carry the empty default until the series' next check.
+ALTER TABLE series_listing ADD COLUMN IF NOT EXISTS copies jsonb NOT NULL DEFAULT '[]';
+
 -- Content identity, so a chapter can be recognised after it moves. Derived from the archive's central
 -- directory (entry names + CRC-32 + uncompressed sizes), which is cheap to read and survives recompression.
 -- Nothing reads these yet; a background job fills them in, and fp_at is set even on failure so an unreadable
@@ -635,6 +676,12 @@ CREATE TABLE IF NOT EXISTS suwayomi_sources (
 -- API. Without it there is no way to keep an age-capped account out of an adult source, and on a real
 -- install that is not a corner case: 36 of 44 enabled sources on the one this was written for are adult.
 ALTER TABLE suwayomi_sources ADD COLUMN IF NOT EXISTS nsfw boolean NOT NULL DEFAULT false;
+-- Which installed extension (APK package) the source came out of, and that extension's own name. One
+-- package can expose dozens of sources -- 3Hentai is one extension and twenty-nine language variants --
+-- and the Providers page folds them into one card by pkg_name. NULL when the engine did not say; the API
+-- then falls back to the display name with its language suffix stripped.
+ALTER TABLE suwayomi_sources ADD COLUMN IF NOT EXISTS pkg_name text;
+ALTER TABLE suwayomi_sources ADD COLUMN IF NOT EXISTS ext_name text;
 
 
 -- OIDC identity linked to a local account. Kept alongside the password columns rather than replacing them,

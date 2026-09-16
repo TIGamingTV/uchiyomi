@@ -10,15 +10,18 @@ import { bytes, relativeTime } from '@/lib/format';
 import { useToast } from '@/components/Toast';
 import { ConfirmDialog, Modal, msgOf } from '@/components/ConfirmDialog';
 import { Avatar } from '@/components/Avatar';
-import { IcChevronLeft, IcTrash, IcPlus, IcRefresh } from '@/components/icons';
+import { IcChevronLeft, IcTrash, IcPlus, IcRefresh, IcInfo } from '@/components/icons';
+import { SourcesExplainer } from '@/components/SourcesExplainer';
 import { Backdrop, Img } from '@/components/ui';
 import { SeriesCard } from '@/components/cards';
 import { Switch } from '@/components/Switch';
 import { ConsoleNav } from '@/components/ConsoleNav';
 import { motion, useReducedMotion } from 'framer-motion';
 import { t as tr, keys } from '@/lib/i18n';
-import type { Series, StoredPrefs } from '@/lib/types';
+import type { KnownGroup, Series, StoredPrefs } from '@/lib/types';
 import { hasGroup, normGroup, reorder, withoutGroup } from '@/lib/scanlators';
+import { suggestGroups } from '@/lib/groupSuggest';
+import { groupProviders, type ProviderGroup, type ProviderSrc } from '@/lib/providerGroups';
 
 /**
  * Ten panels, grouped by what an admin is actually doing rather than by what the code is called.
@@ -476,6 +479,9 @@ function Providers() {
   };
   const inval = () => { qc.invalidateQueries({ queryKey: ['sources'] }); qc.invalidateQueries({ queryKey: ['admin-sources'] }); qc.invalidateQueries({ queryKey: ['admin-custom'] }); };
   const [eng, setEng] = useState<'auto' | 'madara' | 'manganato' | 'mangathemesia'>('auto');
+  // The (i) beside "Add a site": what a source, an extension and a site by URL are, in the explainer the
+  // reader-facing sheets share. This panel is where the words are first met by whoever runs the server.
+  const [explaining, setExplaining] = useState(false);
   const [sname, setSname] = useState('');
   const [sbase, setSbase] = useState('');
   const [adding, setAdding] = useState(false);
@@ -586,11 +592,130 @@ function Providers() {
     catch (e: any) { toast(msgOf(e, 'Could not read that list'), 'error'); }
     setParsing(false);
   };
-  const list = srcs?.content || [];
+  const list = (srcs?.content || []) as ProviderSrc[];
+  // One card per extension PACKAGE rather than per source: a multi-language extension is one install that
+  // exposes one source per language, and 3Hentai alone put twenty-nine near-identical cards here, enabled
+  // or not. A package with a single variant, and every engine, pack and custom site, renders the card it
+  // always did. Which packages are unfolded lives here, not in storage: collapsed is the useful default and
+  // the panel is opened to look, not to keep.
+  const groups = groupProviders(list);
+  const [unfolded, setUnfolded] = useState<Set<string>>(new Set());
+  const toggleGroup = (key: string) => setUnfolded((prev) => { const n = new Set(prev); if (n.has(key)) n.delete(key); else n.add(key); return n; });
+
+  /**
+   * The diagnosis, then the fix, then the raw error last and small. The raw string was all there used to
+   * be: "timeout", truncated to one line, written by three different faults. Shared by the full card and
+   * the compact variant row, so a language variant inside a folded package can be tested and read the same way.
+   */
+  function diagnosisOf(s: ProviderSrc, st: string) {
+    const h = hmap.get(s.id) as any;
+    const t = tested.get(s.id);
+    const d = t?.diagnosis;
+    const unwell = st === 'blocked' || st === 'rate_limited' || st === 'down' || st === 'quiet';
+    if (!d && !(h?.last_error && unwell)) return null;
+    return (
+      <div className="mt-1.5 space-y-1">
+        {d && <p className="text-[12px] text-fog-200">{d.reason || 'Working normally.'}</p>}
+        {d?.fix && <p className="text-[11px] leading-relaxed text-fog-400">{d.fix}</p>}
+        {h?.last_error && unwell && (
+          <p className="truncate text-[11px] text-fog-600" title={h.last_error}>{h.consecutive}× · {h.last_error}</p>
+        )}
+      </div>
+    );
+  }
+  function testResultOf(s: ProviderSrc) {
+    const t = tested.get(s.id);
+    if (!t) return null;
+    return (
+      <div className={`mt-2 rounded-xl border p-2 ${t.ok ? 'border-emerald-600/30 bg-emerald-600/10' : 'border-amber-600/30 bg-amber-600/10'}`}>
+        {t.checks.map((c: any, i: number) => (
+          <p key={i} className="text-[11px] text-fog-300">{c.ok ? '✓' : '✗'} {c.name}: <span className="text-fog-500">{c.detail}</span></p>
+        ))}
+        {t.timedOut && <p className="text-[11px] text-amber-300">Gave up waiting. The site is slow or heavily protected.</p>}
+      </div>
+    );
+  }
+  /** Test / Clear block / Enable-Disable, plus the two custom-site buttons when the source is one. */
+  function controlsOf(s: ProviderSrc, st: string) {
+    return (
+      <>
+        <button onClick={() => testSource(s.id)} disabled={testingId === s.id} className="chip text-xs disabled:opacity-50">
+          {testingId === s.id ? 'Testing…' : tr('Test')}
+        </button>
+        {(st === 'blocked' || st === 'rate_limited' || st === 'down') && <button onClick={() => act(s.id, 'unblock', 'Cleared')} className="chip text-xs">{tr('Clear block')}</button>}
+        <button onClick={() => act(s.id, st === 'disabled' ? 'enable' : 'disable', st === 'disabled' ? 'Enabled' : 'Disabled')} className="chip text-xs">{st === 'disabled' ? 'Enable' : 'Disable'}</button>
+        {customIds.has(s.id) && tested.get(s.id)?.diagnosis?.code === 'moved' && (
+          <button onClick={() => moveSite(s.id)} className="chip text-xs text-accent">{tr('Update address')}</button>
+        )}
+        {customIds.has(s.id) && <button onClick={() => removeSite(s.id)} className="ms-auto text-xs text-red-300 hover:underline">{tr('Remove')}</button>}
+      </>
+    );
+  }
+  const statusChip = (st: string) => (
+    <span className={`rounded-full px-2 py-0.5 text-[11px] font-semibold ${STATUS_STYLE[st] || STATUS_STYLE.ok}`}>{st === 'rate_limited' ? 'rate-limited' : st}</span>
+  );
+
+  /** The card every source has always had: one source, its status, its diagnosis, its controls. */
+  function sourceCard(s: ProviderSrc) {
+    const st = (s.status ?? 'ok') as string;
+    return (
+      <div key={s.id} className="card grad-border p-4">
+        <div className="flex items-center gap-2">
+          <span className="flex-1 text-sm text-fog-100">{s.name}{customIds.has(s.id) && <span className="ms-2 rounded bg-ink-700 px-1.5 py-0.5 text-[10px] text-fog-400">custom</span>}</span>
+          {statusChip(st)}
+        </div>
+        {diagnosisOf(s, st)}
+        {testResultOf(s)}
+        <div className="mt-2 flex flex-wrap gap-1.5">{controlsOf(s, st)}</div>
+      </div>
+    );
+  }
+
+  /**
+   * One extension package with several language variants: a header that says how many languages, how many
+   * are on and the unhappiest status among them (so a blocked language colours the card even folded), and
+   * on unfold one compact row per variant carrying the same controls the full card has. Rows wrap rather
+   * than scroll: at 390 px the language, status and count sit on one line and the buttons drop below.
+   */
+  function packageCard(g: ProviderGroup) {
+    const isOpen = unfolded.has(g.key);
+    return (
+      <div key={g.key} className="card grad-border p-4">
+        <button type="button" onClick={() => toggleGroup(g.key)} aria-expanded={isOpen} className="flex w-full items-center gap-2 text-start">
+          <span className="min-w-0 flex-1 text-sm text-fog-100">
+            {g.name}
+            <span className="ms-2 text-[11px] text-fog-500">{tr('{n} languages', { n: g.languages.length })} · {tr('{n} on', { n: g.on })}</span>
+          </span>
+          {statusChip(g.worst)}
+          <span className="shrink-0 text-xs text-fog-500">{isOpen ? '▴' : '▾'}</span>
+        </button>
+        {isOpen && (
+          <ul className="mt-2 divide-y divide-ink-800">
+            {g.sources.map((s) => {
+              const st = (s.status ?? 'ok') as string;
+              return (
+                <li key={s.id} className="py-2">
+                  <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+                    <span className="w-14 shrink-0 font-mono text-[11px] uppercase text-fog-200" title={s.name}>{s.lang || '—'}</span>
+                    {statusChip(st)}
+                    <span className="text-[11px] text-fog-500">{tr('{n} series', { n: s.used ?? 0 })}</span>
+                    <span className="ms-auto flex flex-wrap gap-1.5">{controlsOf(s, st)}</span>
+                  </div>
+                  {diagnosisOf(s, st)}
+                  {testResultOf(s)}
+                </li>
+              );
+            })}
+          </ul>
+        )}
+      </div>
+    );
+  }
+
   return (
     <div className="board">
       <div className="full flex flex-wrap items-center justify-between gap-3">
-        <p className="text-sm text-fog-400">{list.length} source{list.length === 1 ? '' : 's'} installed</p>
+        <p className="text-sm text-fog-400">{tr('{n} sources in {m} providers', { n: list.length, m: groups.length })}</p>
         <div className="flex gap-1.5">
           {/* The same sweep that runs daily on its own, so what you see here is what happens unattended. */}
           <button onClick={checkAll} disabled={checking} className="chip shrink-0 text-xs disabled:opacity-50">
@@ -618,7 +743,16 @@ function Providers() {
 
       {/* Add a site (Madara / Manganato engines — most manga aggregators) */}
       <div className="card grad-border wide p-4">
-        <p className="mb-2 text-xs font-semibold uppercase tracking-wider text-fog-500">{tr('Add a site')}</p>
+        <div className="mb-2 flex items-center gap-1.5">
+          <p className="text-xs font-semibold uppercase tracking-wider text-fog-500">{tr('Add a site')}</p>
+          {/* 32px to tap, the same as the sheets' (i); the negative margins keep the eyebrow row 20px tall so
+              the label does not drop. At h-5 this was a 20px target on a phone, a quarter the size of the
+              (i) one tap away in the Sources sheet. */}
+          <button type="button" onClick={() => setExplaining(true)} aria-label={tr('What are sources and extensions?')}
+            className="-my-1.5 grid h-8 w-8 place-items-center rounded-full text-fog-500 transition hover:text-fog-200">
+            <IcInfo width={14} height={14} />
+          </button>
+        </div>
         <div className="flex flex-wrap gap-2">
           <select value={eng} onChange={(e) => setEng(e.target.value as any)} className="field w-auto">
             <option value="auto">{tr('Auto-detect')}</option>
@@ -711,60 +845,11 @@ function Providers() {
         </div>
       ) : (
         <>
-          {list.map((s: any) => {
-            const h = hmap.get(s.id) as any;
-            const st = s.status as string;
-            return (
-              <div key={s.id} className="card grad-border p-4">
-                <div className="flex items-center gap-2">
-                  <span className="flex-1 text-sm text-fog-100">{s.name}{customIds.has(s.id) && <span className="ms-2 rounded bg-ink-700 px-1.5 py-0.5 text-[10px] text-fog-400">custom</span>}</span>
-                  <span className={`rounded-full px-2 py-0.5 text-[11px] font-semibold ${STATUS_STYLE[st] || STATUS_STYLE.ok}`}>{st === 'rate_limited' ? 'rate-limited' : st}</span>
-                </div>
-                {/* The diagnosis, then the fix, then the raw error last and small. The raw string was all there
-                    used to be: "timeout", truncated to one line, written by three different faults. */}
-                {(() => {
-                  const t = tested.get(s.id);
-                  const d = t?.diagnosis;
-                  const unwell = st === 'blocked' || st === 'rate_limited' || st === 'down' || st === 'quiet';
-                  if (!d && !(h?.last_error && unwell)) return null;
-                  return (
-                    <div className="mt-1.5 space-y-1">
-                      {d && <p className="text-[12px] text-fog-200">{d.reason || 'Working normally.'}</p>}
-                      {d?.fix && <p className="text-[11px] leading-relaxed text-fog-400">{d.fix}</p>}
-                      {h?.last_error && unwell && (
-                        <p className="truncate text-[11px] text-fog-600" title={h.last_error}>{h.consecutive}× · {h.last_error}</p>
-                      )}
-                    </div>
-                  );
-                })()}
-                {(() => {
-                  const t = tested.get(s.id);
-                  if (!t) return null;
-                  return (
-                    <div className={`mt-2 rounded-xl border p-2 ${t.ok ? 'border-emerald-600/30 bg-emerald-600/10' : 'border-amber-600/30 bg-amber-600/10'}`}>
-                      {t.checks.map((c: any, i: number) => (
-                        <p key={i} className="text-[11px] text-fog-300">{c.ok ? '✓' : '✗'} {c.name}: <span className="text-fog-500">{c.detail}</span></p>
-                      ))}
-                      {t.timedOut && <p className="text-[11px] text-amber-300">Gave up waiting. The site is slow or heavily protected.</p>}
-                    </div>
-                  );
-                })()}
-                <div className="mt-2 flex flex-wrap gap-1.5">
-                  <button onClick={() => testSource(s.id)} disabled={testingId === s.id} className="chip text-xs disabled:opacity-50">
-                    {testingId === s.id ? 'Testing…' : tr('Test')}
-                  </button>
-                  {(st === 'blocked' || st === 'rate_limited' || st === 'down') && <button onClick={() => act(s.id, 'unblock', 'Cleared')} className="chip text-xs">{tr('Clear block')}</button>}
-                  <button onClick={() => act(s.id, st === 'disabled' ? 'enable' : 'disable', st === 'disabled' ? 'Enabled' : 'Disabled')} className="chip text-xs">{st === 'disabled' ? 'Enable' : 'Disable'}</button>
-                  {customIds.has(s.id) && tested.get(s.id)?.diagnosis?.code === 'moved' && (
-                    <button onClick={() => moveSite(s.id)} className="chip text-xs text-accent">{tr('Update address')}</button>
-                  )}
-                  {customIds.has(s.id) && <button onClick={() => removeSite(s.id)} className="ms-auto text-xs text-red-300 hover:underline">{tr('Remove')}</button>}
-                </div>
-              </div>
-            );
-          })}
+          {groups.map((g) => (g.sources.length === 1 ? sourceCard(g.sources[0]) : packageCard(g)))}
         </>
       )}
+
+      {explaining && <SourcesExplainer onClose={() => setExplaining(false)} />}
     </div>
   );
 }
@@ -1104,8 +1189,10 @@ const NO_PREFS: StoredPrefs = { priority: [], blocked: [], patienceDays: 2 };
  * Names are compared the way the server compares them, so typing "asura-scans" next to "Asura Scans" is a
  * no-op rather than a second chip the server would fold into the first on save.
  */
-function GroupChips({ label, hint, value, ordered, onChange }: {
+function GroupChips({ label, hint, value, ordered, onChange, suggestions }: {
   label: string; hint: string; value: string[]; ordered?: boolean; onChange: (next: string[]) => void;
+  /** Every group the server has seen, for the chips under the box. Absent or empty renders no chips. */
+  suggestions?: KnownGroup[];
 }) {
   const [draft, setDraft] = useState('');
   const toast = useToast();
@@ -1119,7 +1206,14 @@ function GroupChips({ label, hint, value, ordered, onChange }: {
     onChange([...value, t]);
   };
   return (
-    <div className="mt-3">
+    // ⚠️ The draft is committed when focus leaves the WHOLE control, not the input. The input's own blur
+    // fired when Tab moved focus to a suggestion chip (they are plain buttons, keyboard-reachable on
+    // purpose), so the half-typed draft landed as a chip beside the one then chosen -- "asu" next to
+    // "Asura Scans", and a save blocked a group that matches nothing. Focus moving within the control
+    // (input -> chip, chip -> chip) commits nothing; leaving it from anywhere commits the draft, so a
+    // keyboard user who tabs straight past the chips still gets their text as a chip, as before.
+    // Reintroduce by moving the onBlur back onto the input: type "asu", Tab, Enter gives two chips.
+    <div className="mt-3" onBlur={(e) => { if (!e.currentTarget.contains(e.relatedTarget as Node | null)) add(draft); }}>
       <p className="mb-1 text-xs font-semibold uppercase tracking-wider text-fog-500">{label}</p>
       <div className="flex flex-wrap gap-1.5 rounded-xl border border-ink-700 bg-ink-850 p-2">
         {value.map((g, i) => (
@@ -1140,11 +1234,37 @@ function GroupChips({ label, hint, value, ordered, onChange }: {
           onChange={(e) => (e.target.value.endsWith(',') ? add(e.target.value) : setDraft(e.target.value))}
           onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); add(draft); }
                               else if (e.key === 'Backspace' && !draft && value.length) onChange(value.slice(0, -1)); }}
-          onBlur={() => add(draft)}
           placeholder={tr('Add a group…')}
           className="min-w-[8rem] flex-1 bg-transparent px-1 py-1 text-sm text-fog-50 outline-hidden"
         />
       </div>
+      {/* Names the server has actually seen, filtered by what is being typed: the exact spelling a source
+          uses is the one thing nobody knows without looking. Plain buttons, the LibraryFilters "Find a
+          genre" pattern -- reachable by keyboard, no combobox state machine. Hidden entirely when the
+          server knows no groups at all: an empty "Known groups" heading would only raise the question. */}
+      {!!suggestions?.length && (() => {
+        const offered = suggestGroups(suggestions, draft, value);
+        return (
+          <div className="mt-2">
+            <p className="mb-1 text-[10px] font-semibold uppercase tracking-wider text-fog-600">{tr('Known groups')}</p>
+            {offered.length ? (
+              <div className="flex flex-wrap gap-1.5">
+                {offered.map((g) => (
+                  // ⚠️ preventDefault on mousedown, not click: a click first moves focus off the input, whose
+                  // onBlur adds the half-typed draft as a chip, and the suggestion would then land as a
+                  // second chip beside a wrong one.
+                  <button key={g.name} type="button" data-suggest onMouseDown={(e) => e.preventDefault()} onClick={() => add(g.name)}
+                    className="chip text-xs">
+                    {g.name}<span className="ms-1 tabular-nums text-fog-600">· {g.onDisk + g.listed}</span>
+                  </button>
+                ))}
+              </div>
+            ) : (
+              <p className="text-[11px] text-fog-500">{tr('No known group matches that.')}</p>
+            )}
+          </div>
+        );
+      })()}
       <p className="mt-1 max-w-prose text-[11px] text-fog-500">{hint}</p>
     </div>
   );
@@ -1164,15 +1284,25 @@ function ScanlatorDefaults({ data, save }: { data: any; save: (body: any, ok: st
   const cur = draft ?? stored;
   const dirty = !!draft && JSON.stringify(draft) !== JSON.stringify(stored);
   const set = (patch: Partial<StoredPrefs>) => setDraft({ ...cur, ...patch });
+  // Every group name the server has seen, on disk or in a source's listing, busiest first. Memoised on the
+  // server for 30 s and held here for the same, so typing into either box never asks again. A failure
+  // renders no chips rather than an error: the text field still works without them.
+  const { data: known } = useQuery({
+    queryKey: ['admin-scanlators'],
+    queryFn: () => api<{ content: KnownGroup[] }>('/api/admin/scanlators'),
+    staleTime: 30_000,
+    retry: false,
+  });
+  const suggestions = known?.content ?? [];
   return (
     <div className="card grad-border full p-4">
       <p className="text-sm text-fog-100">{tr('Scanlators')}</p>
       <p className="max-w-prose text-[11px] leading-relaxed text-fog-500">
         {tr('When a source lists the same chapter from more than one group, the updater takes the first group ranked here and never a blocked one. Each series can rank its own on its page; blocks made here apply to every series.')}
       </p>
-      <GroupChips label={tr('Blocked groups')} value={cur.blocked} onChange={(blocked) => set({ blocked, priority: blocked.reduce((p, g) => withoutGroup(p, g), cur.priority) })}
+      <GroupChips label={tr('Blocked groups')} value={cur.blocked} suggestions={suggestions} onChange={(blocked) => set({ blocked, priority: blocked.reduce((p, g) => withoutGroup(p, g), cur.priority) })}
         hint={tr('Never take a release from these groups, in any series. A chapter only they have released is skipped until someone else releases it.')} />
-      <GroupChips label={tr('Default priority')} ordered value={cur.priority} onChange={(priority) => set({ priority, blocked: priority.reduce((b, g) => withoutGroup(b, g), cur.blocked) })}
+      <GroupChips label={tr('Default priority')} ordered value={cur.priority} suggestions={suggestions} onChange={(priority) => set({ priority, blocked: priority.reduce((b, g) => withoutGroup(b, g), cur.blocked) })}
         hint={tr('Tried in this order. A series with its own ranking ignores this list.')} />
       <div className="mt-3 flex flex-wrap items-center gap-2">
         <label className="text-xs font-semibold uppercase tracking-wider text-fog-500" htmlFor="scanlator-patience">{tr('Patience (days)')}</label>
@@ -1242,7 +1372,7 @@ function ReadCleanup({ data, save }: { data: any; save: (body: any, ok: string) 
             : tr('Counted from the moment the last reader finished. Re-opening the chapter starts the wait again.')}
         </p>
         <p className="mt-2 max-w-prose text-[11px] leading-relaxed text-fog-600">
-          {tr('Only chapters Uchiyomi downloaded itself are removed \u2014 nothing in a library you built by hand is touched. The chapter stays listed and everyone keeps their reading history; the pages are what goes. It will not be downloaded again.')}
+          {tr('Only chapters Uchiyomi downloaded itself are removed \u2014 nothing in a library you built by hand is touched. The chapter stays listed and everyone keeps their reading history; the pages are what goes. It is not downloaded again by itself; Fetch again on the series page brings it back.')}
         </p>
         {due !== null && (
           <p className={`mt-2 text-[11px] ${due > 0 ? 'text-amber-300' : 'text-fog-500'}`}>
@@ -1257,7 +1387,7 @@ function ReadCleanup({ data, save }: { data: any; save: (body: any, ok: string) 
           title={tr('Start deleting chapters after they are read?')}
           body={(
             <>
-              <p>{tr('From now on, an hourly job will permanently delete the file of any chapter that everyone who started it has finished, once it has been finished for the number of days set here. There is no undo and no recycle bin.')}</p>
+              <p>{tr('From now on, an hourly job will permanently delete the file of any chapter that everyone who started it has finished, once it has been finished for {n} days. There is no undo and no recycle bin.', { n: cur })}</p>
               <p className="mt-2">{tr('Chapters somebody is partway through, chapters nobody has read, bookmarked chapters, and files in a library you assembled yourself are all left alone. Reading history is never deleted.')}</p>
               {due !== null && (
                 <p className={`mt-2 font-semibold ${due > 0 ? 'text-amber-300' : 'text-fog-400'}`}>
@@ -1270,7 +1400,12 @@ function ReadCleanup({ data, save }: { data: any; save: (body: any, ok: string) 
           )}
           confirmLabel={tr('Turn it on')}
           danger
-          onConfirm={() => { setConfirm(false); save({ cleanupRead: true }, 'Read chapters will be deleted'); }}
+          // ⚠️ The day count goes with the switch when it is unsaved. The dialog quotes the number in the
+          // box, so confirming it with only `cleanupRead: true` ran the job at the OLD stored value while
+          // the box kept showing the new one -- with the due count deliberately withheld in that state,
+          // there was no figure left to notice it by. Reintroduce by saving `{ cleanupRead: true }` alone:
+          // type 7 over 30, switch on, and the next run uses 30.
+          onConfirm={() => { setConfirm(false); save({ cleanupRead: true, ...(cur !== stored ? { cleanupReadDays: cur } : {}) }, 'Read chapters will be deleted'); }}
           onClose={() => setConfirm(false)}
         />
       )}

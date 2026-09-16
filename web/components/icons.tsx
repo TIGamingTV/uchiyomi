@@ -25,6 +25,13 @@ export const IcSearch = (p: P) => (
 export const IcDownload = (p: P) => (
   <svg {...base(p)}><path d="M12 3v12" /><path d="m7 11 5 5 5-5" /><path d="M5 21h14" /></svg>
 );
+// A cloud with an arrow out of it: "fetch from the source onto this server". Deliberately NOT IcDownload,
+// which every on-disk chapter row spends on "save to this device" -- the two are different promises
+// (a file arrives on the server vs. on the phone in hand), and a ghost row showing the same arrow as the
+// row above it would read as the same action.
+export const IcCloudDownload = (p: P) => (
+  <svg {...base(p)}><path d="M7 18a4.5 4.5 0 0 1-.6-8.96A6 6 0 0 1 18 8a4 4 0 0 1 1 7.9" /><path d="M12 12v9" /><path d="m8.5 17.5 3.5 3.5 3.5-3.5" /></svg>
+);
 export const IcUser = (p: P) => (
   <svg {...base(p)}><circle cx="12" cy="8" r="4" /><path d="M4 21c0-4 4-6 8-6s8 2 8 6" /></svg>
 );
@@ -84,6 +91,12 @@ export const IcBell = (p: P) => (
 );
 export const IcRefresh = (p: P) => (
   <svg {...base(p)}><path d="M21 12a9 9 0 1 1-2.6-6.4" /><path d="M21 4v5h-5" /></svg>
+);
+export const IcInfo = (p: P) => (
+  <svg {...base(p)}><circle cx="12" cy="12" r="9" /><path d="M12 11v5" /><path d="M12 8h.01" /></svg>
+);
+export const IcFilter = (p: P) => (
+  <svg {...base(p)}><path d="M4 5h16" /><path d="M7 12h10" /><path d="M10 19h4" /></svg>
 );
 export const IcWifiOff = (p: P) => (
   <svg {...base(p)}><path d="M2 4l20 20M8.5 16.5a5 5 0 0 1 7 0M5 12.5a10 10 0 0 1 4-2.6M2 9a15 15 0 0 1 4-2.5M19 12.5q.8.6 1.5 1.3M22 9a15 15 0 0 0-7-4" /><circle cx="12" cy="20" r="0.6" fill="currentColor" /></svg>
