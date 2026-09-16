@@ -1,5 +1,32 @@
 # Changelog
 
+## Unreleased
+
+### Mihon can now connect directly to Uchiyomi using the Komga extension
+
+Generate a personal API token in Uchiyomi (Profile → Account → Tokens), paste it into the Mihon Komga
+extension's **API key** field along with your Uchiyomi address, and your library shows up in Mihon's
+Discover immediately. No separate Komga server. No extra setup.
+
+Uchiyomi now exposes a Komga-compatible API at `/api/v1/` and `/api/v2/`. The full surface the extension
+uses is covered:
+
+- **Library browsing**: Popular, Latest, Search, genre/status/collection filters, pagination.
+- **Chapter reading**: page list and raw page images, served straight from Uchiyomi's own files.
+- **Thumbnails**: series cover and chapter thumbnail, resized by Uchiyomi to ~300 px.
+- **Progress tracking** (via Mihon's built-in Komga tracker, which binds automatically): reading a chapter
+  in Mihon marks it read in Uchiyomi; the tracker writes to `PUT /api/v2/series/{id}/read-progress/tachiyomi`
+  and Uchiyomi marks the matching chapters read silently, without inflating reading streaks or Wrapped.
+- **Auth**: `X-API-Key` header (the recommended way, using a `uy_...` token) or HTTP Basic with
+  username:password.
+
+The Komga tracker's `lastReadContinuousNumberSort` is computed as the highest chapter number N where every
+chapter up to N is read, not just the maximum completed chapter. This prevents "mark as read up to 50"
+from marking chapters 30-49 read when the user skipped them.
+
+Marking something **unread** does not cross, in either direction: both apps spell unread as the absence of
+a row, which has no timestamp, so a missing row loses to a present one.
+
 ## v0.31.0 — 2026-09-13
 
 Both halves of [#35](https://github.com/AngeloSha/uchiyomi/issues/35): which group's release to keep, and
