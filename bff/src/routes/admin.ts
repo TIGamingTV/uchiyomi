@@ -5,7 +5,7 @@ import { q, one, tx } from '../lib/db';
 import { content as komga } from '../lib/backend';
 import { cacheBytes } from '../lib/imageCache';
 import { runtime } from '../lib/runtime';
-import { persistScan, libraryIdFor, LIBRARY_ROOT, DL_ROOT, setBookDates, setBookMeta } from '../lib/library';
+import { persistScan, reconcileLibrary, libraryIdFor, LIBRARY_ROOT, DL_ROOT, setBookDates, setBookMeta } from '../lib/library';
 import { containedPath, allWritable } from '../lib/fsGuard';
 import { deleteSeries, restoreSeries, mergeSeries, getSeriesRow, deleteSeriesFiles, renameSeriesFolder } from '../lib/libraryAdmin';
 import { runFingerprintBackfill, fingerprintRemaining, fpState } from '../lib/fingerprintJob';
@@ -158,8 +158,19 @@ export default async function adminRoutes(app: FastifyInstance) {
   app.addHook('preHandler', authenticate);
   app.addHook('preHandler', requireAdmin);
 
-  // Owned-library scan (Phase 1): walk the CBZ folder and upsert lib_series/lib_books.
-  app.post('/api/admin/library/scan', async () => persistScan());
+  // Owned-library scan (Phase 1): walk the CBZ folder and upsert lib_series/lib_books. Reconciliation runs
+  // right after: a scan only ever confirms files that ARE there, so it is the natural place to also ask
+  // about the rows it did NOT just confirm -- see reconcileLibrary's own comment for why that matters after
+  // restoring a database-only backup.
+  // Logged, not silently swallowed: a reconcile that throws on every scan would otherwise be invisible,
+  // and the symptom it exists to cure (chapters reporting "up to date" forever) looks exactly like it
+  // working. Still never fatal -- the scan's own result is the answer.
+  app.post('/api/admin/library/scan', async (req) => {
+    const scan = await persistScan();
+    const reconciled = await reconcileLibrary()
+      .catch((e) => { req.log.error(e as any, 'reconcile: failed after scan'); return null; });
+    return { ...scan, ...(reconciled ? { reconciled } : {}) };
+  });
 
   // Owned downloader/updater (Phase 2): pull new chapters from the source for one series or the whole library.
   app.post('/api/admin/update/:id', async (req) => updateSeries((req.params as { id: string }).id, Number((req.body as any)?.maxNew) || 10));
@@ -340,7 +351,12 @@ export default async function adminRoutes(app: FastifyInstance) {
   app.post('/api/admin/tasks/:id/run', async (req) => {
     const { id } = req.params as { id: string };
     await logAudit('task.run', { userId: userIdOf(req), detail: { task: id }, req });
-    if (id === 'scan') return { ok: true, ...(await persistScan()) };
+    if (id === 'scan') {
+      const scan = await persistScan();
+      const reconciled = await reconcileLibrary()
+        .catch((e) => { req.log.error(e as any, 'reconcile: failed after scan'); return null; });
+      return { ok: true, ...scan, ...(reconciled ? { reconciled } : {}) };
+    }
     if (id === 'update') {
       // Never awaited: a sweep is minutes to hours, and the caller is an admin clicking a button. runSweep
       // marks it running, keeps the result, logs the summary and refuses to start on top of another one --
@@ -910,6 +926,46 @@ export default async function adminRoutes(app: FastifyInstance) {
     if (!r.ok) return reply.code(409).send({ error: 'refused', message: r.reason, fix: r.fix });
     await logAudit('series.delete_files', { userId: userIdOf(req), detail: { id, files: r.files, bytes: r.bytes }, req });
     return r;
+  });
+
+  // Bulk, permanent delete for the library page's multi-select toolbar: hide + delete files for every
+  // chosen series in one request. A typed literal ("DELETE") gates it instead of each series' exact title
+  // -- that per-item match is right for a single deliberate click, but is not something anyone retypes N
+  // times for a batch, so the word is the confirmation surface here instead. Per-id failures (already
+  // gone, merged away, files not writable) are reported rather than aborting the whole batch, the same
+  // choice made for the read/favourite bulk routes.
+  app.post('/api/admin/series/bulk/delete', async (req, reply) => {
+    const b = z.object({
+      seriesIds: z.array(z.string()).min(1).max(500),
+      confirm: z.string(),
+    }).safeParse(req.body);
+    if (!b.success) return reply.code(400).send({ error: 'bad_request' });
+    if (b.data.confirm.trim().toUpperCase() !== 'DELETE') {
+      return reply.code(400).send({ error: 'confirm_mismatch', message: 'Type DELETE to confirm.' });
+    }
+
+    const results: { id: string; ok: boolean; reason?: string }[] = [];
+    let files = 0;
+    let bytes = 0;
+    for (const id of b.data.seriesIds) {
+      const row = await getSeriesRow(id);
+      if (!row) { results.push({ id, ok: false, reason: 'not_found' }); continue; }
+      if (row.merged_into) { results.push({ id, ok: false, reason: 'merged' }); continue; }
+      if (!row.deleted_at) await deleteSeries(id);
+      const r = await deleteSeriesFiles(id);
+      if (!r.ok) { results.push({ id, ok: false, reason: r.reason }); continue; }
+      files += r.files;
+      bytes += r.bytes;
+      results.push({ id, ok: true });
+    }
+
+    const applied = results.filter((r) => r.ok).length;
+    await logAudit('series.bulk_delete', {
+      userId: userIdOf(req),
+      detail: { seriesIds: b.data.seriesIds, applied, files, bytes },
+      req,
+    });
+    return { ok: true, applied, files, bytes, skipped: results.filter((r) => !r.ok) };
   });
 
   // ---- chapter-level file operations ----
@@ -2079,8 +2135,24 @@ export default async function adminRoutes(app: FastifyInstance) {
       return reply.code(422).send({ error: 'parse_failed', message: (e as Error)?.message || 'Could not read that.' });
     }
 
-    // flag what's already here so the admin isn't re-importing their own library
-    const have = new Set((await q<{ title: string }>('SELECT title FROM lib_series')).map((r) => norm(r.title)));
+    // flag what's already here so the admin isn't re-importing their own library. A deleted series does
+    // not count: re-adding it is how you undo a delete, and the add flow revives the row -- so flagging it
+    // here drops it from the review list and the delete can never be undone by import.
+    //
+    // Two halves, both through visible() (lib/visibility.ts) rather than a hand-written predicate. The
+    // second is not decoration: a merged-away row keeps deleted_at NULL and its own title (lib/libraryAdmin
+    // mergeSeries points it at the survivor instead of deleting it, because its folder is still on disk), and
+    // that title is often the alternate spelling the merge existed to fold in. Dropping those from `have`
+    // would offer every absorbed title back as "not in library", i.e. offer to re-add exactly what an admin
+    // just merged. It counts as held only while its survivor is itself visible, so a merge into a series that
+    // was later deleted can still be re-added.
+    const have = new Set(
+      (await q<{ title: string }>(
+        `SELECT s.title FROM lib_series s WHERE ${visibleToAll('s')}
+         UNION
+         SELECT m.title FROM lib_series m JOIN lib_series t ON t.id = m.merged_into WHERE ${visibleToAll('t')}`,
+      )).map((r) => norm(r.title)),
+    );
     const items = titles.slice(0, 500).map((title) => ({ title, inLibrary: have.has(norm(title)) }));
     return { origin, total: titles.length, truncated: titles.length > 500, items };
   });

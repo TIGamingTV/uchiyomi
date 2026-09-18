@@ -93,7 +93,7 @@ export interface UpdateResult {
 const nothing = (title: string, outcome: UpdateOutcome): UpdateResult =>
   ({ title, added: 0, available: 0, outcome, failed: 0, waiting: 0, landed: [] });
 
-export async function updateSeries(seriesId: string, maxNew = 10): Promise<UpdateResult> {
+export async function updateSeries(seriesId: string, maxNew = 10, newestOnly = false): Promise<UpdateResult> {
   const s = await one<any>(`SELECT id,title,source_id,source_series_id,web,folder,summary,author,genres,status,chapter_floor,scanlator_prefs FROM lib_series s WHERE s.id=$1 AND ${visibleToAll('s')}`, [seriesId]);
   if (!s) return nothing('', 'gone');
 
@@ -165,6 +165,16 @@ export async function updateSeries(seriesId: string, maxNew = 10): Promise<Updat
   const have = new Set((await q<{ number: number }>('SELECT number FROM lib_books WHERE series_id=$1', [seriesId])).map((r) => Number(r.number)));
   const missing = wanted.filter((c) => !have.has(c.number)).sort((a, b) => a.number - b.number);
   await stampChecked(seriesId, releases.length, missing.length);
+  // The floor is the SWEEP's rule, not the button's. A follow-only series -- a "Nothing yet" add, or a row
+  // imported by the Mihon-backup wizard, which adds every candidate with chapterFrom 'none' -- is floored a
+  // hair above everything its source lists today, so `wanted`/`missing` are empty and "Download newest"
+  // would answer "already at latest" over a series holding no chapters at all. The explicit action picks
+  // from EVERY release instead: the floor exists to stop the unattended sweep backfilling a back catalogue,
+  // and a person who clicked the button is not the sweep. `missing` above is still what gets stamped, so
+  // "{n} behind" keeps counting only what the sweep would fetch.
+  const newestMissing = newestOnly
+    ? releases.filter((c) => !have.has(c.number)).sort((a, b) => a.number - b.number)
+    : [];
   // Chapters that have already failed CHAPTER_RETRY_CAP times are not attempted again by the sweep.
   const cappedNums = new Set(
     (await q<{ number: number }>(`SELECT number FROM chapter_failures WHERE series_id = $1 AND attempts >= $2`, [seriesId, CHAPTER_RETRY_CAP])
@@ -176,6 +186,13 @@ export async function updateSeries(seriesId: string, maxNew = 10): Promise<Updat
   const eligible = missing.filter((c) => !cappedNums.has(c.number) && !heldNums.has(c.number));
   const capped = missing.filter((c) => cappedNums.has(c.number)).length;
   const waiting = missing.filter((c) => heldNums.has(c.number)).length;
+  // "Download newest" (the library toolbar) queues ONLY the newest missing chapter, floor ignored
+  // (newestMissing above). The sweep's oldest-first order is for backfilling; this action is named for the
+  // latest release, so the newest takes the queue. Neither the retry cap nor a hold filters it: an explicit
+  // click is the series page's manual-fetch precedent, and those guards exist to hold back the unattended
+  // sweep, not a person. Everything else (stamps, clearance, the refusal break) is this same loop with one
+  // row in the queue.
+  const queue = newestOnly ? newestMissing.slice(-1) : eligible;
 
   // What the sources listed, kept for the series page and for manual fetches (lib/seriesListing.ts).
   // Persisted BEFORE the download loop so a listing survives a run the budget or the disk cuts short --
@@ -210,7 +227,7 @@ export async function updateSeries(seriesId: string, maxNew = 10): Promise<Updat
   const refusing = new Set<string>();
   // oldest-missing-first: a partial "first N" add fills forward coherently, and new releases (all > our max)
   // are still the only gap once a series is fully downloaded.
-  for (const ch of eligible) {
+  for (const ch of queue) {
     if (attempts >= maxNew) break;
     if (runtime.stopping) break; // between chapters, never mid-write
     const via = ch.source ?? (s.source_id as string);
