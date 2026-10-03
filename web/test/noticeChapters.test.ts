@@ -6,6 +6,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'fs';
 import { join } from 'path';
 import { SERIES_TYPES, seriesTypeKey } from '../lib/seriesTypes';
+import { metaBody, seedMeta } from '../lib/seriesMeta';
 
 const read = (p: string) => readFileSync(join(__dirname, '..', p), 'utf8');
 
@@ -33,8 +34,12 @@ test('the Sources & translations sheet: what applies, its own choice, and the wa
   assert.match(src, /'series-books'/, 'the chapter list is not refetched after a flip');
 });
 
-test('Edit series: the type is sent, null for automatic, seeded from the override only', () => {
-  const src = read('app/series/page.tsx');
-  assert.match(src, /useState<string>\(series\.overrides\?\.seriesType \?\? ''\)/);
-  assert.match(src, /seriesType: seriesType \|\| null/);
+test('Edit details: the type is sent on every save, null for automatic, seeded from the override only', () => {
+  const series = { name: 'x', metadata: {}, overrides: null } as any;
+  assert.equal(seedMeta(series).seriesType, '', 'a detected type must not be seeded as an override');
+  assert.equal(seedMeta({ ...series, overrides: { seriesType: 'manhwa' } }).seriesType, 'manhwa');
+  assert.equal(metaBody({ ...seedMeta(series), seriesType: '' }).seriesType, null);
+  assert.equal(metaBody({ ...seedMeta(series), seriesType: 'comic' }).seriesType, 'comic');
+  const src = read('components/SeriesEditor.tsx');
+  assert.match(src, /onPick=\{\(seriesType\) => save\(\{ seriesType \}\)\}/, 'the Reading tab has no Series type row');
 });

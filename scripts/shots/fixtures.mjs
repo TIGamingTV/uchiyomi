@@ -8,8 +8,9 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 // ⚠️ No screenshot may show a real extension, site or repository name (owner, v0.45.0). The extension shots used
 // to photograph the live catalogue -- perfectly legible walls of third-party site names, some of them 18+ --
 // which is exactly what Uchiyomi says it does not ship; and a shot of the repository row would have shown the
-// live server's repository address. So every Extensions and Providers shot is taken on a page whose
-// `/api/admin/extensions/*`, `/api/sources`, `/api/admin/sources*` answers come from here: the REAL components
+// live server's repository address. So every shot of Admin → Sources (Extensions and Providers until v0.54.0) is
+// taken on a page whose `/api/admin/extensions/*`, `/api/sources`, `/api/admin/sources*` answers come from here --
+// the sources overview too, which names every source: the REAL components
 // rendering real response shapes (the bff's routes/admin.ts and routes/sources.ts), fed invented names, neutral
 // generated icons and the example.org repository the tests use. It applies on every run, against any instance,
 // so a later live run cannot put the real catalogue back. Declared in docs/SCREENSHOTS.md.
@@ -61,16 +62,22 @@ export function fixtureIcon(i) {
 export function extensionFixture(state) {
   const cat = () => (state.repos.length ? FIXTURE_EXTENSIONS : []);
   const langs = () => [...new Set(cat().map((e) => e.lang))];
+  // The installed extensions' sources, one per language, all on (v0.53.0's Installed rows and sheets read them).
+  const sources = () => cat().filter((e) => e.installed).flatMap((e, i) => (e.lang === 'all' ? ['en', 'es', 'fr'] : [e.lang]).map((l, j) => ({
+    id: String(9100 + i * 10 + j), name: `${e.name} (${l.toUpperCase()})`, lang: l, nsfw: false, enabled: true, supportsLatest: true, pkgName: e.pkgName, used: 0,
+  })));
   return async (url, req) => {
     const path = url.pathname;
     if (path.startsWith('/img/extensions/icon/fixture-')) {
       return { contentType: 'image/svg+xml', body: fixtureIcon(Number(path.match(/fixture-(\d+)/)?.[1] || 0)) };
     }
     if (!path.startsWith('/api/admin/extensions/')) return null;
-    const on = cat().filter((e) => e.installed).length * 2;
     const route = path.slice('/api/admin/extensions/'.length);
     if (route === 'status') {
-      return { json: { configured: true, reachable: true, version: 'v2.3.2243', enabled: on, known: on, registered: on, skipped: 0, cap: 25, hiddenLangs: [] } };
+      return { json: {
+        configured: true, reachable: true, version: 'v2.3.2243', enabled: sources().length, known: sources().length, registered: sources().length,
+        skipped: 0, cap: 25, hiddenLangs: [], solver: { supported: true, enabled: true, wiring: 'ok', connectable: true },
+      } };
     }
     if (route === 'repos' && req.method() === 'POST') {
       await sleep(1800);
@@ -79,21 +86,32 @@ export function extensionFixture(state) {
     }
     if (route === 'repos') return { json: { content: state.repos } };
     if (route === 'sources') {
-      return { json: { langs: langs().map((l) => ({ lang: l, sources: cat().filter((e) => e.lang === l).length, enabled: cat().filter((e) => e.lang === l && e.installed).length, used: 0, hidden: false })) } };
+      const pkg = url.searchParams.get('pkg');
+      const ls = [...new Set(sources().map((s) => s.lang))];
+      return { json: {
+        content: sources().filter((s) => !pkg || s.pkgName === pkg), reachable: true, total: sources().length, hiddenLangs: [],
+        langs: ls.map((l) => ({ lang: l, sources: sources().filter((s) => s.lang === l).length, enabled: sources().filter((s) => s.lang === l).length, used: 0, hidden: false })),
+      } };
     }
     if (route.startsWith('catalog')) {
       const q = (url.searchParams.get('q') || '').toLowerCase();
       const lang = url.searchParams.get('lang') || '';
       const only = url.searchParams.get('installed') === 'true';
-      const content = cat().filter((e) => (!q || e.name.toLowerCase().includes(q)) && (!lang || e.lang === lang) && (!only || e.installed));
-      return { json: { content, total: cat().length, matched: content.length, shown: content.length, installed: cat().filter((e) => e.installed).length, updatable: cat().filter((e) => e.hasUpdate).length, hiddenAdult: 0, langs: langs() } };
+      const updates = url.searchParams.get('updates') === 'true';
+      const matched = cat().filter((e) => (!q || e.name.toLowerCase().includes(q)) && (!lang || e.lang === lang) && (!only || e.installed) && (!updates || e.hasUpdate))
+        .sort((a, b) => Number(b.installed) - Number(a.installed) || Number(b.hasUpdate) - Number(a.hasUpdate) || a.name.localeCompare(b.name));
+      // A page at a time, as the route answers since v0.53.0.
+      const offset = Number(url.searchParams.get('offset')) || 0;
+      const limit = Math.min(400, Number(url.searchParams.get('limit')) || 400);
+      const content = matched.slice(offset, offset + limit);
+      return { json: { content, total: cat().length, matched: matched.length, shown: content.length, offset, limit, installed: cat().filter((e) => e.installed).length, updatable: cat().filter((e) => e.hasUpdate).length, hiddenAdult: 0, langs: langs() } };
     }
     if (route === 'refresh') return { json: { count: cat().length } };
     return { status: 404, json: { error: 'not_in_fixture' } };
   };
 }
 
-/** The Providers tab's source lists: MangaDex, two sites added by URL, and one extension in three languages. */
+/** The source lists: MangaDex, two sites added by URL, and one extension in three languages (the Providers tab's). */
 export const FIXTURE_SOURCES = [
   { id: 'mangadex', name: 'MangaDex', lang: 'en', extension: null },
   { id: 'custom:example-manga', name: 'Example Manga', lang: 'en', extension: null },
@@ -103,9 +121,32 @@ export const FIXTURE_SOURCES = [
   { id: 'sw:1003', name: 'Example Manga (FR)', lang: 'fr', extension: { pkgName: 'org.example.fixture.examplemanga', name: 'Example Manga' } },
   { id: 'sw:1004', name: 'Example Comics', lang: 'en', extension: { pkgName: 'org.example.fixture.examplecomics', name: 'Example Comics' } },
 ].map((s) => ({ latest: true, popular: true, used: 0, status: 'ok', blockedUntil: null, note: null, ...s }));
-export function sourcesFixture() {
+/**
+ * The sources overview (GET /api/admin/sources/overview, v0.54.0) for `state` (extensionFixture's): MangaDex, the two
+ * sites added by URL, and the installed fixture extensions' sources -- every one working, used by made-up numbers of
+ * series, with one extension update waiting once a repository is there.
+ */
+export function overviewFixture(state) {
+  const installed = state.repos.length ? FIXTURE_EXTENSIONS.filter((e) => e.installed) : [];
+  const row = (o) => ({ lang: 'en', pkgName: null, standing: 'usable', offBy: null, state: 'ok', stage: null, cooldown: null, offline: false,
+    main: 0, followed: 0, withBackup: 0, lastTestedAt: null, icon: false, address: null, ...o });
+  const sources = [
+    row({ id: 'custom:example-manga', name: 'Example Manga', kind: 'site', main: 42, followed: 3, address: 'https://manga.example.com' }),
+    row({ id: 'mangadex', name: 'MangaDex', kind: 'mangadex', main: 18, followed: 9 }),
+    ...installed.flatMap((e, i) => (e.lang === 'all' ? ['en', 'es', 'fr'] : [e.lang]).map((l, j) => row({
+      // A source is its extension's name and its language, as the engine names it: "Example Manga (EN)", never "(EN) (EN)".
+      id: `sw:${9100 + i * 10 + j}`, name: `${e.name.replace(/\s*\([^)]*\)$/, '')} (${l.toUpperCase()})`, kind: 'extension', lang: l, pkgName: e.pkgName, icon: true,
+      main: [11, 6, 2][i] ?? 0, followed: [4, 1, 0][i] ?? 0,
+    }))),
+    row({ id: 'custom:sample-comics', name: 'Sample Comics', kind: 'site', followed: 2, address: 'https://comics.example.org' }),
+  ];
+  return { sources, attention: { replace: [], failingUnused: [], updates: installed.filter((e) => e.hasUpdate).length } };
+}
+
+export function sourcesFixture(state = { repos: [] }) {
   return async (url) => {
     if (url.pathname === '/api/sources') return { json: { hiddenAdult: 0, content: FIXTURE_SOURCES } };
+    if (url.pathname === '/api/admin/sources/overview') return { json: overviewFixture(state) };
     if (url.pathname === '/api/admin/sources') return { json: { content: [] } };
     if (url.pathname === '/api/admin/sources/custom') {
       return { json: { content: [
@@ -113,13 +154,24 @@ export function sourcesFixture() {
         { id: 'custom:sample-comics', name: 'Sample Comics', engine: 'mangathemesia', base: 'https://comics.example.org' },
       ] } };
     }
+    // Test all, as a server with no sweep running answers it.
+    if (url.pathname === '/api/admin/sources/check') return { json: { running: false, total: 0, done: 0, current: null, result: null } };
     return null;
   };
 }
 
+/**
+ * ⚠️ The app's service worker answers /api/admin/* and the images with fetches of its own (web/public/sw.js), which a
+ * page's request interception never sees -- so wherever one can register (https, or a localhost base) the fixtures
+ * below and neutralNames() were silently skipped, and the real server's sources, names and icons reached the shot.
+ * Every page here bypasses it.
+ */
+const noServiceWorker = (p) => p.setBypassServiceWorker(true);
+
 /** Answer from the first fixture that knows the request; everything else goes to the real server. */
 export async function fixturePage(ctx, profile, fixtures) {
   const p = await ctx.newPage();
+  await noServiceWorker(p);
   await p.setViewport(profile);
   await p.emulateMediaFeatures([{ name: 'prefers-reduced-motion', value: 'reduce' }]);
   await p.setRequestInterception(true);
@@ -250,6 +302,7 @@ export async function neutralNames(page, { fixtures = [] } = {}) {
       }
     }).observe(document, { childList: true, subtree: true, characterData: true, attributes: true, attributeFilter: ['title', 'aria-label', 'alt'] });
   });
+  await noServiceWorker(page);
   // In node: collect names from every API answer, and hand the new ones to this document and every later one.
   page.on('response', async (res) => {
     let u;
@@ -289,13 +342,14 @@ export async function neutralNames(page, { fixtures = [] } = {}) {
 }
 
 /**
- * Meet every source name before the screens that show one: the Providers tab asks for all of them (/api/sources
- * and the sites added by URL), so a name that later reaches the screen inside a sentence -- a Health row, a
- * search's "via" line -- is already known to neutralNames(). ⚠️ For the tour this runs before the recording
- * starts: a name learned mid-recording is rewritten a moment AFTER it is drawn, and a frame or two may show it.
+ * Meet every source name before the screens that show one: Admin → Sources asks for all of them (the sources
+ * overview, v0.54.0; Providers asked /api/sources and the sites added by URL), so a name that later reaches the
+ * screen inside a sentence -- a Health row, a search's "via" line -- is already known to neutralNames(). ⚠️ For the
+ * tour this runs before the recording starts: a name learned mid-recording is rewritten a moment AFTER it is drawn,
+ * and a frame or two may show it.
  * @param {import('puppeteer').Page} page signed in, with neutralNames() installed @param {string} base
  */
 export async function meetNames(page, base) {
-  await page.goto(`${base}/admin/?tab=Providers`, { waitUntil: 'networkidle2', timeout: 60000 }).catch(() => {});
+  await page.goto(`${base}/admin/?tab=Sources`, { waitUntil: 'networkidle2', timeout: 60000 }).catch(() => {});
   await page.waitForNetworkIdle({ idleTime: 700, timeout: 20000 }).catch(() => {});
 }

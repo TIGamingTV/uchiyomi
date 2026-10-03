@@ -27,7 +27,7 @@ override its type's switch in its **Sources & translations** sheet.
   4. a Webtoon genre.
 
   A series tagged both Manhwa and Webtoon is a manhwa. You can override the type under **Series type** in
-  **Edit series**. Existing series are typed from their genres on the first boot. A series is also typed
+  *Edit details* → **Reading**. Existing series are typed from their genres on the first boot. A series is also typed
   whenever MangaDex or AniList is asked about its reading direction.
 - **API.**
   - `PATCH /api/admin/settings {hideNoticeTypes}`
@@ -36,6 +36,196 @@ override its type's switch in its **Sources & translations** sheet.
   - Admin-only `seriesType`, `detectedType`, `hideNotices`, `hideNoticesEffective` and `hiddenNotices` on
     `GET /api/series/:id`.
 - **OPDS** now lists a chapter under the admin's renumber, as the app and the Komga-compatible API already did.
+
+## v0.54.0 — 2026-10-03
+
+**Admin → Providers and Admin → Extensions are now one place, Admin → Sources, and a source that stopped working can
+be replaced in one press: its series move to sources that work, and it is turned off.** Until now nothing could change
+a series' main source. Find other sources added followers, so a series whose site went offline kept that site as its
+main source for good, in every count, filter and queue.
+
+### One Sources section
+
+- **Admin → Sources** holds every source, of every kind: the built-in ones, MangaDex's languages, the sites you
+  added by address and every extension's sources. One list, the ones your series use first, each row one line
+  (*Healthy · 125 series · English*) and at most one key. The switched-off ones fold away.
+- **Needs attention** comes first, when there is anything: a broken source your series depend on, with **Replace**;
+  the failing sources nothing uses, with **Turn off all**; extension updates, with **Update**.
+- **Test all** tests every source, with how far it has got. **Add sources** has the extensions catalogue, adding a
+  site by its address, MangaDex's languages and Import a list.
+- **One sheet for every source:** how it is doing (with the evidence under *Details*), how many series use it, which
+  opens the Library on them, **Test**, **Replace**, **Turn off** or **on** (which asks first when series use it) and
+  **Remove** for a site, and, for an extension, its languages and settings.
+- **Old links still land.** `?tab=Providers`, `?tab=Extensions`, `card=mangadex` and `settings=` open the same things
+  in Sources, so bookmarks and notifications keep working.
+
+### Replace a source
+
+- **Replace** on a broken source says what it will do before it does it: *184 already follow a working source: it
+  becomes their main source. The other 11 are searched for on your other sources. It is turned off once nothing uses
+  it.* Then it does it, with the series moving as you watch and the count of moved, newly found and not replaced.
+- A series that already follows a working source moves at once: the best of them becomes its main source, by health,
+  then by how many of your chapters it carries, then your source order. One that follows none is searched for, under
+  its other names too, and the first match becomes its main source. A series numbered by posting order is left alone
+  and says why: its numbers come from its main source.
+- **Let me review each match first** shows every move before it happens, with **Make main** and **Make all green
+  main**.
+- **Make main** is also on each working source in a series' *Sources & translations*, for one series at a time.
+- Nothing moves on disk: chapters stay in the series' folder, and what you read stays read. A chapter that had failed
+  too often on the old source gets another try from the new one.
+
+### Turned off means off
+
+- A switched-off source was still asked for every chapter list by the scheduled check, and new chapters could still
+  be downloaded from it, whatever the button said. Now a switched-off source is never asked and never downloaded
+  from, and a series whose every source is off is skipped until one is back.
+- **Health** leads with **Replace** on a broken source that some series use as their main source. *Series that can no
+  longer update* now also lists series whose main source is broken or switched off with nothing working to fall back
+  on, and a switched-off source no longer counts as a working backup.
+- A source still main to any series cannot be removed or retired: *It is the main source of 3 series. Replace it
+  first.* A site added by address could be removed before, and its series stopped updating without a word.
+
+### Upgrading
+
+- **No database change.** v0.53.1 runs on the same database, and nothing changes in compose files or the environment.
+- **A behaviour change:** turning a source off now stops its chapter lists too, not just its downloads. Turn it back on
+  to see its lists again.
+- **For scripts** ([api.md](docs/api.md)):
+  - `GET /api/admin/sources/overview`: every source with its kind, standing, series counts and what needs attention.
+  - `POST /api/admin/series/:id/main-source` `{sourceId, old?}` makes a followed source the main one. It answers 409
+    for posting order, a pending renumber, a series being checked, a source switched off, unloaded or in another
+    language, and a source not followed.
+  - `POST /api/admin/sources/find` takes `mode: "replace"` (with `turnOff`), with
+    `GET /api/admin/sources/:id/replace-preview` and `POST /api/admin/sources/find/:runId/promote`. Runs carry
+    `mode`, `promoted`, `left`, `turnedOff`, `sourceId` and `sourceName`.
+  - `POST /api/admin/sources/:id/retire` `{how}` turns off or removes a source no series has as its main source,
+    and `DELETE /api/admin/sources/custom/:id` refuses while the site is in use.
+  - Series sources carry `standing`, and Health's source rows and frozen series carry `replace_source`.
+
+## v0.53.1 — 2026-10-03
+
+**Find other sources asks the sources you can see, and learns a series' other names before it searches.** Both, and a
+repair for installs whose other names could not be read, are **@TIGamingTV**'s
+([#141](https://github.com/AngeloSha/uchiyomi/pull/141)).
+
+### Find other sources finds manhwa again
+
+- **Sources marked 18+.** A run asked a source that flags itself adult only for a series rated 18+, the background
+  hunt's rule. Most manhwa extensions flag themselves adult, so on a library that reads them nearly every series ended
+  with *no other source could be asked* or *no match*. A run, and a review's **Follow**, now ask every source the admin
+  who started it may see, as Discover and following a source by hand already do. The background hunt keeps its rule.
+- **Other names before the search.** A series added before v0.49.1 has no other names stored, so it was searched
+  under its own title alone, and a manhwa whose sites each romanise it another way matched nothing. A run now first
+  takes the names its description lists, and only when that gives none, its main source's description: once, with a
+  time limit, and never while that source is switched off, cooling down or already failed in the run. They are kept
+  like any other name, so a name you removed stays removed.
+- When a series has no source to ask, the server log now says why, by count.
+
+### Upgrading
+
+- **The database:** an install that ran the fork build of PR #119 kept that build's `series_alt_titles`, which every
+  read failed on, so no other names showed and none were searched. It is brought to the right shape on first start.
+  On any other install nothing changes, and v0.53.0 still starts.
+
+## v0.53.0 — 2026-10-03
+
+**Three screens that had grown cluttered are redone around what you do on them: Admin → Extensions, Health's Source
+health, and a series' Edit details. Each now says first what needs you, offers one action for it, and keeps the rest
+a tap away.** And the series page shows a series' banner sharp. Much of the Extensions work answers **@Kedryn**'s notes
+on Discussion [#121](https://github.com/AngeloSha/uchiyomi/discussions/121).
+
+### Admin → Extensions, redesigned
+
+- **The engine at a glance.** One slim strip. **Extension engine** says *Ready*, its version and how many sources are
+  on against the limit (*5 of 25 sources on*). **Cloudflare helper** says *Connected*, or offers **Connect** with one
+  line on why it matters. Turning the engine off is under the strip's ⋯. When the engine is not answering or not set
+  up, the tab is the setup screen, as before.
+- **Installed and Browse,** two views with their counts, and **Languages** and **Check for extension updates** beside
+  them.
+- **Installed is one list.** While something needs you it is grouped: **Needs attention** first, with **Update all**
+  and **Turn on all** in its header, then **Ready**. Each extension says at most one thing (*Update available*, *No
+  source on*) and offers at most one key; the others show their languages and how many are on. The amber bars and the
+  warning on every card are gone.
+- **Browse reaches every extension.** On a repository of 1,300 the list stopped at the first 400 and said *narrow the
+  search*, so an extension past them, MangaFire in Kedryn's case, could not be found by scrolling. Browse now shows
+  60 at a time and the next ones as you scroll, to the last. Search by name and pick a language. **Show 18+
+  extensions** is a switch that says what it does (a chip reading *18+* was taken for "only 18+"), and the Browse tab
+  counts what the list holds. *1 repository* in the count line opens the repositories.
+- **Install is one press,** with its own busy state: the extension's sources switch on and are searchable from
+  Discover at once, and one with several languages then opens on them, so you can switch off the ones you don't read.
+- **An extension installed in the engine's own page** arrived with every source off, and the only way on was Remove
+  and Add again. Now it says *No source on* and offers **Turn on**. A language you hid stays off.
+- **The extension's sheet:**
+  - a switch per language (*Each language is its own source; turn on the ones you read.*), with a status under one
+    only when something is wrong: failing, blocked by the site, over the source limit, or hidden in every extension;
+  - the source limit, said when you are near it;
+  - **Settings**, folded until you open them. *Settings for* picks whose settings you see: a language select there
+    looked like it chose the language to read;
+  - **Remove extension**, which asks first and says how many series came from it.
+- **Languages** lists every language your extensions offer, with its sources, how many are on and how many series
+  came from it, and a switch that hides it in every extension, now and in the next one you install.
+- **Phones and right-to-left.** The sheets come up from the bottom and nothing scrolls sideways at 390 px; in Arabic
+  names and facts keep their own direction.
+
+### Health: Source health, sorted by what it costs you
+
+- On a library with many extensions the card listed every source with anything to say, switched-off ones first. On
+  one real library that was 31 sources turned off on purpose, each with its own Test key, under a glossary and a
+  paragraph, and above the few sources its series depended on: several screens of it.
+- It now leads with **Used by your series**, the most series first. Each row is one line (*Rate-limited — trying
+  again in 20 minutes · 37 series*) with one key, **Test** or **Clear block**; the rest are under ⋯, and the evidence
+  under *Details*.
+- **Failing, used by no series** comes next, with **Turn off all**, which asks first and turns them off one by one.
+- **Switched off by you** and **Nothing to fix right now** fold into one line each. The switched-off ones link to
+  where each comes back on, Providers or Extensions. What the keys do, and what counts as failing, are links at the
+  card's foot.
+- The card's summary counts the two groups that matter: *4 sources your series use need a look · 5 sources nothing
+  uses are failing*.
+
+### Edit details, redone
+
+- A series' **Edit details** was one long column where some fields saved at once and the rest only with a *Save
+  details* key halfway down, easy to miss. It is now a dialog with tabs, **Details**, **Reading**, **New chapters**
+  and **Files**, and every field saves itself, said once at the top (*Saved*), as Profile and Admin → Settings do.
+- **The art is in view while you edit:** the cover and the banner as the page shows them, with **Upload** (or
+  drop an image on the preview), **From a link**, **New banner** while the banner is an automatic one, and **Reset to
+  automatic**. Images up to 11 MB, as it says: a picture over about 9 MB used to fail as too large.
+- Status, reading direction and age rating are one-tap choices; *Always show* and *Auto-update* are switches. The
+  folder paths and **Mark caught up** keep their place, under Files and New chapters. On a phone it is a sheet with
+  **Art** as a tab of its own. Its words that were still English in every language are translated, and so are
+  Content → Art's notices and the home page's *Because you read*.
+
+### The series page shows its banner sharp
+
+- A series with a real banner, AniList's or one you set, now shows it sharp at the top of its page, under the same
+  shading that keeps the title readable. It was blurred, like the cover that stands in for a series with none, which
+  stays blurred, because a cover stretched that wide looks rough sharp. The banner made from a series' own pages
+  (v0.51.0) was sharp already. Content → Art's review tiles show a banner the way the series page does.
+
+### Also
+
+- A language switched on in an extension's sheet, for a source Uchiyomi had not recorded yet (one installed in the
+  engine's own page), stayed off without a word. It now switches on.
+
+### Upgrading
+
+- **No database change.** v0.52.0 runs on the same database, and nothing changes in compose files or the environment.
+- **For scripts** ([api.md](docs/api.md)):
+  - `GET /api/admin/extensions/catalog` answers a page at a time: `offset` (from 0) and `limit` (default and maximum
+    400, so a call with neither gets the first 400 as before), echoed beside `shown` and `matched`. It takes
+    `updates=true`, `hiddenAdult` counts the 18+ extensions the other filters match (it counted the whole catalogue),
+    and `adultTotal` is the whole catalogue's 18+ extensions that are not installed.
+  - `POST /api/admin/extensions/catalog/:pkgName` takes `enable` beside `install`, `update` and `uninstall`: it
+    switches an installed extension's sources on as its install would, answering `{ok, sources, on, hidden,
+    registered}`, or 409 `no_sources`; it is audited as `extension.enable`.
+  - `GET /api/admin/extensions/sources` gives each source `used`, the series that came from it, and
+    `POST /api/admin/extensions/sources/bulk` records a source it has no row for and switches it as asked.
+  - Health's `sources` items carry `group` (`affected`, `unused`, `quiet`, `off`), `state`, `stage`, `cooldown`,
+    `offBy` and `icon`, and come in that order. The card's summary uses new codes (`sources.affected`,
+    `sources.failingUnused`, `sources.working`) and a new join, `dot`.
+  - `GET /img/series/:id/backdrop` takes `style=banner`: a real banner sharp, the blurred cover for a series without
+    one.
+  - `PUT /api/admin/series/:id/art` accepts the body of an 11 MB picture.
 
 ## v0.52.0 — 2026-10-02
 

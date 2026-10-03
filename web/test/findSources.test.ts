@@ -17,7 +17,7 @@ import { renderToStaticMarkup } from 'react-dom/server';
 import { setActiveDict } from '../lib/i18n';
 import {
   altKey, altOriginLabel, altRefusal, amberNote, bulkOutcome, decideRefusal, earlierRuns, findEndedRunIds, findEta, findGate, findReviewFirst,
-  findRunState, findSlotState, findSummary, findWhyLine, greenToFollow, groupResults, lineUpText, notTriedIds, progressLine,
+  findRunState, findSlotState, findSummary, findWhyLine, greenToFollow, groupResults, lineUpText, notTriedIds, progressLine, promoteRefusal,
   seriesOutcome, setFindReviewFirst, startRefusal, FIND_SERIES_MAX_MS,
   type FindProposal, type FindResult, type FindRun, type FindRunSummary, type FindStatus,
 } from '../lib/findSources';
@@ -472,7 +472,7 @@ test('the results open on <body>, whatever card opened them, and each group is i
   // `fixed` sheet inside it (the slow archive's s14 MAJOR). Reintroduce `return (<Sheet` without OnBody: this names it.
   const src = code(read('components/FindSources.tsx'));
   const sheet = slice(src, 'export function FindResultsSheet(', 'export function FindRunCard(');
-  assert.match(sheet, /return \(\s*<OnBody>\s*<Sheet title=\{tr\('Other-source search'\)\}/, 'the results are rendered inside the card that opened them');
+  assert.match(sheet, /return \(\s*<OnBody>\s*<Sheet title=\{run && isReplace\(run\) \? replaceRunTitle\(run\.sourceName\) : tr\('Other-source search'\)\}/, 'the results are rendered inside the card that opened them');
   // The skipped group has a key of its own (v0.52.0): the shared "Skipped" is also a match's state and an import row's,
   // and the heading is about series, which es, fr and pt agree it with. Reintroduce the shared key: this fails.
   for (const [id, title] of [['found', 'New sources'], ['nothing', 'Nothing found'], ['skipped', 'Skipped series'], ['not-tried', 'Not tried']]) {
@@ -734,6 +734,11 @@ test('review first: green and amber in words, and Follow all green follows only 
   // v0.52.0: a match kept from before the language guard is refused by its language, in words. Reintroduce by dropping
   // its case: the refusal falls through to the server's English.
   assert.equal(decideRefusal('language_differs'), 'That source is in another language than this series', 'a refusal for its language is not worded');
+  // v0.54.0, Replace's review: Make main's refusals with no words of the server's own (it says the main-source switch's
+  // by their codes). Reintroduce by wording `decided` alone: a series at the follower cap reads the server's English.
+  assert.equal(promoteRefusal('decided'), 'Made main or skipped already');
+  assert.equal(promoteRefusal('full'), findWhyLine('full'), 'a match refused at the follower cap is not worded');
+  assert.equal(promoteRefusal('posting_order'), null, 'a refusal the server words is worded twice');
 });
 
 test("review first: each match beside the series' own cover, its title in its own direction, and Follow / Skip until decided", () => {
@@ -771,8 +776,9 @@ test('an earlier search opens in the sheet by its id, and the latest is a key aw
   assert.match(sheet, /useEffect\(\(\) => \{\s*if \(shown\.current === openId\) return;\s*shown\.current = openId;\s*top\.current\?\.scrollIntoView\(\{ block: 'start' \}\);\s*\}, \[openId\]\);/,
     'an opened run begins a screen above where the reader is');
   assert.match(sheet, /<div data-find-results ref=\{top\}/);
-  // A match's state has a key of its own too: one match, beside "Followed", in the number and gender it agrees with.
-  assert.match(code(read('components/FindSources.tsx')), /p\.state === 'followed' \? tr\('Followed'\) : tr\('Skipped for good'\)/);
+  // A match's state has a key of its own too: one match, beside "Followed" (and v0.54.0's "Made main"), in the number
+  // and gender it agrees with.
+  assert.match(code(read('components/FindSources.tsx')), /p\.state === 'followed' \? tr\('Followed'\) : p\.state === 'promoted' \? tr\('Made main'\) : tr\('Skipped for good'\)/);
 });
 
 test('the start dialog remembers the last choice on this device; storage that throws reads as automatic', () => {

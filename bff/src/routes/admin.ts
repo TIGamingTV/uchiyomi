@@ -39,14 +39,14 @@ import {
   listExtensions, refreshExtensions, setExtensionState, sourcesOfExtension, getRepos, setRepos, altRepoUrl,
   parseRepoInput, repoKey, contributedBy, engineReason, REPO_MESSAGES, type ExtensionInfo,
 } from '../lib/sources/suwayomi/extensions';
-import { getHiddenLangs, setSourcesEnabled, adoptExtensionSources, langOverview } from '../lib/sources/suwayomi/langs';
-import { lastSuwayomiLoad } from '../lib/sources/suwayomi/register';
+import { getHiddenLangs, setSourcesEnabled, adoptExtensionSources, langOverview, turnOnExtensionSources } from '../lib/sources/suwayomi/langs';
+import { lastSuwayomiLoad, rememberMissing } from '../lib/sources/suwayomi/register';
 import { engineStatusReport, connectEngineSolver } from '../lib/extensionEngine';
 import { env } from '../env';
 import { readFile, writeFile, mkdir, rm, rename, stat } from 'fs/promises';
 import { dirname, resolve } from 'path';
 import sharp from 'sharp';
-import { ART_DIR, artFile, artOverview } from '../lib/seriesArt';
+import { ART_BODY_LIMIT, ART_DIR, artFile, artOverview } from '../lib/seriesArt';
 import { writePreflight } from '../lib/fsGuard';
 // Admin stats report on the whole library by definition; this route is already behind requireAdmin.
 import { NO_LIBRARIES, SYSTEM_CTX, visibleToAll, sanitiseAdultList, sanitiseSourceIds, invalidateAdultFilter, browsableIds, viewCtxFor, hideAdult } from '../lib/visibility';
@@ -68,6 +68,9 @@ import { groupsOf, normGroup } from '../lib/releases';
 import { groupStats, emptyGroupStat, type StatCopy } from '../lib/groupStats';
 import { copyToChapter, type ListingCopy } from '../lib/seriesListing';
 import { seriesSourcesFor } from '../lib/seriesSources';
+import { switchMainSource } from '../lib/mainSource';
+import { mainUses, retireSource } from '../lib/retireSource';
+import { sourcesOverview } from '../lib/sourcesOverview';
 import { titlesFromBackup, entriesFromBackup, type BackupEntry } from '../lib/tachibk';
 import { linkSeries, seedTrackerFloor } from '../lib/trackers';
 import { ADAPTERS, PROVIDERS, LIST_STATUSES, TRACKER_LIST_MAX, type Provider, type LibraryEntry } from '../lib/trackerProviders';
@@ -447,6 +450,9 @@ const scrubResult = <R extends { skips?: RepairSkip[] } | null | undefined>(r: R
 
 /** The run kinds the status route always estimates: the Health page's three chips, its cards and the nightly. */
 const ESTIMATED_KINDS = ['full', 'fix_short', 'fill', 'retry', 'steps:solver', 'steps:short', 'steps:gaps', 'steps:failures', 'steps:failures:now'];
+
+/** The most extensions GET /api/admin/extensions/catalog answers at once, and how many it answers when not asked. */
+export const CATALOG_PAGE_MAX = 400;
 
 export default async function adminRoutes(app: FastifyInstance) {
   app.addHook('preHandler', authenticate);
@@ -1093,6 +1099,11 @@ export default async function adminRoutes(app: FastifyInstance) {
   // a JSON file; the source pack's custom plugin instantiates the adapters from it on reload. ----
   // readSites/writeSites moved to lib/sources/customSites so the watchdog can follow a moved site too.
   const slug = (s: string) => s.toLowerCase().replace(/[^a-z0-9]+/g, '').slice(0, 40);
+  /** A source some series still has as its main source cannot be retired or removed (v0.54.0): how many, in words. */
+  const inUse = (main: number) => {
+    const said = say('retire.inUse', { n: main });
+    return { error: 'in_use', main, message: said.text, messageSaid: saidOf(said) };
+  };
 
   app.get('/api/admin/sources/custom', async () => ({ content: await readSites() }));
   app.post('/api/admin/sources/custom', async (req, reply) => {
@@ -1151,8 +1162,13 @@ export default async function adminRoutes(app: FastifyInstance) {
     const src = getSource(id);
     return reply.send({ ok: true, id, base: site.base, smoke: src ? await smokeTest(src) : null });
   });
-  app.delete('/api/admin/sources/custom/:id', async (req) => {
+  // Refused while the site is some series' main source (v0.54.0): it was removed at once, with no check, and every series
+  // from it froze -- "no longer installed". Replace moves them first. Reintroduce by dropping the guard: "the custom
+  // site's delete is refused while it is in use" in retireSource.int.test.ts removes it.
+  app.delete('/api/admin/sources/custom/:id', async (req, reply) => {
     const { id } = req.params as { id: string };
+    const main = await mainUses(id);
+    if (main > 0) return reply.code(409).send(inUse(main));
     await writeSites((await readSites()).filter((s) => s.id !== id));
     await reloadAll();
     await logAudit('source.custom_remove', { userId: userIdOf(req), detail: { id }, req });
@@ -1421,7 +1437,13 @@ export default async function adminRoutes(app: FastifyInstance) {
     if (plan.seriesId !== id) return reply.code(400).send({ error: 'bad_request', message: 'That plan is for another series.' });
     const cand = plan.candidates.find((c) => c.source === source && c.sourceSeriesId === sourceSeriesId);
     if (!cand) return reply.code(400).send({ error: 'not_in_plan', message: 'That source was not one of the options.' });
-    if (cand.pinned) return reply.code(409).send({ error: 'is_primary', message: 'That is already the series’ own source.' });
+    // The plan's own mark, and the series' main source NOW (v0.54.0): a plan lives five minutes, and a Make main in
+    // between can make one of its candidates the main source -- following that would list every chapter twice.
+    // Reintroduce by checking `cand.pinned` alone: "a fill plan made before a switch cannot follow the series' own
+    // main source" in seriesSources.int.test.ts is answered 200, with a row naming the main.
+    if (cand.pinned || source === (await one<{ source_id: string | null }>('SELECT source_id FROM lib_series WHERE id = $1', [id]))?.source_id) {
+      return reply.code(409).send({ error: 'is_primary', message: 'That is already the series’ own source.' });
+    }
     // The one rule, shared with the add-time auto-follow (lib/fill.ts followable(): coverage at or over
     // MIN_COVERAGE with a verdict that says the numbering lines up), so the two paths cannot disagree
     // about what may be followed.
@@ -1490,6 +1512,34 @@ export default async function adminRoutes(app: FastifyInstance) {
     // refreshes the listing itself before it picks a copy.
     void updateSeries(id, 0).catch(() => {});
     return { ok: true, sources: list };
+  });
+
+  /**
+   * Make a source the series follows its main source (v0.54.0, lib/mainSource.ts): the Sources sheet's Make main.
+   * Body `{sourceId, old?}`: `old` is what becomes of the old main -- `auto` (the default) keeps it as the last
+   * follower while it still carries the series (usable or cooling), `keep` and `drop` decide. 200 `{ok, from, to, old:
+   * kept|dropped, langPinned?, sources}`; 404 `not_found`; 409 with the refusal's code, its English and its said code
+   * (`is_main`, `not_followed`, `posting_order`, `renumber_pending`, `busy`, `source_unavailable`, `moved`, and
+   * `language_differs` with `edition {of, lang, existing?}`, as the follow route answers it).
+   */
+  app.post('/api/admin/series/:id/main-source', async (req, reply) => {
+    const { id } = req.params as { id: string };
+    const b = z.object({ sourceId: z.string().min(1).max(200), old: z.enum(['auto', 'keep', 'drop']).optional() }).strict().safeParse(req.body ?? {});
+    if (!b.success) return reply.code(400).send({ error: 'bad_request', message: 'Name the source ({sourceId}), and optionally what becomes of the old main ({old}).' });
+    const out = await switchMainSource(id, b.data.sourceId, {
+      old: b.data.old ?? 'auto', ctx: await viewCtxFor(userIdOf(req), roleOf(req)), userId: userIdOf(req), via: 'manual', req,
+    });
+    if ('refused' in out) {
+      if (out.refused === 'not_found' || !out.said) return reply.code(404).send({ error: 'not_found' });
+      return reply.code(409).send({
+        error: out.refused, message: out.said.text, messageSaid: saidOf(out.said), ...(out.edition ? { edition: out.edition } : {}),
+      });
+    }
+    // Read before the refresh starts, as the follow's answer is (above): the switch is not a check.
+    const list = await seriesSourcesFor(id);
+    // The listing again, through the new main: its chapters show on the series page now, not at the next sweep.
+    void updateSeries(id, 0).catch(() => {});
+    return { ok: true, from: out.from, to: out.to, old: out.old, ...(out.langPinned ? { langPinned: out.langPinned } : {}), sources: list };
   });
 
   app.delete('/api/admin/series/:id/sources/:sourceId', async (req, reply) => {
@@ -2631,8 +2681,9 @@ export default async function adminRoutes(app: FastifyInstance) {
     return { ok: true };
   });
 
-  // Set/replace a cover or background: paste a URL, upload an image (base64 data URL), or reset to automatic.
-  app.put('/api/admin/series/:id/art', { bodyLimit: 12 * 1024 * 1024 }, async (req, reply) => {
+  // Set/replace a cover or background: paste a URL, upload an image (base64 data URL), or reset to automatic. The body
+  // limit fits the largest picture Edit details takes once it is base64 (lib/seriesArt.ts ART_BODY_LIMIT).
+  app.put('/api/admin/series/:id/art', { bodyLimit: ART_BODY_LIMIT }, async (req, reply) => {
     const { id } = req.params as { id: string };
     const b = z.object({
       kind: z.enum(['cover', 'banner']),
@@ -2809,6 +2860,15 @@ export default async function adminRoutes(app: FastifyInstance) {
     const on = new Set(
       (await q<{ source_id: string }>('SELECT source_id FROM suwayomi_sources WHERE enabled = true')).map((r) => r.source_id),
     );
+    // How many series came from each source (v0.53.0), switched on or not: Admin → Extensions says it beside each of an
+    // extension's languages, and what removing the extension leaves without updates. By the same rule the Languages
+    // overview counts by, keyed on the engine's id (`lib_series.source_id` holds 'sw:' + it).
+    const used = new Map(
+      (await q<{ source_id: string; n: number }>(
+        `SELECT s.source_id, count(*)::int AS n FROM lib_series s
+          WHERE s.source_id LIKE 'sw:%' AND ${visibleToAll('s')} GROUP BY s.source_id`,
+      )).map((r) => [r.source_id.slice('sw:'.length), r.n]),
+    );
     const needle = (term || '').trim().toLowerCase();
     const content = remote
       .map((s) => ({
@@ -2819,6 +2879,7 @@ export default async function adminRoutes(app: FastifyInstance) {
         supportsLatest: !!s.supportsLatest,
         enabled: on.has(String(s.id)),
         pkgName: s.extension?.pkgName ?? null,
+        used: used.get(String(s.id)) ?? 0,
       }))
       .filter((s) => (!needle || s.name.toLowerCase().includes(needle)) && (!lang || s.lang === lang) && (!pkg || s.pkgName === pkg))
       .sort((a, b) => Number(b.enabled) - Number(a.enabled) || a.name.localeCompare(b.name));
@@ -2844,6 +2905,9 @@ export default async function adminRoutes(app: FastifyInstance) {
     if (!b.success) return reply.code(400).send({ error: 'bad_request' });
     if (needExt(reply)) return;
     const { ids = [], langs = [] } = b.data;
+    // A source of an extension installed in the engine's own page since the last registration has no row yet, and
+    // the switch below only flips rows: recorded first, or switching it on was a quiet no-op (v0.53.0).
+    await rememberMissing(ids);
     const r = await setSourcesEnabled({ ids, langs, enabled: b.data.enabled });
     const load = await reloadAll();
     await logAudit(b.data.enabled ? 'source.extension_enable' : 'source.extension_disable', {
@@ -2892,7 +2956,15 @@ export default async function adminRoutes(app: FastifyInstance) {
   // in this codebase and nothing is fetched until one is added.
   app.get('/api/admin/extensions/catalog', async (req, reply) => {
     if (needExt(reply)) return;
-    const { q: term, lang, installed, nsfw } = req.query as { q?: string; lang?: string; installed?: string; nsfw?: string };
+    const { q: term, lang, installed, nsfw, updates, offset: rawOffset, limit: rawLimit } = req.query as {
+      q?: string; lang?: string; installed?: string; nsfw?: string; updates?: string; offset?: string; limit?: string;
+    };
+    // A page of the matches (v0.53.0): `offset` from 0, `limit` up to CATALOG_PAGE_MAX, which is also the default -- the
+    // first 400, as the route always answered. ⚠️ It answered ONLY those: on a 1,300-extension repository the panel said
+    // "Showing 400 of 570 matches -- narrow the search", and an extension past the 400th could not be reached by
+    // scrolling (discussion #121). Admin → Extensions now asks for the next page as it scrolls.
+    const offset = Math.min(1_000_000, Math.max(0, Math.floor(Number(rawOffset)) || 0));
+    const limit = Math.min(CATALOG_PAGE_MAX, Math.max(1, Math.floor(Number(rawLimit)) || CATALOG_PAGE_MAX));
     let all;
     try {
       all = await listExtensions();
@@ -2900,10 +2972,13 @@ export default async function adminRoutes(app: FastifyInstance) {
       return reply.code(502).send({ error: 'unreachable', message: (e as Error)?.message || 'Could not reach the extension server.' });
     }
     const needle = (term || '').trim().toLowerCase();
-    const filtered = all
+    const matching = all
       .filter((e) => (!needle || e.name.toLowerCase().includes(needle) || e.pkgName.toLowerCase().includes(needle)))
       .filter((e) => (!lang || lang === 'all' ? true : e.lang === lang))
       .filter((e) => (installed === 'true' ? e.installed : true))
+      // `updates` (v0.53.0): only the extensions with a newer version waiting.
+      .filter((e) => (updates === 'true' ? e.hasUpdate : true));
+    const filtered = matching
       // adult extensions are hidden unless asked for — this is a household server by default, and they
       // otherwise dominate the top of an alphabetical list
       .filter((e) => (nsfw === 'true' ? true : !e.nsfw || e.installed))
@@ -2911,15 +2986,23 @@ export default async function adminRoutes(app: FastifyInstance) {
       .sort((a, b) => Number(b.installed) - Number(a.installed) || Number(b.hasUpdate) - Number(a.hasUpdate) || a.name.localeCompare(b.name));
     const langs = [...new Set(all.map((e) => e.lang).filter(Boolean))].sort() as string[];
     // Serve icons through our own origin; the extension server is not reachable from a browser.
-    const withIcons = filtered.map((e) => ({ ...e, iconUrl: e.iconUrl ? `/img/extensions/icon/${e.pkgName}` : null }));
+    const page = filtered.slice(offset, offset + limit).map((e) => ({ ...e, iconUrl: e.iconUrl ? `/img/extensions/icon/${e.pkgName}` : null }));
     return {
-      content: withIcons.slice(0, 400),
+      content: page,
       total: all.length,
-      shown: Math.min(filtered.length, 400),
+      shown: page.length,
       matched: filtered.length,
+      offset,
+      limit,
       installed: all.filter((e) => e.installed).length,
       updatable: all.filter((e) => e.hasUpdate).length,
-      hiddenAdult: nsfw === 'true' ? 0 : all.filter((e) => e.nsfw && !e.installed).length,
+      // The 18+ extensions the other filters match and the 18+ filter keeps out (v0.53.0; the whole catalogue's before):
+      // what "Nothing matches" can offer to show.
+      hiddenAdult: nsfw === 'true' ? 0 : matching.filter((e) => e.nsfw && !e.installed).length,
+      // The 18+ extensions in the whole catalogue that are not installed, whatever was asked: what Browse leaves out
+      // while Show 18+ extensions is off. The Browse tab counts `total` less these, as its list does -- it said
+      // "Browse 1,304" over a list that ended at "1,118 of 1,118".
+      adultTotal: all.filter((e) => e.nsfw && !e.installed).length,
       langs,
     };
   });
@@ -2976,8 +3059,27 @@ export default async function adminRoutes(app: FastifyInstance) {
   app.post('/api/admin/extensions/catalog/:pkgName', async (req, reply) => {
     if (needExt(reply)) return;
     const { pkgName } = req.params as { pkgName: string };
-    const b = z.object({ action: z.enum(['install', 'uninstall', 'update']) }).safeParse(req.body);
+    const b = z.object({ action: z.enum(['install', 'uninstall', 'update', 'enable']) }).safeParse(req.body);
     if (!b.success) return reply.code(400).send({ error: 'bad_request' });
+
+    // "Turn on its sources" (v0.53.0): an installed extension's sources switched on as its install would have, and the
+    // engine asked for nothing but the list. An extension installed in the engine's own page showed as installed with
+    // every source off, and Remove then Add again was the only way to switch them on (discussion #121).
+    if (b.data.action === 'enable') {
+      let provided: Awaited<ReturnType<typeof sourcesOfExtension>>;
+      try {
+        provided = await sourcesOfExtension(pkgName);
+      } catch (e) {
+        return reply.code(502).send({ error: 'unreachable', message: (e as Error)?.message || 'Could not reach the extension server.' });
+      }
+      if (!provided.length) {
+        return reply.code(409).send({ error: 'no_sources', message: 'That extension is not installed, or provides no source.' });
+      }
+      const turned = await turnOnExtensionSources(provided);
+      await logAudit('extension.enable', { userId: userIdOf(req), detail: { pkgName, on: turned.on }, req });
+      const load = await reloadAll();
+      return { ok: true, sources: provided.length, on: turned.on, hidden: turned.hidden, registered: load.suwayomi };
+    }
 
     // Ask which sources this extension provides BEFORE acting: once it is uninstalled it provides none, and
     // we would leave the rows behind claiming sources that no longer exist.
@@ -3883,6 +3985,13 @@ export default async function adminRoutes(app: FastifyInstance) {
   });
   app.get('/api/admin/sources/check', async () => checkProgress());
 
+  /**
+   * Every source the server knows, of every kind, in one answer (v0.54.0, lib/sourcesOverview.ts): the one Sources
+   * section reads it. `attention` is what it leads with: the sources to Replace, the failing ones nothing uses, and how
+   * many extensions have an update waiting. The extension engine's own state stays GET /api/admin/extensions/status's.
+   */
+  app.get('/api/admin/sources/overview', async () => sourcesOverview());
+
   const testing = new Set<string>();
   app.post('/api/admin/sources/:id/test', async (req, reply) => {
     const { id } = req.params as { id: string };
@@ -3903,6 +4012,22 @@ export default async function adminRoutes(app: FastifyInstance) {
     } finally {
       testing.delete(id);
     }
+  });
+
+  /**
+   * Retire a source no series has as its main source (v0.54.0, lib/retireSource.ts): its follows are dropped with their
+   * listing rows, then `how: 'off'` (the default) switches it off, and `remove` takes a site added by address out of
+   * the list, switches an extension's source off in the extension, and turns anything else (MangaDex, a built-in, a
+   * pack) off -- `done` says which: `turned_off`, `removed` or `switched_off`. 409 `in_use` {main} while it is some
+   * series' main source: Replace it first. Its own route, which Fastify ranks above `/:id/:action` as it ranks `/test`.
+   */
+  app.post('/api/admin/sources/:id/retire', async (req, reply) => {
+    const { id } = req.params as { id: string };
+    const b = z.object({ how: z.enum(['off', 'remove']).optional() }).strict().safeParse(req.body ?? {});
+    if (!b.success) return reply.code(400).send({ error: 'bad_request', message: 'How to retire it: {how: "off" | "remove"}.' });
+    const r = await retireSource(id, { how: b.data.how ?? 'off', userId: userIdOf(req), req });
+    if ('inUse' in r) return reply.code(409).send(inUse(r.inUse));
+    return r;
   });
 
   app.post('/api/admin/sources/:id/:action', async (req, reply) => {

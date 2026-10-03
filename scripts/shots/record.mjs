@@ -168,21 +168,24 @@ async function main() {
   };
   await clickTab('Health');
   await awaitThen(() => /checks found something|All good/i.test(document.body.innerText), 2400);
-  // Extensions, not Providers: v0.39.0 moved the extension catalogue out of the Providers tab into its own,
-  // leaving a link card behind. capture.mjs was updated and this was not, so the search below silently found
-  // nothing (`if (f)`), the icon wait never fired, and the Add hover at the end landed on the Providers
-  // tab's own disabled "Add a site" button. All three failures are silent by design, so the recording just
-  // quietly lost its best twelve seconds.
-  await clickTab('Extensions'); await skim(900);
-  const f = await page.$('input[placeholder*="Search extensions"]');
+  // ⚠️ When the catalogue moves, move this with capture.mjs: v0.39.0 moved it out of the Providers tab into its own
+  // and only capture.mjs followed, so the search below silently found nothing (`if (f)`), the icon wait never fired,
+  // and the Add hover at the end landed on Providers' own disabled "Add a site" button. All three failures are
+  // silent by design, so the recording just quietly lost its best twelve seconds.
+  // v0.54.0: Providers and Extensions are one Sources tab; the catalogue is in its Add sources, whose search is
+  // Browse's. Missing either is a silent skip, as everything here is -- look at the recording.
+  await clickTab('Sources'); await skim(900);
+  const browse = await page.$('[data-sources-view="add"]');
+  if (browse) { await browse.click(); await skim(700); }
+  const f = await page.$('[data-ext-search]');
   if (f) {
     await f.click();
     for (const ch of 'manga') { await page.keyboard.type(ch); await sleep(85); }
     await awaitThen(() => document.querySelectorAll('img[src*="/img/extensions/icon/"]').length > 3, 2200);
   }
-  // hover an Add button, deliberately without clicking (the catalogue is the fixture's, but the rule stands).
-  const add = await page.evaluateHandle(() => [...document.querySelectorAll('button')].find((b) => (b.textContent || '').trim() === 'Add'));
-  if (add.asElement()) { await add.asElement().hover(); await hold(1600); }
+  // hover an Install key, deliberately without clicking (the catalogue is the fixture's, but the rule stands).
+  const add = await page.$('[data-ext-install]');
+  if (add) { await add.hover(); await hold(1600); }
 
   await client.send('Page.stopScreencast');
   console.log(`  captured ${frames.length} frames over ${((Date.now() - t0) / 1000).toFixed(1)}s`);

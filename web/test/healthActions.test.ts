@@ -80,6 +80,9 @@ const ACTIONS: { action: string; labels: string[]; wants: RegExp }[] = [
   { action: 'find_sources', labels: ['label: copy.label({ ...ctx, n: item.findSeries })'], wants: /onRun: \(\) => setAsking\('find'\)/ },
   // v0.52.0 (#72): a duplicate pair in two languages is linked as editions after a confirmation that names both.
   { action: 'link_editions', labels: ["tr('Link as editions')"], wants: /onRun: \(\) => setAsking\('link'\)/ },
+  // v0.54.0: a dead main source's series move in one run (POST /api/admin/sources/find, mode 'replace'). The press opens
+  // the Replace dialog (components/ReplaceDialog.tsx), the one Admin → Sources opens; its Start posts the source.
+  { action: 'replace_source', labels: ["tr('Replace')"], wants: /onRun: \(\) => setAsking\('replace'\)/ },
 ];
 
 test('every action the health check can offer renders one key, with the label and the request it promises', () => {
@@ -215,10 +218,10 @@ test('#115: the Test key holds no verdict of its own, its status line says the l
   assert.match(arm, /\}, testStep\(check\.testMs\)\),/, 'the running Test does not say its limit');
   assert.match(row, /setSync\(\{ action: a, at, state: \{ kind: 'working', startedAt: at, step \} \}\);/, 'act ignores the step it is given');
   // Through healthRowEvidence, which drops the fix a row's detail already says and the one under a row listed for
-  // reference (lib/sourceEvidence.ts; its rules are held in sourceEvidence.test.ts).
-  const page = code(read(PAGE));
-  const health = page.slice(page.indexOf('function Health()'), page.indexOf('function DesktopUpdateNote('));
-  assert.match(health, /\{c\.id === 'sources' && <SourceEvidence \{\.\.\.healthRowEvidence\(it\)\} \/>\}\n\s*<\/HealthRow>/,
+  // reference (lib/sourceEvidence.ts; its rules are held in sourceEvidence.test.ts). v0.53.0: Source health draws its
+  // own rows (components/SourceHealthBody.tsx), and the stage lines wait behind each row's Details.
+  const body = code(read('components/SourceHealthBody.tsx'));
+  assert.match(body, /details: [^\n]*\(\s*<div data-source-details[^>]*>[\s\S]*?<SourceEvidence \{\.\.\.healthRowEvidence\(it\)\} \/>\s*<\/div>\s*\),/,
     'Health\'s source rows do not show the stage lines');
 });
 

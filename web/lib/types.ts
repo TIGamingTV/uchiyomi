@@ -39,6 +39,11 @@ export interface SeriesSource {
   registered: boolean;
   /** Followed by the add, not by a person (`added_by IS NULL`). Absent from an older server. */
   auto?: boolean;
+  /**
+   * v0.54.0: whether updates can use it (bff lib/sourceStanding.ts): working, cooling down, failing, switched off, or not
+   * loaded. A follower that works is what the Sources sheet offers Make main for. Absent from an older server.
+   */
+  standing?: 'usable' | 'cooling' | 'failing' | 'off' | 'not_loaded';
 }
 
 /**
@@ -453,7 +458,10 @@ export type HealthAction =
   // v0.49.1: look for other sources for every series whose main source is `sourceId` (POST /api/admin/sources/find).
   | 'find_sources'
   // v0.52.0 (#72): a duplicate pair in two languages, linked as editions of one work (POST /api/admin/series/:id/editions).
-  | 'link_editions';
+  | 'link_editions'
+  // v0.54.0: move every series whose main source is `sourceId` -- off or failing -- to a working source, in one Replace
+  // run (POST /api/admin/sources/find in its replace mode); the source and the frozen-series rows offer it.
+  | 'replace_source';
 
 /** One step of the nightly repair (`bff/src/lib/repair.ts`), as `POST /api/admin/tasks/repair/run` takes it. */
 export type RepairStep = 'solver' | 'count' | 'failures' | 'short' | 'gaps' | 'groups' | 'names' | 'directions';
@@ -517,7 +525,26 @@ export interface HealthItem {
    * source is `sourceId`. The key's words say the number when it is here.
    */
   findSeries?: number;
+
+  // ---- v0.53.0, Source health rows only (bff lib/health.ts): the card's group, and what the row's one line and its
+  // one key are chosen by. components/SourceHealthBody.tsx reads them; lib/sourceHealth.ts words them.
+  /** `affected` and `unused` are the findings; `quiet` and `off` are listed for reference, folded away. */
+  group?: SourceGroup;
+  state?: SourceState;
+  /** The stage a `failing`, `inconclusive` or `untested` row is about. */
+  stage?: StageLine['stage'];
+  /** A `blocked` row's status and when its cooldown ends (null: none is set). */
+  cooldown?: { status: string; until: string | null };
+  /** Where an `off` row was switched off, which is where it comes back on: Providers, Extensions, or a hidden language. */
+  offBy?: 'admin' | 'extension' | 'language';
+  /** The source has an extension's logo, which /img/sources/icon/:id serves. */
+  icon?: boolean;
 }
+
+/** v0.53.0: the Source health card's groups, in the server's order. */
+export type SourceGroup = 'affected' | 'unused' | 'quiet' | 'off';
+/** v0.53.0: a source row's one state (bff lib/health.ts SourceState). */
+export type SourceState = 'blocked' | 'failing' | 'slow' | 'empty' | 'inconclusive' | 'untested' | 'off';
 
 /** The last attempt at a finding, per check (bff lib/health.ts `HealthOutcome`). */
 export type HealthOutcome =
