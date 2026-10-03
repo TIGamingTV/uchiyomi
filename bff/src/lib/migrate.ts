@@ -1,6 +1,7 @@
 import type { PoolClient } from 'pg';
 import { pool, one } from './db';
 import { env } from '../env';
+import { MANGADEX_LANGS } from './lang';
 
 // NOTE: gen_random_uuid() is in Postgres core (v13+); no pgcrypto extension needed.
 // (The supabase/postgres image's event triggers reject CREATE EXTENSION under a custom role.)
@@ -1314,6 +1315,40 @@ CREATE TABLE IF NOT EXISTS source_find_runs (
 CREATE INDEX IF NOT EXISTS source_find_runs_started ON source_find_runs (started_at DESC);
 -- (Both tables are new and nothing older writes to them: v0.49.0 starts on this schema and ignores them.)
 
+-- An install that ran the fork build of PR #119 before v0.49.1 has a series_alt_titles of another shape, which the
+-- CREATE TABLE IF NOT EXISTS above leaves as it is: no removed_at, added_by a uuid referencing users, a source_id
+-- column, and origins 'confirmed' and 'merged'. Every read of the other names filters on removed_at, so on such an
+-- install each read failed, altTitlesFor answered nothing, the Sources sheet listed no other names and Find other
+-- sources searched under the series' own title alone. Brought to v0.49.1's shape here, each step only when it is
+-- needed, so a v0.49.1 table is untouched: the column added, the reference dropped and the id kept as text, the two
+-- origins read as an admin's (a person confirmed both), the extra column dropped and the origin CHECK added.
+ALTER TABLE series_alt_titles ADD COLUMN IF NOT EXISTS removed_at timestamptz;
+DO $$
+DECLARE c record;
+BEGIN
+  IF EXISTS (SELECT 1 FROM information_schema.columns
+              WHERE table_schema = current_schema() AND table_name = 'series_alt_titles'
+                AND column_name = 'added_by' AND data_type = 'uuid') THEN
+    FOR c IN SELECT conname FROM pg_constraint
+              WHERE conrelid = 'series_alt_titles'::regclass AND contype = 'f'
+                AND conkey = ARRAY[(SELECT attnum FROM pg_attribute
+                                     WHERE attrelid = 'series_alt_titles'::regclass AND attname = 'added_by')]::smallint[]
+    LOOP
+      EXECUTE format('ALTER TABLE series_alt_titles DROP CONSTRAINT %I', c.conname);
+    END LOOP;
+    ALTER TABLE series_alt_titles ALTER COLUMN added_by TYPE text USING added_by::text;
+  END IF;
+  IF EXISTS (SELECT 1 FROM information_schema.columns
+              WHERE table_schema = current_schema() AND table_name = 'series_alt_titles' AND column_name = 'source_id') THEN
+    ALTER TABLE series_alt_titles DROP COLUMN source_id;
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid = 'series_alt_titles'::regclass AND contype = 'c') THEN
+    UPDATE series_alt_titles SET origin = 'admin' WHERE origin NOT IN ('description', 'admin', 'import');
+    ALTER TABLE series_alt_titles ADD CONSTRAINT series_alt_titles_origin_check
+      CHECK (origin IN ('description', 'admin', 'import'));
+  END IF;
+END $$;
+
 -- v0.51.0: automatic hero banners, made from a series' own pages (lib/autoHero.ts). One row per series that has had
 -- one made or tried. seed picks its chapters and pages (Shuffle sets a new one; 0 until then); made_at is when the
 -- current one was made; failed_at and fail_reason are the last try that made none, which is not repeated for a week.
@@ -1326,6 +1361,31 @@ CREATE TABLE IF NOT EXISTS series_hero (
   failed_at   timestamptz,
   fail_reason text
 );
+
+-- v0.52.0: the language a series is in, and editions of one work (lib/lang.ts, lib/seriesLang.ts, lib/editions.ts).
+-- lang: BCP-47, as lib/lang.ts canonLang writes it, stated at add time, by the v0.52.0 data migration (below, in
+-- DATA_MIGRATIONS) or by an admin; NULL = not stated, inferred from the main source, else unstated_lang.
+-- work_id: series that are language editions of one work share it; NULL = a series on its own.
+ALTER TABLE lib_series ADD COLUMN IF NOT EXISTS lang    text;
+ALTER TABLE lib_series ADD COLUMN IF NOT EXISTS work_id uuid;
+CREATE INDEX IF NOT EXISTS lib_series_work_idx ON lib_series (work_id) WHERE work_id IS NOT NULL;
+-- One edition per language per work. A hidden edition keeps its slot, so Put back can never collide.
+CREATE UNIQUE INDEX IF NOT EXISTS lib_series_work_lang_idx ON lib_series (work_id, lang) WHERE work_id IS NOT NULL;
+-- MangaDex languages besides English, as app codes (the choices are lib/lang.ts MANGADEX_LANGS). Applied live.
+ALTER TABLE server_settings ADD COLUMN IF NOT EXISTS mangadex_langs jsonb NOT NULL DEFAULT '[]'::jsonb;
+-- The language of sources and series that do not say. English, as lib/borrowNames.ts has assumed since v0.47.0.
+ALTER TABLE server_settings ADD COLUMN IF NOT EXISTS unstated_lang  text  NOT NULL DEFAULT 'en';
+-- (Every column is nullable or has a default, and the unique index is partial on work_id, which v0.51.0 never
+-- writes: v0.51.0 boots on this schema and keeps writing its rows.)
+-- What a rollback leaves, put right at every boot (in steady state both match nothing). v0.52.0's merge takes the
+-- row merged away out of its work (lib/libraryAdmin.ts mergeSeries); v0.51.0's, after a rollback, does not, so the
+-- absorbed row kept its language's slot in the unique index above, and adding that language to the work again was
+-- refused as "That language already has its edition" with no such edition in sight. Then a work left with one
+-- edition, by that merge or by a v0.51.0 Forget, stands alone again, as lib/editions.ts dissolveLoneWork leaves it.
+UPDATE lib_series SET work_id = NULL WHERE merged_into IS NOT NULL AND work_id IS NOT NULL;
+UPDATE lib_series s SET work_id = NULL
+ WHERE s.work_id IS NOT NULL
+   AND (SELECT count(*) FROM lib_series w WHERE w.work_id = s.work_id AND w.merged_into IS NULL) <= 1;
 `;
 
 // Serialises migrate() across processes. CREATE TABLE IF NOT EXISTS is not safe to run concurrently:
@@ -1455,6 +1515,35 @@ const DATA_MIGRATIONS: { id: string; run: (c: PoolClient) => Promise<void> }[] =
     id: 'v0.40.0-retry-incomplete',
     run: async (c) => {
       await c.query(`UPDATE chapter_failures SET attempts = 0 WHERE status = 'incomplete'`);
+    },
+  },
+
+  // v0.52.0: state the language of every series whose main source is MangaDex, from the copies its listing chose.
+  // The one case inference cannot see: when a title has no English chapters, MangaDex's English adapter falls back
+  // to Spanish, Portuguese and the rest (lib/sources/mangadex.ts CHAPTER_LANGS), so a Spanish title added through it
+  // reads as the adapter's English. The majority language of its MangaDex rows is what it really is, in the app's
+  // codes (es-la is es-419: lib/lang.ts MANGADEX_LANGS); a code outside the table stays unstated. Only MangaDex's own
+  // rows count, since a follower's copies say nothing about the main source, and a stated language is never
+  // overwritten. One grouped read of those series' listings and one UPDATE.
+  {
+    id: 'v0.52.0-series-lang-from-mangadex',
+    run: async (c) => {
+      await c.query(
+        `WITH tally AS (
+           SELECT l.series_id, lower(l.chosen->>'lang') AS md, count(*) AS n
+             FROM series_listing l
+             JOIN lib_series s ON s.id = l.series_id
+            WHERE s.source_id = 'mangadex' AND s.lang IS NULL
+              AND l.source_id = 'mangadex' AND COALESCE(l.chosen->>'lang', '') <> ''
+            GROUP BY 1, 2
+         ), top AS (
+           SELECT DISTINCT ON (series_id) series_id, md FROM tally ORDER BY series_id, n DESC, md
+         )
+         UPDATE lib_series s SET lang = m.code
+           FROM top t JOIN unnest($1::text[], $2::text[]) AS m(md, code) ON m.md = t.md
+          WHERE s.id = t.series_id AND s.lang IS NULL`,
+        [MANGADEX_LANGS.map((l) => l.md), MANGADEX_LANGS.map((l) => l.code)],
+      );
     },
   },
 

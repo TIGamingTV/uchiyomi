@@ -66,20 +66,24 @@ test('AdultToggle renders for a second reason, and still for its first', () => {
 });
 
 test('the admin console lists every source, including the ones Discover hides', () => {
-  // Reintroduce by putting `queryKey: ['sources'], queryFn: () => api(\'/api/sources\')` back on either
-  // admin query: the Providers tab and its count tile drop to the non-adult sources and an admin can no
-  // longer test, unblock or disable the rest.
+  // Since v0.54.0 the Sources tab and its count tile read GET /api/admin/sources/overview (lib/sourcesPanel.ts), where
+  // the console read GET /api/sources with `?adult=1` while the reveal was off. The overview lists every source to an
+  // admin and never reads the parameter (bff sourcesOverview.int.test.ts "an admin sees every 18+ source"), so it is
+  // asked for plainly: an admin can test, unblock, switch off or replace an adult source whatever the reveal says.
+  // Reintroduce the parameter (`adultShown() ? … : '…?adult=1'`): "the overview is asked for with a parameter it does
+  // not read" fails.
+  const lib = code(read('lib/sourcesPanel.ts'));
+  assert.match(lib, /export const OVERVIEW_URL = '\/api\/admin\/sources\/overview';/, 'the overview is asked for with a parameter it does not read');
   const admin = code(read('app/admin/page.tsx'));
-  assert.match(admin, /const allSourcesUrl = \(\) => \(adultShown\(\) \? '\/api\/sources' : '\/api\/sources\?adult=1'\);/,
-    'the admin console no longer asks for the full source list');
-  // ⚠️ Never an unconditional `?adult=1`: lib/api.ts appends its own when the reveal is on, and two copies
-  // of the parameter arrive as an array, which the server reads as "not 1" -- i.e. hidden.
-  assert.doesNotMatch(admin, /api<[^>]*>\('\/api\/sources\?adult=1'\)/,
-    'the admin console hardcodes adult=1, which doubles the parameter once the reveal is on');
-  // Its own key: `['sources']` is the browsing list several screens share, and two shapes under one key is
-  // how a revealed answer gets replayed to a screen that asked for a hidden one.
-  assert.equal((admin.match(/queryKey: ALL_SOURCES_KEY/g) ?? []).length, 2,
-    'the two admin source queries are not both on the console key');
+  const panel = code(read('components/SourcesPanel.tsx'));
+  const dialog = code(read('components/ReplaceDialog.tsx'));
+  for (const src of [admin, panel, dialog, lib]) {
+    assert.doesNotMatch(src, /\/api\/admin\/sources\/overview\?|adultShown\(\)/, 'the overview is asked for with a parameter it does not read');
+  }
+  // Its own key, under ['sources'] so every change that asks the source lists again asks this too: the tab and its tile.
+  assert.match(lib, /export const OVERVIEW_KEY = \['sources', 'overview'\] as const;/);
+  assert.equal((admin.match(/queryKey: OVERVIEW_KEY, queryFn: \(\) => api<SourcesOverview>\(OVERVIEW_URL\)/g) ?? []).length, 1, 'the tile does not read the overview');
+  assert.equal((panel.match(/queryKey: OVERVIEW_KEY, queryFn: \(\) => api<SourcesOverview>\(OVERVIEW_URL\)/g) ?? []).length, 1, 'the tab does not read the overview');
   assert.doesNotMatch(admin, /queryKey: \['sources'\], queryFn: \(\) => api<\{ content: any\[\] \}>\('\/api\/sources'\)/,
     'an admin source query is back on the shared browsing key');
 });

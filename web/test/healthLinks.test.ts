@@ -8,7 +8,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'fs';
 import { join } from 'path';
-import { chParam, healthLinks, landingNumber, numberingHref, readerHref, seriesHref } from '../lib/healthLinks';
+import { chParam, healthLinks, landingNumber, numberingHref, readerHref, seriesHref, INSTALL_VOLUMES } from '../lib/healthLinks';
 import { extSourceIdOf } from '../lib/sourcePrefs';
 
 test('links are the query shape, encoded, with ?ch= only for a real number', () => {
@@ -40,7 +40,7 @@ test('#116: a numbering finding opens its plan, and an extension source its own 
   // link further. Reintroduce the plain series link: "Open does not open the plan" fails.
   assert.equal(numberingHref('s 1'), '/series/?id=s%201&numbering=review');
   assert.deepEqual(healthLinks('numbering', { title: 't', detail: 'd', seriesId: 's1', sourceId: 'sw:2522335540328470744', actions: ['renumber', 'keep_numbers'] }),
-    [{ href: '/series/?id=s1&numbering=review' }, { href: '/admin/?tab=Extensions&settings=2522335540328470744', label: 'Source settings' }],
+    [{ href: '/series/?id=s1&numbering=review' }, { href: '/admin/?tab=Sources&settings=2522335540328470744', label: 'Source settings' }],
     'Open does not open the plan');
   assert.deepEqual(healthLinks('numbering', { title: 't', detail: 'd', seriesId: 's1', sourceId: 'mangadex', actions: ['renumber'] }), [{ href: '/series/?id=s1&numbering=review' }],
     'a built-in source is sent to extension settings');
@@ -54,7 +54,7 @@ test('#116: a numbering row with nothing to review opens the series, not a plan 
   // (info, Keep only) opened "Use the source's numbers" with a Rename key, and an interrupted renumber (no key: the
   // next check finishes it) a Confirm over its journal (web2 review). Reintroduce the plan for every numbering row:
   // each assertion below names its row.
-  const ext = { href: '/admin/?tab=Extensions&settings=2522335540328470744', label: 'Source settings' };
+  const ext = { href: '/admin/?tab=Sources&settings=2522335540328470744', label: 'Source settings' };
   assert.deepEqual(healthLinks('numbering', { title: 't', detail: 'd', seriesId: 's1', sourceId: 'sw:2522335540328470744', actions: ['keep_numbers'], info: true }),
     [{ href: '/series/?id=s1' }, ext], 'a series numbered by posting order lately opens a rename plan');
   assert.deepEqual(healthLinks('numbering', { title: 't', detail: 'd', seriesId: 's1', sourceId: 'sw:2522335540328470744' }),
@@ -118,4 +118,16 @@ test("Health's Open links wrap onto a second line rather than being cut", () => 
   assert.match(cls!, /\bmax-w-\[11rem\]/, 'the links column can take the finding\'s words\' width');
   // The arrow stays with the last word: a no-break space, so "›" never starts the second line on its own.
   assert.match(links, /\{'\\u00a0'\}›/, 'the arrow can wrap onto a line of its own');
+});
+
+test('a folder scanned twice links to the install guide\'s Volumes section, which opens beside the app (v0.52.0, #134)', () => {
+  // Reintroduce by dropping the case in healthLinks: the row has no way to the fix.
+  assert.deepEqual(healthLinks('folders-twice', { title: 'Library / uchiyomi_manga', detail: '' }),
+    [{ href: INSTALL_VOLUMES, label: 'Volumes, in the install guide' }], 'a folder scanned twice links to the install guide');
+  assert.match(INSTALL_VOLUMES, /\/docs\/INSTALL\.md#volumes$/);
+  // The section is there, under that anchor.
+  assert.match(readFileSync(join(__dirname, '..', '..', 'docs', 'INSTALL.md'), 'utf8'), /^## Volumes$/m, 'INSTALL.md has no Volumes section');
+  // A link off the app opens beside it, never in its place.
+  assert.match(readFileSync(join(__dirname, '..', 'app', 'admin', 'page.tsx'), 'utf8'),
+    /\{\.\.\.\(\/\^https\?:\\\/\\\/\/\.test\(l\.href\) \? \{ target: '_blank', rel: 'noopener noreferrer' \} : \{\}\)\}/, 'the install guide opens in place of the app');
 });

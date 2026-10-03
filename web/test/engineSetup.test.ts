@@ -157,8 +157,16 @@ test('the card polls the status while it is looked at, and Check again refetches
   assert.match(src, /<ProgressRing size="bar" progress=\{waiting \? 'spin' : 'idle'\}/);
   assert.doesNotMatch(src, /animate-|@keyframes|motion\./, 'a custom animation the Reduce effects switch does not reach');
   assert.doesNotMatch(src, /rounded-full/, 'a capsule');
-  const admin = code(read('app/admin/page.tsx'));
-  assert.match(admin, /<EngineReadyFoot status=\{status\} desktop=\{isDesktop\(\)\} \/>/, 'the ready panel lost its helper line and Turning it off');
+  // v0.53.0: a working engine's strip keeps the helper's Connect and the way to turn the engine off (a sheet, behind the
+  // engine's ⋯ since round 2).
+  // v0.54.0: the strip heads Admin → Sources.
+  const panel = code(read('components/SourcesPanel.tsx'));
+  assert.match(panel, /<EngineReady status=\{status\} desktop=\{isDesktop\(\)\} \/>/, 'the ready panel lost its helper line and Turning it off');
+  const ready = src.slice(src.indexOf('export function EngineReady('));
+  assert.match(ready, /\{!said\?\.ok && helper\?\.action === 'connect' && \(\s*<button[^>]*data-engine-connect>/, 'the helper has no Connect');
+  assert.match(ready, /useContextMenu\(\(\) => \(desktop \? \[\] : \[\{ label: tr\('Turning it off'\), onSelect: \(\) => setShowOff\(true\) \}\]\)/, 'Turning it off is gone, or shows on desktop');
+  assert.match(ready, /\{!desktop && \(\s*<button type="button" onClick=\{\(e\) => menu\.openFrom\(e\.currentTarget\)\}/, 'the ⋯ that holds Turning it off shows on desktop');
+  assert.match(ready, /<Steps steps=\{offSteps\(platform\)\} \/>\s*<DataWarning platform=\{platform\} linked=\{status\.linkedSeries \?\? 0\} \/>/, 'turning it off lost its steps or the data warning');
 });
 
 /**
@@ -177,8 +185,10 @@ test('"Last tried" is the last attempt to reach the engine, and says when it did
   assert.match(src, /: waiting \? lastTryLine\(status\) \|\| null : null;/, 'the waiting card does not read the last try through lastTryLine');
 });
 
-test('the engine row on Health opens the Extensions tab', () => {
-  assert.deepEqual(healthLinks('extension-engine', { title: 'Cloudflare helper', detail: '' } as any), [{ href: '/admin/?tab=Extensions' }]);
+test('the engine row on Health opens Admin → Sources, where the engine is', () => {
+  // v0.54.0: the Extensions tab is part of Sources. Reintroduce `?tab=Extensions`: it lands there through the alias, but
+  // this names the old address.
+  assert.deepEqual(healthLinks('extension-engine', { title: 'Cloudflare helper', detail: '' } as any), [{ href: '/admin/?tab=Sources' }]);
 });
 
 /** Reintroduce by deleting any one of these keys from public/locales/ar.json: the test names it. */

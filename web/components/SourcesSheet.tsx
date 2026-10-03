@@ -12,9 +12,11 @@ import { useEffect, useMemo, useState } from 'react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { api, ApiError } from '@/lib/api';
 import { useAuth } from '@/lib/auth';
-import type { GroupStat, Series, SeriesGroups, SeriesSource, StoredPrefs } from '@/lib/types';
+import type { EditionRow, GroupStat, Series, SeriesGroups, SeriesSource, StoredPrefs } from '@/lib/types';
 import { t as tr } from '@/lib/i18n';
-import { chapterLabel, relativeTime } from '@/lib/format';
+import { chapterLabel, languageName, relativeTime } from '@/lib/format';
+import { editionNames } from '@/lib/editions';
+import Link from 'next/link';
 import { useToast } from '@/components/Toast';
 import { msgOf } from '@/components/ConfirmDialog';
 import { Sheet } from '@/components/ui';
@@ -33,7 +35,8 @@ import {
   altKey, altOriginLabel, altRefusal, findGate, findReviewFirst, findSlotState, seriesOutcome, setFindReviewFirst, type AltTitle,
 } from '@/lib/findSources';
 import { useFindRuns } from '@/lib/useFindRun';
-import { FindModeChoice, SeriesReview } from '@/components/FindSources';
+import { FindModeChoice, SeriesReview, type EditionAsk } from '@/components/FindSources';
+import { makeMainQuestion, mayMakeMain } from '@/lib/mainSource';
 
 // The patience field, and only that: `w-14`, not the page's `w-full` field class, so "Patience [ 2 ] days ·
 // Currently 2" and the two buttons share one row -- on a phone the footer sits under the sheet's cap and
@@ -151,7 +154,7 @@ const codeOf = (e: unknown): string | null => {
  * inline above the key (a dialog opened from a Sheet would sit under it), on the admin's last choice; a review's
  * matches for this series then show under the key, each with Follow and Skip.
  */
-function FindMore({ id, onFound }: { id: string; onFound: () => void }) {
+function FindMore({ id, onFound, onAddEdition }: { id: string; onFound: () => void; onAddEdition?: (ask: EditionAsk) => void }) {
   const fr = useFindRuns({ onEnded: onFound });
   const [review, setReview] = useState(findReviewFirst);
   const slot = fr.slots.series;
@@ -178,7 +181,7 @@ function FindMore({ id, onFound }: { id: string; onFound: () => void }) {
       <div className="mb-2"><FindModeChoice review={review} onChange={setReview} /></div>
       <ActionKeys actions={[spec]} />
       <ActionStatus state={state} />
-      {mineRow && run && <SeriesReview runId={run.id} r={mineRow} onFollowed={onFound} />}
+      {mineRow && run && <SeriesReview runId={run.id} r={mineRow} onFollowed={onFound} onAddEdition={onAddEdition} />}
     </div>
   );
 }
@@ -280,12 +283,77 @@ const Eyebrow = ({ children }: { children: React.ReactNode }) => (
   <p className="mb-2 text-xs font-semibold uppercase tracking-wider text-fog-500">{children}</p>
 );
 
-/** One source the updater asks: favicon, name, its role, what it lists, when it was last asked. */
-function SourceRow({ s, onUnfollow, unfollowing }: { s: SeriesSource; onUnfollow?: () => void; unfollowing?: boolean }) {
+/**
+ * Languages (v0.52.0, #72), after Sources: the language the series is in, and its other language editions. On its
+ * own it says which language and offers "Add a language" (the add dialog's edition flow) -- the way p3t3t3 was
+ * missing -- and an admin's Change (Edit details' Language). With editions it lists each, its chapter count, and
+ * "this edition" or Open; an admin's × unlinks one, after a confirmation the page shows. The helper sentence is said
+ * once, here, rather than on every chip.
+ */
+function Languages({ series, onAdd, onChange, onUnlink, onOpen }: {
+  series: Series | undefined;
+  onAdd?: () => void;
+  onChange?: () => void;
+  onUnlink?: (e: EditionRow) => void;
+  /** Closes the sheet as Open navigates: the page under it is about to change. */
+  onOpen: () => void;
+}) {
+  if (!series?.lang) return null;
+  const editions = (series.edition?.editions?.length ?? 0) > 1 ? series.edition!.editions! : null;
+  const names = editions ? editionNames(editions.map((e) => e.lang), languageName) : [];
+  return (
+    <section className="mt-5" data-languages>
+      <Eyebrow>{tr('Languages')}</Eyebrow>
+      {!editions ? (
+        <p className="flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-fog-300">
+          <span>{tr('This series is in {language}.', { language: languageName(series.lang) })}</span>
+          {onChange && <button type="button" onClick={onChange} className="text-[11px] text-accent hover:underline">{tr('Change')}</button>}
+        </p>
+      ) : (
+        <>
+          <p className="mb-1.5 max-w-prose text-[11px] leading-relaxed text-fog-500">
+            {tr('Each language is its own edition, with its own chapters, sources and reading progress. The Library shows one card for them.')}
+          </p>
+          <div className="divide-y divide-ink-800/70">
+            {editions.map((e, i) => (
+              <div key={e.seriesId} className="flex min-w-0 items-center gap-2 py-2 text-sm" data-edition-row={e.lang}>
+                <span className="min-w-0 flex-1 truncate text-fog-100">
+                  {names[i]}
+                  <span className="text-[11px] text-fog-500"> · {e.booksCount === 1 ? tr('1 chapter') : tr('{n} chapters', { n: e.booksCount })}</span>
+                </span>
+                {e.current
+                  ? <span className="shrink-0 rounded-[4px] border border-accent/40 px-1.5 text-[10px] leading-4 text-accent">{tr('this edition')}</span>
+                  : <Link href={`/series/?id=${encodeURIComponent(e.seriesId)}`} onClick={onOpen} className="btn-key">{tr('Open')}</Link>}
+                {onUnlink && (
+                  <button type="button" onClick={() => onUnlink(e)} aria-label={tr('Unlink the {language} edition', { language: languageName(e.lang) })}
+                    className="grid size-7 shrink-0 place-items-center rounded-lg text-fog-500 hover:text-rose-300">×</button>
+                )}
+              </div>
+            ))}
+          </div>
+        </>
+      )}
+      {onAdd && (
+        <button type="button" onClick={onAdd} className="btn-key mt-2">{tr('Add a language')}</button>
+      )}
+    </section>
+  );
+}
+
+/**
+ * One source the updater asks: favicon, name, its role, what it lists, when it was last asked -- and, for an admin, the
+ * × that stops following it and (v0.54.0) Make main on a follower that works: it asks first, in one line, what becomes
+ * of the main source it replaces (lib/mainSource.ts).
+ */
+export function SourceRow({ s, onUnfollow, unfollowing, makeMain }: {
+  s: SeriesSource; onUnfollow?: () => void; unfollowing?: boolean;
+  makeMain?: { question: string; busy: boolean; refusal: string | null; asking: boolean; onAsk: () => void; onCancel: () => void; onConfirm: () => void };
+}) {
   // ⚠️ The server names an adapter it no longer loads by its id, and an extension's id is nineteen digits
   // nobody can read (supplyLine.ts applies the same rule to the line under the title).
   const unknown = !s.registered && s.name === s.sourceId;
   return (
+    <>
     <div className="flex items-center gap-2.5 py-2 text-sm">
       <SourceIcon id={s.sourceId} name={unknown ? '?' : s.name} size={24} registered={s.registered} />
       <span className="min-w-0 flex-1">
@@ -305,11 +373,28 @@ function SourceRow({ s, onUnfollow, unfollowing }: { s: SeriesSource; onUnfollow
           {s.checkedAt && tr('checked {ago}', { ago: relativeTime(s.checkedAt) })}
         </span>
       </span>
+      {makeMain && !makeMain.asking && (
+        <button type="button" onClick={makeMain.onAsk} disabled={makeMain.busy} className="btn-key shrink-0" data-make-main={s.sourceId}>
+          {tr('Make main')}
+        </button>
+      )}
       {onUnfollow && (
         <button type="button" onClick={onUnfollow} disabled={unfollowing} aria-label={tr('Stop following {s}', { s: s.name })}
           className="shrink-0 px-1 text-fog-500 hover:text-rose-400 disabled:opacity-50">×</button>
       )}
     </div>
+    {/* Asked in one line under the row, inside the sheet: a dialog opened over a Sheet paints under it. */}
+    {makeMain?.asking && (
+      <div role="alertdialog" aria-label={makeMain.question} className="mb-2 border-s-2 border-accent/70 bg-ink-850/80 py-2 pe-2 ps-2.5" data-make-main-confirm={s.sourceId}>
+        <p className="text-[12px] leading-relaxed text-fog-100">{makeMain.question}</p>
+        <div className="mt-2 flex flex-wrap gap-2">
+          <button type="button" onClick={makeMain.onConfirm} disabled={makeMain.busy} className="btn-key" data-make-main-yes>{tr('Make main')}</button>
+          <button type="button" autoFocus onClick={makeMain.onCancel} disabled={makeMain.busy} className="btn-key">{tr('Cancel')}</button>
+        </div>
+      </div>
+    )}
+    {makeMain?.refusal && <p role="alert" className="mb-2 text-[11px] leading-relaxed text-amber-300" data-make-main-refusal>{makeMain.refusal}</p>}
+    </>
   );
 }
 
@@ -400,7 +485,7 @@ function GroupRow({ g, blocked, serverBlocked, haveNumbers, seriesStatus, contro
  * turn "follows the defaults" into a per-series copy of them on the first tap -- a copy that then stops
  * following when the defaults change. Blank patience means the same thing for the same reason.
  */
-export function SourcesSheet({ id, series, groups, admin, error, isLoading, haveNumbers, checkedAt, onSaved, onClose, onExplain, onFindMissing, onShowChapter }: {
+export function SourcesSheet({ id, series, groups, admin, error, isLoading, haveNumbers, checkedAt, onSaved, onClose, onExplain, onFindMissing, onShowChapter, onAddLanguage, onChangeLanguage, onUnlink, onAddEdition }: {
   id: string;
   series: Series | undefined;
   groups: GroupStat[];
@@ -424,6 +509,16 @@ export function SourcesSheet({ id, series, groups, admin, error, isLoading, have
    * `getElementById` finds nothing.
    */
   onShowChapter?: (n: number) => void;
+  /**
+   * v0.52.0 (#72), the Languages section. Each is absent for a viewer it is not for -- Add a language for one who may
+   * not add series, Change and the unlink × for anyone but an admin -- and the page closes this sheet before opening
+   * the dialog behind it (a Modal under a Sheet cannot be tapped).
+   */
+  onAddLanguage?: () => void;
+  onChangeLanguage?: () => void;
+  onUnlink?: (e: EditionRow) => void;
+  /** A review's match refused for its language (v0.52.0): "Add it as an edition", on that source's language. */
+  onAddEdition?: (ask: EditionAsk) => void;
 }) {
   const toast = useToast();
   const qc = useQueryClient();
@@ -512,6 +607,29 @@ export function SourcesSheet({ id, series, groups, admin, error, isLoading, have
     return patch({ priority: stored.priority, blocked: stored.blocked, patienceDays: n });
   };
   const useDefaults = async () => { if (await patch(null)) { setLocal({ priority: [], blocked: [] }); setPatience(''); } };
+
+  // Make main (v0.54.0): a follower that works becomes the series' main source, asked first in one line. The server
+  // keeps the old main as a backup while it works and drops it when it does not; a refusal is said by its code.
+  const [asked, setAsked] = useState<string | null>(null);
+  const [promoting, setPromoting] = useState<string | null>(null);
+  const [refused, setRefused] = useState<{ id: string; why: string } | null>(null);
+  const makeMain = async (s: SeriesSource) => {
+    setPromoting(s.sourceId);
+    setRefused(null);
+    try {
+      await api(`/api/admin/series/${encodeURIComponent(id)}/main-source`, { json: { sourceId: s.sourceId } });
+      setAsked(null);
+      toast(tr('{name} is now the main source', { name: `\u2068${s.name}\u2069` }), 'success');
+      onSaved();
+      for (const k of ['series-listing', 'series-scanlators', 'series-groups']) qc.invalidateQueries({ queryKey: [k, id] });
+    } catch (e) {
+      // The refusal in the server's own words, by its code (lib/mainSource.ts): not followed, posting order, a series being
+      // checked, another language…
+      setRefused({ id: s.sourceId, why: msgOf(e, tr('Could not change the main source')) });
+      setAsked(null);
+    }
+    setPromoting(null);
+  };
 
   // Extra sources are added from Find missing chapters, where a person has seen the source's title and its
   // overlap with what is on disk. Here they can only be removed; the main one is not removable at all,
@@ -613,7 +731,16 @@ export function SourcesSheet({ id, series, groups, admin, error, isLoading, have
           ? <div className="divide-y divide-ink-800/70">
               {sources.map((s) => (
                 <SourceRow key={s.sourceId} s={{ ...s, checkedAt: s.checkedAt ?? (s.primary ? checkedAt : null) }}
-                  onUnfollow={isAdmin && !s.primary ? () => unfollow(s) : undefined} unfollowing={unfollowing === s.sourceId} />
+                  onUnfollow={isAdmin && !s.primary ? () => unfollow(s) : undefined} unfollowing={unfollowing === s.sourceId}
+                  makeMain={adminAccount && mayMakeMain(s) ? {
+                    question: makeMainQuestion(s, main?.primary ? main : null),
+                    busy: promoting !== null,
+                    refusal: refused?.id === s.sourceId ? refused.why : null,
+                    asking: asked === s.sourceId,
+                    onAsk: () => { setRefused(null); setAsked(s.sourceId); },
+                    onCancel: () => setAsked(null),
+                    onConfirm: () => void makeMain(s),
+                  } : undefined} />
               ))}
             </div>
           : <p className="text-xs text-fog-500">{tr('No source — the chapters were scanned from disk.')}</p>}
@@ -668,6 +795,8 @@ export function SourcesSheet({ id, series, groups, admin, error, isLoading, have
         )}
       </section>
 
+      <Languages series={series} onAdd={onAddLanguage} onChange={onChangeLanguage} onUnlink={onUnlink} onOpen={onClose} />
+
       <section className="mt-5">
         <Eyebrow>{tr('Translated by')}</Eyebrow>
         {isLoading && <div className="skeleton h-12 rounded-xl" />}
@@ -711,7 +840,8 @@ export function SourcesSheet({ id, series, groups, admin, error, isLoading, have
           disk may gain its first one this way, and the server says so when there is nothing it may search for. */}
       {adminAccount && <OtherNames id={id} />}
       {adminAccount && (
-        <FindMore id={id} onFound={() => { onSaved(); for (const k of ['series-scanlators', 'series-groups', 'series-listing', 'series-versions', 'series-alt-titles']) qc.invalidateQueries({ queryKey: [k, id] }); }} />
+        <FindMore id={id} onAddEdition={onAddEdition}
+          onFound={() => { onSaved(); for (const k of ['series-scanlators', 'series-groups', 'series-listing', 'series-versions', 'series-alt-titles']) qc.invalidateQueries({ queryKey: [k, id] }); }} />
       )}
     </Sheet>
   );

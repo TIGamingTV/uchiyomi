@@ -25,13 +25,18 @@ import { api } from '@/lib/api';
 import { ConfirmDialog, msgOf } from '@/components/ConfirmDialog';
 import { useToast } from '@/components/Toast';
 import { ActionKeys, ActionList, ActionStatus, type ActionSpec } from '@/components/ActionList';
+import { useContextMenu, type MenuItem } from '@/components/ContextMenu';
+import { Disclosure } from '@/components/settings';
 import { StatusMark } from '@/components/StatusMark';
 import { OnBody } from '@/components/ui';
 import { NumberingSheet } from '@/components/NumberingSheet';
 import { FindStartDialog } from '@/components/FindSources';
+import { ReplaceDialog } from '@/components/ReplaceDialog';
 import { t as tr } from '@/lib/i18n';
+import { deletedText, skippedBookmarkedText, skippedNotOursText } from '@/lib/counted';
 import { isDesktop } from '@/lib/desktop';
-import { IDLE, type ActionState } from '@/lib/actionState';
+import { languageName } from '@/lib/format';
+import { IDLE, actionButton, isBusy, type ActionState } from '@/lib/actionState';
 import { triggerRefresh, type RefreshAnswer } from '@/lib/refresh';
 import {
   ACTION_COPY, actionCopy, caveatLine, caveatTone, fixAllWhat, outcomeLine, planFooter, planLine, repairGate, rowState, solverDownLine, timeLine,
@@ -43,7 +48,7 @@ import {
 } from '@/lib/repairRun';
 import { useRepairRun } from '@/lib/useRepairRun';
 import { testStep } from '@/lib/sourceEvidence';
-import { diagnosisReason, itemDetail, type Said } from '@/lib/said';
+import { diagnosisReason, itemDetail, itemTitle, type Said } from '@/lib/said';
 import { useFindRun } from '@/lib/useFindRun';
 import { findGate, findSlotState } from '@/lib/findSources';
 import { numberingOutcome, refusalText, type NumberingAnswer, type PlanMode, type RenumberMode } from '@/lib/numbering';
@@ -93,6 +98,32 @@ export function scanState(r: RefreshAnswer, startedAt: number): ActionState {
 }
 
 /**
+ * Turn off: the one request behind a row's Turn off and Source health's Turn off all (v0.53.0), which makes it for
+ * each source in turn (lib/sourceHealth.ts turnOffEach).
+ */
+export const disableSource = (sourceId: string) =>
+  api(`/api/admin/sources/${encodeURIComponent(sourceId)}/disable`, { method: 'POST' });
+
+/**
+ * v0.53.0, Source health's compact row (components/SourceHealthBody.tsx): the row on one line -- `lead` before its
+ * words, ONE key, and every other action in a ⋯ menu -- with `details` behind a Details disclosure.
+ */
+export interface CompactRow {
+  /** Before the words: the source's tile. */
+  lead: ReactNode;
+  /** The row's one line, under its name (the row's children). */
+  line: ReactNode;
+  /** The one key the row shows, or none (lib/sourceHealth.ts primaryOf). Every other action is in its menu. */
+  primary: HealthAction | null;
+  /** Behind Details, closed until opened. */
+  details?: ReactNode;
+  /** What the row is about, for its menu's name and its ⋯ key's. */
+  name: string;
+  /** More hooks on the row, for the browser walks. */
+  hooks?: Record<`data-${string}`, string>;
+}
+
+/**
  * One finding's row: its words (the caller's children -- title, detail, and #115's evidence), what the last
  * attempt found, what an action will not be able to do, the keys, and the status line.
  *
@@ -100,12 +131,14 @@ export function scanState(r: RefreshAnswer, startedAt: number): ActionState {
  * lib/healthKeys.ts: its state -- a Fix working, a Test's verdict -- must follow the finding when a re-check
  * removes the row above it.
  */
-export function HealthRow({ check, item, rowKey, links, children }: {
+export function HealthRow({ check, item, rowKey, links, children, compact }: {
   check: HealthCheck;
   item: HealthItem;
   rowKey: string;
   links?: ReactNode;
   children: ReactNode;
+  /** v0.53.0: Source health's compact row. The actions, their states and their confirmations are this row's own either way. */
+  compact?: CompactRow;
 }) {
   const toast = useToast();
   const qc = useQueryClient();
@@ -116,7 +149,7 @@ export function HealthRow({ check, item, rowKey, links, children }: {
   const slot = slots[slotKey];
   // Answers-at-once actions keep their own state: pressed, asked, re-checked, then what they said.
   const [sync, setSync] = useState<{ action: HealthAction; state: ActionState; at: number } | null>(null);
-  const [asking, setAsking] = useState<'delete' | 'disable' | 'merge' | 'find' | null>(null);
+  const [asking, setAsking] = useState<'delete' | 'disable' | 'merge' | 'link' | 'find' | 'replace' | null>(null);
   // #116: the renumbering plan a numbering key opened, and which key opened it (its row state is that key's).
   const [plan, setPlan] = useState<{ action: HealthAction; mode: PlanMode } | null>(null);
   const [keepFirst, setKeepFirst] = useState(() => keptIndex(item) === 0);
@@ -149,6 +182,10 @@ export function HealthRow({ check, item, rowKey, links, children }: {
   // where one busy key would disable every key of its group for the whole run.
   const findSlot = fr?.slots[slotKey];
   const findNow = findSlotState(findSlot, fr?.runOf(slotKey), () => { void fr?.stop(slotKey); });
+  // v0.54.0: a Replace run started from this row, under a key of its own -- the Replace dialog shows the run its key
+  // started, never the row's Find other sources -- with its own status line under the row.
+  const replaceKey = `${slotKey}:replace`;
+  const replaceNow = findSlotState(fr?.slots[replaceKey], fr?.runOf(replaceKey), () => { void fr?.stop(replaceKey); });
   // The newest of the two is the row's line.
   const useSync = !!sync && sync.state.kind !== 'idle' && (repairState.kind === 'idle' || sync.at >= (slot?.startedAt ?? live?.startedAt ?? record?.finishedAt ?? 0));
   const rowNow: ActionState = useSync ? sync!.state : repairState;
@@ -172,6 +209,9 @@ export function HealthRow({ check, item, rowKey, links, children }: {
       await rr.recheck().catch(() => {});
       if (err) { setSync({ action: a, at, state: { kind: 'failed', finishedAt: Date.now(), reason: err } }); toast(err, 'error'); return; }
       if (!out) { setSync(null); return; }
+      // v0.53.0, Source health: Turn off and Ignore move a compact row into a fold that is closed, and this line goes with
+      // it -- so it is said in a notice too, as a delete's and a merge's are.
+      if (compact && out.ok !== false && (a === 'disable' || a === 'ignore' || a === 'unignore')) toast(out.text, 'success');
       setSync({ action: a, at, state: out.ok === false
         ? { kind: 'failed', finishedAt: Date.now(), reason: out.text }
         : { kind: 'done', finishedAt: Date.now(), tookMs: Date.now() - at, outcome: out.text, ...(out.partial ? { partial: true } : {}) } });
@@ -208,16 +248,16 @@ export function HealthRow({ check, item, rowKey, links, children }: {
     const notOwned = count('not_owned');
     const other = res.skipped.length - bookmarked - notOwned;
     const lines = [
-      { n: bookmarked, text: tr('{n} skipped: bookmarked by a reader', { n: bookmarked }) },
-      { n: notOwned, text: tr('{n} skipped: not downloaded by Uchiyomi', { n: notOwned }) },
+      { n: bookmarked, text: skippedBookmarkedText(bookmarked) },
+      { n: notOwned, text: skippedNotOursText(notOwned) },
       { n: other, text: other === 1 ? tr('1 chapter could not be deleted') : tr('{n} chapters could not be deleted', { n: other }) },
     ].filter((l) => l.n > 0);
     // ⚠️ A delete that deleted nothing is not a success: a green "0 deleted" over unchanged rows is what a
     // refused delete used to look like, and the reason is what the admin needs in front of them.
     if (res.applied === 0 && lines.length) return { text: lines.map((l) => l.text).join(' · '), ok: false };
     // The row goes when Health answers again, taking its status line with it: the count is said in a notice too.
-    toast(tr('{n} deleted', { n: res.applied }), 'success');
-    return { text: [tr('{n} deleted', { n: res.applied }), ...lines.map((l) => l.text)].join(' · ') };
+    toast(deletedText(res.applied), 'success');
+    return { text: [deletedText(res.applied), ...lines.map((l) => l.text)].join(' · ') };
   };
 
   const doMerge = async (): Promise<{ text: string } | null> => {
@@ -233,9 +273,23 @@ export function HealthRow({ check, item, rowKey, links, children }: {
     return { text };
   };
 
+  /**
+   * Link the pair as language editions of one work (v0.52.0, #72): the duplicates row of a work in two languages. Both
+   * stay series of their own; the pair leaves the page when Health answers, so this is said in a notice too.
+   */
+  const doLink = async (): Promise<{ text: string } | null> => {
+    setAsking(null);
+    const ids = item.seriesIds || [];
+    if (ids.length !== 2) return null;
+    await api(`/api/admin/series/${encodeURIComponent(ids[1])}/editions`, { method: 'POST', json: { with: ids[0] } });
+    const text = tr('Linked as editions of one work');
+    toast(text, 'success');
+    return { text };
+  };
+
   const doDisable = async (): Promise<{ text: string }> => {
     setAsking(null);
-    await api(`/api/admin/sources/${encodeURIComponent(item.sourceId || '')}/disable`, { method: 'POST' });
+    await disableSource(item.sourceId || '');
     return { text: tr('That source is switched off') };
   };
 
@@ -288,6 +342,8 @@ export function HealthRow({ check, item, rowKey, links, children }: {
         return { ...base, danger: true, label: tr('Turn off'), onRun: () => setAsking('disable') };
       case 'merge':
         return { ...base, label: tr('Merge'), onRun: () => setAsking('merge') };
+      case 'link_editions':
+        return { ...base, primary: true, label: tr('Link as editions'), onRun: () => setAsking('link') };
       case 'ignore':
         return { ...base, label: tr('Ignore'), onRun: () => act(a, async () => ({ text: await postIgnore(check.id, item, true) })) };
       case 'unignore':
@@ -319,6 +375,12 @@ export function HealthRow({ check, item, rowKey, links, children }: {
           state: findNow, what: copy.what({ ...ctx, n: item.findSeries }), label: copy.label({ ...ctx, n: item.findSeries }),
           onRun: () => setAsking('find'),
         };
+      // v0.54.0: every series whose main source is this row's source -- off or failing -- moved to a working source in ONE
+      // Replace run. The press opens the Replace dialog, which says the numbers first and becomes the run once started;
+      // the run is followed under this row's find slot, so the row's status line says what it is doing too. The one
+      // filled key of the row, as it is on Admin → Sources.
+      case 'replace_source':
+        return { ...base, primary: true, label: tr('Replace'), onRun: () => setAsking('replace') };
       // #116, the chapter numbering check. Review opens the plan of whatever waits -- the route picks the change --
       // and its Confirm is this row's press (`renumber` above), so nothing is renamed before the admin has seen
       // which file becomes which chapter.
@@ -356,25 +418,9 @@ export function HealthRow({ check, item, rowKey, links, children }: {
   const caveats = (item.caveats ?? []).filter((c) => actions.includes(c.action))
     .map((c) => ({ text: caveatLine(c), tone: caveatTone(c) })).filter((c) => c.text);
 
-  return (
-    <div data-health-item={rowKey} data-repair-state={rowNow.kind} className={`px-4 py-2.5 ${item.info ? 'opacity-60' : ''}`}>
-      <div className="flex min-w-0 items-start gap-3">
-        <div className="min-w-0 flex-1">{children}</div>
-        {links && <div className="flex shrink-0 flex-col items-end gap-1 pt-0.5">{links}</div>}
-      </div>
-      {outcome && <p data-health-outcome className="mt-1 text-[11px] leading-relaxed text-fog-400">{outcome}</p>}
-      {caveats.map((c) => (
-        <p key={c.text} data-health-caveat={c.tone} className={`mt-1 text-[11px] leading-relaxed ${c.tone === 'calm' ? 'text-fog-400' : 'text-amber-300/90'}`}>{c.text}</p>
-      ))}
-      {(specs.length > 0 || finds.length > 0) && (
-        <div className="mt-2 flex flex-wrap items-center gap-1.5">
-          {specs.length > 0 && <ActionKeys actions={specs} />}
-          {finds.length > 0 && <ActionKeys actions={finds} />}
-        </div>
-      )}
-      <ActionStatus state={rowNow} />
-      {finds.length > 0 && <ActionStatus state={findNow} />}
-
+  // The plan a numbering key opens and every confirmation, wherever the row draws its keys.
+  const dialogs = (
+    <>
       {/* #116: the plan a numbering key opened (on <body>, itself). Its Confirm is this row's press. */}
       {plan && item.seriesId && (
         <NumberingSheet seriesId={item.seriesId} mode={plan.mode} onClose={() => setPlan(null)}
@@ -410,14 +456,48 @@ export function HealthRow({ check, item, rowKey, links, children }: {
           onStart={(review) => { setAsking(null); if (item.sourceId) void fr?.start(slotKey, { sourceId: item.sourceId, ...(review ? { review } : {}) }); }} />
       )}
 
+      {/* On <body>: a Health card is a `.card`, whose backdrop blur would make it the sheet's containing block. A source
+          row is titled with the source's name; a frozen series' row is the series', and the dialog finds the source's. */}
+      {asking === 'replace' && item.sourceId && (
+        <OnBody>
+          <ReplaceDialog sourceId={item.sourceId} name={check.id === 'sources' ? itemTitle(item) : undefined} fr={fr} slot={replaceKey}
+            onClose={() => setAsking(null)} />
+        </OnBody>
+      )}
+
       {asking === 'disable' && (
         <OnBody>
           <ConfirmDialog
             title={tr('Turn this source off?')}
             confirmLabel={tr('Turn off')}
             danger
-            body={<p>{tr('Nothing is deleted. Series that follow it stop being asked for new chapters until you turn it back on under Providers.')}</p>}
+            // True since v0.54.0, when a switched-off source stopped being asked by the sweep too.
+            body={<p>{tr('Nothing is deleted. Series that follow it stop getting new chapters from it until you turn it back on in Admin → Sources.')}</p>}
             onConfirm={() => act('disable', doDisable)}
+            onClose={() => setAsking(null)}
+          />
+        </OnBody>
+      )}
+
+      {asking === 'link' && (item.seriesIds || []).length === 2 && (
+        <OnBody>
+          <ConfirmDialog
+            title={tr('Link these two as editions?')}
+            confirmLabel={tr('Link as editions')}
+            body={
+              <>
+                <p>{tr('Each keeps its own chapters, sources and reading progress. The Library shows one card for the work, and the series page switches between them.')}</p>
+                <ul className="mt-3 space-y-2">
+                  {(item.titles || []).map((t, i) => (
+                    <li key={i} className="flex min-w-0 items-center gap-2 rounded-lg border border-ink-700 px-3 py-2 text-sm">
+                      <span dir="auto" className="min-w-0 truncate text-fog-100">{t}</span>
+                      {item.langs?.[i] && <span className="shrink-0 text-[11px] text-fog-500">{languageName(item.langs[i])}</span>}
+                    </li>
+                  ))}
+                </ul>
+              </>
+            }
+            onConfirm={() => act('link_editions', doLink)}
             onClose={() => setAsking(null)}
           />
         </OnBody>
@@ -447,6 +527,102 @@ export function HealthRow({ check, item, rowKey, links, children }: {
           />
         </OnBody>
       )}
+    </>
+  );
+
+  // v0.53.0, Source health: the same keys, one shown and the rest in a ⋯ menu. An item there runs exactly what its key
+  // would -- the same press, the same state line under the row, the same confirmation -- and is disabled as the key
+  // would be: while another key of its group works (a running Find other sources keeps its own group), or Stop while
+  // that run goes.
+  const main = compact?.primary ? specs.find((sp) => sp.id === compact.primary) ?? null : null;
+  const specsBusy = specs.some((sp) => isBusy(sp.state));
+  const findBusy = finds.some((sp) => isBusy(sp.state));
+  const menu = useContextMenu(() => all
+    // A running search shows its Stop as a key beside the row's own, so it is not in the menu twice.
+    .filter((sp) => sp !== main && !(findBusy && sp.id === 'find_sources'))
+    .map((sp): MenuItem => {
+      const st = sp.state ?? IDLE;
+      const btn = actionButton(st, sp.runLabel ?? sp.label);
+      const groupBusy = sp.id === 'find_sources' ? findBusy : specsBusy;
+      return {
+        label: btn.stop ? btn.label : (sp.runLabel ?? sp.label),
+        hook: sp.id,
+        danger: sp.danger,
+        divider: sp.id === 'ignore' || sp.id === 'unignore',
+        disabled: !!sp.disabled || (st.kind === 'working' && !!st.stopping) || (groupBusy && !btn.stop),
+        onSelect: () => { if (btn.stop && st.kind === 'working') st.onStop?.(); else sp.onRun?.(); },
+      };
+    }), { label: compact?.name ?? '' });
+
+  if (compact) {
+    // The name, the key and the ⋯ share the first line, and the row's line runs under them: on a phone across the
+    // row's whole width, so neither the key nor a long name squeezes it; from `sm` under the name alone, the tile, the
+    // key and the ⋯ centred beside the two lines. ⚠️ Start and end lines only, never `sm:col-span-*` / `sm:row-span-*`:
+    // a span utility is the `grid-column` shorthand, which resets the start, and every cell fell back to auto-placement.
+    return (
+      <div data-health-item={rowKey} data-repair-state={rowNow.kind} {...compact.hooks} {...menu.bind}
+        className="grid grid-cols-[auto_minmax(0,1fr)_auto_auto] items-center gap-x-3 px-4 py-2.5">
+        <div className="col-start-1 row-start-1 sm:row-end-3">{compact.lead}</div>
+        <div className="col-start-2 row-start-1 min-w-0">{children}</div>
+        <div className="col-start-2 col-end-5 row-start-2 min-w-0 sm:col-end-3">{compact.line}</div>
+        {(main || findBusy) && (
+          <div className="col-start-3 row-start-1 flex items-center gap-1.5 sm:row-end-3">
+            {main && (
+              <ActionKeys actions={[{
+                ...main,
+                disabled: main.disabled || (specsBusy && !isBusy(main.state)),
+                buttonProps: { ...main.buttonProps, 'data-health-primary': '' } as ActionSpec['buttonProps'],
+              }]} />
+            )}
+            {findBusy && <ActionKeys actions={finds} />}
+          </div>
+        )}
+        <button type="button" data-health-more onClick={(e) => menu.openFrom(e.currentTarget)}
+          aria-haspopup="menu" aria-expanded={menu.open} aria-label={`${tr('More')}: ${compact.name}`}
+          className="btn-key col-start-4 row-start-1 w-8 px-0 text-fog-400 sm:row-end-3">
+          <svg aria-hidden width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><circle cx="5" cy="12" r="1.8" /><circle cx="12" cy="12" r="1.8" /><circle cx="19" cy="12" r="1.8" /></svg>
+        </button>
+        <div className="col-start-2 col-end-5 row-start-3 min-w-0">
+          {outcome && <p data-health-outcome className="mt-1 text-[11px] leading-relaxed text-fog-400">{outcome}</p>}
+          {caveats.map((c) => (
+            <p key={c.text} data-health-caveat={c.tone} className={`mt-1 text-[11px] leading-relaxed ${c.tone === 'calm' ? 'text-fog-400' : 'text-amber-300/90'}`}>{c.text}</p>
+          ))}
+          <ActionStatus state={rowNow} />
+          {finds.length > 0 && <ActionStatus state={findNow} />}
+          {actions.includes('replace_source') && <ActionStatus state={replaceNow} />}
+          {compact.details && (
+            <div data-health-details>
+              <Disclosure label={tr('Details')}>{compact.details}</Disclosure>
+            </div>
+          )}
+        </div>
+        {menu.element}
+        {dialogs}
+      </div>
+    );
+  }
+
+  return (
+    <div data-health-item={rowKey} data-repair-state={rowNow.kind} className={`px-4 py-2.5 ${item.info ? 'opacity-60' : ''}`}>
+      <div className="flex min-w-0 items-start gap-3">
+        <div className="min-w-0 flex-1">{children}</div>
+        {links && <div className="flex shrink-0 flex-col items-end gap-1 pt-0.5">{links}</div>}
+      </div>
+      {outcome && <p data-health-outcome className="mt-1 text-[11px] leading-relaxed text-fog-400">{outcome}</p>}
+      {caveats.map((c) => (
+        <p key={c.text} data-health-caveat={c.tone} className={`mt-1 text-[11px] leading-relaxed ${c.tone === 'calm' ? 'text-fog-400' : 'text-amber-300/90'}`}>{c.text}</p>
+      ))}
+      {(specs.length > 0 || finds.length > 0) && (
+        <div className="mt-2 flex flex-wrap items-center gap-1.5">
+          {specs.length > 0 && <ActionKeys actions={specs} />}
+          {finds.length > 0 && <ActionKeys actions={finds} />}
+        </div>
+      )}
+      <ActionStatus state={rowNow} />
+      {finds.length > 0 && <ActionStatus state={findNow} />}
+      {actions.includes('replace_source') && <ActionStatus state={replaceNow} />}
+
+      {dialogs}
     </div>
   );
 }
@@ -458,7 +634,7 @@ const SCAN_CHECKS = ['library-scan', 'downloads-missing'];
 export function hasCardActions(check: HealthCheck): boolean {
   const step = CARD_STEP[check.id];
   return (!!step && stepFindings(check, step).length > 0) || SCAN_CHECKS.includes(check.id) || solverDown(check)
-    || (check.id === 'duplicates' && check.items.some((it) => !it.info && (it.seriesIds || []).length === 2))
+    || (check.id === 'duplicates' && check.items.some((it) => !it.info && (it.seriesIds || []).length === 2 && !!it.actions?.includes('merge')))
     || laterCopies(check).length > 0;
 }
 
@@ -474,7 +650,11 @@ const laterCopies = (check: HealthCheck): HealthItem[] =>
  * long), then the card-wide actions as full rows with their own status -- Fix all (the card's one repair
  * step), Reset the solver, Merge all, Scan the library now.
  */
-export function HealthCardActions({ check }: { check: HealthCheck }) {
+export function HealthCardActions({ check, className = 'border-b border-ink-800/70 px-4 pt-2' }: {
+  check: HealthCheck;
+  /** Where it sits: above a card's rows by default; Source health opens it at the card's foot (v0.53.0). */
+  className?: string;
+}) {
   const toast = useToast();
   const rr = useRepairRun();
   const { status, slots } = rr;
@@ -485,7 +665,8 @@ export function HealthCardActions({ check }: { check: HealthCheck }) {
   const [askingPurge, setAskingPurge] = useState(false);
   const ctx: CopyCtx = { limits: status?.limits, check };
   const findings = check.items.filter((it) => !it.info);
-  const pairs = check.id === 'duplicates' ? findings.filter((it) => (it.seriesIds || []).length === 2) : [];
+  // A pair in two languages is linked, never merged (v0.52.0): Merge all takes only the rows offering a merge.
+  const pairs = check.id === 'duplicates' ? findings.filter((it) => (it.seriesIds || []).length === 2 && !!it.actions?.includes('merge')) : [];
   const later = laterCopies(check);
 
   const rows: ActionSpec[] = [];
@@ -575,9 +756,9 @@ export function HealthCardActions({ check }: { check: HealthCheck }) {
         kept += r.skipped?.length || 0;
       } catch { kept += it.bookIds?.length ?? 0; }
     }
-    const line = [tr('{n} deleted', { n: deleted }),
+    const line = [deletedText(deleted),
       ...(kept ? [kept === 1 ? tr('1 chapter could not be deleted') : tr('{n} chapters could not be deleted', { n: kept })] : [])].join(' · ');
-    if (deleted) toast(tr('{n} deleted', { n: deleted }), 'success');
+    if (deleted) toast(deletedText(deleted), 'success');
     setPurge({ kind: 'working', startedAt: at, step: tr('Checking the result…') });
     await rr.recheck().catch(() => {});
     setPurge(deleted === 0 && kept
@@ -613,7 +794,7 @@ export function HealthCardActions({ check }: { check: HealthCheck }) {
   };
 
   return (
-    <div data-health-legend={check.id} className="border-b border-ink-800/70 px-4 pt-2">
+    <div data-health-legend={check.id} className={className}>
       <ActionList actions={rows} aria-label={tr('What you can do here')} />
       {asking && (
         <OnBody>

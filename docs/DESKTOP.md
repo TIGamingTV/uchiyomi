@@ -143,17 +143,17 @@ The library is empty until you add somewhere to get manga from. There are three 
 them:
 
 1. **MangaDex** works straight away: open **Discover**, search a title and add it.
-2. **A site by its address.** **Admin → Providers** → **Add a site**: paste the site's homepage address, give it
-   a name, **Add**. Uchiyomi recognises the common manga-site families by itself. Step by step:
-   [the user guide, section 7](USAGE.md#add-a-site--step-by-step).
+2. **A site by its address.** **Admin → Sources** → **Add sources** → **Add a site by address**: paste the site's
+   homepage address, give it a name, **Add**. Uchiyomi recognises the common manga-site families by itself. Step by
+   step: [the user guide, section 7](USAGE.md#add-a-site--step-by-step).
 3. **Mihon / Tachiyomi extensions.** These need the **extension engine**, a separate download, then an
    extension repository:
 
-   ![The Extensions card before the engine is installed: Download the extension engine (about 200 MB)](shots/desktop-engine.webp)
+   ![The extension engine's card before it is installed: Download the extension engine (about 200 MB)](shots/desktop-engine.webp)
 
-   1. Open **Admin → Extensions** and choose **Download the extension engine (about 200 MB)**. (Until then the
-      Extensions card under Admin → Providers says *Not installed yet — download it under Extensions*.) You
-      see *Downloading the extension engine…* with how much has arrived, *Installing the extension engine…*,
+   1. Open **Admin → Sources** and choose **Download the extension engine (about 200 MB)**, at the top of the tab
+      (until then MangaDex and the sites you add are listed under it, and work). You see *Downloading the
+      extension engine…* with how much has arrived, *Installing the extension engine…*,
       then *Starting the extension engine…*: Uchiyomi restarts its own server once to connect to it, a blink of
       two or three seconds, and reconnects by itself. The download comes from this project's own GitHub
       release for the engine, and is checked against a SHA-256 fingerprint pinned inside the app before
@@ -161,9 +161,11 @@ them:
    2. **Add an extension repository** — the list of extensions someone publishes, the same address you added in
       Mihon. [Add an extension repository — step by step](extensions.md#add-an-extension-repository--step-by-step)
       explains what to paste and what each message means.
-   3. **Choose extensions** from the list and press **Add** on each one you want. Hide the languages you don't
-      read first (**Choose languages**): only 25 extension sources can be switched on at once, and on the desktop
-      app there is no setting to raise that.
+   3. **Choose extensions** under **Browse** and press **Install** on each one you want. Then hide the languages
+      you don't read (**Languages**, at the end of the **Installed** | **Browse** row, or the switches in an
+      extension's own sheet): only 25 extension sources can be switched on at once, and on the desktop app there is
+      no setting to raise that. The strip at the top of the tab has no **⋯** on the desktop app: there is no turning
+      the engine off there.
 
    If the download fails, *The extension engine could not be installed.* shows the reason and **Try again**.
    From then on the engine starts with Uchiyomi. It listens only on this computer, with a random password,

@@ -71,7 +71,8 @@ test('the add dialog wires the switch into the request, the counts and the other
   const src = code(read('components/AddSeriesDialog.tsx'));
   // Reintroduce by dropping `numbering` from the add body: the switch is shown and ignored.
   // (#117's "Archive the rest slowly" rides after it, pinned in addSeriesDialog.test.ts.)
-  assert.match(src, /json: \{ source: picked\.source, sourceId: picked\.sourceId, chapterCount, chapterFrom, autoUpdate, force, alsoFollow: alsoFollowBody, numbering(?:, \.\.\.\(archiving \? \{ archive: true \} : \{\}\))? \}/,
+  // (v0.52.0's language edition rides after those, pinned in addSeriesDialog.test.ts.)
+  assert.match(src, /json: \{\s*source: picked\.source, sourceId: picked\.sourceId, chapterCount, chapterFrom, autoUpdate, force, alsoFollow: alsoFollowBody, numbering,?(?:\s*\.\.\.\(archiving \? \{ archive: true \} : \{\}\),?)?(?:\s*\.\.\.\(editionBody \? \{ edition: editionBody \} : \{\}\),?)?\s*\}/,
     'the add body does not carry the numbering');
   assert.match(src, /const numbering = view\?\.send \?\? 'auto';/);
   assert.match(src, /const view = detail \? addNumberingView\(detail, flipNumbering\) : null;/, 'the counts do not follow the switch');
@@ -288,7 +289,7 @@ test('the settings sheet draws every kind of setting with the right control', ()
   assert.equal(needsRenumberConfirm({ numbering: true }, 3), true);
   assert.equal(needsRenumberConfirm({ numbering: true }, 0), false);
   assert.equal(needsRenumberConfirm({ numbering: false }, 3), false);
-  assert.equal(extensionSettingsHref('2522335540328470744'), '/admin/?tab=Extensions&settings=2522335540328470744');
+  assert.equal(extensionSettingsHref('2522335540328470744'), '/admin/?tab=Sources&settings=2522335540328470744');
 });
 
 test('the settings sheet writes by key, warns in the row, and asks its second word inside the sheet', () => {
@@ -304,25 +305,37 @@ test('the settings sheet writes by key, warns in the row, and asks its second wo
   assert.match(src, /\{p\.numbering && \(\s*<div className="[^"]*" data-renumber-warning>/, 'the renumber warning is not in the setting\'s row');
   assert.match(src, /<Sheet\b[^>]*\boverBottomNav\b/s, 'the settings sheet opens under the phone nav');
   // An extension whose package lists no source says so, and stops saying "Loading…" beside it. Reintroduce the guard
-  // without `!pkgSources`: this fails.
-  assert.match(src, /\{\(isLoading \|\| \(!sourceId && !pkgFailed && !pkgSources\)\) && <p[^>]*>\{tr\('Loading…'\)\}<\/p>\}/, 'an empty package reads "Loading…" for good');
+  // without `!pkgSources`: this fails. (v0.53.0: the sheet's own wait; the body has its own, for the settings.)
+  assert.match(src, /\{!sourceId && !pkgFailed && !pkgSources && <p[^>]*>\{tr\('Loading…'\)\}<\/p>\}/, 'an empty package reads "Loading…" for good');
+  assert.match(src, /\{isLoading && <p[^>]*>\{tr\('Loading…'\)\}<\/p>\}/, 'the settings say nothing while they load');
   // Reintroduce by returning the Sheet itself: inside the Extensions `.card` (backdrop-filter) it covers the card
   // only, and the admin header shows through above it.
   assert.match(src, /return createPortal\(\s*<Sheet\b/, 'the settings sheet is not portalled out of the card');
   assert.match(src, /<\/Sheet>,\s*document\.body,\s*\);/);
-  // The deep link: read once, dropped from the address on close.
-  assert.match(src, /const id = params\.get\('settings'\);/, 'the sheet does not read ?settings=');
-  assert.match(src, /u\.searchParams\.delete\('settings'\);/, 'a closed sheet reopens on reload');
 
-  const admin = code(read('app/admin/page.tsx'));
-  const ext = admin.slice(admin.indexOf('function Extensions('), admin.indexOf('\n}\n', admin.indexOf('function Extensions(')));
-  // Reintroduce by dropping the hook from Extensions: /admin/?tab=Extensions&settings=<id> opens nothing.
-  assert.match(ext, /const \[settingsFor, setSettingsFor\] = useExtensionSettingsParam\(\);/, 'Extensions does not read the ?settings= deep link');
-  assert.match(ext, /\{e\.installed && \(\s*<button onClick=\{\(\) => setSettingsFor\(\{ pkgName: e\.pkgName, name: e\.name \}\)\} className="btn-key">\{tr\('Settings'\)\}<\/button>/,
-    'an installed extension has no Settings key');
-  assert.match(ext, /\{settingsFor && status\.reachable && <ExtensionSettings target=\{settingsFor\} onClose=\{\(\) => setSettingsFor\(null\)\} \/>\}/);
-  // The hook sits with the other state, before the early returns (hooks keep their order).
-  assert.ok(ext.indexOf('useExtensionSettingsParam()') < ext.indexOf('if (!status) return null;'), 'the deep-link hook runs after an early return');
+  // v0.54.0: the deep link is Admin → Sources' (components/SourcesPanel.tsx): `settings=<id>` opens that source's sheet
+  // on its settings -- an installed extension's settings are a section of it (components/ExtensionSheet.tsx), the same
+  // body as this sheet's -- read once, and dropped from the address on close. A source the overview does not hold yet
+  // opens this sheet alone, as before.
+  assert.match(read('lib/sourcesPanel.ts'), /const id = params\.get\('settings'\);/, 'the panel does not read ?settings=');
+  const panel = code(read('components/SourcesPanel.tsx'));
+  const top = panel.slice(panel.indexOf('export function SourcesPanel('), panel.indexOf('function AttentionRow('));
+  // Reintroduce by dropping the initialiser: /admin/?tab=Sources&settings=<id> opens nothing.
+  assert.match(top, /const \[sheet, setSheet\] = useState<SheetTarget \| null>\(\(\) => \{\s*const id = settingsTarget\(params\);\s*return id \? \{ id, settings: true \} : null;\s*\}\);/,
+    'Sources does not read the ?settings= deep link');
+  assert.match(panel, /u\.searchParams\.delete\('settings'\);/, 'a closed sheet reopens on reload');
+  assert.match(top, /const closeSheet = \(\) => \{ setSheet\(null\); dropSettingsParam\(\); \};/, 'a closed sheet reopens on reload');
+  assert.match(top, /<ExtensionSettings target=\{\{ sourceId: sheet\.id\.replace\(\/\^sw:\/, ''\) \}\} onClose=\{closeSheet\} \/>/, 'a source the overview does not hold opens nothing');
+  assert.match(code(read('components/SourceSheet.tsx')), /settingsOpen=\{'id' in target && !!target\.settings\}/, 'the sheet opens on its languages, not its settings');
+  // Reintroduce by dropping the Settings section from the sheet: an installed extension has no way to its settings.
+  const sheet = code(read('components/ExtensionSheet.tsx'));
+  assert.match(sheet, /<ExtensionSettingsBody sourceId=\{settingsOf\} onSourceId=\{setSettingsOf\} note \/>/, 'an installed extension has no settings');
+  // One extension, several sources: the picker says whose settings these are, by language, and that each keeps its
+  // own -- a "Source" select read as choosing the language the extension reads in (#121). Reintroduce the old label:
+  // this fails.
+  assert.match(src, /\{tr\('Settings for'\)\}<\/span>\s*<select [^\n]*data-ext-settings-for>/, 'the language picker does not say it picks whose settings these are');
+  assert.match(src, /\{tr\('Each language keeps its own settings\.'\)\}/);
+  assert.doesNotMatch(src, /tr\('Source'\)/, 'the settings picker is labelled "Source" again');
 });
 
 test("the plan sheet's title wraps onto a second line rather than being cut", () => {

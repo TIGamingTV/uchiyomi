@@ -39,6 +39,11 @@ export interface SeriesSource {
   registered: boolean;
   /** Followed by the add, not by a person (`added_by IS NULL`). Absent from an older server. */
   auto?: boolean;
+  /**
+   * v0.54.0: whether updates can use it (bff lib/sourceStanding.ts): working, cooling down, failing, switched off, or not
+   * loaded. A follower that works is what the Sources sheet offers Make main for. Absent from an older server.
+   */
+  standing?: 'usable' | 'cooling' | 'failing' | 'off' | 'not_loaded';
 }
 
 /**
@@ -66,6 +71,8 @@ export interface TrackerStatus {
  * AddSeriesDialog.tsx) -- a code this list does not know is printed as-is so it is at least visible.
  */
 export type FollowWhy = 'followed' | 'numbering_differs' | 'title_differs' | 'unreachable' | 'too_few_listed' | 'not_tried' | 'cap' | 'unavailable'
+  // v0.52.0 (#123): the source is in another language than the series (bff lib/autoFollow.ts, the language guard).
+  | 'language_differs'
   // #116: the series is numbered by posting order, and no other source's numbers line up with it (bff lib/autoFollow.ts).
   | 'posting_order';
 
@@ -101,11 +108,46 @@ export interface StoredPrefs {
   patienceDays: number | null;
 }
 
+/** One language edition of a work, as GET /api/series/:id lists them (v0.52.0, #72). */
+export interface EditionRow {
+  seriesId: string;
+  /** BCP-47: en, es-419, pt-BR. */
+  lang: string;
+  title: string;
+  booksCount: number;
+  /** The edition the page is showing. */
+  current: boolean;
+  /** This viewer's highest finished chapter there, or null. */
+  lastRead: number | null;
+}
+
+/**
+ * The work a series is a language edition of (v0.52.0). The lists send `langs` -- the work's languages this viewer may
+ * browse, oldest edition first -- and GET /api/series/:id sends `workId` and `editions` instead. Null on a series on
+ * its own, or one whose every sibling is out of the viewer's sight.
+ */
+export interface SeriesEdition {
+  langs?: string[];
+  workId?: string;
+  editions?: EditionRow[];
+}
+
 export interface Series {
   /** Whether the scheduled updater fetches new chapters for this series. */
   autoUpdate?: boolean;
   /** The folder on disk, relative to the library root. Only sent to admins, for the rename control. */
   folder?: string;
+  /** Admins only (v0.52.0, #136): the folder as full paths on the server, one per root its chapters are under. */
+  paths?: string[];
+  /** The language the series is in (v0.52.0): its own, else its main source's, else the server's unstated one. */
+  lang?: string;
+  /** Admins only (v0.52.0): whether `lang` is the series' own rather than inferred -- Edit details' "Automatic". */
+  langStated?: boolean;
+  /** Admins only (v0.52.0): the language "Automatic" means -- what the main source declares, else the unstated one. */
+  langAuto?: string;
+  /** The work this series is a language edition of, or null on its own (v0.52.0). */
+  workId?: string | null;
+  edition?: SeriesEdition | null;
   id: string;
   libraryId: string;
   /** Whether an admin filed this series into that library by hand, rather than the folder rule doing it. */
@@ -213,6 +255,8 @@ export interface Book {
    * the holes and clears this when the last one lands.
    */
   missingPages?: number[] | null;
+  /** Admins only (v0.52.0, #136): the chapter file's full path on the server, for its menu's Copy file path. */
+  path?: string;
 }
 
 /**
@@ -343,6 +387,16 @@ export interface KnownGroup {
   series: number;
 }
 
+/** GET /api/admin/settings, the languages Admin → Providers sets (v0.52.0, #123). Codes are the app's (BCP-47). */
+export interface LanguageSettings {
+  /** The MangaDex languages besides English that are on. */
+  mangadex_langs: string[];
+  /** Every language MangaDex is offered in, English first. English is always on. */
+  mangadex_available: string[];
+  /** The language of sources and series that do not say which they are in. */
+  unstated_lang: string;
+}
+
 export interface PageInfo {
   number: number;
   /** Set by the server when this page recurs across chapters of the series -- a credit page, an advert. */
@@ -387,7 +441,12 @@ export type HealthAction =
   // source gives (GET/POST /api/admin/series/:id/numbering).
   | 'renumber' | 'keep_numbers'
   // v0.49.1: look for other sources for every series whose main source is `sourceId` (POST /api/admin/sources/find).
-  | 'find_sources';
+  | 'find_sources'
+  // v0.52.0 (#72): a duplicate pair in two languages, linked as editions of one work (POST /api/admin/series/:id/editions).
+  | 'link_editions'
+  // v0.54.0: move every series whose main source is `sourceId` -- off or failing -- to a working source, in one Replace
+  // run (POST /api/admin/sources/find in its replace mode); the source and the frozen-series rows offer it.
+  | 'replace_source';
 
 /** One step of the nightly repair (`bff/src/lib/repair.ts`), as `POST /api/admin/tasks/repair/run` takes it. */
 export type RepairStep = 'solver' | 'count' | 'failures' | 'short' | 'gaps' | 'groups' | 'names' | 'directions';
@@ -418,6 +477,8 @@ export interface HealthItem {
   sourceId?: string;
   /** The duplicate pair's suggested survivor: the id inside `seriesIds` a merge should keep. */
   keep?: string;
+  /** v0.52.0, on a duplicates row: the language of each of `seriesIds`, for Link as editions' confirmation. */
+  langs?: string[];
   /** Which chips this item offers. Absent or empty means the item is a statement, not a task. */
   actions?: HealthAction[];
   /** Already dealt with, and when -- a confirmed-short chapter, a gap nobody lists. */
@@ -449,7 +510,26 @@ export interface HealthItem {
    * source is `sourceId`. The key's words say the number when it is here.
    */
   findSeries?: number;
+
+  // ---- v0.53.0, Source health rows only (bff lib/health.ts): the card's group, and what the row's one line and its
+  // one key are chosen by. components/SourceHealthBody.tsx reads them; lib/sourceHealth.ts words them.
+  /** `affected` and `unused` are the findings; `quiet` and `off` are listed for reference, folded away. */
+  group?: SourceGroup;
+  state?: SourceState;
+  /** The stage a `failing`, `inconclusive` or `untested` row is about. */
+  stage?: StageLine['stage'];
+  /** A `blocked` row's status and when its cooldown ends (null: none is set). */
+  cooldown?: { status: string; until: string | null };
+  /** Where an `off` row was switched off, which is where it comes back on: Providers, Extensions, or a hidden language. */
+  offBy?: 'admin' | 'extension' | 'language';
+  /** The source has an extension's logo, which /img/sources/icon/:id serves. */
+  icon?: boolean;
 }
+
+/** v0.53.0: the Source health card's groups, in the server's order. */
+export type SourceGroup = 'affected' | 'unused' | 'quiet' | 'off';
+/** v0.53.0: a source row's one state (bff lib/health.ts SourceState). */
+export type SourceState = 'blocked' | 'failing' | 'slow' | 'empty' | 'inconclusive' | 'untested' | 'off';
 
 /** The last attempt at a finding, per check (bff lib/health.ts `HealthOutcome`). */
 export type HealthOutcome =

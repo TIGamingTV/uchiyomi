@@ -7,7 +7,8 @@ import { ProgressBar } from '@/components/ui';
 import { t as tr } from '@/lib/i18n';
 
 /**
- * Admin → Extensions on Uchiyomi Desktop, until the extension engine is running.
+ * The top of Admin → Sources on Uchiyomi Desktop (Admin → Extensions until v0.54.0), until the extension engine is
+ * running.
  *
  * The engine (Suwayomi: a Java runtime and its jar, about 200 MB) is never in the installer -- most people
  * who only read MangaDex or a Madara site never need it -- so the Docker card's "bring it back with docker
@@ -64,7 +65,7 @@ export function EngineInstall({ span = '' }: { span?: string }) {
   const pct = st?.total ? (st.bytes ?? 0) / st.total : st?.progress ?? 0;
 
   return (
-    <div className={`card grad-border p-4 ${span}`}>
+    <div className={`card grad-border rounded-2xl p-4 ${span}`}>
       <p className="mb-2 text-xs font-semibold uppercase tracking-wider text-fog-500">{tr('Extensions')}</p>
 
       {!b ? (

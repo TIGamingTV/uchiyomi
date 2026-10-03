@@ -24,7 +24,14 @@ import { IcChevronLeft, IcSearch, IcSparkle, IcX } from '@/components/icons';
 import { forStrip } from '@/lib/jobs';
 import { downloadsHref, stripHref } from '@/lib/libraryView';
 import { useServerDownloads } from '@/lib/useServerDownloads';
-interface SearchGroup { title: string; coverUrl?: string; inLibrary?: boolean; librarySeriesId?: string; updatedAt?: string; providers: { source: string; name: string; sourceId: string; title: string; coverUrl?: string }[] }
+/**
+ * One search card. Since v0.52.0 (#72) `inLibrary` means held in every provider's language, `libraryLangs` the
+ * languages the library holds the title in, and each provider carries its own `lang` and `inLibrary`.
+ */
+interface SearchGroup {
+  title: string; coverUrl?: string; inLibrary?: boolean; librarySeriesId?: string; libraryLangs?: string[]; updatedAt?: string;
+  providers: { source: string; name: string; sourceId: string; title: string; coverUrl?: string; lang?: string | null; inLibrary?: boolean }[];
+}
 /** One source's line in a search answer (v0.40.0): what it did with the term, or that it is still being asked. */
 interface SearchSourceLine { id: string; name: string; state: 'ok' | 'empty' | 'timeout' | 'failed' | 'skipped' | 'pending'; ms?: number; why?: 'disabled' | 'cooldown' }
 /**
@@ -238,6 +245,7 @@ export default function DiscoverPage() {
       source: pick.source ?? '', sourceId: pick.sourceId ?? g.title,
       title: g.title, coverUrl: g.coverUrl, updatedAt: g.updatedAt,
       inLibrary: g.inLibrary, librarySeriesId: g.librarySeriesId, providerCount: g.providers.length,
+      ...(g.libraryLangs ? { libraryLangs: g.libraryLangs } : {}), ...(pick.lang !== undefined ? { lang: pick.lang } : {}),
     }];
   }), [searchQ.data, selected]);
   const groupsRef = useRef<Record<string, SearchGroup['providers']>>({});
@@ -328,11 +336,21 @@ export default function DiscoverPage() {
 
   const open = (it: SourceItem) => {
     const key = normTitle(it.title);
+    // Only a card held in every provider's language is done with (v0.52.0): one held in another language opens the
+    // dialog, which offers the new language as an edition and says which the library has.
     if (it.inLibrary || added.has(key)) return;
+    // What the library holds of this title, for the dialog's "In your library in English" and its edition block.
+    const library = it.librarySeriesId && it.libraryLangs?.length ? { seriesId: it.librarySeriesId, langs: it.libraryLangs } : undefined;
     // The wall's own fold first, then what the last search stored: both are keyed the same way.
     const providers = wall.groups[key] ?? groupsRef.current[key];
-    if (providers?.length) setSeed({ kind: 'group', title: it.title, providers });
-    else setSeed({ kind: 'result', provider: { source: it.source, name: nameOf(it.source) ?? it.source, sourceId: it.sourceId, title: it.title, coverUrl: it.coverUrl } });
+    if (providers?.length) setSeed({ kind: 'group', title: it.title, providers, ...(library ? { library } : {}) });
+    else {
+      setSeed({
+        kind: 'result',
+        provider: { source: it.source, name: nameOf(it.source) ?? it.source, sourceId: it.sourceId, title: it.title, coverUrl: it.coverUrl, lang: it.lang, inLibrary: it.inLibrary },
+        ...(library ? { library } : {}),
+      });
+    }
   };
 
   // ---------------------------------------------------------------- more
@@ -408,8 +426,8 @@ export default function DiscoverPage() {
         ) : isAdmin ? (
           <EmptyState art={ART.emptyLibrary} title={tr('No sources installed')}
             sub={isDesktop()
-              ? tr('Add a site, or turn on an extension source, in Admin → Providers.')
-              : tr('Mount a source pack at SOURCES_DIR, or switch on an extension source, then reload from the Providers tab.')} />
+              ? tr('Add a site, or turn on an extension source, in Admin → Sources.')
+              : tr('Add a site or an extension in Admin → Sources, or mount a source pack at SOURCES_DIR.')} />
         ) : (
           <EmptyState art={ART.emptyLibrary} title={tr('No sources available')}
             sub={tr('There is nothing set up for your account to browse yet. Ask whoever runs this server.')} />
@@ -568,7 +586,7 @@ export default function DiscoverPage() {
           <p className={`text-sm ${alone?.warn ? 'text-amber-300' : 'text-fog-400'}`}>
             {mode === 'search' ? (searchQ.isError ? tr('Search failed') : tr('No results across your sources — try another title.'))
               // Only an admin can act on the first sentence; a member told to open Admin has nowhere to go.
-              : budget.length === 0 ? (isAdmin ? tr('No sources are set up yet. Add one in Admin \u2192 Providers.') : tr('No sources are set up yet. Ask whoever runs this server.'))
+              : budget.length === 0 ? (isAdmin ? tr('No sources are set up yet. Add one in Admin \u2192 Sources.') : tr('No sources are set up yet. Ask whoever runs this server.'))
               // One source alone: its reason, amber, before any sentence about the wall as a whole.
               : alone ? alone.text
               : Object.values(states).every((s) => s === 'blocked')

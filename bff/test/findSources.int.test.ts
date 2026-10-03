@@ -4,8 +4,9 @@
 // who wants every one of its series to follow another source without doing it 189 times by hand. Every rule the run
 // keeps is asserted by what the fake sites were asked and what was written:
 //
-//   - the main source is never asked, nor a source the series already follows, a disabled or cooling one, or an
-//     adult one for a clean series; a series numbered by posting order, or already at the cap, is not searched;
+//   - the main source is never asked, nor a source the series already follows, or a disabled or cooling one; a
+//     source that flags itself adult IS asked for a clean series (the admin's reach, #132); a series numbered by
+//     posting order, or already at the cap, is not searched;
 //   - sources are asked in scan order under the hunt's slots, a series stops once its free slots are filled or three
 //     sources carried the title, and an other name matches exactly;
 //   - judgeCandidate decides, followJudged writes with the admin as added_by, and a search that fails reports
@@ -54,7 +55,8 @@ const CATALOGUE: Record<string, Array<{ title: string; nums: number[] }>> = {
   'fs-throws': [],
   'fs-cool': [{ title: 'Alpha Tale', nums: R(1, 12) }],
   'fs-off': [{ title: 'Alpha Tale', nums: R(1, 12) }],
-  'fs-adult': [{ title: 'Eta Adult', nums: R(1, 12) }, { title: 'Alpha Tale', nums: R(1, 12) }, { title: 'Epsilon Nothing', nums: R(1, 12) }],
+  // Flags itself adult, as most manhwa extensions do, and is the only one that carries a clean series' title.
+  'fs-adult': [{ title: 'Eta Adult', nums: R(1, 12) }, { title: 'Omega Manhwa', nums: R(1, 12) }],
   // Carries it in its search, and its chapter list never loads: a candidate that cannot be judged.
   'fs-nolist': [{ title: 'Iota Unlisted', nums: R(1, 12) }],
   // Carries it and lines up, and the series is deleted while this lists its chapters (the judgement's read).
@@ -69,6 +71,9 @@ const searches: string[] = [];
 /** When set, fs-a's searches wait on it: a run that stays running while a test looks at it. */
 let gate: Promise<void> | null = null;
 let openGate: () => void = () => {};
+/** When set, fs-a's chapter lists wait on it: a check that stays inside its series (v0.54.0, Replace's `busy`). */
+let listGate: Promise<void> | null = null;
+let openList: () => void = () => {};
 
 function fake(id: string) {
   return {
@@ -83,6 +88,7 @@ function fake(id: string) {
     },
     async getSeries(sid: string) { return { sourceId: sid, source: id, title: sid.split('|')[1] }; },
     async listChapters(sid: string) {
+      if (listGate && id === 'fs-a') await listGate;
       if (id === 'fs-nolist') throw new Error('fs-nolist: the chapter list did not load');
       if (id === 'fs-vanish') await q(`UPDATE lib_series SET deleted_at = now() WHERE title = 'Mu Vanishing'`);
       const c = CATALOGUE[id].find((x) => x.title === sid.split('|')[1]);
@@ -163,6 +169,7 @@ beforeEach(async () => {
   await fsLib.findSettled();
   searches.length = 0;
   gate = null;
+  listGate = null;
   runtime.updating = false;
   fsLib.setFindTiming({ paceMs: 0, wallMs: 10_000, quietMs: 20 });
   await q('DELETE FROM lib_series WHERE library_id = ANY($1)', [[LIB, ADULT_LIB]]);
@@ -197,6 +204,7 @@ test('a run over a down source follows other sources for each of its series, by 
   await series('e', 'Epsilon Nothing');
   await series('f', 'Zeta Wrong');
   await series('h', 'Eta Adult', { library: ADULT_LIB });
+  await series('o', 'Omega Manhwa');
   await q(`INSERT INTO source_health (source_id, blocked_until) VALUES ('fs-cool', now() + interval '1 hour')`);
   await q(`INSERT INTO source_health (source_id, disabled) VALUES ('fs-off', true)`);
   const asked = summaryAsks;
@@ -205,7 +213,7 @@ test('a run over a down source follows other sources for each of its series, by 
   assert.equal(r.statusCode, 202, r.body);
   const { runId, total } = r.json();
   assert.match(runId, /^[0-9a-f-]{36}$/);
-  assert.equal(total, 7, 'every series whose main source it is');
+  assert.equal(total, 8, 'every series whose main source it is');
   await fsLib.findSettled();
 
   const st = await state();
@@ -213,7 +221,7 @@ test('a run over a down source follows other sources for each of its series, by 
   const run = st.run;
   assert.equal(run.id, runId);
   assert.equal(run.status, 'done');
-  assert.deepEqual([run.total, run.done, run.followed], [7, 7, 4]);
+  assert.deepEqual([run.total, run.done, run.followed], [8, 8, 5]);
   assert.equal(run.startedBy, ADMIN, 'the account by name, never its id');
   assert.equal(run.sourceId, MAIN);
   assert.equal(run.sourceName, 'Main Down');
@@ -225,7 +233,7 @@ test('a run over a down source follows other sources for each of its series, by 
   const by = Object.fromEntries(run.results.map((x: any) => [x.seriesId, x]));
   // The order: series that follow nothing first, then by title; B already follows two, so it is last.
   assert.deepEqual(run.results.map((x: any) => x.title),
-    ['Alpha Tale', 'Delta Order', 'Epsilon Nothing', 'Eta Adult', 'Gamma Saga', 'Zeta Wrong', 'Beta Story']);
+    ['Alpha Tale', 'Delta Order', 'Epsilon Nothing', 'Eta Adult', 'Gamma Saga', 'Omega Manhwa', 'Zeta Wrong', 'Beta Story']);
 
   // A: the first two sources in scan order carry it and line up; its two free slots are filled, and the third
   // carrier is never asked. Reintroduce by dropping `ok >= free` from enough(): fs-c is searched for it.
@@ -241,26 +249,31 @@ test('a run over a down source follows other sources for each of its series, by 
   // D: posting order -- never searched. Reintroduce by dropping the posting_order return: it is searched.
   assert.equal(by[S('d')].why, 'posting_order');
   assert.equal(searches.some((x) => x.endsWith(':Delta Order')), false);
-  // E: nobody that answered carries it (the adult source that does may not be asked for a clean series).
+  // E: nobody that answered carries it.
   assert.equal(by[S('e')].why, 'no_match');
   // F: three sources carried the title, each numbered another way: refused, and the fourth never asked.
   // Reintroduce by dropping `carriers >= FIND_CARRIERS` from enough(): fs-f is asked, lines up, and is followed.
   assert.equal(by[S('f')].why, 'refused');
   assert.ok(['fs-c', 'fs-d', 'fs-e'].every((id) => searches.includes(`${id}:Zeta Wrong`)));
   assert.equal(searches.includes('fs-f:Zeta Wrong'), false, 'the three-source stop');
-  // H: an adult series may reach the adult source.
+  // H: an adult series reaches the adult source.
   assert.deepEqual(by[S('h')].followed.map((f: any) => f.sourceId), ['fs-adult']);
+  // O: a clean series reaches it too -- the admin's reach, not the hunt's adult rule (#132): most manhwa extensions
+  // flag themselves adult, and a run that skipped them had no source to ask on a typical library. Reintroduce the
+  // hunt's sweepAllowedFor in findFor: O reads no_match.
+  assert.deepEqual(by[S('o')].followed.map((f: any) => f.sourceId), ['fs-adult'], 'an adult-flagged source is asked for a clean series');
 
-  // Never asked: the main source (it is the one that is down), a cooling or disabled source, the adult source for a
-  // clean series. Reintroduce by dropping `id === row.source_id` from the order filter: the main source is searched.
+  // Never asked: the main source (it is the one that is down), a cooling or disabled source. Reintroduce by dropping
+  // `id === row.source_id` from the order filter: the main source is searched.
   assert.equal(searches.filter((x) => x.startsWith(`${MAIN}:`)).length, 0, 'the main source is excluded always');
   assert.equal(searches.filter((x) => x.startsWith('fs-cool:') || x.startsWith('fs-off:')).length, 0);
-  assert.deepEqual(searches.filter((x) => x.startsWith('fs-adult:')), ['fs-adult:Eta Adult'], 'the adult source only for the adult series');
+  assert.ok(searches.includes('fs-adult:Omega Manhwa'));
 
   // Written by followJudged under the admin's name; nothing else followed.
   const rows = await q(`SELECT series_id, source_id, added_by FROM series_sources WHERE series_id = ANY($1) AND source_id NOT LIKE 'fs-x%' ORDER BY series_id, source_id`,
-    [[S('a'), S('c'), S('f'), S('h'), S('e')]]);
-  assert.deepEqual(rows.map((x: any) => `${x.series_id}:${x.source_id}`), [`${S('a')}:fs-a`, `${S('a')}:fs-b`, `${S('c')}:fs-b`, `${S('h')}:fs-adult`]);
+    [[S('a'), S('c'), S('f'), S('h'), S('e'), S('o')]]);
+  assert.deepEqual(rows.map((x: any) => `${x.series_id}:${x.source_id}`),
+    [`${S('a')}:fs-a`, `${S('a')}:fs-b`, `${S('c')}:fs-b`, `${S('h')}:fs-adult`, `${S('o')}:fs-adult`]);
   assert.ok(rows.every((x: any) => x.added_by === adminId), 'added_by is the admin who started the run');
 
   // A search that threw reported nothing: no cooldown, no evidence. Reintroduce by reporting it (reportFail or
@@ -271,24 +284,40 @@ test('a run over a down source follows other sources for each of its series, by 
   const [audit] = await q(`SELECT detail FROM audit_log WHERE event = 'source.find'`);
   assert.deepEqual(
     { ...audit.detail, runId: undefined },
-    { runId: undefined, scope: { sourceId: MAIN }, status: 'done', total: 7, done: 7, followed: 4, series: 3 },
+    { runId: undefined, scope: { sourceId: MAIN }, status: 'done', total: 8, done: 8, followed: 5, series: 4 },
   );
   const follows = await q(`SELECT detail FROM audit_log WHERE event = 'series.follow_source' AND detail->>'via' = 'find_sources'`);
-  assert.equal(follows.length, 4);
+  assert.equal(follows.length, 5);
   assert.ok(follows.every((f: any) => f.detail.runId === runId));
 
   // The paced refresh of every series that gained a follower: its followers were asked for their listing.
   // Reintroduce by dropping scheduleFindRefresh: checked_at stays empty.
   const checked = await q(`SELECT series_id, source_id FROM series_sources WHERE checked_at IS NOT NULL AND series_id = ANY($1) ORDER BY 1, 2`,
-    [[S('a'), S('c'), S('h')]]);
-  assert.deepEqual(checked.map((x: any) => `${x.series_id}:${x.source_id}`), [`${S('a')}:fs-a`, `${S('a')}:fs-b`, `${S('c')}:fs-b`, `${S('h')}:fs-adult`]);
+    [[S('a'), S('c'), S('h'), S('o')]]);
+  assert.deepEqual(checked.map((x: any) => `${x.series_id}:${x.source_id}`),
+    [`${S('a')}:fs-a`, `${S('a')}:fs-b`, `${S('c')}:fs-b`, `${S('h')}:fs-adult`, `${S('o')}:fs-adult`]);
   // And the Health summary is asked to catch up.
   await until(() => summaryAsks > asked, 'a Health summary refresh');
 
   // The run card is its admin's, and says so; it downloads nothing.
   const jobs = (await app.inject({ method: 'GET', url: '/api/sources/jobs', headers: adminAuth })).json();
   const card = jobs.runs.find((x: any) => x.kind === 'find_sources');
-  assert.deepEqual([card.status, card.done, card.total, card.followed, card.downloads, card.mine], ['done', 7, 7, 4, false, true]);
+  assert.deepEqual([card.status, card.done, card.total, card.followed, card.downloads, card.mine], ['done', 8, 8, 5, false, true]);
+});
+
+test('a series with no other name stored is searched under the ones its description lists', { skip }, async () => {
+  // Names are kept when a series is added or its main source looked up, so one added before v0.49.1 -- or on an
+  // install whose series_alt_titles could not be read -- has none, and was searched under its own title alone.
+  // Reintroduce by dropping learnNames from findFor: P reads no_match, and fs-adult is never asked for Omega Manhwa.
+  await series('p', 'Pi Original Title');
+  await q(`UPDATE lib_series SET summary = $2 WHERE id = $1`, [S('p'), 'A story.\nAlternative Titles: Omega Manhwa; 오메가\nStatus: Ongoing']);
+  await post({ seriesIds: [S('p')] });
+  await fsLib.findSettled();
+  const r = (await state()).run.results[0];
+  assert.deepEqual(r.followed.map((f: any) => f.sourceId), ['fs-adult'], JSON.stringify(r));
+  assert.ok(searches.includes('fs-adult:Omega Manhwa'), 'searched under the name its description lists');
+  const kept = await q(`SELECT title, origin FROM series_alt_titles WHERE series_id = $1 AND removed_at IS NULL`, [S('p')]);
+  assert.deepEqual(kept.map((x: any) => [x.title, x.origin]), [['Omega Manhwa', 'description']], 'kept as a description name');
 });
 
 test('one run at a time; the scope must name something; a stop ends it at once, the rest not tried', { skip }, async () => {
@@ -343,13 +372,16 @@ test('one run at a time; the scope must name something; a stop ends it at once, 
   const st = await state();
   assert.equal(st.running, false);
   assert.equal(st.run.status, 'stopped');
-  assert.equal(st.run.done, 1, 'the series in flight is settled; the one never reached is not');
+  // v0.52.0: the series the stop caught was not searched through, so it is not counted either -- the card read "1 of 4
+  // series" with none searched. Reintroduce by counting every series settled in runAll: this reads 1.
+  assert.equal(st.run.done, 0, 'the series a stop caught in flight counts as searched');
   // "Not tried", never "not found": the series the stop cut short, and the one it never reached.
   assert.deepEqual(st.run.results.map((x: any) => [x.seriesId, x.why]), [[S('a'), 'not_tried'], [S('e'), 'not_tried']]);
   assert.equal((await q(`SELECT count(*)::int AS n FROM series_sources WHERE series_id = $1`, [S('a')]))[0].n, 0, 'nothing followed after the stop');
   assert.deepEqual((await app.inject({ method: 'POST', url: '/api/admin/sources/find/stop', headers: adminAuth })).json(), { stopped: false });
   const card2 = (await app.inject({ method: 'GET', url: '/api/sources/jobs', headers: adminAuth })).json().runs.find((x: any) => x.kind === 'find_sources');
   assert.equal(card2.status, 'cancelled');
+  assert.equal(card2.done, 0, 'the card counts the series a stop caught in flight as searched');
 });
 
 test('it waits while a sweep runs, and says so', { skip }, async () => {
@@ -626,7 +658,8 @@ test('following a proposal follows exactly that one, under the cap, the posting-
   await series('c', 'Gamma Saga');
   await q(`INSERT INTO series_alt_titles (series_id, norm, title, origin) VALUES ($1,'gammalegend','Gamma Legend','admin')`, [S('c')]);
   await series('f', 'Zeta Wrong');
-  const runId = await reviewRun([S('a'), S('c'), S('f')]);
+  await series('o', 'Omega Manhwa');
+  const runId = await reviewRun([S('a'), S('c'), S('f'), S('o')]);
   assert.equal((await decide(runId, 'follow', S('a'), 'fs-b', memberAuth)).statusCode, 403, 'admins only');
 
   // Exactly the one named, written by the follow path with the admin as its author; its result says so.
@@ -658,6 +691,12 @@ test('following a proposal follows exactly that one, under the cap, the posting-
   assert.deepEqual(await followers([S('c'), S('f')]), [`${S('f')}:fs-c:fs-c|Elsewhere:null`], 'nothing else was written');
   assert.equal((await state()).run.results.find((x: any) => x.seriesId === S('f')).proposals.every((p: any) => !p.state), true,
     'a refused follow decides nothing');
+
+  // An adult-flagged source proposed for a clean series is followed: the deciding admin's reach, the run's own rule.
+  // Reintroduce the hunt's sweepAllowedFor in decide(): it reads source_unavailable.
+  const o = await decide(runId, 'follow', S('o'), 'fs-adult');
+  assert.equal(o.statusCode, 200, o.body);
+  assert.deepEqual(await followers([S('o')]), [`${S('o')}:fs-adult:fs-adult|Omega Manhwa:admin`]);
 });
 
 test('a dismissed proposal stays dismissed', { skip }, async () => {
@@ -671,6 +710,27 @@ test('a dismissed proposal stays dismissed', { skip }, async () => {
   assert.deepEqual([again.statusCode, again.json().error, again.json().state], [409, 'decided', 'dismissed'], 'a dismissed proposal is followed');
   assert.deepEqual(await followers([S('a')]), [], 'nothing followed');
   assert.equal((await state()).run.results[0].proposals[0].state, 'dismissed');
+});
+
+test('an earlier search opens by its id, and its matches can still be decided there', { skip }, async () => {
+  // v0.52.0: only the newest run was read in full, so a review-first run with matches still to decide could not be
+  // reopened once another search had run after it.
+  await series('a', 'Alpha Tale');
+  await series('e', 'Epsilon Nothing');
+  const older = await reviewRun([S('a')]);
+  const newer = (await post({ seriesIds: [S('e')] })).json().runId;
+  await fsLib.findSettled();
+  assert.equal((await state()).run.id, newer, 'the newest run is the default');
+  // Reintroduce by reading the newest whatever is asked (findState ignoring runId): this reads the newer run.
+  const opened = await state(`?runId=${older}`);
+  assert.equal(opened.run.id, older, 'an earlier search does not open');
+  assert.deepEqual([opened.run.review, opened.run.results[0].proposals.map((p: any) => p.sourceId)], [true, ['fs-a', 'fs-b']]);
+  assert.deepEqual(opened.recent.map((r: any) => r.id), [newer, older], 'the kept runs, as for the newest');
+  const d = await decide(older, 'follow', S('a'), 'fs-a');
+  assert.equal(d.statusCode, 200, d.body);
+  assert.equal((await state(`?runId=${older}`)).run.results[0].proposals[0].state, 'followed', 'the decision reads back on the earlier run');
+  const gone = await app.inject({ method: 'GET', url: '/api/admin/sources/find?runId=00000000-0000-0000-0000-000000000000', headers: adminAuth });
+  assert.deepEqual([gone.statusCode, gone.json().error], [404, 'not_found']);
 });
 
 test("Health offers Find other sources on a failing source's row and on the series that can no longer update", { skip }, async () => {
@@ -698,4 +758,326 @@ test("Health offers Find other sources on a failing source's row and on the seri
            VALUES ('fs-d', 'down', 3, 'boom', now(), now() + interval '1 hour')`);
   const idle = (await runHealthChecks()).checks.find((c) => c.id === 'sources')!.items.find((i) => i.sourceId === 'fs-d')!;
   assert.equal(idle.actions!.includes('find_sources'), false);
+});
+
+// ---- v0.54.0: Replace ------------------------------------------------------------------------------------------
+//
+// The owner, after a full Find run left all 195 aqua series on aqua: "i have to go one by one test and find replacement
+// sources". A Replace run moves every series of one source off it: its best working follower becomes its main source
+// with no search, and only a series with none is searched for, followed and then promoted.
+
+/** Follows for a series, in this order: `fresh` answered with 12 numbers just now; `coverage` the follow-time share. */
+async function follows(key: string, list: Array<[string, { fresh?: boolean; coverage?: number }?]>) {
+  for (const [i, [source, o]] of list.entries()) {
+    await q(`INSERT INTO series_sources (series_id, source_id, source_series_id, coverage, checked_at, chapters, created_at)
+             VALUES ($1, $2, $3, $4, $5, $6, now() - interval '1 hour' + $7 * interval '1 minute')`,
+      [S(key), source, `${source}|${key}`, o?.coverage ?? null, o?.fresh ? new Date() : null, o?.fresh ? 12 : null, i]);
+  }
+}
+const mainOf = async (key: string) => (await q('SELECT source_id FROM lib_series WHERE id = $1', [S(key)]))[0]?.source_id;
+const followersOf = async (key: string) =>
+  (await q('SELECT source_id FROM series_sources WHERE series_id = $1 ORDER BY created_at, source_id', [S(key)])).map((r: any) => r.source_id);
+const promote = (runId: string, payload: unknown) =>
+  app.inject({ method: 'POST', url: `/api/admin/sources/find/${runId}/promote`, headers: adminAuth, payload });
+const resultsBy = (run: any) => Object.fromEntries(run.results.map((x: any) => [x.seriesId, x]));
+
+test("Replace promotes each series' best working follower without searching, drops the replaced source, and reports from and to", { skip }, async () => {
+  // Each series' `to` is the ranking's (lib/replaceSource.ts rankFollowers). Reintroduce by dropping the health tier:
+  // Rho Two takes the cooling fs-cool. The tenths of coverage: Rho Three takes fs-d. The source order: Rho Four takes fs-e.
+  const { invalidateSourcePrefs } = await import('../src/lib/sourcePrefs');
+  await series('r1', 'Rho One'); await follows('r1', [['fs-off', { fresh: true }], ['fs-a', { fresh: true }]]);
+  await series('r2', 'Rho Two'); await follows('r2', [['fs-cool', { fresh: true }], ['fs-b']]);
+  await series('r3', 'Rho Three'); await follows('r3', [['fs-d', { fresh: true, coverage: 0.5 }], ['fs-c', { fresh: true, coverage: 1 }]]);
+  await series('r4', 'Rho Four'); await follows('r4', [['fs-e', { fresh: true, coverage: 1 }], ['fs-f', { fresh: true, coverage: 1 }]]);
+  await series('r5', 'Rho Five', { numbering: 'posting_order' }); await follows('r5', [['fs-a', { fresh: true }]]);
+  await q(`INSERT INTO source_health (source_id, disabled) VALUES ('fs-off', true)`);
+  await q(`INSERT INTO source_health (source_id, status, blocked_until) VALUES ('fs-cool', 'rate_limited', now() + interval '1 hour')`);
+  const [{ source_prefs: prefsWas }] = await q('SELECT source_prefs FROM server_settings WHERE id = 1');
+  await q(`UPDATE server_settings SET source_prefs = '{"priority":["fs-f"]}'::jsonb WHERE id = 1`);
+  invalidateSourcePrefs();
+  try {
+    const r = await post({ sourceId: MAIN, mode: 'replace' });
+    assert.equal(r.statusCode, 202, r.body);
+    assert.equal(r.json().total, 5);
+    await fsLib.findSettled();
+    const run = (await state()).run;
+    assert.deepEqual([run.mode, run.status, run.promoted, run.left, run.turnedOff], ['replace', 'done', 4, 1, false], 'the run says what it moved and what is left');
+    const by = resultsBy(run);
+    assert.deepEqual(['r1', 'r2', 'r3', 'r4'].map((k) => by[S(k)].promoted?.to), ['fs-a', 'fs-b', 'fs-c', 'fs-f'], "each series' best working follower");
+    assert.deepEqual(by[S('r1')].promoted, { from: MAIN, fromName: 'Main Down', to: 'fs-a', toName: 'Name fs-a', via: 'follower', old: 'dropped' });
+    assert.equal('why' in by[S('r1')], false, 'a promoted series says no why');
+    assert.deepEqual(by[S('r1')].skipped, [{ sourceId: 'fs-off', name: 'Name fs-off', why: 'off' }], 'the switched-off follower was passed over');
+    assert.deepEqual(by[S('r2')].skipped, [{ sourceId: 'fs-cool', name: 'Name fs-cool', why: 'cooling' }], 'and the cooling one, ranked last');
+    assert.equal(by[S('r5')].why, 'posting_order', 'a series numbered by posting order is left alone');
+    for (const [k, to] of [['r1', 'fs-a'], ['r2', 'fs-b'], ['r3', 'fs-c'], ['r4', 'fs-f'], ['r5', MAIN]]) assert.equal(await mainOf(k), to, `${k}'s main source`);
+    assert.deepEqual(await followersOf('r1'), ['fs-off'], 'the replaced source is dropped, the rest stay');
+    assert.deepEqual(await followersOf('r5'), ['fs-a'], 'the posting-order series is untouched');
+    assert.deepEqual(searches, [], 'nothing was searched: every series was decided from its followers');
+    const audits = await q(`SELECT detail FROM audit_log WHERE event = 'series.main_source' AND detail->>'runId' = $1`, [run.id]);
+    assert.equal(audits.length, 4, 'each switch audited');
+    assert.ok(audits.every((x: any) => x.detail.via === 'replace' && x.detail.from === MAIN));
+    const find = (await q(`SELECT detail FROM audit_log WHERE event = 'source.find' AND detail->>'runId' = $1`, [run.id]))[0].detail;
+    assert.deepEqual([find.mode, find.promoted, find.left, find.turnedOff], ['replace', 4, 1, false]);
+    // The recent list counts what each run promoted, from its results.
+    assert.deepEqual([(await state()).recent[0].mode, (await state()).recent[0].promoted], ['replace', 4]);
+  } finally {
+    await q('UPDATE server_settings SET source_prefs = $1::jsonb WHERE id = 1', [JSON.stringify(prefsWas)]);
+    invalidateSourcePrefs();
+  }
+});
+
+test('a Replace run names the source it replaces, on its card and in its summary', { skip }, async () => {
+  // A Replace dialog opened again for a source while its run goes shows that run, not the offer to start one: the web
+  // finds it by the run's source (components/ReplaceDialog.tsx), on Admin → Sources, on Health, or after a reload.
+  // Reintroduce by leaving the source off the card (startFind): the card names no source. By dropping it from scopeOf:
+  // the summary does not.
+  await series('a', 'Alpha Tale');
+  gate = new Promise<void>((r) => { openGate = r; });
+  const r = await post({ sourceId: MAIN, mode: 'replace' });
+  assert.equal(r.statusCode, 202, r.body);
+  try {
+    await until(() => searches.length > 0, 'the run to reach its search');
+    const card = (await app.inject({ method: 'GET', url: '/api/sources/jobs', headers: adminAuth })).json().runs
+      .find((x: any) => x.kind === 'find_sources');
+    assert.deepEqual([card.status, card.mode, card.sourceId, card.sourceName], ['running', 'replace', MAIN, 'Main Down'],
+      'the card names the source it replaces');
+    const going = await state();
+    assert.deepEqual([going.running, going.run.mode, going.run.sourceId, going.run.sourceName], [true, 'replace', MAIN, 'Main Down'],
+      'the running run names it');
+    assert.deepEqual([going.recent[0].sourceId, going.recent[0].sourceName], [MAIN, 'Main Down'], 'and so does its summary');
+  } finally {
+    openGate();
+    gate = null;
+  }
+  await fsLib.findSettled();
+  const ended = (await app.inject({ method: 'GET', url: '/api/sources/jobs', headers: adminAuth })).json().runs
+    .find((x: any) => x.kind === 'find_sources');
+  assert.deepEqual([ended.status, ended.sourceId, ended.sourceName], ['done', MAIN, 'Main Down'], 'an ended card still names it');
+});
+
+test('a series with no working follower is searched, followed and promoted; one with nothing to follow says why', { skip }, async () => {
+  // Reintroduce by not promoting after a follow: Alpha Tale stays on the replaced source. By counting its dead
+  // followers against the cap: it is `full` and never searched.
+  await series('a', 'Alpha Tale'); await follows('a', [['fs-nowhere'], ['fs-off']]);
+  await series('e', 'Epsilon Nothing');
+  await q(`INSERT INTO source_health (source_id, disabled) VALUES ('fs-off', true)`);
+  const r = await post({ sourceId: MAIN, mode: 'replace' });
+  assert.equal(r.statusCode, 202, r.body);
+  await fsLib.findSettled();
+  const run = (await state()).run;
+  const by = resultsBy(run);
+  assert.deepEqual(by[S('a')].promoted, { from: MAIN, fromName: 'Main Down', to: 'fs-a', toName: 'Name fs-a', via: 'search', old: 'dropped' },
+    'a series with no working follower is searched, followed and promoted');
+  assert.deepEqual(by[S('a')].followed.map((f: any) => f.sourceId), ['fs-a', 'fs-b']);
+  assert.deepEqual(by[S('a')].dropped, [{ sourceId: 'fs-nowhere', name: 'fs-nowhere' }, { sourceId: 'fs-off', name: 'Name fs-off' }],
+    'its dead followers made room, the one not loaded first');
+  assert.equal(await mainOf('a'), 'fs-a');
+  assert.deepEqual(await followersOf('a'), ['fs-b'], 'the other source it followed stays a follower');
+  assert.ok(searches.includes('fs-a:Alpha Tale'));
+  assert.equal(by[S('e')].why, 'no_match', 'the search said why it found nothing');
+  assert.equal(await mainOf('e'), MAIN, 'and that series stays where it was');
+  assert.equal(run.promoted, 1);
+});
+
+test('review first moves nothing, proposes what it would promote, and promote does exactly that', { skip }, async () => {
+  // Reintroduce by dropping the review branch in replaceFor: Rho One moves during the run.
+  await series('r1', 'Rho One'); await follows('r1', [['fs-off', { fresh: true }], ['fs-a', { fresh: true, coverage: 1 }]]);
+  await series('a', 'Alpha Tale');
+  await q(`INSERT INTO source_health (source_id, disabled) VALUES ('fs-off', true)`);
+  const both = await post({ sourceId: MAIN, mode: 'replace', review: true, turnOff: true });
+  assert.deepEqual([both.statusCode, both.json().error], [400, 'bad_request'], 'a review never turns a source off');
+  assert.equal((await post({ sourceId: MAIN, turnOff: true })).statusCode, 400, 'only Replace does');
+  assert.equal((await post({ seriesIds: [S('r1')], mode: 'replace' })).statusCode, 400, 'and Replace names its source');
+  const r = await post({ sourceId: MAIN, mode: 'replace', review: true });
+  assert.equal(r.statusCode, 202, r.body);
+  const runId = r.json().runId;
+  await fsLib.findSettled();
+  const run = (await state()).run;
+  assert.deepEqual([run.review, run.mode, run.promoted], [true, 'replace', 0], 'review first moves nothing');
+  assert.equal(await mainOf('r1'), MAIN, 'review first moves nothing');
+  assert.equal(await mainOf('a'), MAIN);
+  assert.deepEqual(await followersOf('a'), [], 'and follows nothing');
+  const by = resultsBy(run);
+  const fol = by[S('r1')].proposals;
+  assert.deepEqual(fol.map((p: any) => [p.kind, p.sourceId, p.promote ?? false, p.verdict, p.standing]), [['follower', 'fs-a', true, 'green', 'usable']],
+    'its working follower, marked as the one to promote');
+  assert.deepEqual(by[S('r1')].skipped, [{ sourceId: 'fs-off', name: 'Name fs-off', why: 'off' }]);
+  const found = by[S('a')].proposals;
+  assert.deepEqual(found.map((p: any) => [p.kind, p.sourceId, p.promote ?? false]), [['search', 'fs-a', true], ['search', 'fs-b', false]],
+    'what the search found, the first green one marked');
+
+  const one = await promote(runId, { seriesId: S('r1'), sourceId: 'fs-a' });
+  assert.equal(one.statusCode, 200, one.body);
+  assert.equal(one.json().result.promoted.to, 'fs-a');
+  assert.equal(one.json().result.proposals[0].state, 'promoted');
+  assert.equal(await mainOf('r1'), 'fs-a', 'promote does exactly that');
+  const again = await promote(runId, { seriesId: S('r1'), sourceId: 'fs-a' });
+  assert.deepEqual([again.statusCode, again.json().error, again.json().state], [409, 'decided', 'promoted'], 'and only once');
+  // A search's match is followed first, then made the main source.
+  const two = await promote(runId, { seriesId: S('a'), sourceId: 'fs-a' });
+  assert.equal(two.statusCode, 200, two.body);
+  assert.deepEqual([two.json().result.promoted.via, two.json().result.followed.map((f: any) => f.sourceId)], ['search', ['fs-a']]);
+  assert.equal(await mainOf('a'), 'fs-a');
+  assert.deepEqual(await followersOf('a'), [], 'the replaced source dropped, nothing else followed');
+  assert.equal((await promote(runId, { seriesId: S('a'), sourceId: 'fs-c' })).statusCode, 404, 'a source never proposed');
+  assert.equal((await state(`?runId=${runId}`)).run.promoted, 2, 'the run counts what was promoted from it');
+});
+
+test('turnOff turns the replaced source off only when no series is left on it, and drops its follows elsewhere', { skip }, async () => {
+  // Reintroduce by not checking `left` before turning it off: the first run turns it off with Rho Five still on it.
+  const { isDisabled } = await import('../src/lib/sourceHealth');
+  await series('r1', 'Rho One'); await follows('r1', [['fs-a', { fresh: true }]]);
+  await series('r5', 'Rho Five', { numbering: 'posting_order' }); await follows('r5', [['fs-b', { fresh: true }]]);
+  // A series that only follows the replaced source: that follow goes when it is turned off, with its listing rows.
+  await series('x', 'Xi Follower', { source: 'fs-c' });
+  await follows('x', [[MAIN]]);
+  await q(`INSERT INTO series_listing (series_id, number, source_id, chosen) VALUES ($1, 13, $2, '{}'::jsonb)`, [S('x'), MAIN]);
+  const first = await post({ sourceId: MAIN, mode: 'replace', turnOff: true });
+  assert.equal(first.statusCode, 202, first.body);
+  await fsLib.findSettled();
+  let run = (await state()).run;
+  assert.deepEqual([run.promoted, run.left, run.turnedOff], [1, 1, false], 'a series is left on it: it stays on');
+  assert.equal(await isDisabled(MAIN), false, 'turnOff turns the replaced source off only when no series is left on it');
+  assert.deepEqual(await followersOf('x'), [MAIN], 'and its follows stay');
+
+  await q('UPDATE lib_series SET numbering = NULL WHERE id = $1', [S('r5')]);
+  const second = await post({ sourceId: MAIN, mode: 'replace', turnOff: true });
+  assert.equal(second.statusCode, 202, second.body);
+  await fsLib.findSettled();
+  run = (await state()).run;
+  assert.deepEqual([run.promoted, run.left, run.turnedOff], [1, 0, true], 'nothing left: turned off');
+  assert.equal(await isDisabled(MAIN), true);
+  assert.deepEqual(await followersOf('x'), [], 'its follows elsewhere dropped');
+  assert.equal((await q('SELECT count(*)::int AS n FROM series_listing WHERE series_id = $1 AND source_id = $2', [S('x'), MAIN]))[0].n, 0,
+    'with their listing rows');
+  const retire = (await q(`SELECT detail FROM audit_log WHERE event = 'source.retire' AND detail->>'runId' = $1`, [run.id]))[0]?.detail;
+  assert.deepEqual([retire?.source, retire?.done, retire?.via], [MAIN, 'turned_off', 'replace']);
+});
+
+test('a series being checked is waited for; past the wait it is busy', { skip }, async () => {
+  // Reintroduce by not waiting (drop waitOut's loop): the series is switched under the check it waited for.
+  const { updateSeries, runsInside } = await import('../src/lib/updater');
+  fsLib.setFindTiming({ paceMs: 0, wallMs: 10_000, quietMs: 20, busyMs: 300 });
+  await series('b1', 'Beta One'); await follows('b1', [['fs-a', { fresh: true }]]);
+  listGate = new Promise<void>((r) => { openList = r; });
+  let check = updateSeries(S('b1'), 0);
+  try {
+    await until(() => runsInside(S('b1')) > 0, 'the check to be inside the series');
+    assert.equal((await post({ sourceId: MAIN, mode: 'replace' })).statusCode, 202);
+    await fsLib.findSettled();
+    const busy = resultsBy((await state()).run)[S('b1')];
+    assert.equal(busy.why, 'busy', 'past the wait it is busy');
+    assert.equal(await mainOf('b1'), MAIN, 'and untouched');
+  } finally { openList(); listGate = null; await check; }
+
+  // The check ends within the wait: the series is replaced as soon as it has.
+  fsLib.setFindTiming({ paceMs: 0, wallMs: 10_000, quietMs: 20, busyMs: 10_000 });
+  listGate = new Promise<void>((r) => { openList = r; });
+  check = updateSeries(S('b1'), 0);
+  try {
+    await until(() => runsInside(S('b1')) > 0, 'the second check');
+    assert.equal((await post({ sourceId: MAIN, mode: 'replace' })).statusCode, 202);
+    await new Promise((r) => setTimeout(r, 300));
+    assert.equal(await mainOf('b1'), MAIN, 'not while the check is inside it');
+    openList();
+    await fsLib.findSettled();
+    assert.equal(resultsBy((await state()).run)[S('b1')].promoted?.to, 'fs-a', 'a series being checked is waited for');
+  } finally { openList(); listGate = null; await check; }
+});
+
+test('a stop leaves every series either replaced or untouched', { skip }, async () => {
+  const { updateSeries, runsInside } = await import('../src/lib/updater');
+  fsLib.setFindTiming({ paceMs: 0, wallMs: 10_000, quietMs: 20, busyMs: 10_000 });
+  for (const k of ['t1', 't2', 't3', 't4']) { await series(k, `Tau ${k}`); await follows(k, [['fs-a', { fresh: true }]]); }
+  // The third waits on a check inside it, and the stop comes while it waits.
+  listGate = new Promise<void>((r) => { openList = r; });
+  const check = updateSeries(S('t3'), 0);
+  try {
+    await until(() => runsInside(S('t3')) > 0, 'the check');
+    assert.equal((await post({ sourceId: MAIN, mode: 'replace' })).statusCode, 202);
+    await until(async () => (await state()).run?.current?.seriesId === S('t3'), 'the run to wait on the third series');
+    assert.equal((await app.inject({ method: 'POST', url: '/api/admin/sources/find/stop', headers: adminAuth })).json().stopped, true);
+    // Let the check go once the run has ended: the listing refreshes after it list through fs-a too.
+    await until(async () => !(await state()).running, 'the run to end');
+    openList();
+    await fsLib.findSettled();
+  } finally { openList(); listGate = null; await check; }
+  const run = (await state()).run;
+  assert.equal(run.status, 'stopped');
+  const by = resultsBy(run);
+  for (const k of ['t1', 't2', 't3', 't4']) {
+    const main = await mainOf(k);
+    const fols = await followersOf(k);
+    if (by[S(k)].promoted) assert.deepEqual([main, fols], ['fs-a', []], `${k}: replaced, all of it`);
+    else assert.deepEqual([main, fols, by[S(k)].why], [MAIN, ['fs-a'], 'not_tried'], `${k}: untouched, and says so`);
+  }
+  assert.deepEqual(['t1', 't2', 't3', 't4'].map((k) => !!by[S(k)].promoted), [true, true, false, false], 'a stop leaves every series either replaced or untouched');
+});
+
+test('Find and Replace share one run; the preview says so', { skip }, async () => {
+  await series('a', 'Alpha Tale');
+  gate = new Promise<void>((r) => { openGate = r; });
+  try {
+    assert.equal((await post({ sourceId: MAIN })).statusCode, 202, 'a Find run');
+    const busy = await post({ sourceId: MAIN, mode: 'replace' });
+    assert.deepEqual([busy.statusCode, busy.json().error], [409, 'busy'], 'Find and Replace share one run');
+    const preview = await app.inject({ method: 'GET', url: `/api/admin/sources/${MAIN}/replace-preview`, headers: adminAuth });
+    assert.equal(preview.json().busy, true, 'and the preview says one is going');
+  } finally {
+    openGate(); gate = null;
+    await app.inject({ method: 'POST', url: '/api/admin/sources/find/stop', headers: adminAuth });
+    await fsLib.findSettled();
+  }
+});
+
+test("a live-shaped library: 195 series on a switched-off main, 184 with a working follower -- the preview says 184 and 11, and the run promotes the 184 without one search", { skip }, async () => {
+  const { setDisabled } = await import('../src/lib/sourceHealth');
+  await q(`INSERT INTO lib_series (id, source, title, folder, books_count, library_id, source_id, source_series_id, auto_update)
+           SELECT 's_fs_live' || i, 'T!fs', 'Live ' || lpad(i::text, 3, '0'), 's_fs_live' || i, 0, $1, $2::text, $2::text || '|live' || i, true
+             FROM generate_series(1, 195) i`, [LIB, MAIN]);
+  await q(`INSERT INTO series_sources (series_id, source_id, source_series_id, checked_at, chapters)
+           SELECT 's_fs_live' || i, 'fs-a', 'fs-a|live' || i, now(), 12 FROM generate_series(1, 184) i`);
+  // The eleven with nothing to follow list twelve numbers, so they are searched for (MIN_HAVE).
+  await q(`INSERT INTO series_listing (series_id, number, source_id, chosen)
+           SELECT 's_fs_live' || i, n, $1::text, '{}'::jsonb FROM generate_series(185, 195) i, generate_series(1, 12) n`, [MAIN]);
+  await setDisabled(MAIN, true);
+  const preview = await app.inject({ method: 'GET', url: `/api/admin/sources/${MAIN}/replace-preview`, headers: adminAuth });
+  assert.equal(preview.statusCode, 200, preview.body);
+  assert.deepEqual(preview.json(), { main: 195, withBackup: 184, toSearch: 11, postingOrder: 0, busy: false }, 'the preview says 184 and 11');
+  const r = await post({ sourceId: MAIN, mode: 'replace' });
+  assert.equal(r.statusCode, 202, r.body);
+  assert.equal(r.json().total, 195);
+  await fsLib.findSettled();
+  const run = (await state()).run;
+  assert.deepEqual([run.status, run.promoted, run.left], ['done', 184, 11]);
+  const searched = new Set(searches.map((x) => x.slice(x.indexOf(':') + 1)));
+  const lone = Array.from({ length: 11 }, (_, i) => `Live ${String(185 + i).padStart(3, '0')}`);
+  assert.deepEqual([...searched].sort(), lone, 'only the eleven with no working follower were searched for: the 184 without one search');
+  assert.equal((await q(`SELECT count(*)::int AS n FROM lib_series WHERE library_id = $1 AND source_id = 'fs-a'`, [LIB]))[0].n, 184);
+  // The run lists them followers-first: every promotion before the first search.
+  assert.ok(run.results.slice(0, 184).every((x: any) => x.promoted?.via === 'follower'), 'the instant promotions land first');
+});
+
+test('a series moved off the source after the run started is left alone, and says so', { skip }, async () => {
+  // Reintroduce by dropping the `moved` check at the top of replaceFor: Alpha Tale is searched for and follows two sources.
+  const { updateSeries, runsInside } = await import('../src/lib/updater');
+  fsLib.setFindTiming({ paceMs: 0, wallMs: 10_000, quietMs: 20, busyMs: 10_000 });
+  await series('m1', 'Mu One'); await follows('m1', [['fs-a', { fresh: true }]]);
+  await series('m2', 'Alpha Tale');
+  listGate = new Promise<void>((r) => { openList = r; });
+  const check = updateSeries(S('m1'), 0);
+  try {
+    await until(() => runsInside(S('m1')) > 0, 'the check');
+    assert.equal((await post({ sourceId: MAIN, mode: 'replace' })).statusCode, 202);
+    await until(async () => (await state()).run?.current?.seriesId === S('m1'), 'the run to wait on the first series');
+    // Moved by hand while the run waits: Make main, or another run.
+    await q(`UPDATE lib_series SET source_id = 'fs-c', source_series_id = 'fs-c|m2' WHERE id = $1`, [S('m2')]);
+    openList();
+    await fsLib.findSettled();
+  } finally { openList(); listGate = null; await check; }
+  const by = resultsBy((await state()).run);
+  assert.equal(by[S('m1')].promoted?.to, 'fs-a');
+  assert.equal(by[S('m2')].why, 'moved', 'a series moved off the source after the run started is left alone');
+  assert.equal(searches.some((x) => x.endsWith(':Alpha Tale')), false, 'and not searched for');
+  assert.deepEqual(await followersOf('m2'), []);
 });

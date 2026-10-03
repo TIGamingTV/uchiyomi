@@ -29,7 +29,8 @@ export type Join =
   | 'dash'      // "a — b"
   | 'dashCap'   // "a — B"
   | 'paren'     // "a (b)"
-  | 'colon';    // "a: b"
+  | 'colon'     // "a: b"
+  | 'dot';      // "a · b" -- v0.53.0, Source health's summary: two counts side by side, neither a clause of the other
 
 export type Param = string | number | boolean | null | string[] | number[];
 
@@ -65,6 +66,13 @@ export function solverVersionLabel(version?: string | null): string {
 }
 /** The engine's version as its Health row says it: " (v2.3.2243)". */
 const engineVersion = (v?: string | null) => (v ? ` (v${v.replace(/^v/i, '')})` : '');
+/**
+ * A language code as English names it ("es-419" is "Latin American Spanish"), the name the web's languageName gives in
+ * English; the code itself where Intl cannot. The web says it in the reader's language.
+ */
+const langName = (code: string) => {
+  try { return new Intl.DisplayNames(['en'], { type: 'language' }).of(code) || code; } catch { return code; }
+};
 /** Up to five names, then how many more: "Manga Ball, MangaDex and 3 more". */
 const names = (list: string[], more: number) => list.join(', ') + (more > 0 ? ` and ${more} more` : '');
 /** Where a census reason found the walk's trouble: this folder, or one above it ('' is the downloads folder). */
@@ -110,7 +118,7 @@ const EN = {
     'to). A new series from such a source is numbered by posting order; one already in your library is renumbered only ' +
     'when you confirm its plan, and downloads nothing until then. Renaming keeps every file, and reading progress stays ' +
     'with its chapter. "Keep the source\'s numbers" records your choice; the source\'s own "Use sequential chapter numbering" ' +
-    'setting, under Admin → Extensions, is the other way out.',
+    'setting, under Admin → Sources, is the other way out.',
   'numbering.shared': ({ name, extras, posts }: { name: string | null; extras: number; posts: number }) =>
     `${name ?? 'Its source'} gives ${extras} of ${posts} posts a number another post has`,
   'numbering.sharedMost': ({ name, extras, posts, most, number }: { name: string | null; extras: number; posts: number; most: number; number: number }) =>
@@ -163,7 +171,7 @@ const EN = {
   'frozen.live': ({ n }: { n: number }) => `${n} series ${s(n, 'has', 'have')} no working source`,
   'frozen.none': () => 'Every series has a working source',
   'frozen.covered': ({ n }: { n: number }) => `${n} lost ${s(n, 'its', 'their')} primary but still follow${s(n, 's', '')} another`,
-  'frozen.engineNote': () => 'Series that came from extensions wait for the extension engine; Admin → Extensions shows how to bring it back.',
+  'frozen.engineNote': () => 'Series that came from extensions wait for the extension engine; Admin → Sources shows how to bring it back.',
   'frozen.note': () =>
     'These read fine, but nothing can fetch new chapters for them and "find missing chapters" will not offer ' +
     'their own source. Switch the source back on, re-add the extension, or re-point the series at a source that carries it.',
@@ -177,12 +185,30 @@ const EN = {
   'frozen.overLimit': ({ n, source }: { n: number; source: string }) =>
     `${n} chapters; its source ${source} is ${forDesktop('over the source limit (SUWAYOMI_MAX_SOURCES)', 'over the source limit')}`,
   'frozen.uninstalled': ({ n, source }: { n: number; source: string }) => `${n} chapters; its source ${source} is no longer installed`,
+  // v0.52.0 (#123): its source is MangaDex in a language an admin switched off. `lang` is the app code (es-419).
+  'frozen.mangadexOff': ({ n, lang }: { n: number; lang: string }) =>
+    `${n} chapter${s(n, '', 's')}; MangaDex in ${langName(lang)} is switched off in Admin → Sources`,
   'frozen.following': ({ source, names: followed }: { source: string | null; names: string[] }) =>
     `primary ${source ?? '(none)'} gone; still following ${followed.join(', ')}`,
+  // v0.54.0: a main source that is loaded and failing at a step an update needs; `offline` when the failure is the
+  // site's own offline notice (lib/sources/offline.ts).
+  'frozen.failing': ({ n, source, offline }: { n: number; source: string; offline: boolean }) =>
+    `${n} chapter${s(n, '', 's')}; its source ${source} ${offline ? 'says it is offline' : 'is failing'}`,
+  // v0.54.0: the main source is loaded but switched off or failing (`state`: off | failing), and a follower carries
+  // the series.
+  'frozen.followingDown': ({ source, state, names: followed }: { source: string; state: string; names: string[] }) =>
+    `primary ${source} ${state === 'off' ? 'switched off' : 'failing'}; still following ${followed.join(', ')}`,
 
   // ---- Source health (#115). `status` is a SourceStatus code; `stage` a Stage.
-  'sources.live': ({ n }: { n: number }) => `${n} source${s(n, ' is', 's are')} failing or blocked`,
+  // v0.53.0: the summary counts the card's two groups that need a look, joined by 'dot'; with neither, `sources.unused`
+  // while rows are listed for reference (never "all working" over a source nobody could test to the end), else
+  // `sources.working`. The five after `sources.unused` are the summary before v0.53.0, no longer sent: a summary an
+  // older server stored still carries them (the header reads the last stored report), so they keep their words.
+  'sources.affected': ({ n }: { n: number }) => `${n} source${s(n, '', 's')} your series use ${s(n, 'needs', 'need')} a look`,
+  'sources.failingUnused': ({ n }: { n: number }) => `${n} source${s(n, ' nothing uses is', 's nothing uses are')} failing`,
+  'sources.working': () => 'All sources are working',
   'sources.unused': () => 'Nothing is failing that your library uses',
+  'sources.live': ({ n }: { n: number }) => `${n} source${s(n, ' is', 's are')} failing or blocked`,
   'sources.none': () => 'All sources responding normally',
   'sources.off': ({ n }: { n: number }) => `${n} turned off by you`,
   'sources.idle': ({ n }: { n: number }) => `${n} no series use`,
@@ -223,6 +249,9 @@ const EN = {
     'never automatic: the nightly repair leaves these alone and you confirm each one.',
   'dupes.same': () => 'Same AniList entry',
   'dupes.copies': ({ n }: { n: number }) => `${n} copies — merge them one pair at a time`,
+  // v0.52.0 (#72): a pair in two languages. `a` and `b` are language codes; the web names them in the reader's language.
+  'dupes.languages': ({ a, b }: { a: string; b: string }) =>
+    `The same work in ${langName(a)} and ${langName(b)}: link them as editions rather than merging.`,
 
   // ---- Impossible chapter numbers
   'outliers.live': ({ n }: { n: number }) => `${n} series ${s(n, 'has', 'have')} chapters numbered far beyond the rest`,
@@ -354,6 +383,26 @@ const EN = {
   'census.loop': ({ above, ancestor, detail }: { above?: string | null; ancestor?: string; detail?: string }) =>
     `the scan took ${where(above)} for a loop: ${loopedTo(ancestor, detail)}`,
 
+  // ---- Folders scanned twice (v0.52.0, #134: lib/health.ts foldersScannedTwice). `folder` is where one root sits in
+  // the other; `lib` and `dl` the two roots as configured.
+  'nested.same': () => 'The downloads folder and the library are one folder, so every downloaded chapter is scanned twice',
+  'nested.downloadsInside': ({ folder }: { folder: string }) =>
+    `The downloads folder is inside the library, at ${folder}, so every downloaded chapter is scanned twice`,
+  'nested.libraryInside': ({ folder }: { folder: string }) =>
+    `The library is inside the downloads folder, at ${folder}, so every chapter in it is scanned twice`,
+  'nested.byPath': () => 'Their paths put one inside the other.',
+  'nested.byScan': () => 'The last library scan read the same files here a second time.',
+  'nested.note': ({ lib, dl }: { lib: string; dl: string }) => forDesktop(
+    `Uchiyomi scans the library (${lib}) and its downloads folder (${dl}) both, so neither may be inside the other: `
+      + 'each downloaded chapter then shows up twice, once in a series with its source and once in a series with none. '
+      + 'Mount them side by side, each in a folder of its own, and restart Uchiyomi; then remove the copies with no '
+      + 'source. The Volumes section of the install guide shows how.',
+    // The desktop app's own words (docs/DESKTOP.md): its "library folder" is the downloads, the reader's is the manga
+    // folder they added.
+    'Uchiyomi scans its library folder and the manga folder you added both, so neither may be inside the other: each '
+      + 'downloaded chapter then shows up twice. Keep the two side by side; then remove the copies with no source.',
+  ),
+
   // ---- The extension engine (#72, lib/engineHealth.ts)
   'engine.waiting': ({ n }: { n: number }) =>
     `${n} series that came from extensions ${s(n, 'keeps its', 'keep their')} chapters and ${s(n, 'gets', 'get')} no new ones until it is back`,
@@ -361,12 +410,12 @@ const EN = {
   // source's gender ("Désactivée", "Desactivada"; the v0.49.1 translation review).
   'engine.switchedOff': () => 'Switched off',
   'engine.notSetUp': () => 'Not set up',
-  'engine.offNote': () => 'Admin → Extensions shows how to bring it back. Its data is kept while it is off.',
+  'engine.offNote': () => 'Admin → Sources shows how to bring it back. Its data is kept while it is off.',
   'engine.fromExtensions': () => 'Series from extensions',
   'engine.notAnswering': ({ error }: { error: string | null }) => `Not answering${error ? ` (${error})` : ''}`,
   'engine.retries': () => 'Uchiyomi asks again every 5 minutes by itself, and its extensions come back without a restart.',
   'engine.reopen': () => 'If it stays this way, quit and reopen Uchiyomi, which starts its extension engine again.',
-  'engine.checkAgain': () => 'Admin → Extensions shows what to check for your setup, and Check again there asks at once.',
+  'engine.checkAgain': () => 'Admin → Sources shows what to check for your setup, and Check again there asks at once.',
   'engine.notAnsweringTitle': () => 'Not answering',
   'engine.asked': ({ n }: { n: number }) => `asked ${n} ${s(n, 'time', 'times')} since it stopped answering`,
   'engine.noAnswer': () => 'no answer at the last try',
@@ -458,6 +507,27 @@ const EN = {
   'pref.choices': ({ label }: { label: string }) => `${label} takes a list of its choices.`,
   'pref.text': ({ label }: { label: string }) => `${label} takes text.`,
   'pref.tooLong': ({ label }: { label: string }) => `${label} is too long.`,
+
+  // ---- A follow refused for its language (v0.52.0, #123: routes/admin.ts, the manual follow's backstop). `theirs`
+  // and `ours` are language codes: the English names them in English, the web in the reader's language.
+  'follow.languageDiffers': ({ theirs, ours }: { theirs: string; ours: string }) =>
+    `That source is in ${langName(theirs)} and this series is in ${langName(ours)}. Add it as an edition in ${langName(theirs)} instead: each language keeps its own chapters.`,
+  // The same, when the work holds an edition that may follow the source already (`edition` is its language): no new
+  // edition is wanted, the follow belongs there.
+  'follow.languageDiffersEdition': ({ theirs, ours, edition }: { theirs: string; ours: string; edition: string }) =>
+    `That source is in ${langName(theirs)} and this series is in ${langName(ours)}. Follow it on the ${langName(edition)} edition instead.`,
+
+  // ---- Making a followed source a series' main source refused (v0.54.0: lib/mainSource.ts, the Replace run). A busy
+  // series says 'renumber.checking'; another language, the follow's own two sentences.
+  // Every path that lines two sources up by number refuses a series numbered by posting order (lib/numbering.ts).
+  'numbering.postingRefusal': () => 'This series is numbered by posting order, so another source’s chapter numbers do not line up with it.',
+  'main.isMain': () => 'That source is already this series’ main source.',
+  'main.notFollowed': () => 'This series does not follow that source. Only a source it follows can become its main source.',
+  'main.renumberPending': () => 'This series’ chapters are waiting to be renumbered. Review that on the series page first.',
+  'main.unavailable': () => 'That source cannot be used right now: it is not installed, it is switched off, or it is not available on this account.',
+  'main.moved': () => 'This series’ main source changed meanwhile. Look again.',
+  // A source retired, or a site removed, while some series still has it as its main source (v0.54.0, lib/retireSource.ts).
+  'retire.inUse': ({ n }: { n: number }) => `It is the main source of ${n} series. Replace it first.`,
 };
 
 export type SaidCode = keyof typeof EN;
@@ -503,6 +573,7 @@ const JOIN: Record<Join, (a: string, b: string) => string> = {
   dashCap: (a, b) => `${a} — ${cap(b)}`,
   paren: (a, b) => `${a} (${b})`,
   colon: (a, b) => `${a}: ${b}`,
+  dot: (a, b) => `${a} · ${b}`,
 };
 
 type Parts = ReadonlyArray<Part | null | undefined | false>;

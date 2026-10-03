@@ -27,7 +27,7 @@ function walk(dir: string, out: string[] = []): string[] {
  * The source with its comments blanked and its strings left alone.
  *
  * ⚠️ Not the `code()` regex the other tests use. Its `/\*[\s\S]*?\*\/` reads the `/*` inside
- * `accept="image/*"` (series/page.tsx) as the start of a comment and deletes everything up to the next `*\/`
+ * `accept="image/*"` (components/SeriesEditor.tsx) as the start of a comment and deletes everything up to the next `*\/`
  * -- which, over the whole app, would silently drop real keys from this scan. This walks the characters
  * instead, so a `//` or `/*` inside a string is left as the string it is. Comments go because several quote
  * the code they forbid (ConfirmDialog.tsx says `tr('Type')` in one).
@@ -97,18 +97,20 @@ const placeholders = (s: string) => [...new Set(s.match(/\{\w+\}/g) ?? [])].sort
 
 test('the scan itself sees the app: inline keys, keys() arrays, and nothing from comments', () => {
   // A scan that silently finds nothing passes everything. Reintroduce the naive block-comment regex in
-  // stripComments: series/page.tsx loses the strings after its `accept="image/*"` and "a key after
-  // image/* in series/page.tsx" fails.
+  // stripComments: everything after an `accept="image/*"` up to the next comment's end is lost, and "a key after
+  // image/* is not scanned" fails.
   const keys = appKeys();
   assert.ok(keys.size >= 1300, `only ${keys.size} keys found -- the scan is broken`);
   assert.ok(keys.get('Library')?.has('components/BottomNav.tsx (keys)'), 'the bottom nav\'s keys() labels are not scanned');
   assert.ok(keys.get('Needs attention')?.has('lib/status.ts (keys)'), 'a keys() array in lib/ is not scanned');
   assert.ok(keys.has('Up to {n} minutes'), 'an inline tr() in lib/ is not scanned');
   assert.ok(keys.has('Not asked: enough other sources already list this series'), 'an inline tr() in components/ is not scanned');
-  const series = readFileSync(join(ROOT, 'app/series/page.tsx'), 'utf8');
-  const after = series.slice(series.indexOf('accept="image/*"'));
-  const later = after.match(/\btr\('((?:[^'\\\n]|\\.)*)'/);
-  assert.ok(later && keys.has(unescape(later[1])), 'a key after image/* in series/page.tsx is not scanned');
+  // The case on a snippet of its own: the app's one such string (Edit details' file input, v0.53.0) is the last thing
+  // in its file, where the naive regex finds no comment end to run to and so eats nothing a real scan would miss.
+  const tricky = '<input accept="image/*" hidden />\n<p>{tr(\'After the accept\')}</p>\n{/* a comment */}\n';
+  assert.match(stripComments(tricky), /tr\('After the accept'\)/, 'a key after image/* is not scanned');
+  assert.doesNotMatch(stripComments(tricky), /a comment/, 'a comment after it is scanned as code');
+  assert.ok(readFileSync(join(ROOT, 'components/SeriesEditor.tsx'), 'utf8').includes('accept="image/*"'), 'no file input left to make this case real');
   assert.ok(!keys.has('Type'), 'a key quoted only in a comment (ConfirmDialog.tsx) is scanned as if it were used');
 });
 
@@ -156,15 +158,22 @@ const numberPair = (one: string, many: string) =>
  */
 const AGREES_ABROAD = /^(\p{Ll}+ed|not)$/u;
 /**
- * Keys with such a count that shipped before that rule, each reading wrong at 1 in some language. ⚠️ Frozen like
- * SHIPPED_UNPAIRED: fix one by adding its singular and deleting it here, never by adding to it.
+ * So does a count before a state word that ends its phrase: "2 languages · 1 on" on Admin → Providers' cards read
+ * "1 activadas", "1 activées", "1 ativas" (the v0.52.0 check pass). "{n} on server" is a place and agrees with nothing,
+ * so the word must end the key or come before a separator.
  */
-const AGREEING_UNPAIRED = [
-  '{n} selected', '{n} filed by hand', '{n} saved', '{n} deleted', '{n} not here yet',
-  '{n} skipped: not downloaded by Uchiyomi', '{n} skipped: bookmarked by a reader',
-  'Delete all {n} downloaded chapters of “{title}”?', 'Delete all {n} downloaded chapters on this device?',
-];
-const AGREEING_UNPAIRED_MAX = 9;
+const STATE_WORD = /^(on|off)$/u;
+const endsPhrase = (k: string, at: number): boolean => /^(?:1|\{[nm]\}) \p{L}+(?:$|\s*[·.,;:)!?—])/u.test(k.slice(at));
+/** Whether a count asks for its other half: a plural noun, a participle or "not", or a state word ending the phrase. */
+const asksPair = (k: string, c: { at: number; one: boolean; word: string }): boolean =>
+  c.one || /^\p{Ll}+s$/u.test(c.word) || AGREES_ABROAD.test(c.word) || (STATE_WORD.test(c.word) && endsPhrase(k, c.at));
+/**
+ * Keys with such a count that shipped before that rule, each reading wrong at 1 in some language. ⚠️ Frozen like
+ * SHIPPED_UNPAIRED: fix one by adding its singular and deleting it here, never by adding to it. Empty since v0.52.0,
+ * which gave the last nine their singulars (web/lib/counted.ts), and kept so: a new one is a failure, not an entry.
+ */
+const AGREEING_UNPAIRED: string[] = [];
+const AGREEING_UNPAIRED_MAX = 0;
 /** Verbs and determiners that agree with the count, singular → plural. */
 const AGREE: Record<string, string> = {
   has: 'have', is: 'are', was: 'were', needs: 'need', comes: 'come', does: 'do', keeps: 'keep', fails: 'fail',
@@ -225,6 +234,19 @@ const IRREGULAR_PAIRS: Record<string, string> = {
     'the library still marks these {n} deleted, and no scan has read the files since',
   // v0.50.0, The same chapter saved twice: the Fix all confirmation, "this series" against "these {n} series".
   'Delete the later copies in this series?': 'Delete the later copies in these {n} series?',
+  // v0.53.0, Source health's Turn off all: what it asks first, "this source" against "these {n} sources". It names no
+  // place (v0.54.0): it is asked on Admin → Sources itself as well as on Health.
+  'Turn off this source? No series uses it. You can turn it back on any time.':
+    'Turn off these {n} sources? No series uses them. You can turn them back on any time.',
+  // v0.54.0, Admin → Sources: a source's Turn off, and the Replace dialog's head and plan, where "it" and "its" agree too.
+  '1 series uses it. It stops getting new chapters from this source until you turn it back on. Nothing is deleted.':
+    '{n} series use it. They stop getting new chapters from this source until you turn it back on. Nothing is deleted.',
+  '1 series uses it as its main source': '{n} series use it as their main source',
+  '1 already follows a working source: it becomes its main source.': '{n} already follow a working source: it becomes their main source.',
+  '1 numbered by posting order stays as it is.': '{n} numbered by posting order stay as they are.',
+  // v0.52.0, the last of AGREEING_UNPAIRED: one chapter is "the" chapter, not "all 1".
+  'Delete the downloaded chapter of “{title}”?': 'Delete all {n} downloaded chapters of “{title}”?',
+  'Delete the downloaded chapter on this device?': 'Delete all {n} downloaded chapters on this device?',
 };
 /** Keys that look counted and are not a pair, each with why. Not a place to park a new key. */
 const NOT_PAIRED: Record<string, string> = {
@@ -238,6 +260,8 @@ const NOT_PAIRED: Record<string, string> = {
   '{n} copies — merge them one pair at a time': 'said only for three copies or more: never 1',
   'Switched off after {n} failed deliveries in a row. Fix it, then switch it back on.':
     'a target switches itself off only at bff notify AUTO_DISABLE_AFTER (10) failures in a row: never 1',
+  // v0.54.0: its singular, "1 language", was Providers' MangaDex group and the old MangaDex card's, both gone.
+  '{n} languages': 'extLanguagesText names the one language instead (lib/extensions.ts): said only for two or more',
 };
 /**
  * Plural keys that shipped before this check with no singular. Each reads "1 …s" at a count of 1 (or its
@@ -248,23 +272,22 @@ const NOT_PAIRED: Record<string, string> = {
 const SHIPPED_UNPAIRED = [
   '+{n} chapters vs the current pick', 'All {n} chapters are already in your library', 'Best {n} days',
   'Checking {n} sources — this can take a minute. You can close this; anything followed shows under Sources & translations.',
-  'Delete {n} chapters from the server?', 'File {n} series',
+  'File {n} series',
   'From now on, an hourly job will permanently delete the file of any chapter that everyone who started it has finished, once it has been finished for {n} days. There is no undo and no recycle bin.',
   'Merge these {n} pairs?', 'Merged — {n} chapters moved', 'One pair merged, {m} chapters moved', 'Reading pace, busiest day {n} chapters',
   'Syncing {n} series you have already finished…',
   'This one stops working in {n} days. You can revoke it sooner.',
-  'Tip: hide the languages you don’t read first — only {n} sources can be switched on at once.',
-  '{n} chapters behind across {m} series', '{n} days', '{n} days of reading, {t} chapters in total', '{n} languages',
+  '{n} chapters behind across {m} series', '{n} days', '{n} days of reading, {t} chapters in total',
   '{n} of {m} chapters match', '{n} of {m} sources answered · still asking {names}', '{n} of {m} sources answered · still asking {name}',
   '{n} pairs could not be merged', '{n} pairs merged, {m} chapters moved', '{n} series would move',
-  '{n} sources in {m} providers', '{n} versions', 'quiet — no release in {n} days', 'waiting for {g} · {n} days left',
+  '{n} versions', 'quiet — no release in {n} days', 'waiting for {g} · {n} days left',
   'failed {n} times',
   '{n} titles matched', '{n} chapters listed', '{n} chapters listed · none fetched yet',
   '{n} chapters saved', '{n} chapters qualify right now.', '{n} chapters qualify today and would go on the first run.',
   'Fetch {n} chapters again?', '{n} fewer chapters than the current pick',
 ];
 /** What SHIPPED_UNPAIRED may hold at most: lower it with every entry fixed, never raise it. */
-const SHIPPED_UNPAIRED_MAX = 37;
+const SHIPPED_UNPAIRED_MAX = 33;
 
 test('counted strings come in pairs: every "1 chapter" has its "{n} chapters", and back', () => {
   // Reintroduce by deleting the singular of a pair from the app -- `tr('Refreshed — 1 extension available')`
@@ -281,11 +304,18 @@ test('counted strings come in pairs: every "1 chapter" has its "{n} chapters", a
     if (Object.values(IRREGULAR_PAIRS).includes(k)) continue;
     for (const c of counts(k)) {
       // A plural half is `{n}` before a plural noun; `{n} failed` pairs with "1 failed" but is not asked to.
-      if (!c.one && !/^\p{Ll}+s$/u.test(c.word) && !AGREES_ABROAD.test(c.word)) continue;
+      if (!asksPair(k, c)) continue;
       if (!otherHalf(all, k, c.at, c.one)) lonely.push(`${k} has no ${c.one ? 'plural' : 'singular'}`);
     }
   }
   assert.deepEqual(lonely, [], `counted strings without their other half: ${lonely.join(' | ')}`);
+  // A state word asks for its pair only where it ends the phrase. Reintroduce the old rule (no STATE_WORD): "{n} on
+  // is not asked for its 1-form" fails here, and without onText's '1 on' the loop above fails as "{n} on has no singular".
+  const ask = (k: string) => counts(k).some((c) => !c.one && asksPair(k, c));
+  assert.equal(ask('{n} on'), true, '{n} on is not asked for its 1-form');
+  assert.equal(ask('2 languages · {n} on'), true);
+  assert.equal(ask('{n} off · 2 sources'), true);
+  assert.equal(ask('{n} on server'), false, 'a place ("on server") is asked to agree');
   // The matcher itself: the whole key, not its first noun.
   const probe = ['1 chapter behind', '{n} chapters saved', '{n} chapters behind', '1 older chapter not here', '{n} older chapters not here',
     '1 source needs a look', '{n} sources need a look', '1 chapter saved.', '{n} chapters saved,'];

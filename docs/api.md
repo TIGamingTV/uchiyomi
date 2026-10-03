@@ -153,6 +153,20 @@ declares no single language, which means it belongs to every language group), `l
 browsed without a query), `popular` (whether it can offer its own popularity ranking), `used` (how many
 series in the library came from it), its health `status`, and `note`.
 
+**MangaDex in other languages** (since v0.52.0, #123). `mangadex` is MangaDex in English, always on. Every other
+language an admin switches on (`mangadexLangs` on `PATCH /api/admin/settings`) is a source of its own, with the id
+`mangadex-<code>` and the name "MangaDex (ES-419)" (`mangadex-es-419`, `mangadex-pt-br`, `mangadex-zh-hant`, …) and
+`lang` set to the app code. Its search and Popular find only titles with chapters in that language, its Newest is
+its newest chapters, and its chapter list is that language only, with no fallback; English search is unfiltered and
+English's chapter list still falls back to other languages for a title with no English. Newest, in every language
+including English, is the newest chapters in that language (`/chapter` ordered by `readableAt`) and the series they
+belong to, so a title whose last English chapter is old no longer heads English Newest because of an upload in
+another language. Every MangaDex source shares one rate limit: a 429 pauses all of them until the moment MangaDex
+names, and a request that would wait more than ten seconds is refused without being sent (a listing counts it as
+slow, never as a cooldown). Each carries `extension: {pkgName: "mangadex", name: "MangaDex"}`, so a client can
+show them as one provider. A chapter's `lang` on a MangaDex copy is the app code (`es-419`, never MangaDex's
+`es-la`).
+
 `status` is `ok`, `disabled`, or, while a cooldown is running, one of `rate_limited` / `blocked` / `down`.
 It is also `quiet`, which means the source answers without error and returns nothing: a listing that has
 stopped parsing never throws, so it never earns a cooldown, and before this existed such a source kept
@@ -219,6 +233,26 @@ does not). Everything else is reported with a reason and a suggested fix, and ad
 for what is new. Answers **409** while a sweep is running (since v0.49.0 with its `progress`, so a client can
 follow that one instead). It no longer touches extensions -- that is its own scheduled task,
 below, because the engine has to re-read its repositories before "an update is available" means anything.
+
+`GET /api/admin/sources/overview` (admin, since v0.54.0) is every source the server knows, of every kind, in one
+answer -- the one Sources section's list: `{sources, attention}`. Each source is `{id, name, kind: builtin|mangadex|
+site|extension|pack, lang, pkgName? (extensions), standing, offBy, state, stage, cooldown, offline, main, followed,
+withBackup, lastTestedAt, icon, address? (sites)}`: `state`, `stage`, `cooldown` and `offBy` are Source health's own
+(`ok` when Health has nothing to say), `standing` the series' Sources sheet's, `main` the series whose main source it
+is, `followed` the series that follow it without it being their main, `withBackup` of `main` the series a working
+follower would take over (the Replace preview's count), `offline` a confirmed site-offline notice. `attention` is
+`{replace, failingUnused, updates}`: the sources off or failing that are some series' main source, the findings on
+sources no series uses (Health's `unused` group), and installed extensions with an update waiting. The sources in
+`attention` come first, then by `main + followed`, then by name; switched-off sources last. The engine's own state
+stays `GET /api/admin/extensions/status`'s.
+
+`POST /api/admin/sources/:id/retire {how?: 'off'|'remove'}` (admin, since v0.54.0) retires a source no series has as
+its main source -- **409** `in_use` with `main` and `messageSaid` (`retire.inUse`) while one does: Replace it first.
+Every series' follow of it is dropped with its listing rows; then `off` (the default) switches it off, and `remove`
+takes a site added by address out of the site list (`done: removed`), switches an extension's source off in its
+extension (`done: switched_off`; the extension stays installed), and only turns anything else off (`done:
+turned_off`). It answers `{ok, done, followsDropped}`, audited `source.retire`. `DELETE /api/admin/sources/custom/:id`
+answers the same **409** `in_use` while the site is some series' main source.
 
 `PATCH /api/admin/sources/custom/:id` (admin) changes a custom site's `base` address and nothing else. The
 source id is derived from its name and the library is keyed on that id, so editing in place is the only way
@@ -295,7 +329,8 @@ chapters with it; either way they leave the day's activity feed and the download
 `done: false` with no results while the other sources are asked, then one entry per candidate in the order
 given, `{source, name, theirTitle, followed, coverage, why}`, with `why` one of `followed`,
 `numbering_differs` (under 90% of the primary's numbers listed there or, when judged both ways, under 90%
-of its numbers listed here — the rule above), `title_differs`, `unreachable` (threw or timed out — never
+of its numbers listed here — the rule above), `language_differs` (since v0.52.0, #123: it is in another language than
+the series, and nothing was asked), `title_differs`, `unreachable` (threw or timed out — never
 mistaken for "lists nothing"), `too_few_listed` (the primary lists under three numbers; nothing was
 asked), `not_tried` (the 90-second wall ran out first, or the judgement itself failed before any source
 was asked — every candidate then reads so, rather than the card finishing with an empty list), `cap`
@@ -488,7 +523,10 @@ and since v0.48.2 folders it could not look into at all), and since v0.48.2 `dow
 file in the downloads folder that is not in the library, per folder, with the reason when the scan knows it, and
 since v0.50.0 `saved-twice`: series where two sources' splits of one chapter are both on disk, each item with
 `bookIds` and `numbers` for the files that arrived later and the `delete` action (nothing is deleted by the check
-itself). Each check reports `status` (`ok`, `warn`, `problem`), a
+itself), and since v0.52.0 `folders-twice`, only while the downloads folder sits inside the library or the library
+inside it (by path, or met by the last scan's walk however it was mounted): `warn`, one item naming where, and the
+fix in its note -- every chapter in the inner folder is otherwise scanned twice. Each check reports `status` (`ok`,
+`warn`, `problem`), a
 one-line `summary`, and the individual `items`. A check is `ok` exactly when none of its items is a finding:
 an item flagged `info` is listed for reference (a source you turned off, a source no series uses, a chapter
 already confirmed short, a gap the nightly repair has already searched for) and never decides the verdict.
@@ -512,7 +550,7 @@ params?, join?}` — `code` stable (`gaps.live`, `sources.failing`, `job.partial
 `pref.noChoice`, a diagnosis's `fix.moved`…), `params` what fills it (counts as numbers, moments as ISO strings,
 names, file names and a system's own error text as strings), and, in a field that is a list, `join` how a part
 joins the one before it (`clause` "a; b" when absent, `sentence`, `then` — a sentence that opens on a name, left as
-it is — `period`, `dash`, `dashCap`, `paren`, `colon`).
+it is — `period`, `dash`, `dashCap`, `paren`, `colon`, and since v0.53.0 `dot`, "a · b").
 The fields: a check's `summarySaid` and `noteSaid`, an item's `detailSaid` and `titleSaid`, a diagnosis's
 `fixSaid` (its `reason` is its `code`'s sentence), a download card's and an activity entry's `reasonSaid` (a list),
 a run card's `reasonSaid`, a refusal's `messageSaid`, and a numbering answer's `errorSaid`. The English is
@@ -565,6 +603,22 @@ disabled*, the check is `warn` with the summary *It cannot use its Cloudflare he
 there is a setting to write and a helper (`FLARESOLVERR_URL`) to share. A `frozen-series` item for an extension
 series now names the engine when it is the reason (*can't be reached because the extension engine isn't answering*
 / *is off*).
+
+**Source health's groups** (since v0.53.0). Every `sources` item carries `group`: `affected` (a finding on a source
+series use), `unused` (a finding on a source no series uses — a confirmed failure is a finding whatever uses it, so
+it is grouped apart rather than hidden), `quiet` (listed for reference: a cooldown on a source nothing uses, a test
+that ran out of time, a failure unchecked for seven days, an ignored finding) or `off` (switched off, with `offBy`:
+`admin` under Providers, `extension` in Admin → Extensions, or `language` for a language hidden in every extension —
+where it comes back on). The check lists them in that
+order: `affected` by series, most first, then blocked or failing before slow or empty; the other three by name.
+`state` is the row's one state — `blocked`, `failing`, `slow`, `empty`, `inconclusive`, `untested` or `off` — with
+`stage` for failing, inconclusive and untested, and `cooldown` `{status, until}` for blocked (`until` null when no
+cooldown is set), so a client picks a row's words and its one key without reading `detail`; `icon` is true when the
+source has an extension's logo, which `GET /img/sources/icon/:id` serves. The summary counts the first two groups —
+*3 sources your series use need a look · 5 sources nothing uses are failing* (`sources.affected`,
+`sources.failingUnused`, joined by `dot`) — and with neither says *All sources are working* (`sources.working`), or
+*Nothing is failing that your library uses* while quiet rows are listed. The status is decided as before: `warn`
+while any finding remains.
 
 **Chapter numbering and the slow archive** (since v0.49.0). A new check, `numbering` (#116, *Chapter numbering*),
 lists the series whose numbering has something to say, each item with `seriesId` and `sourceId` (the numbering
@@ -755,6 +809,37 @@ Komga backend. `name` is the one Health uses: the loaded source's, else the name
 else the id; `installed` is false while a source is not loaded (its extension gone or switched off, or the
 engine down).
 
+**Language editions of one work** (since v0.52.0, #72). Blue Lock in English and in Spanish are two series —
+each with its own folder, chapters, sources and reading progress — linked as editions of one work. Every series
+DTO carries `lang` (the BCP-47 code it is in: its own, else its main source's declared language, else the
+server's unstated language, English by default; also `metadata.language`), `workId` (or null), and from the list
+routes `edition: {langs} | null`, the work's languages the caller may browse. `GET /api/series/:id` carries
+`edition: {workId, editions: [{seriesId, lang, title, booksCount, current, lastRead}]} | null` instead, the
+editions the caller may open, oldest first; admins also get `langStated` and `langAuto` (what "Automatic"
+means). `POST /api/series/search {collapseEditions: true}` (the Library grid) answers one series per work — the
+edition the caller read last, else the oldest — and counts works in `totalElements`. An edition is added with
+`POST /api/sources/add {edition: {of, lang?, ofLang?}}` into its own folder, `<source>/<title> (<LANG>)`; `GET
+/api/sources/edition-candidates ?seriesId=` lists the languages the sources offer and, with `&lang=`, searches
+them for the work. Discover's `inLibrary` now means held in that source's language, with `libraryLangs` beside
+it, and a `duplicate` from a source in a new language carries the offer `edition: {of, heldLangs, lang}`. Admins
+link two series already here with `POST /api/admin/series/:id/editions {with, lang?, withLang?}` (Health's "Link
+as editions" on a duplicate pair in two languages), unlink with `DELETE /api/admin/series/:id/edition`, and
+state a series' language with `PATCH /api/admin/series/:id {lang}`. The age rating set in Edit details is the
+work's, a merge inside one work is refused (`same_work`), and a work left with one edition — by an unlink, a
+merge or a forget — dissolves. The Komga-compatible API and OPDS keep every edition a series of its own and
+title it with its code, "Blue Lock (ES-419)", while a sibling is in the caller's sight; a tracker push never
+goes below what another series on the same tracker entry has sent.
+
+**Mark caught up** (since v0.52.0, from discussion #72). `PATCH /api/admin/series/:id {chapterFloor:
+'caught_up'}` floors a series just above the newest chapter its sources list or the library holds, as a
+"Nothing yet" add does: the back catalogue is not fetched, every later release is. The answer's
+`chapterFloor: {floor, previous}` is the Undo: `{chapterFloor: previous}` (a number, or null) puts the old floor
+back.
+
+**Where things are on disk** (since v0.52.0, #136, admins only). `GET /api/series/:id` carries `paths`, the
+series' folder as full paths on the server — one per root its chapters are under — and each chapter of `GET
+/api/series/:id/books` its file's `path`.
+
 **Where a series and its chapters came from.** `GET /api/series/:id` carries `sources`, primary first, then
 any source the series has been followed on (`POST /api/admin/series/:id/sources`, below); each entry is
 `{sourceId, name, sourceSeriesId, primary, checkedAt, chapters, registered, auto}`, where `registered` says
@@ -881,6 +966,7 @@ GET    /api/discover/trending     POST   /api/sources/fill/scan
 GET    /api/sources/fill/scan/:id POST   /api/sources/fill
 POST   /api/sources/fetch
 GET    /api/sources/archive       POST   /api/sources/archive
+GET    /api/sources/edition-candidates
 POST   /api/sources/archive/:seriesId/pause
 POST   /api/sources/archive/:seriesId/resume
 DELETE /api/sources/archive/:seriesId
@@ -1100,20 +1186,25 @@ POST   /api/sources/runs/:kind/cancel
 DELETE /api/sources/runs/:kind
 GET    /api/admin/sources         POST   /api/admin/sources/:id/:action
 POST   /api/admin/sources/:id/test
+POST   /api/admin/sources/:id/retire GET    /api/admin/sources/overview
 POST   /api/admin/sources/check   GET    /api/admin/sources/check
 POST   /api/admin/sources/find    GET    /api/admin/sources/find
 POST   /api/admin/sources/find/stop
 POST   /api/admin/sources/find/:runId/follow
 POST   /api/admin/sources/find/:runId/dismiss
+POST   /api/admin/sources/find/:runId/promote
+GET    /api/admin/sources/:id/replace-preview
 POST   /api/admin/sources/reload  GET    /api/admin/sources/custom
 POST   /api/admin/sources/custom  DELETE /api/admin/sources/custom/:id
 PATCH  /api/admin/sources/custom/:id
 PUT    /api/admin/series/:id/art  PUT    /api/admin/series/:id/meta
 POST   /api/admin/series/:id/hero/shuffle
 PATCH  /api/admin/series/:id      DELETE /api/admin/series/:id
+POST   /api/admin/series/:id/editions DELETE /api/admin/series/:id/edition
 POST   /api/admin/series/bulk/hide
 GET    /api/admin/series/:id/scanlators GET    /api/admin/scanlators
 POST   /api/admin/series/:id/sources DELETE /api/admin/series/:id/sources/:sourceId
+POST   /api/admin/series/:id/main-source
 GET    /api/admin/series/:id/alt-titles POST   /api/admin/series/:id/alt-titles
 DELETE /api/admin/series/:id/alt-titles/:norm
 GET    /api/admin/libraries       POST   /api/admin/libraries
@@ -1149,7 +1240,8 @@ PATCH  /api/admin/import/candidates/:cid
 **Server settings.** `GET /api/admin/settings` is the one row: `server_name`, `allow_registration`,
 `updater_hours`, `extension_hours`, `extension_auto_update`, `update_check`, `install_ping`, `install_ping_last`,
 `cleanup_read`, `cleanup_read_days`, `backup_hour`, `scanlator_prefs`, `auto_follow_on_failure`,
-`repair_enabled`, `source_prefs`, `group_upgrade`, `borrow_names`, plus `extensions_configured` (computed). `auto_follow_on_failure` defaults to true and
+`repair_enabled`, `source_prefs`, `group_upgrade`, `borrow_names`, `mangadex_langs`, `unstated_lang`, plus
+`extensions_configured` and `mangadex_available` (computed). `auto_follow_on_failure` defaults to true and
 controls the bounded once-per-series-per-day source hunt after an ordinary scheduled-download failure; it
 never makes an interactive Add/Fetch hunt and never runs after a refusal. `PATCH
 /api/admin/settings` takes any subset of `serverName` (1–64 chars), `allowRegistration`, `updaterHours`
@@ -1161,7 +1253,17 @@ after; `GET /api/admin/tasks` shows the backup's `schedule` as `daily at HH:00` 
 `borrowNames` (chapter names from another source, off by default; switching it off clears the names it wrote),
 `autoFollowOnFailure`, and `repairEnabled` (the nightly library repair, on by
 default — switching it off stops the schedule only, since nothing it does deletes, merges or renumbers
-anything). Each field is written on its own, an out-of-range value is a **400** and nothing is written, and
+anything). Since v0.52.0 it also takes `mangadexLangs` and `unstatedLang`: `mangadexLangs` is the MangaDex
+languages besides English to switch on, replaced whole, as app codes from `mangadex_available` (every language
+MangaDex is offered in, English first; MangaDex's own `es-la`, `pt-br`, `zh`, `zh-hk` are read as `es-419`, `pt-BR`,
+`zh-Hans`, `zh-Hant`). It is applied at once: each language turned on is registered as its own source, each turned
+off is unregistered, and its series keep their chapters and read as frozen on the Health page until it is back.
+English is always on and is refused (**400** `english_always_on`), as is a code MangaDex is not offered in (**400**
+`unknown_language`); a change is audited as `settings.mangadex_langs` `{from, to}`. `unstatedLang` is the language
+of sources and series that do not say which they are in (English by default, `unstated_lang` on GET): a source is
+followed for a series automatically only when both are in the same language. Any one language is accepted and
+normalised (`pt-br` is `pt-BR`); `all`, `other` or an empty string is a **400** `unknown_language`. Each field is
+written on its own, an out-of-range value is a **400** and nothing is written, and
 the audit row `settings.update` carries the body. The admin console's Settings tab sends one
 row per PATCH as each row is changed (the read-chapter confirmation carries the day count with the switch).
 
@@ -1303,7 +1405,7 @@ compared case-insensitively with spaces and punctuation ignored. The server-wide
 `scanlator_prefs` on `GET /api/admin/settings`, written whole through `PATCH /api/admin/settings
 {scanlatorPrefs}` (`priority` up to 50 names, `blocked` up to 200, `patienceDays` an integer 0–30 or
 `null`; the default is nothing ranked, nothing blocked, two days). A series can carry its own through
-`PATCH /api/admin/series/:id`, whose body is now `{autoUpdate?, scanlatorPrefs?, sourcePrefs?, borrowNames?}` — at least one, no other
+`PATCH /api/admin/series/:id`, whose body is now `{autoUpdate?, scanlatorPrefs?, sourcePrefs?, borrowNames?, lang?, chapterFloor?}` — at least one, no other
 fields, each written on its own, and `scanlatorPrefs: null` clears the series' set. The two merge:
 **blocked is the union**, a series **priority replaces** the global list, and a series `patienceDays` of
 `null` **falls back** to the global one. A copy whose known groups are all blocked is dropped before the
@@ -1603,8 +1705,14 @@ judgement on the server, starting from that rule (`followable()` in `lib/fill.ts
 the admin looking at each candidate; there from the add's own listing plus the candidate's title, and the
 numbering both ways unless the title is exact on a listing of at least ten (`lib/autoFollow.ts`, described
 under the add route). Neither takes a bare pair on trust, which would let a client follow anything it
-could name. Refusals: **409** `plan_stale` (scan again), `is_primary`, `source_unavailable` (adapter not
-loaded or disabled); **400** `not_in_plan`, `not_followable` (with `reason` and `coverage`), or
+could name. Refusals: **409** `plan_stale` (scan again), `is_primary` (since v0.54.0 also for a plan's candidate
+that has become the main source since the plan was made), `source_unavailable` (adapter not
+loaded or disabled), and since v0.52.0 (#123) `language_differs` -- the source is in another language than the
+series; the scan never offers one, so only a plan from before the series' language changed meets it. Its `message`
+and `messageSaid` (`follow.languageDiffers`, `{theirs, ours}` as language codes) name both, and `edition: {of, lang}`
+is the add route's edition to add instead -- or, when the work already holds an edition that may follow the source,
+`edition` also carries `existing: {id, lang}` (that edition's series id and language) and the sentence is
+`follow.languageDiffersEdition` (`{theirs, ours, edition}`): follow it on that edition instead; **400** `not_in_plan`, `not_followable` (with `reason` and `coverage`), or
 `bad_request` when the plan belongs to another series; **404** for an unknown series. Following the same source again updates its
 series id and coverage, and makes a follower the add-time path chose the confirming admin's (`auto:
 false`). `DELETE /api/admin/series/:id/sources/:sourceId` stops following it (**404** when
@@ -1616,6 +1724,32 @@ With a follower in place, the updater takes each missing number from whichever f
 best copy — a ranked group first, then a hosted copy over an external link, then the primary over the
 followers in the order they were added, then the earliest release — and a series whose primary is in a
 cooldown still updates from a follower that answers; it is `blocked` only when every followed source is.
+Since v0.54.0 a source an admin switched off (`POST /api/admin/sources/:id/disable`) is asked for nothing by the
+sweep, *Check now* or a listing refresh -- not its chapter list, and not a chapter, even one chosen before it was
+switched off (another followed source's copy of the number is taken instead): before, only *Fetch newest* left it
+alone. A series whose every source is switched off is not asked at all: the sweep counts it as `off` (not a
+failure), stamps nothing and leaves its listing standing. The sweep's queues follow the source each series is
+asked through -- the first it follows that is loaded and not switched off -- so a dead main source's cooldown no
+longer parks series that update from their followers.
+
+**Making a follower the main source** (since v0.54.0). `POST /api/admin/series/:id/main-source {sourceId, old?}`
+makes a source the series already follows its main source -- only a followed one: its follow is the "same series?"
+judgement already made, and the sweep already merges its chapters, so the switch changes which source wins a tie
+and the label, not which chapters arrive. The pair moves under the series row's lock and the promoted row leaves the
+followers. `old` says what becomes of the old main: `auto` (the default) keeps it as the last follower while it still
+carries the series (`standing` usable or cooling) and the follower cap has room; `keep` and `drop` decide. A dropped
+old main takes its listing rows with it, as an unfollow does, and the chapters capped against it get their tries back
+for the new main. A series whose language was only inferred from its main source is pinned to that language when
+the new main would say otherwise (`langPinned`), so the language guard, its editions and Komga's `language` do not
+change by the way. Its last-check figures, folder, cover, reading direction and floor stay. It answers `{ok, from, to,
+old: kept|dropped, langPinned?, sources}` (read before the listing refresh it starts through the new main), **404**
+`not_found`, or **409** with `message` and `messageSaid`: `is_main`, `not_followed`, `posting_order` (the series
+takes its chapters from its numbering source alone), `renumber_pending`, `busy` (a check, the sweep or a listing
+refresh is inside the series), `source_unavailable` (not loaded, switched off, or beyond the admin's age reach),
+`moved` (the main changed meanwhile) or `language_differs` (with `edition`, as the follow route answers it). Audited
+as `series.main_source` with `via: manual`. Each entry of `sources` (here, in the follow and unfollow answers and in
+`GET /api/series/:id`) carries `standing`: `usable`, `cooling`, `failing` (a confirmed failure at the chapter list,
+the pages or the images, or the site's own offline notice), `off` (switched off) or `not_loaded`.
 `GET /api/admin/series/:id/check` now reports `waiting` alongside `added`: the number of missing chapters
 held back for a ranked group (omitted when none). The `frozen-series` health check lists a series whose
 primary is gone but which still follows a live source as information rather than a warning.
@@ -1643,9 +1777,10 @@ given) or `{sourceId}` (every series whose **main** source that is -- the "this 
 background run and answers **202** `{runId, total}`; **409** `{error: 'busy', runId}` while another is going,
 **400** `empty_scope` when nothing named is a series this admin may see (or `bad_request`). Per series it skips a
 series numbered by posting order (`why: posting_order`) or already following two sources (`full`); otherwise it
-searches the sources the series may reach (an adult source only for an adult series) in scan order -- never its
-main source, never one it follows, never one disabled or cooling down -- under its title and up to three other
-names, stops once the free follower slots are filled or three sources carried the title, judges each candidate as
+searches the sources the starting admin may reach (their own age cap, as Discover and the manual follow route read
+it: an admin reaches every source, including extensions flagged adult) in scan order -- never its main source,
+never one it follows, never one disabled or cooling down -- under its title and up to three other names (a series
+with none stored is first given the ones its stored description, or else its main source's, lists), stops once the free follower slots are filled or three sources carried the title, judges each candidate as
 the add's auto-follow does, and follows the ones that qualify with the admin as their author. It waits while a
 sweep, a repair or the daily source check runs, paces 1.5 s between series that searched, gives a series 90 s, and
 its searches report nothing to source health (a site that fails one is neither put in a cooldown nor marked
@@ -1653,7 +1788,10 @@ failing). `GET /api/admin/sources/find` answers `{running, run, recent}`: `run` 
 newest, `{id, status: running|done|stopped|failed|interrupted, total, done, followed, startedBy (a username),
 startedAt, finishedAt?, sourceId?, sourceName?, current?: {seriesId, title}, waiting?: sweep|repair|check,
 results: [{seriesId, title?, followed: [{sourceId, name, chapters}], why?}]}`, and `recent` the newest 20 runs
-without `results` or `current`. `why` is set when nothing was followed, and says exactly what happened. Decided
+without `results` or `current`. Since v0.52.0 `?runId=` reads that kept run in full as `run` instead, an earlier
+search reopened (a review-first run's matches can still be decided there), or **404** `not_found` when no kept run
+has that id. `done` counts the series searched through: a series a stop cut short with nothing to show is listed
+as `not_tried` and, since v0.52.0, not counted (runs kept from before count it). `why` is set when nothing was followed, and says exactly what happened. Decided
 without a search: `posting_order`, `full` (two sources followed already), `too_few` (fewer than three chapter
 numbers, which nothing can be measured against) and `no_source` (no other source to ask: all turned off, cooling
 down or excluded). After one: `refused` (a candidate failed the title and chapter-number check), `no_answer`
@@ -1672,7 +1810,14 @@ and the counts (each follow as `series.follow_source` with `via: find_sources`).
 `current` (hidden like any run's), `downloads: false`, and `waiting` (`sweep`, `repair` or `check`, as the run's
 own `waiting`) while it waits for one of those. On Health, a failing (or turned-off) source that is some
 series' main source carries the action `find_sources` with `findSeries`, and so does a "Series that can no longer
-update" row whose reason is its source.
+update" row whose reason is its source. Since v0.54.0 such a source row carries `replace_source` before it, when the
+source is switched off or failing at a step an update needs (the chapter list, the pages or the images, or the
+site's own offline notice; not a cooldown, not a failure at search alone): the replace mode below. The
+`frozen-series` check also lists a series whose main source is loaded but switched off or failing
+(`frozen.failing` {n, source, offline}) and that follows nothing that can update it -- a follower counts only while
+it is usable or cooling down -- with `replace_source` and `find_sources`; a series that still has such a follower is
+`info` (`frozen.followingDown` {source, state, names}) with `replace_source`. A main that is only cooling down is not
+listed.
 
 **Review first** (since v0.51.0, #132; @TIGamingTV's idea from PR #133). `POST /api/admin/sources/find` with
 `review: true` runs the same search and the same judgement, follows nothing, and keeps what it found: the run
@@ -1688,9 +1833,47 @@ checked again (the series visible and not numbered by posting order; the source 
 source, reachable for the series' rating, and not followed already -- never re-pointed), then written under the
 follower cap with the admin as its author, its listing refreshed, and audited as `series.follow_source` with `via:
 find_review`; it answers `{result}`, the series' result as it now reads, or **404** `not_found`, **409** `decided`
-(with `state`), `posting_order`, `source_unavailable`, `already_followed` or `full`. `POST
+(with `state`), `posting_order`, `source_unavailable`, `language_differs` (since v0.52.0: the source is in another
+language than the series, with `edition: {of, lang}`, the add route's edition to add instead, and `existing: {id,
+lang}` in it when the work already holds an edition that may follow the source, as the manual follow answers it),
+`already_followed` or `full`. `POST
 /api/admin/sources/find/:runId/dismiss {seriesId, sourceId}` dismisses one for good. `state` is `followed` or
 `dismissed`. A series the viewer may not list keeps its proposals without `title`, `coverUrl` and `url`.
+
+**Replace** (since v0.54.0). `POST /api/admin/sources/find {sourceId, mode: 'replace', review?, turnOff?}` runs the
+same one-at-a-time job over every series whose main source is `sourceId`, and MOVES them off it: the series that
+follow other sources first. Per series, its best working follower becomes its main source at once -- no search, no
+pacing -- exactly as `POST /api/admin/series/:id/main-source` switches, the replaced source dropped from it. A follower
+may take over when it is usable or cooling down, in the series' language and within the starting admin's age reach;
+the best is the one that answered with its list within the week, then the one listing the most of the series'
+numbers (in tenths), then the admin's source order, then the one furthest ahead, then the follow order -- a cooling
+one only after every usable one. A series with none is searched for as Find does, its dead followers (failing, not
+loaded, switched off) not counting against the cap and dropped -- worst first, with their listing rows -- only as far
+as a follow needs the room; the first source it follows becomes its main source. A series numbered by posting order
+(`posting_order`), waiting for a renumber (`renumber_pending`), no longer on the source (`moved`), or with a sweep, a
+check or a listing refresh inside it for 30 s (`busy`) is left alone. Each result adds `promoted: {from, fromName,
+to, toName, via: follower|search, old: dropped|kept}` (and then no `why`), `skipped: [{sourceId, name, why: off|
+failing|cooling|not_loaded|language|age}]` (the followers passed over) and `dropped: [{sourceId, name}]`. The run reads
+`mode: 'replace'` and `promoted` (counted from its results; in `recent` too), and in full `left` (the series on the
+source now) and `turnedOff` (whether it is switched off now); its card in `GET /api/sources/jobs` carries `mode`,
+`promoted`, `left` and, once ended, `turnedOff`, and -- as the card of any run over one source's series does --
+`sourceId` and `sourceName`, the run's summary's: Admin → Sources and Health find a Replace run going for a source by
+them. `turnOff: true` (Replace only, never with `review`: **400**) switches
+the source off when the run ends done with no series left on it, and drops it from every series' followers with
+their listing rows (audited `source.retire`); a stopped run, or one that left a series behind, turns nothing off.
+Every switch is audited as `series.main_source` with `via: replace` and the run's id; `source.find` adds `mode`,
+`promoted`, `left` and `turnedOff`. With `review: true` nothing is written: a series with followers that could take
+over carries them as proposals with `kind: follower` (best first, `amber: cooling|coverage|stale` where one should be
+looked at, `newer`, `standing`), a series with none what its search found with `kind: search`, and the one the run
+would promote is marked `promote: true`. `POST /api/admin/sources/find/:runId/promote {seriesId, sourceId}` applies
+one: a follower's is switched to; a search's is checked as a follow, followed under the cap and switched to. It answers
+`{result}` (the proposal `promoted`, the result's `promoted`), **404** `not_found`, or **409** `decided` (with `state`),
+`posting_order`, `source_unavailable`, `language_differs` (with `edition`), `full`, `moved`, `busy`,
+`renumber_pending`, `not_followed` or `is_main`, with `messageSaid` where it has one. Find and Replace share the one
+run at a time (**409** `busy`). `GET /api/admin/sources/:id/replace-preview` answers what a Replace run over the
+source would do, counted as the run decides it: `{main, withBackup, toSearch, postingOrder, busy}` -- the series
+whose main source it is, those a working follower takes over at once, those it would search for, those numbered by
+posting order (left alone), and whether a run is going.
 
 ### Admin — extensions (Mihon / Tachiyomi)
 
@@ -1740,6 +1923,21 @@ language is null is reachable only by id. `GET /api/admin/extensions/sources` ca
 overview as `langs` (sources, enabled, series that came from them, hidden), unaffected by its `q`/`lang`
 filters, and `GET /api/admin/extensions/status` reports `registered`, `skipped` and `cap` so the
 `SUWAYOMI_MAX_SOURCES` overflow is visible rather than a line in the boot log.
+
+**v0.53.0 redesigned Admin → Extensions.** `GET /api/admin/extensions/catalog` answers a page at a time: `offset`
+(from 0) and `limit` (default and maximum 400, so a call with neither still gets the first 400), echoed in the answer
+beside `shown` (the page's length) and `matched` (every match), so the last extension of a 1,300-extension repository
+is as reachable as the first -- it used to stop at 400 and say "narrow the search". `updates=true` keeps only the
+extensions with a newer version waiting, and `hiddenAdult` now counts the 18+ extensions the other filters match (it
+counted the whole catalogue); `adultTotal` is the whole catalogue's 18+ extensions that are not installed, whatever was
+asked, so `total - adultTotal` is how many the list holds without `nsfw=true`. `POST /api/admin/extensions/catalog/:pkgName` takes `enable` beside `install`, `update`
+and `uninstall`: it switches an installed extension's sources on as its install would -- a hidden language's stay off,
+and none is ever switched off -- and asks the engine for nothing but the list, answering `{ ok, sources, on, hidden,
+registered }`, or **409** `no_sources` when the extension is not installed or provides no source; it is audited as
+`extension.enable`. It is what *Turn on its sources* does for an extension installed in the engine's own page, which
+shows as installed with every source off. Rows of `GET /api/admin/extensions/sources` carry `used`, the series that came
+from that source, on or off; and `POST /api/admin/extensions/sources/bulk` records an id the engine lists that Uchiyomi
+has not seen yet before switching it, so a language switch on such a source is not a quiet no-op.
 
 `GET /api/admin/extensions/status` is also what Admin → Extensions' setup screen reads (v0.49.0, #72). With no
 engine to talk to it answers `{ configured: false, reachable: false, off, platform, linkedSeries }`: `off` is
@@ -1879,11 +2077,19 @@ last try that made none, which is left alone for a week — and **404** when a t
 keeps its usual art. Every series in a payload carries `autoHero`: `{seed}` once its banner is made (`v` is that
 seed, a cache-buster only), `null` otherwise — not made yet included, so a client asks only for a banner that is
 there. `POST /api/admin/series/:id/hero/shuffle` (admin) picks a new seed and makes
-the banner with it before switching: `{ok: true, seed}`, or `{ok: false, error: 'not_made'}` with the old banner kept;
-**409** `not_automatic` for a series that may not have one. Banners are made one at a time server-wide: by a paced
+the banner with it before switching: `{ok: true, seed}`, or `{ok: false, error: 'not_made'}` with the old banner kept,
+or since v0.52.0 `{ok: true, seed, same: true}` when the series' pages give no other banner (a short series whose few
+good crops are all on the one it has; nothing changes, and `seed` is the one it had); **409** `not_automatic` for a
+series that may not have one. Banners are made one at a time server-wide: by a paced
 background pass (twenty minutes after start, then daily), for a series soon after its backdrop is asked for, by
 Shuffle, and by this route when its cache misses; the background ones stand aside for a sweep, a repair or the daily
 source check.
+
+**A series' backdrop.** `GET /img/series/:id/backdrop` is the blurred, darkened ambient wash of the series' art; with
+`style=hero&ar=wide|tall` the real art sharp in the home hero's frame (a banner, or a cover shown whole over a blurred
+copy of itself); and since v0.53.0, with `style=banner`, what the series page shows: a real banner -- AniList's or an
+admin's -- sharp and uncropped (at most 1920 wide), and for a series without one the same ambient wash of its cover,
+which looks bad stretched sharp. `av=<n>` is the art version, a cache-buster.
 ```
 GET    /img/series/:id/thumb      GET    /img/series/:id/backdrop
 GET    /img/series/:id/hero

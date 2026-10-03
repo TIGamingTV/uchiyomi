@@ -160,16 +160,18 @@ test('the intake copy names the button that commits, and the review copy tells t
   assert.match(src, /a long list takes a few minutes/, 'the review card does not say how long an import takes');
 });
 
-test('Admin → Providers has one way to import: the reviewed flow', () => {
+test('Admin → Sources has one way to import: the reviewed flow', () => {
   // The PR stacked the new button on top of the old textarea flow ("or, without a review step:"), which still
   // added the first cross-source hit with no review -- two ways to do one thing, one of them the bug the
-  // other fixes. Reintroduce by putting the textarea and its POST /api/admin/import back on the card.
-  const src = code(read('app/admin/page.tsx'));
-  assert.equal((src.match(/router\.push\('\/admin\/import\/'\)/g) || []).length, 1, 'the Providers card does not link to /admin/import/ exactly once');
+  // other fixes. Reintroduce by putting the textarea and its POST /api/admin/import back on the card. Since v0.54.0
+  // the door is a row of Admin → Sources' Add sources (Providers' card before).
+  const src = code(read('app/admin/page.tsx')) + code(read('components/SourcesPanel.tsx'));
+  assert.equal((src.match(/'\/admin\/import\/'/g) || []).length, 0, 'the console pushes to /admin/import/ by hand again');
+  assert.equal((src.match(/<LinkRow href="\/admin\/import\/" label=\{tr\('Import a list'\)\}/g) || []).length, 1, 'Add sources does not link to /admin/import/ exactly once');
   assert.doesNotMatch(src, /'\/api\/admin\/import'[,)]/, 'the one-shot POST /api/admin/import is back in the UI');
   assert.doesNotMatch(src, /\/api\/admin\/import\/(parse|status)/, 'the old parse/status calls are back');
   assert.doesNotMatch(src, /without a review step/, 'the "or, without a review step" fork is back');
-  assert.match(src, /import a list → review matches → add/, 'the card no longer says what the flow is');
+  assert.match(src, /you review every match before anything is added\./, 'the row no longer says what the flow is');
 });
 
 /**
@@ -200,10 +202,10 @@ test('every string the import screens render is in all eight locale files', () =
   // the parity test (library.test.ts) could not see it because it compares the files with each other, not
   // with the code. Reintroduce by deleting any one of these keys from es.json.
   const keys = trKeys(['app/admin/import/page.tsx', 'components/ImportMatchSheet.tsx', 'lib/importBatch.ts']);
-  // The Providers entry card too: it is the door to the page.
-  const admin = read('app/admin/page.tsx');
-  for (const k of ['Import a list', 'Import and review matches →']) {
-    assert.ok(admin.includes(`tr('${k}')`), `the Providers card no longer renders "${k}" through tr()`);
+  // Add sources' row too: it is the door to the page.
+  const door = read('components/SourcesPanel.tsx');
+  for (const k of ['Import a list', 'A Mihon or Tachiyomi backup, a public MangaDex list, or pasted titles: you review every match before anything is added.']) {
+    assert.ok(door.includes(`tr('${k}')`), `Add sources no longer renders "${k}" through tr()`);
     keys.add(k);
   }
   assert.ok(keys.size >= 70, `only ${keys.size} tr() keys found on the import screens — the extractor lost them`);
@@ -496,7 +498,7 @@ test('the profile page opens the tab named in ?tab=, under Suspense', () => {
   assert.match(src, /const PROFILE_TABS = PROFILE_GROUPS\[0\]\.tabs;/, 'the tab list is not the first group\'s tabs');
   assert.match(src, /const \[tab, setTab\] = useTabParam<Tab>\(PROFILE_TABS, 'You'\);/, 'the tab is not read from the query');
   const hook = code(read('lib/useTabParam.ts'));
-  assert.match(hook, /useState<T>\(\(\) => readTab\(params\.get\('tab'\), tabs, fallback\)\)/, 'the hook does not read the query once, lazily');
+  assert.match(hook, /useState<T>\(\(\) => readTab\(params\.get\('tab'\), tabs, fallback, aliases\)\)/, 'the hook does not read the query once, lazily');
   assert.doesNotMatch(hook, /useEffect\(/, 'the hook re-reads the query in an effect');
   // The pure half, called: an arbitrary ?tab= value falls back rather than rendering an empty panel.
   assert.equal(readTab('Bogus', ['You', 'Settings'], 'You'), 'You', 'an arbitrary ?tab= value is not rejected');
@@ -619,8 +621,11 @@ test('the add dialog offers the other sources only when it already holds a list,
   // whatever the switch says ("alsoFollow rides with the switch off" fails).
   const src = code(read('components/AddSeriesDialog.tsx'));
   assert.match(src, /const ALSO_FOLLOW_MAX = 6;/, 'the cap is not six');
-  const memo = src.slice(src.indexOf('const others = useMemo('), src.indexOf('}, [providers, picked]);'));
-  assert.match(memo, /if \(!picked \|\| !providers\) return \[\];/, 'a result seed sends candidates (providers is null there)');
+  // v0.52.0: the list is `offered` -- the seed's providers, or an edition's search in its language -- null all the same
+  // for a result seed.
+  const memo = src.slice(src.indexOf('const others = useMemo('), src.indexOf('}, [offered, picked]);'));
+  assert.match(memo, /if \(!picked \|\| !offered\) return \[\];/, 'a result seed sends candidates (providers is null there)');
+  assert.match(src, /const offered = edSeed \? \(edSearch\.data\?\.providers \?\? null\) : providers;/, 'a result seed has a list to offer');
   assert.match(memo, /if \(seen\.has\(p\.source\)\) continue;/, 'the picked source, or a source twice, can be a candidate');
   assert.match(memo, /return out\.slice\(0, ALSO_FOLLOW_MAX\);/, 'more than six can ride');
   assert.doesNotMatch(memo, /api</, 'others is fetched rather than taken from the list the dialog already has');
@@ -628,7 +633,8 @@ test('the add dialog offers the other sources only when it already holds a list,
   assert.match(src, /const alsoFollowBody = mayFollow && alsoFollow && others\.length && !view\?\.posting \? others\.map\(\(\{ source, sourceId \}\) => \(\{ source, sourceId \}\)\) : undefined;/, 'alsoFollow rides with the switch off, or carries more than the identity');
   // (#116's `numbering` and #117's "Archive the rest slowly" ride after it, pinned in numbering.test.ts and
   // addSeriesDialog.test.ts.)
-  assert.match(src, /json: \{ source: picked\.source, sourceId: picked\.sourceId, chapterCount, chapterFrom, autoUpdate, force, alsoFollow: alsoFollowBody, numbering(?:, \.\.\.\(archiving \? \{ archive: true \} : \{\}\))? \}/, 'the add body does not carry alsoFollow');
+  // (v0.52.0's language edition rides after those, pinned in addSeriesDialog.test.ts.)
+  assert.match(src, /json: \{\s*source: picked\.source, sourceId: picked\.sourceId, chapterCount, chapterFrom, autoUpdate, force, alsoFollow: alsoFollowBody, numbering,?(?:\s*\.\.\.\(archiving \? \{ archive: true \} : \{\}\),?)?(?:\s*\.\.\.\(editionBody \? \{ edition: editionBody \} : \{\}\),?)?\s*\}/, 'the add body does not carry alsoFollow');
   // The switch is on the options step only with candidates, remembered per device under one key.
   assert.match(src, /\{mayFollow && others\.length > 0 && !view\?\.posting && \(\s*<div className="mt-3" data-also-follow>/, 'the switch shows without candidates');
   assert.match(src, /const ALSO_FOLLOW_KEY = 'uchiyomi\.alsoFollow';/, 'the per-device key changed');

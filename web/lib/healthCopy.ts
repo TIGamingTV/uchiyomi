@@ -32,7 +32,7 @@ const CHECK_TITLE_KEYS = keys(
   'Chapter gaps', 'Suspiciously short chapters', 'Chapters that would not download', 'Series that can no longer update',
   'Source health', 'Duplicate series', 'Impossible chapter numbers', 'Cloudflare solver', 'Version',
   'Extension source limit', 'Library scan', 'Downloads missing from the library', 'Extension engine', 'Chapter numbering',
-  'The same chapter saved twice',
+  'The same chapter saved twice', 'Folders scanned twice',
 );
 export const CHECK_TITLES: Readonly<Record<string, (typeof CHECK_TITLE_KEYS)[number]>> = {
   'chapter-gaps': CHECK_TITLE_KEYS[0],
@@ -53,6 +53,8 @@ export const CHECK_TITLES: Readonly<Record<string, (typeof CHECK_TITLE_KEYS)[num
   numbering: CHECK_TITLE_KEYS[13],
   // v0.50.0: chapters downloaded again in another site's split of their parts (bff lib/health.ts savedTwice).
   'saved-twice': CHECK_TITLE_KEYS[14],
+  // v0.52.0 (#134): the downloads folder inside the library, or the library inside it (bff lib/health.ts foldersScannedTwice).
+  'folders-twice': CHECK_TITLE_KEYS[15],
 };
 
 export function checkTitle(c: Pick<HealthCheck, 'id' | 'title'>): string {
@@ -181,12 +183,28 @@ export const ACTION_COPY: Readonly<Record<string, ActionCopy>> = {
   },
   disable: {
     label: () => tr('Turn off'),
-    what: () => tr('Stops asking this source for anything until you turn it back on under Providers. Nothing is deleted.'),
+    // True since v0.54.0, when a switched-off source stopped being asked by the sweep too.
+    what: () => tr('Stops asking this source for anything until you turn it back on in Admin → Sources. Nothing is deleted.'),
     eta: moment,
+  },
+  // v0.54.0: every series whose main source is this one, moved in ONE Replace run (POST /api/admin/sources/find {mode:
+  // 'replace'}): to a source it already follows that works, at once and without a search, else to one the run finds.
+  // The same dialog as Admin → Sources' Replace (components/ReplaceDialog.tsx), which says the numbers first.
+  replace_source: {
+    label: () => tr('Replace'),
+    what: () => tr('Moves every series whose main source this is to a working source: one it already follows, or one found by searching your other sources. It can turn this source off once nothing uses it.'),
+    how: () => tr('A series that already follows a working source switches to it at once, without a search. The others are searched for one at a time, under their titles and other names, and switch only to a match whose title and chapter numbers line up. A series numbered by posting order keeps its main source. Nothing is downloaded and no file moves.'),
+    eta: () => tr('Moments for series that already follow a working source; up to a minute and a half for each one searched for'),
   },
   merge: {
     label: () => tr('Merge'),
     what: () => tr('Makes the two copies one series. Progress, bookmarks, ratings and tracker links move to the kept copy; it cannot be undone.'),
+    eta: moment,
+  },
+  // v0.52.0 (#72): the same work in two languages -- linked as editions, each keeping its own chapters and progress.
+  link_editions: {
+    label: () => tr('Link as editions'),
+    what: () => tr('Keeps both series, each with its own chapters and reading progress, as language editions of one work: the Library shows one card for them. Unlinking from the series page undoes it.'),
     eta: moment,
   },
   // Card-level: the step acts on every source that blames the solver, whatever row was pressed.

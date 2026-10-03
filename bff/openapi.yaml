@@ -6,7 +6,7 @@
 openapi: 3.1.0
 info:
   title: Uchiyomi API
-  version: 0.51.0
+  version: 0.54.0
   description: "Everything the web app does, it does over this API. Session JWTs are for the browser; scripts
     use a personal API token (Profile -> Connections -> API tokens), sent as `Authorization: Bearer uy_...`.
     Scopes: read (every token; GET plus the library search POST, which is a query), write (anything that changes data), admin (the /api/admin surface, which also
@@ -363,7 +363,7 @@ components:
     SeriesSource:
       type: object
       description: One place a series' chapters come from. The primary is the pair the series was added with; the rest were followed later.
-      required: [sourceId, name, sourceSeriesId, primary, checkedAt, chapters, registered, auto]
+      required: [sourceId, name, sourceSeriesId, primary, checkedAt, chapters, registered, auto, standing]
       properties:
         sourceId: { type: string, description: The adapter id. }
         name: { type: string, description: The adapter's display name, or the id when the adapter is not loaded. }
@@ -373,6 +373,19 @@ components:
         chapters: { type: [integer, "null"], description: "For a follower, the distinct chapter numbers it listed then; for the primary, the merged count across every followed source after the release preferences (the same figure as the series' source.chapters)." }
         registered: { type: boolean, description: Whether the adapter is loaded right now; a follower whose extension was removed keeps its row so it can still be unfollowed. }
         auto: { type: boolean, description: "Followed by the add-time auto-follow (POST /api/sources/add alsoFollow) rather than by a person: the row has no author. Always false for the primary. A person confirming the same source through a fill-scan plan turns it false." }
+        standing:
+          $ref: "#/components/schemas/SourceStanding"
+    SourceStanding:
+      type: string
+      enum: [usable, cooling, failing, off, not_loaded]
+      description: >-
+        Since v0.54.0 (bff lib/sourceStanding.ts): whether a series can be updated through the source right now.
+        `off`: switched off -- under Sources (POST /api/admin/sources/{id}/disable) or in the extension's own
+        switches, which also unloads it; `not_loaded`: no adapter by that id is loaded (uninstalled, a site removed,
+        the extension engine away); `failing`: a confirmed, current failure at the chapter list, the page list or the
+        images, or the site's own offline notice at any step (a search failure stops no update); `cooling`: inside a
+        cooldown, which ends by itself; `usable`: none of those. Only a `usable` or `cooling` follower can be made the
+        main source, and only those count as still carrying a series.
     Ghost:
       type: object
       description: A chapter number the sources listed at the last check that this server has no row for.
@@ -697,13 +710,17 @@ components:
               chapters: { type: integer, minimum: 0, description: The distinct chapter numbers that source lists. }
         why:
           type: string
-          enum: [posting_order, full, too_few, no_source, refused, no_answer, followed_already, no_match, not_tried]
+          enum: [posting_order, full, too_few, no_source, refused, no_answer, followed_already, no_match, not_tried, moved, busy, renumber_pending]
           description: >-
-            Only when nothing was followed, and exactly what happened. `posting_order`: numbered by posting order, so
+            Only when nothing was followed (in a Replace run: when nothing was promoted), and exactly what happened.
+            Since v0.54.0, a Replace run: `moved` (the series' main source is no longer the one replaced), `busy` (a
+            sweep, a check or a listing refresh stayed inside the series for 30 s), `renumber_pending` (its chapters
+            wait to be renumbered). `posting_order`: numbered by posting order, so
             no follower is ever merged (not searched). `full`: the series already follows two sources (not searched),
             or another search filled the last slot meanwhile. `too_few`: it lists fewer than three chapter numbers,
             which no candidate can be measured against (not searched). `no_source`: no other source could be asked --
-            every one turned off, cooling down, adult for a clean series, or one it follows already (not searched).
+            every one turned off, cooling down, beyond the starting admin's age cap, in another language than the
+            series (since v0.52.0), or one it follows already (not searched; the server log says which, by count).
             `refused`: a source carried the title and did not pass the title and chapter-number check (another book).
             `no_answer`: the sources asked did not answer, or the one that carried the title did not answer for its
             chapters, so nothing could be judged. `followed_already`: the sources that answered do not carry it, and
@@ -713,9 +730,39 @@ components:
             or during its turn) -- never "not found".
         proposals:
           type: array
-          description: "Since v0.51.0, a review-first run only, for a series it found candidates for: each, in scan order, for an admin to follow or dismiss. Such a series carries no `why`, and `followed` gains each proposal an admin follows."
+          description: "Since v0.51.0, a review-first run only, for a series it found candidates for: each, in scan order, for an admin to follow or dismiss. Such a series carries no `why`, and `followed` gains each proposal an admin follows. In a Replace review (v0.54.0): the series' followers that could take over, best first (`kind: follower`), or what its search found (`kind: search`), the one it would make the main source marked `promote`."
           items:
             $ref: "#/components/schemas/FindProposal"
+        promoted:
+          type: object
+          description: "Since v0.54.0, a Replace run: the series was moved off the replaced source. `via`: a follower it had, or a source its search found and followed. `old`: the replaced source dropped from its followers (always, in a run)."
+          required: [from, fromName, to, toName, via, old]
+          properties:
+            from: { type: string }
+            fromName: { type: string }
+            to: { type: string }
+            toName: { type: string }
+            via: { type: string, enum: [follower, search] }
+            old: { type: string, enum: [dropped, kept] }
+        skipped:
+          type: array
+          description: "Since v0.54.0, a Replace run: the followers passed over, each with why -- off, failing, not_loaded (standing), language (another language than the series), age (beyond the starting admin's age reach), or cooling (a follower in a cooldown that was not the one promoted)."
+          items:
+            type: object
+            required: [sourceId, name, why]
+            properties:
+              sourceId: { type: string }
+              name: { type: string }
+              why: { type: string, enum: [off, failing, cooling, not_loaded, language, age] }
+        dropped:
+          type: array
+          description: "Since v0.54.0, a Replace run: dead followers (failing, not loaded, switched off, worst first) dropped, with their listing rows, to make room under the follower cap for a source the search found."
+          items:
+            type: object
+            required: [sourceId, name]
+            properties:
+              sourceId: { type: string }
+              name: { type: string }
     FindProposal:
       type: object
       description: "A candidate a review-first Find other sources run kept for an admin to confirm, the best one per source (since v0.51.0). For a series the viewer may not list, `title`, `coverUrl` and `url` are left out."
@@ -745,12 +792,20 @@ components:
           description: "`green`: an automatic run would have followed it (title and chapter numbers). `amber`: for a person to look at first, `amber` says why."
         amber:
           type: string
-          enum: [numbering, other_name]
-          description: "`numbering`: a name matches exactly and the chapter numbers do not line up (a title that merely contains the series' with numbers that do not line up -- a sequel's shape -- is never proposed). `other_name`: it lines up, but matched only under another name of the series, not its title."
+          enum: [numbering, other_name, cooling, coverage, stale]
+          description: "`numbering`: a name matches exactly and the chapter numbers do not line up (a title that merely contains the series' with numbers that do not line up -- a sequel's shape -- is never proposed). `other_name`: it lines up, but matched only under another name of the series, not its title. Since v0.54.0, a Replace review's follower: `cooling` (in a cooldown), `coverage` (it lists under 90% of the series' numbers), `stale` (it has not answered for its list within the week)."
         state:
           type: string
-          enum: [followed, dismissed]
-          description: Set once an admin decided; final.
+          enum: [followed, dismissed, promoted]
+          description: "Set once an admin decided; final. `promoted` (since v0.54.0): made the series' main source by POST .../find/{runId}/promote."
+        kind:
+          type: string
+          enum: [follower, search]
+          description: "Since v0.54.0, a Replace review: a follower the series has, or a source its search found."
+        promote: { type: boolean, enum: [true], description: "Since v0.54.0, a Replace review: the one the run would make the main source -- the best follower, or the first green match." }
+        newer: { type: integer, minimum: 0, description: "Since v0.54.0, a Replace review's follower: chapters it lists past what the library holds." }
+        standing:
+          $ref: "#/components/schemas/SourceStanding"
     FindRunSummary:
       type: object
       description: One Find other sources run, without its per-series results (since v0.49.1).
@@ -762,7 +817,7 @@ components:
           enum: [running, done, stopped, failed, interrupted]
           description: "`stopped`: an admin stopped it (POST .../find/stop, or Cancel on its card). `interrupted`: the server went away under it -- a shutdown, where the run closes its own row, or a row found still running after a restart, closed at boot. Either way `results` then lists every series it never reached as `not_tried`, as a stopped run does."
         total: { type: integer, minimum: 0, description: Series in its scope. }
-        done: { type: integer, minimum: 0, description: Series settled so far; a stopped or interrupted run's rest are in `results` as not_tried but not counted here. }
+        done: { type: integer, minimum: 0, description: "Series settled so far; a stopped or interrupted run's rest are in `results` as not_tried but not counted here, and since v0.52.0 neither is the series a stop cut short with nothing to show (runs kept from before count it)." }
         followed: { type: integer, minimum: 0, description: Sources followed, across its series. }
         startedBy: { type: [string, "null"], description: "The admin who started it, by username (never the account id); null for an account since deleted." }
         startedAt: { type: string, format: date-time }
@@ -770,6 +825,8 @@ components:
         sourceId: { type: string, description: The source whose series it was about, when the scope was a source. }
         sourceName: { type: string, description: That source's display name, or its id when it is not loaded. }
         review: { type: boolean, enum: [true], description: "Since v0.51.0: a review-first run, which followed nothing itself; its results carry `proposals`. Absent for an automatic run." }
+        mode: { type: string, enum: [replace], description: "Since v0.54.0: a Replace run, which moved the series of `sourceId` off it. Absent for Find other sources." }
+        promoted: { type: integer, minimum: 0, description: "Since v0.54.0, a Replace run: how many of its series were moved to another main source (counted from its results)." }
     FindRun:
       description: A Find other sources run in full (since v0.49.1).
       allOf:
@@ -788,6 +845,8 @@ components:
               type: string
               enum: [sweep, repair, check]
               description: While it runs, what it is waiting on before its next series.
+            left: { type: integer, minimum: 0, description: "Since v0.54.0, a Replace run: the series whose main source the replaced source is now." }
+            turnedOff: { type: boolean, description: "Since v0.54.0, a Replace run: whether the replaced source is switched off now -- by this run's turnOff, or before." }
             results:
               type: array
               description: "One entry per series settled, in the order they were asked about; after the run ends -- done, stopped or interrupted -- one for every series in its scope, those it never reached as `not_tried`."
@@ -1415,11 +1474,21 @@ paths:
                   type: string
                 condition:
                   type: object
+                collapseEditions:
+                  description: >-
+                    Since v0.52.0. One series per work: of the language editions of one work that pass the filters,
+                    the one this caller read most recently, else the oldest. `totalElements` then counts works. The
+                    Library grid sends it; nothing else does.
+                  type: boolean
       security:
         - bearer: []
       responses:
         "200":
-          description: OK
+          description: >-
+            A page of series. Since v0.52.0 every series carries `lang` (the language it is in: its own, else its
+            main source's, else the server's unstated language), `workId` (the work it is a language edition of, or
+            null) and `edition`: `{langs}` -- the languages of its work this caller may browse, oldest edition
+            first -- or null when that is only this one.
         "400":
           description: Malformed body or parameter
         "401":
@@ -1465,6 +1534,51 @@ paths:
                     description: Where the chapters come from, primary first, then followed sources in the order they were added. Present for every viewer.
                     items:
                       $ref: "#/components/schemas/SeriesSource"
+                  lang:
+                    description: >-
+                      Since v0.52.0. The language the series is in, as a BCP-47 code (`en`, `es-419`, `pt-BR`): its
+                      own, else what its main source declares, else the server's unstated language. Also
+                      `metadata.language`.
+                    type: string
+                  workId:
+                    description: Since v0.52.0. The work this series is a language edition of, or null on its own.
+                    type: [string, "null"]
+                  edition:
+                    description: >-
+                      Since v0.52.0. The language editions of this work the caller may open (removed ones, those in
+                      a library they were not granted and those above their age cap left out), oldest first, or null
+                      when that is only this series. `lastRead` is the caller's highest finished chapter there.
+                    oneOf:
+                      - type: object
+                        properties:
+                          workId: { type: string }
+                          editions:
+                            type: array
+                            items:
+                              type: object
+                              properties:
+                                seriesId: { type: string }
+                                lang: { type: string }
+                                title: { type: string }
+                                booksCount: { type: integer }
+                                current: { type: boolean }
+                                lastRead: { type: [number, "null"] }
+                      - type: "null"
+                  langStated:
+                    description: Admins only (since v0.52.0). Whether `lang` is the series' own (stated) rather than inferred.
+                    type: boolean
+                  langAuto:
+                    description: >-
+                      Admins only (since v0.52.0). The language the series would be in with none of its own: what its
+                      main source declares, else the server's unstated language -- Edit details' "Automatic".
+                    type: string
+                  paths:
+                    description: >-
+                      Admins only (since v0.52.0, #136). The series' folder as full paths on the server, one per root
+                      its chapters are under -- the read library and the downloads folder -- or, holding nothing yet,
+                      where its first chapter will land.
+                    type: array
+                    items: { type: string }
                   scanlatorPrefs:
                     description: >-
                       Admins only. The series' own release preferences, or null when it has none and the
@@ -1595,7 +1709,9 @@ paths:
         - bearer: []
       responses:
         "200":
-          description: "{ content: [Book] }; each Book carries the provenance fields described on GET /api/books/{id}."
+          description: >-
+            { content: [Book] }; each Book carries the provenance fields described on GET /api/books/{id}. For an
+            admin (since v0.52.0, #136) each also carries `path`: the chapter file's full path on the server.
         "401":
           description: Not authenticated
         "404":
@@ -2117,8 +2233,10 @@ paths:
                             out of, so one multi-language extension's variants can be shown as one
                             provider. `pkgName` is the APK package name as the engine reports it; when the
                             engine did not say, `pkgName` is null and `name` is the display name with its
-                            trailing language tag (` (EN)`, ` (PT-BR)`, ` (ALL)`) stripped. Null for
-                            built-in, pack and custom-site sources.
+                            trailing language tag (` (EN)`, ` (PT-BR)`, ` (ALL)`) stripped. Since v0.52.0
+                            every MangaDex language (`mangadex`, `mangadex-es-419`, ...) carries
+                            `{pkgName: "mangadex", name: "MangaDex"}`, so the family is one provider too.
+                            Null for the other built-in, pack and custom-site sources.
                           oneOf:
                             - type: object
                               required: [pkgName, name]
@@ -2168,7 +2286,12 @@ paths:
         - bearer: []
       responses:
         "200":
-          description: OK
+          description: >-
+            { content: [SourceSeries] }. Since v0.52.0 (#72) each item says what it is to the library in its source's language: `inLibrary` when a
+            series holding the title is in that language (a source in every language owns it in any),
+            `libraryLangs` the languages the library holds the title in, `librarySeriesId` the entry to open (the
+            one in this language, else the first), and `lang` the language the source declares (null when it says
+            nothing).
         "401":
           description: Not authenticated
         "403":
@@ -2479,7 +2602,11 @@ paths:
         "200":
           description: >-
             `content` is the title-grouped list (or the per-source rails with `groupBy=source`), exactly as
-            before v0.40.0; the three fields beside it are the search's progress.
+            before v0.40.0; the three fields beside it are the search's progress. Since v0.52.0 a title-grouped
+            card is `inLibrary` only when the library holds the title in EVERY provider's language, so a card
+            with an English and a Spanish provider stays addable while only English is here; it carries
+            `libraryLangs` and `librarySeriesId` when the title is held at all, and each of its `providers` its
+            own `lang` (declared, or null) and `inLibrary`. A per-source rail's results say the same per item.
           content:
             application/json:
               schema:
@@ -2534,7 +2661,12 @@ paths:
         - bearer: []
       responses:
         "200":
-          description: OK
+          description: >-
+            { content: [SourceSeries] }. Since v0.52.0 (#72) each item says what it is to the library in its source's language: `inLibrary` when a
+            series holding the title is in that language (a source in every language owns it in any),
+            `libraryLangs` the languages the library holds the title in, `librarySeriesId` the entry to open (the
+            one in this language, else the first), and `lang` the language the source declares (null when it says
+            nothing).
         "401":
           description: Not authenticated
         "403":
@@ -2568,7 +2700,12 @@ paths:
         - bearer: []
       responses:
         "200":
-          description: OK
+          description: >-
+            { content: [SourceSeries] }. Since v0.52.0 (#72) each item says what it is to the library in its source's language: `inLibrary` when a
+            series holding the title is in that language (a source in every language owns it in any),
+            `libraryLangs` the languages the library holds the title in, `librarySeriesId` the entry to open (the
+            one in this language, else the first), and `lang` the language the source declares (null when it says
+            nothing).
         "401":
           description: Not authenticated
         "403":
@@ -2608,8 +2745,9 @@ paths:
         title is not this series'), `unreachable` (threw or timed out), `too_few_listed` (the primary lists
         under three numbers, nothing asked), `not_tried` (the 90-second wall ran out first, or the judgement
         itself failed before any source was asked -- every candidate then reads so, never an empty list),
-        `cap` (the series already follows two sources) or `unavailable` (the primary itself, disabled, in a
-        cooldown, not loaded, or outside the caller's age cap). A nothing-yet add with candidates gets a
+        `cap` (the series already follows two sources), `unavailable` (the primary itself, disabled, in a
+        cooldown, not loaded, or outside the caller's age cap) or, since v0.52.0 (#123), `language_differs` (it
+        is in another language than the series; nothing was asked). A nothing-yet add with candidates gets a
         card with `total: 0` and `status: done` purely to carry this. Results survive the dialog closing:
         the card lives a day after the judgement ends, and cannot be dismissed (DELETE answers 409
         `running`) until `autoFollow.done`. Since v0.47.0 (#82) a finished card stays listed for a day
@@ -2754,6 +2892,12 @@ paths:
                         seriesId: { type: string, description: "Since v0.49.0, a repair: the series `label` names, when it names one." }
                         followed: { type: integer, minimum: 0, description: "Since v0.49.1, a find_sources run: the sources it has followed so far, across its series." }
                         waiting: { type: string, enum: [sweep, repair, check], description: "Since v0.49.1, a find_sources run: what it waits on before its next series while it waits -- a chapter sweep, a library repair or the daily source check (GET /api/admin/sources/find's run.waiting). Absent otherwise; `current` is then still the series it did last." }
+                        mode: { type: string, enum: [replace], description: "Since v0.54.0, a find_sources run in replace mode." }
+                        promoted: { type: integer, minimum: 0, description: "Since v0.54.0, a Replace run: the series it has moved to another main source so far." }
+                        left: { type: integer, minimum: 0, description: "Since v0.54.0, a Replace run: the series still on the source it replaces, read again after each series." }
+                        turnedOff: { type: boolean, description: "Since v0.54.0, a Replace run that has ended: whether that source is switched off." }
+                        sourceId: { type: string, description: "Since v0.54.0, a find_sources run over one source's series (a Replace run always): that source, as the run's summary names it (GET /api/admin/sources/find)." }
+                        sourceName: { type: string, description: "Since v0.54.0, with sourceId: that source's display name, or its id when it is not loaded." }
                         downloads: { type: boolean, enum: [false], description: "Since v0.49.0: a run that cannot download a chapter (a solver reset, a page count, names, directions, or a reset of failed chapters that names no source and is not `now`). It stays a server task but does not turn the Library ring. Absent: it may download." }
         "401":
           description: Not authenticated
@@ -3010,11 +3154,61 @@ paths:
         - bearer: []
       responses:
         "200":
-          description: OK
+          description: >-
+            { content: [{source, name, sourceId, title, coverUrl}] }, the best hit per provider. Since v0.52.0
+            each also says `lang` (what its source declares, or null), `inLibrary` (held in that language),
+            `libraryLangs` and `librarySeriesId`, as a Discover item does.
         "401":
           description: Not authenticated
         "403":
           description: "Forbidden: token scope, account permission or age limit"
+  /api/sources/edition-candidates:
+    get:
+      tags:
+        - sources
+      summary: The languages a series could be added in, and the sources offering one (v0.52.0).
+      operationId: getApiSourcesEditionCandidates
+      description: >-
+        The add dialog's "Which language?" step for a language edition (#72), opened from the series page. Without
+        `lang`: one row per language some source declares -- every source the caller may be shown that is neither
+        switched off nor cooling down -- leaving out the languages the series' work already holds (a removed
+        edition's too: its slot is taken), plus `unstated`, the sources that declare no single language. Nothing is
+        searched. With `lang` (a code, or `unstated`): those sources are searched for the work -- its title, the
+        other editions' titles and its other names, the title by the fill scan's rule and every other name exactly
+        -- under the source hunt's concurrency and one 30-second wall, and the hits come back as `providers`.
+        Behind the download permission, like every /api/sources route.
+      parameters:
+        - name: seriesId
+          in: query
+          required: true
+          schema:
+            type: string
+        - name: lang
+          in: query
+          required: false
+          schema:
+            type: string
+          description: A language code from `languages`, or `unstated`.
+        - name: adult
+          in: query
+          required: false
+          schema:
+            type: string
+          description: "`1` to include adult sources. Absent means they are not offered."
+      security:
+        - bearer: []
+      responses:
+        "200":
+          description: >-
+            Without `lang`: `{title, held: [{seriesId, lang}], languages: [{lang, sources: [{id, name}]}],
+            unstated: [{id, name}]}`, the languages with the most sources first. With `lang`: `{providers:
+            [{source, name, sourceId, title, coverUrl, lang}]}`.
+        "401":
+          description: Not authenticated
+        "403":
+          description: "Forbidden: token scope or account permission"
+        "404":
+          description: Not found, or not visible to this account
   /api/sources/detail:
     get:
       tags:
@@ -3339,6 +3533,22 @@ paths:
                     Since v0.49.0 (#117): "Archive the rest slowly" -- what the selection leaves is queued for the
                     slow archive (the rules of POST /api/sources/archive), once the add has settled. Ignored when
                     the selection is the whole listing.
+                edition:
+                  type: object
+                  required: [of]
+                  description: >-
+                    Since v0.52.0 (#72): add this as a language edition of the series `of`, which the caller must
+                    be able to open (404 otherwise). The edition is a series of its own -- its own folder,
+                    `<source>/<title> (<LANG>)`, chapters, sources and reading progress -- linked to `of`'s work,
+                    so the Library shows one card for both. `lang` is this copy's language, defaulting to what the
+                    source declares and required when the source declares none (400 `edition_lang`); `ofLang` is
+                    `of`'s language, applied only when `of` does not state one. The title's duplicate check is
+                    skipped. Refused with 409 `edition_exists` when the work already holds that language (exact
+                    code: `es` and `es-419` are two editions) and `edition_hidden` when a removed edition holds it.
+                  properties:
+                    of: { type: string, maxLength: 64 }
+                    lang: { type: string, maxLength: 35, description: A BCP-47 code (`es-419`) or MangaDex's spelling (`es-la`). }
+                    ofLang: { type: string, maxLength: 35 }
       security:
         - bearer: []
       responses:
@@ -3381,8 +3591,22 @@ paths:
                       the add left the series' numbering for an admin's review (#116: a folder that already held
                       books): it is queued, and its boundary is placed once the renumber has settled, in the numbers
                       the series keeps. `nothing` when the selection was the whole listing.
+                  edition:
+                    type: object
+                    description: >-
+                      Since v0.52.0, on an add that asked for `edition`: its language, and `workId` once it is
+                      linked. A download links once its first chapter is scanned in, so this answer has the
+                      language only and the job card (GET /api/sources/jobs, `edition`) the rest. `unlinked`
+                      says the series was added on its own instead: `taken` when another add took the language a
+                      moment earlier, `gone` when `of` was removed meanwhile.
+                    properties:
+                      lang: { type: string }
+                      workId: { type: string }
+                      unlinked: { type: string, enum: [taken, gone] }
         "400":
-          description: Malformed body or parameter
+          description: >-
+            Malformed body or parameter; or, since v0.52.0, `edition_lang`: an edition from a source that
+            declares no single language must say which language it is in.
         "401":
           description: Not authenticated
         "403":
@@ -3394,7 +3618,12 @@ paths:
             Conflict: already exists, already running, or duplicate. A `duplicate` carries
             `existing: {title, source, id?}` -- the copy already on this server, whichever library it is in,
             since that is what makes it a duplicate. `id` is included only when the caller may see that
-            series, so a client can offer to open it.
+            series, so a client can offer to open it. Since v0.52.0 a `duplicate` whose source is in a language
+            the library does not hold the title in also carries the server's offer, `edition: {of, heldLangs,
+            lang}` -- send the add again with `edition: {of}` to add it as that language's edition -- only to a
+            caller who may open `of`. `edition_exists` and `edition_hidden` carry `existing: {title, lang, id?}`,
+            the edition holding the language: `id` when the caller may open it, and to an admin for a removed
+            one, which Admin → Library puts back.
   /api/opds/token:
     post:
       tags:
@@ -4990,22 +5219,37 @@ paths:
     get:
       tags:
         - images
-      summary: Blurred ambient or sharp hero backdrop for a series.
+      summary: Blurred ambient, sharp hero, or sharp banner backdrop for a series.
       operationId: getImgSeriesIdBackdrop
+      description: >-
+        With no `style`, the blurred, darkened ambient wash of the series' art. `style=hero` is the real art sharp in a
+        frame (`ar=wide` 1920x720 or `ar=tall` 1080x1200): a banner, or a cover shown whole over a blurred copy of itself.
+        `style=banner` (v0.53.0, the series page) is a real banner -- AniList's or an admin's -- sharp and uncropped, at
+        most 1920 wide; a series with no banner gets the ambient wash of its cover, as does one whose banner could not be
+        fetched. Gated as the series' cover is.
       parameters:
         - name: id
           in: path
           required: true
           schema:
             type: string
-        - name: hero
+        - name: style
           in: query
           required: false
           schema:
             type: string
+            enum: [hero, banner]
         - name: ar
           in: query
           required: false
+          description: The hero's frame, with style=hero.
+          schema:
+            type: string
+            enum: [wide, tall]
+        - name: av
+          in: query
+          required: false
+          description: The series' art version, a cache-buster.
           schema:
             type: string
       security:
@@ -5595,7 +5839,7 @@ paths:
     get:
       tags:
         - admin
-      summary: Server settings, plus extensions_configured (whether an extension engine exists).
+      summary: Server settings, plus extensions_configured (whether an extension engine exists) and mangadex_available.
       operationId: getApiAdminSettings
       description: >-
         Requires an admin account and a token carrying the admin scope. Scopes only ever restrict. The row
@@ -5674,6 +5918,26 @@ paths:
                   archive_free_gb:
                     type: [number, "null"]
                     description: GiB free under the download root now, one decimal, what archive_min_free_gb is set against; null when it cannot be measured.
+                  mangadex_langs:
+                    type: array
+                    items:
+                      type: string
+                    description: >-
+                      Since v0.52.0 (#123): the MangaDex languages besides English that are on, as app codes in
+                      mangadex_available's order. Each is a source of its own, `mangadex-<code>` named
+                      "MangaDex (ES-419)". See mangadexLangs on PATCH. Empty by default.
+                  mangadex_available:
+                    type: array
+                    items:
+                      type: string
+                    description: >-
+                      Computed: every language MangaDex is offered in, as app codes (BCP-47: es-419, pt-BR,
+                      zh-Hans, zh-Hant, fil, ...), English first. English is always on.
+                  unstated_lang:
+                    type: string
+                    description: >-
+                      Since v0.52.0: the language of sources and series that do not say which they are in
+                      (most added sites). English by default. See unstatedLang on PATCH.
         "401":
           description: Not authenticated
         "403":
@@ -5851,13 +6115,38 @@ paths:
                   minimum: 1
                   maximum: 2000
                   description: The slow archive waits while less than this many GB are free under the download root. Default 20.
+                mangadexLangs:
+                  type: array
+                  maxItems: 100
+                  items:
+                    type: string
+                  description: >-
+                    Since v0.52.0 (#123): the MangaDex languages besides English to switch on, replaced whole, as
+                    app codes from mangadex_available (MangaDex's own es-la, pt-br, zh and zh-hk are read as es-419,
+                    pt-BR, zh-Hans and zh-Hant). Applied at once, with no restart: each language turned on is
+                    registered as a source of its own (`mangadex-es-419`, "MangaDex (ES-419)") whose search, Popular,
+                    Newest and chapters are in that language only; each turned off is unregistered, and its series
+                    keep their chapters and read as frozen in Health until it is back. Every MangaDex source shares
+                    one rate limit. English is always on and is refused here (400 english_always_on), as is a code
+                    MangaDex is not offered in (400 unknown_language); either refusal writes nothing. A change is
+                    audited as `settings.mangadex_langs` {from, to}.
+                unstatedLang:
+                  type: string
+                  description: >-
+                    Since v0.52.0: the language of sources and series that do not say which they are in -- most
+                    added sites declare none. A source is followed for a series automatically only when both are
+                    in the same language, so a server whose sites are in Spanish sets es here. Any one language
+                    (BCP-47, normalised: pt-br is pt-BR); "all", "other" or an empty string is refused (400
+                    unknown_language). Applied at once.
       security:
         - bearer: []
       responses:
         "200":
           description: OK
         "400":
-          description: Malformed body or parameter
+          description: >-
+            Malformed body or parameter; or, with `error`, a language refused: unknown_language (mangadexLangs
+            or unstatedLang), english_always_on (mangadexLangs). Nothing is written.
         "401":
           description: Not authenticated
         "403":
@@ -6235,7 +6524,10 @@ paths:
         - admin
       summary: Remove a custom site.
       operationId: deleteApiAdminSourcesCustomId
-      description: Requires an admin account and a token carrying the admin scope. Scopes only ever restrict.
+      description: >-
+        Requires an admin account and a token carrying the admin scope. Scopes only ever restrict. Since v0.54.0
+        refused while the site is some series' main source (409 `in_use`): removing it froze every series from it.
+        POST /api/admin/sources/{id}/retire {how: remove} also drops its follows.
       parameters:
         - name: id
           in: path
@@ -6253,6 +6545,8 @@ paths:
           description: "Forbidden: token scope, account permission or age limit"
         "404":
           description: Not found, or not visible to this account
+        "409":
+          description: "`in_use` (since v0.54.0) with `main`, how many series have it as their main source, and `message`/`messageSaid` (Said, retire.inUse): replace it first."
   /api/admin/series/{id}:
     patch:
       tags:
@@ -6303,11 +6597,34 @@ paths:
                     server setting, null follows it. Switching it on asks for names now; switching it off
                     clears the ones borrowed for this series.
                   type: [boolean, "null"]
+                lang:
+                  description: >-
+                    Since v0.52.0. The language the series is in, as a BCP-47 code (400 `bad_lang` for anything
+                    that is not one language); null to infer it again from its main source. 409 `edition_lang` for
+                    null on a language edition, which always states its language, and `edition_exists` for a
+                    language another edition of its work holds. Sources in another language are never followed
+                    for it automatically.
+                  type: [string, "null"]
+                chapterFloor:
+                  description: >-
+                    Since v0.52.0, "Mark caught up": `caught_up` sets the series' chapter floor just above the
+                    newest chapter its sources list or the library holds (max + 0.001, as a `none` add floors), so
+                    the back catalogue is not fetched and every later release is; 409 `nothing_listed` when there
+                    is no chapter to be above. A number, or null for no floor, sets it as given: the answer's
+                    `chapterFloor.previous` is what an Undo sends back.
+                  oneOf:
+                    - type: string
+                      enum: [caught_up]
+                    - type: number
+                      minimum: 0
+                    - type: "null"
       security:
         - bearer: []
       responses:
         "200":
-          description: OK
+          description: >-
+            { ok: true }, with `autoUpdate` echoed when it was sent, `lang` when it was, and for `chapterFloor`
+            `{floor, previous}`: the floor now and the one it replaced.
         "400":
           description: Malformed body, an unknown field, or a body naming nothing to change
         "401":
@@ -6316,6 +6633,8 @@ paths:
           description: "Forbidden: token scope, account permission or age limit"
         "404":
           description: Not found, or not visible to this account
+        "409":
+          description: "`edition_lang`, `edition_exists` (see `lang`) or `nothing_listed` (see `chapterFloor`)"
     delete:
       tags:
         - admin
@@ -6580,8 +6899,95 @@ paths:
         "409":
           description: >-
             plan_stale (the plan expired or was never issued: scan again); is_primary (that is the series'
-            own source); source_unavailable (the adapter is not loaded or is disabled); since v0.49.0 (#116)
-            posting_order (the series is numbered by posting order, so a follower would never be merged).
+            own source -- since v0.54.0 also when it became the main source after the plan was made, by
+            POST /api/admin/series/{id}/main-source); source_unavailable (the adapter is not loaded or is disabled); since v0.49.0 (#116)
+            posting_order (the series is numbered by posting order, so a follower would never be merged); since
+            v0.52.0 (#123) language_differs (the source is in another language than the series: the scan never
+            offers one, so only a plan from before the series' language changed meets this. `message` and
+            `messageSaid` (code `follow.languageDiffers`, params `theirs` and `ours`, language codes) name both,
+            and `edition` is `{of, lang}`, the add route's edition to add instead. When the series' work already
+            holds an edition that may follow the source, `edition` also carries `existing: {id, lang}`, that
+            edition's series id and language, and the sentence is `follow.languageDiffersEdition` (params `theirs`,
+            `ours` and `edition`): follow it on that edition instead).
+  /api/admin/series/{id}/main-source:
+    post:
+      tags:
+        - admin
+      summary: Make a source the series follows its main source (since v0.54.0).
+      operationId: postApiAdminSeriesIdMainSource
+      description: >-
+        Requires an admin account and a token carrying the admin scope. Scopes only ever restrict. Only a source the
+        series already follows can be promoted: its follow is the "same series?" judgement already made, and the
+        sweep already merges its chapters, so the switch changes which source wins a tie and the label, not which
+        chapters arrive. The pair (`source_id`, `source_series_id`) moves under the series row's lock and the promoted
+        row leaves the followers. The old main stays as the last follower (`old: kept`) when it still carries the
+        series -- standing usable or cooling -- and the follower cap has room; otherwise it is dropped with its listing
+        rows, and the chapters capped against it get their tries back for the new main. A series whose language was
+        only inferred from its main source is pinned to it when the new main would say otherwise (`langPinned`).
+        The series' last-check figures, folder, cover, reading direction and floor stay. Audited as
+        `series.main_source` {id, title, from, fromRef, to, toRef, old, coverage, addedBy, langPinned?, via:
+        manual}. The answer's `sources` is read before the listing refresh the switch starts (through the new main).
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [sourceId]
+              additionalProperties: false
+              properties:
+                sourceId:
+                  type: string
+                  description: A source the series follows.
+                old:
+                  type: string
+                  enum: [auto, keep, drop]
+                  description: >-
+                    What becomes of the old main: `auto` (the default) keeps it while it still carries the series;
+                    `keep` and `drop` decide whatever its standing.
+      security:
+        - bearer: []
+      responses:
+        "200":
+          description: Switched. The series' full source list, the new main first.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok, from, to, old, sources]
+                properties:
+                  ok: { type: boolean }
+                  from: { type: [string, "null"], description: The old main source. }
+                  to: { type: string }
+                  old: { type: string, enum: [kept, dropped] }
+                  langPinned: { type: string, description: "The language the series was pinned to, when the switch would otherwise have changed it." }
+                  sources:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/SeriesSource"
+        "400":
+          description: bad_request (no sourceId, or an `old` it does not know).
+        "401":
+          description: Not authenticated
+        "403":
+          description: "Forbidden: token scope, account permission or age limit"
+        "404":
+          description: not_found -- not a series this admin may see.
+        "409":
+          description: >-
+            Refused, with `message` and `messageSaid` (Said): is_main (main.isMain); not_followed (main.notFollowed);
+            posting_order (numbering.postingRefusal: the series takes its chapters from its numbering source alone);
+            renumber_pending (main.renumberPending: a renumber waits for a review, or is being applied); busy
+            (renumber.checking: a check, the sweep or a listing refresh is inside the series right now);
+            source_unavailable (main.unavailable: not loaded, switched off, or beyond the admin's age reach);
+            moved (main.moved: the main source changed meanwhile); language_differs (the follow route's refusal:
+            follow.languageDiffers or follow.languageDiffersEdition, with `edition: {of, lang, existing?}`).
   /api/admin/series/{id}/sources/{sourceId}:
     delete:
       tags:
@@ -6963,7 +7369,9 @@ paths:
         transitive: anything the absorbed series had itself absorbed earlier is re-pointed at the new
         survivor in the same transaction, so a title folded in two merges ago still files its folder's
         chapters under the final survivor on the scan and reads "already in your library" in the batch
-        importer instead of being re-added via another source.
+        importer instead of being re-added via another source. Since v0.52.0 two language editions of one work
+        are refused with 409 `same_work` (their chapters are two languages); the absorbed row leaves its work, and
+        a work left with one edition dissolves.
       parameters:
         - name: id
           in: path
@@ -6994,13 +7402,95 @@ paths:
           description: "Forbidden: token scope, account permission or age limit"
         "404":
           description: Not found, or not visible to this account
+        "409":
+          description: "`same_work`: the two are language editions of one work (since v0.52.0)"
+  /api/admin/series/{id}/editions:
+    post:
+      tags:
+        - admin
+      summary: Link this series and another as language editions of one work (v0.52.0).
+      operationId: postApiAdminSeriesIdEditions
+      description: >-
+        Requires an admin account and a token carrying the admin scope. Scopes only ever restrict. Health's "Link
+        as editions" on a duplicate pair in two languages (#72). Both stay series of their own, with their chapters,
+        sources and reading progress; the Library shows one card for the work, and the series page switches
+        between them. `lang` states {id}'s language and `withLang` `with`'s, each only where the series does not
+        state one (otherwise what it is inferred to be). A series already in a work brings it: the other joins.
+        The work's tracker links and the 18+ rating an admin set are copied to the one that joins.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [with]
+              additionalProperties: false
+              properties:
+                with: { type: string, maxLength: 64 }
+                lang: { type: string, maxLength: 35 }
+                withLang: { type: string, maxLength: 35 }
+      security:
+        - bearer: []
+      responses:
+        "200":
+          description: "{ ok: true, workId, lang }: the work and the language the joining series now states."
+        "400":
+          description: Malformed body, the series itself (`same_series`), or a removed series (`deleted`)
+        "401":
+          description: Not authenticated
+        "403":
+          description: "Forbidden: token scope, account permission or age limit"
+        "404":
+          description: Not found
+        "409":
+          description: >-
+            `same_lang` (both in one language: merge them instead), `edition_exists` (the work holds that language
+            already), `same_work` (already editions of one work), `other_work` (each is in another work)
+  /api/admin/series/{id}/edition:
+    delete:
+      tags:
+        - admin
+      summary: Take a series out of its work; it stays in the library on its own (v0.52.0).
+      operationId: deleteApiAdminSeriesIdEdition
+      description: >-
+        Requires an admin account and a token carrying the admin scope. Scopes only ever restrict. Its chapters,
+        sources and reading progress stay; a work left with one edition dissolves.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      security:
+        - bearer: []
+      responses:
+        "200":
+          description: OK
+        "401":
+          description: Not authenticated
+        "403":
+          description: "Forbidden: token scope, account permission or age limit"
+        "404":
+          description: Not found
+        "409":
+          description: "`not_an_edition`: the series is in no work"
   /api/admin/series/{id}/meta:
     put:
       tags:
         - admin
       summary: Override a series' metadata (title, summary, author, genres, status, age rating, 18+ filter exemption, reading direction); survives rescans.
       operationId: putApiAdminSeriesIdMeta
-      description: Requires an admin account and a token carrying the admin scope. Scopes only ever restrict.
+      description: >-
+        Requires an admin account and a token carrying the admin scope. Scopes only ever restrict. Since v0.52.0
+        the age rating and "Always show" are the work's: written onto every other language edition of the series'
+        work in the same transaction, so a capped account can never open one edition of a work rated 18+.
+        Everything else is the edition's own.
       parameters:
         - name: id
           in: path
@@ -7711,7 +8201,10 @@ paths:
         - bearer: []
       responses:
         "200":
-          description: "`{ok: true, seed}`, the seed the series' `autoHero` now carries; or `{ok: false, error: 'not_made'}`."
+          description: >-
+            `{ok: true, seed}`, the seed the series' `autoHero` now carries; or `{ok: false, error: 'not_made'}`; or,
+            since v0.52.0, `{ok: true, seed, same: true}` when the series' pages give no other banner (a short
+            series whose few good crops are all on the one it has): nothing changes, and `seed` is the one it had.
           content:
             application/json:
               schema:
@@ -7720,6 +8213,7 @@ paths:
                 properties:
                   ok: { type: boolean }
                   seed: { type: integer, description: Present when ok. }
+                  same: { type: boolean, enum: [true], description: "Since v0.52.0: present when the pages give no other banner." }
                   error: { type: string, enum: [not_made], description: Present when not ok. }
         "401":
           description: Not authenticated
@@ -7735,7 +8229,11 @@ paths:
         - admin
       summary: Set a series' cover or banner (upload, URL, or a candidate).
       operationId: putApiAdminSeriesIdArt
-      description: Requires an admin account and a token carrying the admin scope. Scopes only ever restrict.
+      description: >-
+        Requires an admin account and a token carrying the admin scope. Scopes only ever restrict. `upload` takes an
+        image of up to 11 MB as a base64 data URL; the body may be up to about 14.7 MB to carry one (v0.53.0; 12 MB
+        before, which refused pictures between 9 and 11 MB). `url` stores the address the art is fetched from, and
+        `reset` hands the art back to the automatic source.
       parameters:
         - name: id
           in: path
@@ -7743,29 +8241,41 @@ paths:
           schema:
             type: string
       requestBody:
-        required: false
+        required: true
         content:
           application/json:
             schema:
               type: object
+              required: [kind, mode]
               properties:
-                cover:
+                kind:
                   type: string
-                banner:
+                  enum: [cover, banner]
+                mode:
                   type: string
+                  enum: [url, upload, reset]
+                url:
+                  type: string
+                  format: uri
+                  description: For `url`.
+                dataUrl:
+                  type: string
+                  description: For `upload`, `data:image/...;base64,...`.
       security:
         - bearer: []
       responses:
         "200":
           description: OK
         "400":
-          description: Malformed body or parameter
+          description: Malformed body or parameter, or an upload that is no readable image (`bad_image`)
         "401":
           description: Not authenticated
         "403":
           description: "Forbidden: token scope, account permission or age limit"
         "404":
           description: Not found, or not visible to this account
+        "413":
+          description: The body is over the limit (a picture over 11 MB)
   /api/admin/art/overview:
     get:
       tags:
@@ -7875,6 +8385,8 @@ paths:
         Requires an admin account and a token carrying the admin scope. Scopes only ever restrict. Each row
         carries the `pkgName` of the extension it comes from (v0.49.0), and `pkg` narrows the list to one
         extension's sources -- one per language -- as the extension settings sheet's language select reads it.
+        Since v0.53.0 each row also carries `used`: the series in the library that came from that source, switched
+        on or not (removed and merged-away series are not counted).
       parameters:
         - name: q
           in: query
@@ -7907,7 +8419,11 @@ paths:
         - admin
       summary: "Enable or disable many extension sources at once, by id or by language, in one statement and one reload. Languages also record the standing preference (hidden_langs) that installs respect; ids do not."
       operationId: postApiAdminExtensionsSourcesBulk
-      description: Requires an admin account and a token carrying the admin scope. Scopes only ever restrict. At least one of ids or langs must be non-empty.
+      description: >-
+        Requires an admin account and a token carrying the admin scope. Scopes only ever restrict. At least one of ids
+        or langs must be non-empty. Since v0.53.0 an id the engine lists that Uchiyomi has not recorded yet -- a source
+        of an extension installed in the engine's own page since the last registration -- is recorded first, so the
+        switch reaches it instead of changing nothing.
       requestBody:
         required: true
         content:
@@ -8071,30 +8587,64 @@ paths:
     get:
       tags:
         - admin
-      summary: "The extension catalogue: installed, updatable, and available."
+      summary: "The extension catalogue: installed, updatable, and available, a page at a time."
       operationId: getApiAdminExtensionsCatalog
-      description: Requires an admin account and a token carrying the admin scope. Scopes only ever restrict.
+      description: >-
+        Requires an admin account and a token carrying the admin scope. Scopes only ever restrict. Installed first,
+        then those with an update, then by name. Answers `{content, total, matched, shown, offset, limit, installed,
+        updatable, hiddenAdult, adultTotal, langs}`: `content` is the page `offset`..`offset + limit` of the
+        `matched` extensions (v0.53.0; before, the first 400 alone), `shown` its length, `total` the whole
+        catalogue, `installed` and `updatable` counted over the whole catalogue, `hiddenAdult` the 18+ extensions
+        the other filters match that the 18+ filter keeps out (0 with `nsfw=true`; the whole catalogue's before
+        v0.53.0), and `adultTotal` (v0.53.0) the whole catalogue's 18+ extensions that are not installed, whatever
+        was asked: `total` less these is how many the list holds without `nsfw=true`. An installed 18+ extension
+        is always listed.
       parameters:
         - name: q
           in: query
           required: false
+          description: Part of the extension's name or package name, any case.
           schema:
             type: string
         - name: lang
           in: query
           required: false
+          description: The extension's language code as the catalogue's `langs` lists it (`all` for a multi-language one); empty or `all` for every language.
           schema:
             type: string
         - name: installed
           in: query
           required: false
+          description: "`true`: installed extensions only."
+          schema:
+            type: string
+        - name: updates
+          in: query
+          required: false
+          description: "`true`: only extensions with a newer version waiting (v0.53.0)."
           schema:
             type: string
         - name: nsfw
           in: query
           required: false
+          description: "`true`: include 18+ extensions that are not installed (they are left out by default)."
           schema:
             type: string
+        - name: offset
+          in: query
+          required: false
+          description: Where the page starts among the matches (v0.53.0). Default 0.
+          schema:
+            type: integer
+            minimum: 0
+        - name: limit
+          in: query
+          required: false
+          description: How many extensions the page holds (v0.53.0). Default and maximum 400.
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 400
       security:
         - bearer: []
       responses:
@@ -8171,12 +8721,16 @@ paths:
     post:
       tags:
         - admin
-      summary: Install, update or uninstall an extension; its sources are enabled or removed to match, except
-        sources in a hidden language, which stay off.
+      summary: Install, update or uninstall an extension, or turn an installed one's sources on; its sources are
+        enabled or removed to match, except sources in a hidden language, which stay off.
       operationId: postApiAdminExtensionsCatalogPkgname
       description: "Requires an admin account and a token carrying the admin scope. Scopes only ever restrict.
         The 200 body carries `sources` (how many the extension provides), `on` (switched on now) and `hidden`
-        (left off because their language is hidden; see /api/admin/extensions/sources/bulk)."
+        (left off because their language is hidden; see /api/admin/extensions/sources/bulk). `enable` (v0.53.0)
+        asks the engine for nothing but the extension's sources and switches them on as an install would, never
+        switching one off: for an extension installed in the engine's own page, which shows as installed with
+        every source off. It answers 409 `no_sources` when the extension is not installed or provides no source,
+        and is audited as `extension.enable`."
 
       parameters:
         - name: pkgName
@@ -8190,9 +8744,12 @@ paths:
           application/json:
             schema:
               type: object
+              required:
+                - action
               properties:
                 action:
                   type: string
+                  enum: [install, uninstall, update, enable]
       security:
         - bearer: []
       responses:
@@ -8206,6 +8763,10 @@ paths:
           description: "Forbidden: token scope, account permission or age limit"
         "404":
           description: Not found, or not visible to this account
+        "409":
+          description: "`enable` on an extension that is not installed, or provides no source (`no_sources`)"
+        "502":
+          description: The extension engine did not answer, or refused the change
   /api/admin/extensions/repos:
     get:
       tags:
@@ -8320,6 +8881,9 @@ paths:
         disk, the later group arriving after the earlier one (`warn` while it finds any); each item carries
         `bookIds` and `numbers` for the later files only (at most 20) and the `delete` action. Nothing is deleted
         by the check.
+        Since v0.52.0 (#134) the `folders-twice` check is there only while the downloads folder sits inside the
+        library, or the library inside it -- by path, or met by the last scan's walk however it was mounted --
+        and every chapter in the inner one is scanned twice: `warn`, one item naming where, the fix in its note.
         Since v0.49.0 an item may carry `outcome`, what the last attempt at it found, from stored rows:
         {kind: 'gaps', at, why, followed, coverage, fetched, landed, sweep, capped, unfillable[], scanned} (the
         gap `detail` is now '<n> missing — <ranges>' alone; the conclusion it used to end with is here), {kind:
@@ -8368,6 +8932,37 @@ paths:
         diagnosis `code` can be `site_offline`: the site answered with its own offline or maintenance notice
         (reason "The site says it is offline (its own page)", fix "Wait for the site to come back, or find other
         sources for its series.") -- a failure of the source, never an empty listing.
+        Since v0.52.0 (#72) the `duplicates` check counts works, not series: the language editions of one work
+        share their tracker entry and are no finding. A pair whose two sides are in different languages carries
+        the action `link_editions` (POST /api/admin/series/{id}/editions {with}) instead of `merge`, with the
+        detail `dupes.languages` ({a, b}, language codes); every duplicates item carries `langs`, the language of
+        each of its `seriesIds`.
+        Since v0.53.0 every `sources` item carries `group`: `affected` (a finding on a source series use),
+        `unused` (a finding on a source no series uses), `quiet` (listed for reference: a cooldown on a source
+        nothing uses, a test that ran out of time, a failure unchecked for a week, an ignored finding) or `off`
+        (switched off, with `offBy`: `admin` under Providers, `extension` in Admin -> Extensions, or `language`
+        for a language hidden in every extension -- where it comes back on). The check lists them in that order: `affected` by series, most first, then blocked or failing
+        before slow or empty; the other three by name. `state` is the row's one state -- blocked, failing, slow,
+        empty, inconclusive, untested or off -- with `stage` for failing, inconclusive and untested, and
+        `cooldown` {status, until} for blocked (`until` null when no cooldown is set); `icon` is true when the
+        source has an extension's logo, which GET /img/sources/icon/{id} serves. The summary counts the first two
+        groups -- "3 sources your series use need a look · 5 sources nothing uses are failing", the codes
+        `sources.affected` and `sources.failingUnused` with the new join `dot` (" · ") -- and with neither says
+        "All sources are working" (`sources.working`), or "Nothing is failing that your library uses" while quiet
+        rows are listed. The status is decided as before.
+        Since v0.54.0 a `sources` item whose source is switched off or failing -- a confirmed failure at the chapter
+        list, the page list or the images, or the site's own offline notice at any step; not a cooldown, and not a
+        failure at search alone -- and is the MAIN source of at least one series carries the action `replace_source`
+        before `find_sources`, over the same `findSeries`: the Find run in replace mode (POST
+        /api/admin/sources/find {sourceId, mode: replace}). `frozen-series` now also lists a series whose main source
+        is loaded but switched off (`frozen.switchedOff`) or failing (`frozen.failing` {n, source, offline}: offline
+        when it is the site's own offline notice) and that follows no source that can update it; a follower counts
+        only while it is usable or cooling down, where before any loaded one did, a switched-off one included. Those
+        rows, and every row whose reason is its source, carry `sourceId`, `findSeries` and the actions
+        `replace_source` and `find_sources`; a series that still has such a follower is listed as `info` with
+        `frozen.followingDown` {source, state: off|failing, names} (or `frozen.following` for a main that is not
+        loaded) and the action `replace_source`, which makes that follower its main source. A main that is only
+        cooling down is not listed.
       security:
         - bearer: []
       responses:
@@ -8990,7 +9585,16 @@ paths:
         (the newest 20), newest first, without results. A run still `running` after a restart reads `interrupted`,
         with every series it never reached in `results` as `not_tried`.
         A series the viewer may not list (the 18+ hide, above all) keeps its entry in `results` without its
-        `title`, and is left out of `current`.
+        `title`, and is left out of `current`. Since v0.52.0 `?runId=` reads that kept run in full as `run` instead
+        (an earlier search reopened -- a review-first run's matches can still be decided), and answers 404
+        `not_found` when no kept run has that id.
+      parameters:
+        - name: runId
+          in: query
+          required: false
+          schema:
+            type: string
+            maxLength: 64
       security:
         - bearer: []
       responses:
@@ -9011,10 +9615,14 @@ paths:
                     type: array
                     items:
                       $ref: "#/components/schemas/FindRunSummary"
+        "400":
+          description: "`bad_request`: `runId` is empty or longer than 64 characters."
         "401":
           description: Not authenticated
         "403":
           description: "Forbidden: token scope, account permission or age limit"
+        "404":
+          description: "`not_found` (since v0.52.0): no kept run has the `runId` asked for."
     post:
       tags:
         - admin
@@ -9043,6 +9651,19 @@ paths:
         `review: true` (since v0.51.0, #132, @TIGamingTV's idea from PR #133): review first -- the same run, which
         follows nothing and keeps each series' candidates as `proposals` in its result (POST
         .../find/{runId}/follow or .../dismiss decides each); audited with `review` and `proposed` (series with any).
+        `mode: replace` (since v0.54.0, with `sourceId` only): Replace -- move every series of that source off it, the
+        series that follow other sources first. Per series: its best working follower (usable, then cooling down;
+        in its language and the admin's reach; ranked by how lately it answered, how much of the series it lists, the
+        source order, how far ahead it is, the follow order) becomes its main source at once, with no search and no
+        pacing (as POST /api/admin/series/{id}/main-source does, the replaced source dropped from it); a series with
+        none is searched for as above -- its dead followers not counting against the cap, and dropped only as far as a
+        follow needs the room -- and the first source it follows becomes its main source. A series numbered by
+        posting order, waiting for a renumber, moved off the source, or with a run inside it for 30 s is left alone
+        and says so. `turnOff: true` (Replace only, never with `review`): when the run ends done with no series left
+        on the source, it is switched off and dropped from every series' followers with their listing rows (audited
+        `source.retire`). Review first proposes instead: POST .../find/{runId}/promote applies one. Each switch is
+        audited as `series.main_source` with `via: replace` and the run's id; `source.find` adds `mode`, `promoted`,
+        `left` and `turnedOff`. Find and Replace share the one run at a time.
       requestBody:
         required: true
         content:
@@ -9060,6 +9681,8 @@ paths:
                   properties:
                     sourceId: { type: string }
                     review: { type: boolean }
+                    mode: { type: string, enum: [follow, replace], description: "Since v0.54.0: `replace` moves every series of the source off it." }
+                    turnOff: { type: boolean, description: "Since v0.54.0, Replace only and never with review: switch the source off once no series is left on it." }
       security:
         - bearer: []
       responses:
@@ -9074,7 +9697,7 @@ paths:
                   runId: { type: string, format: uuid }
                   total: { type: integer, minimum: 1, description: The series it will ask about. }
         "400":
-          description: "`bad_request` (a malformed body, or both scopes at once) or `empty_scope` (nothing named is a series this admin may see)"
+          description: "`bad_request` (a malformed body, both scopes at once, Replace without `sourceId`, or `turnOff` outside Replace or with `review`) or `empty_scope` (nothing named is a series this admin may see)"
         "401":
           description: Not authenticated
         "403":
@@ -9160,7 +9783,96 @@ paths:
         "404":
           description: "`not_found`: no such run, proposal or series, or a series this admin may not see"
         "409":
-          description: "`decided` (with `state`): followed or dismissed already; `posting_order`; `source_unavailable`; `already_followed`; `full` (the series follows two other sources)"
+          description: "`decided` (with `state`): followed or dismissed already; `posting_order`; `source_unavailable`; `language_differs` (since v0.52.0: the source is in another language than the series, with `edition: {of, lang}`, the add route's edition to add instead, plus `existing: {id, lang}` when the work already holds an edition that may follow the source -- the follow belongs there); `already_followed`; `full` (the series follows two other sources)"
+  /api/admin/sources/find/{runId}/promote:
+    post:
+      tags:
+        - admin
+      summary: "Make one proposal of a Replace review the series' main source (since v0.54.0)."
+      operationId: postApiAdminSourcesFindRunIdPromote
+      description: >-
+        Requires an admin account and a token carrying the admin scope. Scopes only ever restrict. Body {seriesId,
+        sourceId}; what is promoted is the run's own record. A follower's proposal is switched to as POST
+        /api/admin/series/{id}/main-source switches (the replaced source dropped); a search's is checked again as a
+        follow is, followed under the cap -- dead followers making room -- and then switched to. The proposal reads
+        `promoted`, and the series' result carries `promoted` (and, for a search's, `followed` gains it). Audited as
+        `series.main_source` with `via: review` (and the follow as `series.follow_source` with `via: replace_review`).
+      parameters:
+        - name: runId
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [seriesId, sourceId]
+              properties:
+                seriesId: { type: string }
+                sourceId: { type: string }
+      security:
+        - bearer: []
+      responses:
+        "200":
+          description: The series' result as it now reads.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [result]
+                properties:
+                  result:
+                    $ref: "#/components/schemas/FindResult"
+        "400":
+          description: "`bad_request`: a malformed body"
+        "401":
+          description: Not authenticated
+        "403":
+          description: "Forbidden: token scope, account permission or age limit"
+        "404":
+          description: "`not_found`: no such Replace review, proposal or series, or a series this admin may not see"
+        "409":
+          description: "`decided` (with `state`); a follow's refusals: `posting_order`, `source_unavailable`, `language_differs` (with `edition`), `full`; a switch's: `moved` (the series is no longer on the replaced source), `busy`, `renumber_pending`, `not_followed`, `is_main`. With `messageSaid` (Said, as the main-source route's) where the refusal has a code."
+  /api/admin/sources/{id}/replace-preview:
+    get:
+      tags:
+        - admin
+      summary: "What a Replace run over this source would do, before it starts (since v0.54.0)."
+      operationId: getApiAdminSourcesIdReplacePreview
+      description: >-
+        Requires an admin account and a token carrying the admin scope. Scopes only ever restrict. The numbers the
+        Replace dialog says before Start, counted as the run decides them: `main` (the series whose main source it
+        is), `withBackup` (of those, the ones a working follower takes over at once), `toSearch` (the ones it searches
+        for), `postingOrder` (numbered by posting order: left alone), and `busy` (a Find or Replace run is going, and
+        Start would answer 409).
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      security:
+        - bearer: []
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [main, withBackup, toSearch, postingOrder, busy]
+                properties:
+                  main: { type: integer, minimum: 0 }
+                  withBackup: { type: integer, minimum: 0 }
+                  toSearch: { type: integer, minimum: 0 }
+                  postingOrder: { type: integer, minimum: 0 }
+                  busy: { type: boolean }
+        "401":
+          description: Not authenticated
+        "403":
+          description: "Forbidden: token scope, account permission or age limit"
   /api/admin/sources/find/{runId}/dismiss:
     post:
       tags:
@@ -9209,6 +9921,130 @@ paths:
           description: "`not_found`: no such run, proposal or series, or a series this admin may not see"
         "409":
           description: "`decided` (with `state`): followed or dismissed already"
+  /api/admin/sources/overview:
+    get:
+      tags:
+        - admin
+      summary: "Every source the server knows, of every kind, in one answer (since v0.54.0)."
+      operationId: getApiAdminSourcesOverview
+      description: >-
+        Requires an admin account and a token carrying the admin scope. Scopes only ever restrict. The one Sources
+        section's list: every source loaded, every extension source the engine ever registered (switched on, off, or not
+        loaded now), every source a series still names, and every source Health lists. Each row's `state`, `stage`,
+        `cooldown` and `offBy` are Source health's own (GET /api/admin/health, check `sources`); `ok` when Health has
+        nothing to say about it. `standing` is lib/sourceStanding.ts's (SeriesSource.standing). `main` counts the series
+        whose main source it is, `followed` the series that follow it without it being their main source, and
+        `withBackup`, of `main`, the series a working follower would take over -- the Replace preview's own count.
+        `offline`: a confirmed failure that is the site's own offline notice. `attention` is what the section leads
+        with: `replace` (off or failing, and some series' main source -- Health's replace_source rule), `failingUnused`
+        (Health's `unused` group: a finding on a source no series uses) and `updates` (installed extensions with an
+        update waiting: the engine asked briefly and kept 30 s, else the last extension check's). Ordered: the
+        sources in `attention` first, then by main + followed, most first, then by name; switched-off sources last.
+        The extension engine's own state stays GET /api/admin/extensions/status's.
+      security:
+        - bearer: []
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [sources, attention]
+                properties:
+                  sources:
+                    type: array
+                    items:
+                      type: object
+                      required: [id, name, kind, lang, standing, offBy, state, stage, cooldown, offline, main, followed, withBackup, lastTestedAt, icon]
+                      properties:
+                        id: { type: string, description: "'sw:<id>' for an extension source, 'mangadex' or 'mangadex-<code>', a site's slug, a pack's or a built-in's id." }
+                        name: { type: string }
+                        kind: { type: string, enum: [builtin, mangadex, site, extension, pack] }
+                        lang: { type: [string, "null"], description: "What it declares ('all' for an extension in every language); null when it declares none." }
+                        pkgName: { type: [string, "null"], description: Extension sources only. }
+                        standing:
+                          $ref: "#/components/schemas/SourceStanding"
+                        offBy: { type: [string, "null"], enum: [admin, extension, language, null], description: "Where it was switched off: under Sources, in its extension, or by hiding its language." }
+                        state: { type: string, enum: [blocked, failing, slow, empty, inconclusive, untested, off, ok] }
+                        stage: { type: [string, "null"], enum: [search, chapters, pages, images, null] }
+                        cooldown:
+                          oneOf:
+                            - type: object
+                              required: [status, until]
+                              properties:
+                                status: { type: string }
+                                until: { type: [string, "null"], format: date-time }
+                            - type: "null"
+                        offline: { type: boolean }
+                        main: { type: integer, minimum: 0 }
+                        followed: { type: integer, minimum: 0 }
+                        withBackup: { type: integer, minimum: 0 }
+                        lastTestedAt: { type: [string, "null"], format: date-time, description: The last deliberate live check (Test or the daily check). }
+                        icon: { type: boolean, description: "GET /img/sources/icon/{id} serves an extension's logo." }
+                        address: { type: string, description: A site added by address only. }
+                  attention:
+                    type: object
+                    required: [replace, failingUnused, updates]
+                    properties:
+                      replace: { type: array, items: { type: string } }
+                      failingUnused: { type: array, items: { type: string } }
+                      updates: { type: integer, minimum: 0 }
+        "401":
+          description: Not authenticated
+        "403":
+          description: "Forbidden: token scope, account permission or age limit"
+  /api/admin/sources/{id}/retire:
+    post:
+      tags:
+        - admin
+      summary: "Retire a source no series has as its main source: turn it off, or remove it (since v0.54.0)."
+      operationId: postApiAdminSourcesIdRetire
+      description: >-
+        Requires an admin account and a token carrying the admin scope. Scopes only ever restrict. Refused (409
+        `in_use`) while the source is some series' main source: Replace it first (POST /api/admin/sources/find {sourceId,
+        mode: replace}). Otherwise every series' follow of it is dropped with its listing rows, and then `how: off` (the
+        default) switches it off (as POST .../{id}/disable does), and `how: remove` takes a site added by address out of
+        the site list and the registry (`done: removed`), switches an extension's source off in its extension, which
+        unloads it (`done: switched_off`; the extension stays installed -- one package carries every language), and
+        turns anything else -- MangaDex, a built-in, a source pack's -- off, saying so (`done: turned_off`). Audited as
+        `source.retire` {source, how, done, followsDropped}.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                how: { type: string, enum: [off, remove], description: "`off` when left out." }
+      security:
+        - bearer: []
+      responses:
+        "200":
+          description: Retired.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok, done, followsDropped]
+                properties:
+                  ok: { type: boolean }
+                  done: { type: string, enum: [turned_off, removed, switched_off] }
+                  followsDropped: { type: integer, minimum: 0, description: Series that followed it and no longer do. }
+        "400":
+          description: "`bad_request`: a `how` it does not know"
+        "401":
+          description: Not authenticated
+        "403":
+          description: "Forbidden: token scope, account permission or age limit"
+        "409":
+          description: "`in_use` with `main` (how many series have it as their main source) and `message`/`messageSaid` (Said, retire.inUse)"
   /api/admin/sources/{id}/test:
     post:
       tags:

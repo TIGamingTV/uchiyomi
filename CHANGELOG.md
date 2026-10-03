@@ -1,5 +1,357 @@
 # Changelog
 
+## v0.54.0 — 2026-10-03
+
+**Admin → Providers and Admin → Extensions are now one place, Admin → Sources, and a source that stopped working can
+be replaced in one press: its series move to sources that work, and it is turned off.** Until now nothing could change
+a series' main source. Find other sources added followers, so a series whose site went offline kept that site as its
+main source for good, in every count, filter and queue.
+
+### One Sources section
+
+- **Admin → Sources** holds every source, of every kind: the built-in ones, MangaDex's languages, the sites you
+  added by address and every extension's sources. One list, the ones your series use first, each row one line
+  (*Healthy · 125 series · English*) and at most one key. The switched-off ones fold away.
+- **Needs attention** comes first, when there is anything: a broken source your series depend on, with **Replace**;
+  the failing sources nothing uses, with **Turn off all**; extension updates, with **Update**.
+- **Test all** tests every source, with how far it has got. **Add sources** has the extensions catalogue, adding a
+  site by its address, MangaDex's languages and Import a list.
+- **One sheet for every source:** how it is doing (with the evidence under *Details*), how many series use it, which
+  opens the Library on them, **Test**, **Replace**, **Turn off** or **on** (which asks first when series use it) and
+  **Remove** for a site, and, for an extension, its languages and settings.
+- **Old links still land.** `?tab=Providers`, `?tab=Extensions`, `card=mangadex` and `settings=` open the same things
+  in Sources, so bookmarks and notifications keep working.
+
+### Replace a source
+
+- **Replace** on a broken source says what it will do before it does it: *184 already follow a working source: it
+  becomes their main source. The other 11 are searched for on your other sources. It is turned off once nothing uses
+  it.* Then it does it, with the series moving as you watch and the count of moved, newly found and not replaced.
+- A series that already follows a working source moves at once: the best of them becomes its main source, by health,
+  then by how many of your chapters it carries, then your source order. One that follows none is searched for, under
+  its other names too, and the first match becomes its main source. A series numbered by posting order is left alone
+  and says why: its numbers come from its main source.
+- **Let me review each match first** shows every move before it happens, with **Make main** and **Make all green
+  main**.
+- **Make main** is also on each working source in a series' *Sources & translations*, for one series at a time.
+- Nothing moves on disk: chapters stay in the series' folder, and what you read stays read. A chapter that had failed
+  too often on the old source gets another try from the new one.
+
+### Turned off means off
+
+- A switched-off source was still asked for every chapter list by the scheduled check, and new chapters could still
+  be downloaded from it, whatever the button said. Now a switched-off source is never asked and never downloaded
+  from, and a series whose every source is off is skipped until one is back.
+- **Health** leads with **Replace** on a broken source that some series use as their main source. *Series that can no
+  longer update* now also lists series whose main source is broken or switched off with nothing working to fall back
+  on, and a switched-off source no longer counts as a working backup.
+- A source still main to any series cannot be removed or retired: *It is the main source of 3 series. Replace it
+  first.* A site added by address could be removed before, and its series stopped updating without a word.
+
+### Upgrading
+
+- **No database change.** v0.53.1 runs on the same database, and nothing changes in compose files or the environment.
+- **A behaviour change:** turning a source off now stops its chapter lists too, not just its downloads. Turn it back on
+  to see its lists again.
+- **For scripts** ([api.md](docs/api.md)):
+  - `GET /api/admin/sources/overview`: every source with its kind, standing, series counts and what needs attention.
+  - `POST /api/admin/series/:id/main-source` `{sourceId, old?}` makes a followed source the main one. It answers 409
+    for posting order, a pending renumber, a series being checked, a source switched off, unloaded or in another
+    language, and a source not followed.
+  - `POST /api/admin/sources/find` takes `mode: "replace"` (with `turnOff`), with
+    `GET /api/admin/sources/:id/replace-preview` and `POST /api/admin/sources/find/:runId/promote`. Runs carry
+    `mode`, `promoted`, `left`, `turnedOff`, `sourceId` and `sourceName`.
+  - `POST /api/admin/sources/:id/retire` `{how}` turns off or removes a source no series has as its main source,
+    and `DELETE /api/admin/sources/custom/:id` refuses while the site is in use.
+  - Series sources carry `standing`, and Health's source rows and frozen series carry `replace_source`.
+
+## v0.53.1 — 2026-10-03
+
+**Find other sources asks the sources you can see, and learns a series' other names before it searches.** Both, and a
+repair for installs whose other names could not be read, are **@TIGamingTV**'s
+([#141](https://github.com/AngeloSha/uchiyomi/pull/141)).
+
+### Find other sources finds manhwa again
+
+- **Sources marked 18+.** A run asked a source that flags itself adult only for a series rated 18+, the background
+  hunt's rule. Most manhwa extensions flag themselves adult, so on a library that reads them nearly every series ended
+  with *no other source could be asked* or *no match*. A run, and a review's **Follow**, now ask every source the admin
+  who started it may see, as Discover and following a source by hand already do. The background hunt keeps its rule.
+- **Other names before the search.** A series added before v0.49.1 has no other names stored, so it was searched
+  under its own title alone, and a manhwa whose sites each romanise it another way matched nothing. A run now first
+  takes the names its description lists, and only when that gives none, its main source's description: once, with a
+  time limit, and never while that source is switched off, cooling down or already failed in the run. They are kept
+  like any other name, so a name you removed stays removed.
+- When a series has no source to ask, the server log now says why, by count.
+
+### Upgrading
+
+- **The database:** an install that ran the fork build of PR #119 kept that build's `series_alt_titles`, which every
+  read failed on, so no other names showed and none were searched. It is brought to the right shape on first start.
+  On any other install nothing changes, and v0.53.0 still starts.
+
+## v0.53.0 — 2026-10-03
+
+**Three screens that had grown cluttered are redone around what you do on them: Admin → Extensions, Health's Source
+health, and a series' Edit details. Each now says first what needs you, offers one action for it, and keeps the rest
+a tap away.** And the series page shows a series' banner sharp. Much of the Extensions work answers **@Kedryn**'s notes
+on Discussion [#121](https://github.com/AngeloSha/uchiyomi/discussions/121).
+
+### Admin → Extensions, redesigned
+
+- **The engine at a glance.** One slim strip. **Extension engine** says *Ready*, its version and how many sources are
+  on against the limit (*5 of 25 sources on*). **Cloudflare helper** says *Connected*, or offers **Connect** with one
+  line on why it matters. Turning the engine off is under the strip's ⋯. When the engine is not answering or not set
+  up, the tab is the setup screen, as before.
+- **Installed and Browse,** two views with their counts, and **Languages** and **Check for extension updates** beside
+  them.
+- **Installed is one list.** While something needs you it is grouped: **Needs attention** first, with **Update all**
+  and **Turn on all** in its header, then **Ready**. Each extension says at most one thing (*Update available*, *No
+  source on*) and offers at most one key; the others show their languages and how many are on. The amber bars and the
+  warning on every card are gone.
+- **Browse reaches every extension.** On a repository of 1,300 the list stopped at the first 400 and said *narrow the
+  search*, so an extension past them, MangaFire in Kedryn's case, could not be found by scrolling. Browse now shows
+  60 at a time and the next ones as you scroll, to the last. Search by name and pick a language. **Show 18+
+  extensions** is a switch that says what it does (a chip reading *18+* was taken for "only 18+"), and the Browse tab
+  counts what the list holds. *1 repository* in the count line opens the repositories.
+- **Install is one press,** with its own busy state: the extension's sources switch on and are searchable from
+  Discover at once, and one with several languages then opens on them, so you can switch off the ones you don't read.
+- **An extension installed in the engine's own page** arrived with every source off, and the only way on was Remove
+  and Add again. Now it says *No source on* and offers **Turn on**. A language you hid stays off.
+- **The extension's sheet:**
+  - a switch per language (*Each language is its own source; turn on the ones you read.*), with a status under one
+    only when something is wrong: failing, blocked by the site, over the source limit, or hidden in every extension;
+  - the source limit, said when you are near it;
+  - **Settings**, folded until you open them. *Settings for* picks whose settings you see: a language select there
+    looked like it chose the language to read;
+  - **Remove extension**, which asks first and says how many series came from it.
+- **Languages** lists every language your extensions offer, with its sources, how many are on and how many series
+  came from it, and a switch that hides it in every extension, now and in the next one you install.
+- **Phones and right-to-left.** The sheets come up from the bottom and nothing scrolls sideways at 390 px; in Arabic
+  names and facts keep their own direction.
+
+### Health: Source health, sorted by what it costs you
+
+- On a library with many extensions the card listed every source with anything to say, switched-off ones first. On
+  one real library that was 31 sources turned off on purpose, each with its own Test key, under a glossary and a
+  paragraph, and above the few sources its series depended on: several screens of it.
+- It now leads with **Used by your series**, the most series first. Each row is one line (*Rate-limited — trying
+  again in 20 minutes · 37 series*) with one key, **Test** or **Clear block**; the rest are under ⋯, and the evidence
+  under *Details*.
+- **Failing, used by no series** comes next, with **Turn off all**, which asks first and turns them off one by one.
+- **Switched off by you** and **Nothing to fix right now** fold into one line each. The switched-off ones link to
+  where each comes back on, Providers or Extensions. What the keys do, and what counts as failing, are links at the
+  card's foot.
+- The card's summary counts the two groups that matter: *4 sources your series use need a look · 5 sources nothing
+  uses are failing*.
+
+### Edit details, redone
+
+- A series' **Edit details** was one long column where some fields saved at once and the rest only with a *Save
+  details* key halfway down, easy to miss. It is now a dialog with tabs, **Details**, **Reading**, **New chapters**
+  and **Files**, and every field saves itself, said once at the top (*Saved*), as Profile and Admin → Settings do.
+- **The art is in view while you edit:** the cover and the banner as the page shows them, with **Upload** (or
+  drop an image on the preview), **From a link**, **New banner** while the banner is an automatic one, and **Reset to
+  automatic**. Images up to 11 MB, as it says: a picture over about 9 MB used to fail as too large.
+- Status, reading direction and age rating are one-tap choices; *Always show* and *Auto-update* are switches. The
+  folder paths and **Mark caught up** keep their place, under Files and New chapters. On a phone it is a sheet with
+  **Art** as a tab of its own. Its words that were still English in every language are translated, and so are
+  Content → Art's notices and the home page's *Because you read*.
+
+### The series page shows its banner sharp
+
+- A series with a real banner, AniList's or one you set, now shows it sharp at the top of its page, under the same
+  shading that keeps the title readable. It was blurred, like the cover that stands in for a series with none, which
+  stays blurred, because a cover stretched that wide looks rough sharp. The banner made from a series' own pages
+  (v0.51.0) was sharp already. Content → Art's review tiles show a banner the way the series page does.
+
+### Also
+
+- A language switched on in an extension's sheet, for a source Uchiyomi had not recorded yet (one installed in the
+  engine's own page), stayed off without a word. It now switches on.
+
+### Upgrading
+
+- **No database change.** v0.52.0 runs on the same database, and nothing changes in compose files or the environment.
+- **For scripts** ([api.md](docs/api.md)):
+  - `GET /api/admin/extensions/catalog` answers a page at a time: `offset` (from 0) and `limit` (default and maximum
+    400, so a call with neither gets the first 400 as before), echoed beside `shown` and `matched`. It takes
+    `updates=true`, `hiddenAdult` counts the 18+ extensions the other filters match (it counted the whole catalogue),
+    and `adultTotal` is the whole catalogue's 18+ extensions that are not installed.
+  - `POST /api/admin/extensions/catalog/:pkgName` takes `enable` beside `install`, `update` and `uninstall`: it
+    switches an installed extension's sources on as its install would, answering `{ok, sources, on, hidden,
+    registered}`, or 409 `no_sources`; it is audited as `extension.enable`.
+  - `GET /api/admin/extensions/sources` gives each source `used`, the series that came from it, and
+    `POST /api/admin/extensions/sources/bulk` records a source it has no row for and switches it as asked.
+  - Health's `sources` items carry `group` (`affected`, `unused`, `quiet`, `off`), `state`, `stage`, `cooldown`,
+    `offBy` and `icon`, and come in that order. The card's summary uses new codes (`sources.affected`,
+    `sources.failingUnused`, `sources.working`) and a new join, `dot`.
+  - `GET /img/series/:id/backdrop` takes `style=banner`: a real banner sharp, the blurred cover for a series without
+    one.
+  - `PUT /api/admin/series/:id/art` accepts the body of an 11 MB picture.
+
+## v0.52.0 — 2026-10-02
+
+**A series can now be in your library in more than one language, as editions of one work: one card in the Library,
+chips to switch between them on the series page and in the reader, and in each language its own chapters, folder and
+reading progress.** MangaDex serves other languages than English, one source per language, switched on in
+**Admin → Providers**. And a source in another language than a series is never followed for it automatically, so a
+series stays in one language. Editions are **@p3t3t3**'s request on Discussion
+[#72](https://github.com/AngeloSha/uchiyomi/discussions/72), MangaDex's languages **@tagius**'s
+([#123](https://github.com/AngeloSha/uchiyomi/issues/123)), and two smaller ones are **@Kedryn**'s: full paths for
+admins ([#136](https://github.com/AngeloSha/uchiyomi/issues/136)) and a warning when the downloads folder sits inside
+the library ([#134](https://github.com/AngeloSha/uchiyomi/discussions/134)).
+
+### Language editions
+
+Blue Lock in English and in Spanish used to be one title to Uchiyomi: Discover showed the Spanish source folded under
+an *In library* card that opened the English series, and following the Spanish source from the English series mixed
+the two, each chapter in whichever language won that number. Now each language is its own **edition**: a series of
+its own, linked with the others as one work.
+
+- **Each edition is a series.** Its own folder (`MangaDex (ES-419)/Blue Lock (ES-419)`, so it never lands in the
+  original's), its own sources, chapters, numbering and reading progress, so reading the Spanish edition never moves
+  where you are in the English one. A series added now states the language it is in, and an admin can set it for
+  one already here.
+- **Adding one.** *Sources & translations* has a **Languages** section that says which language the series is in and
+  offers **Add a language**: pick one of the languages your sources offer, then the title there (searched under the
+  series' title and its other names). An admin is pointed to MangaDex's languages in **Admin → Providers** too,
+  where the one wanted may be a tap away. Or add it from Discover: a card whose title you have in another language stays
+  addable and says so (*EN in library*), and picking its Spanish source offers the Spanish edition straight away. A
+  source that does not say its language asks which one it is, and *It is a different series* adds it on its own.
+- **One card in the Library.** A work shows once: the edition you read last, else the first one added, with every
+  language under its title (*EN · ES-419*).
+- **Switching.** The series page has a row of language chips under the title, and *Spanish · Ch. 12* says how far
+  you are there. The reader's chapter list has the same chips: one opens the chapter you are on in the other edition,
+  or that edition's page at the chapter when the server does not have it yet, with its Fetch.
+- **For admins.** *Edit details* has a **Language** field (*Automatic* shows what it would be). Health's duplicate
+  check counts works, not series, and a pair in two languages offers **Link as editions** instead of a merge, which
+  is refused inside a work. The × in Languages unlinks an edition, which stays in the library on its own. The age
+  rating and *Always show* in *Edit details* apply to every edition, so an 18+ work is 18+ in each language; and a
+  viewer sees only the editions they may open.
+- **Mihon, OPDS and trackers.** Komga's API (what Mihon reads) and OPDS keep the editions separate and title one
+  *Blue Lock (ES-419)* while another edition is there, with its language set. The editions share their AniList,
+  MyAnimeList or Kitsu entry, and reading the one that is behind never pushes your progress back.
+
+### MangaDex in other languages
+
+**@tagius** ([#123](https://github.com/AngeloSha/uchiyomi/issues/123)) reads MangaDex in other languages than English.
+MangaDex was one English source that fell back to Spanish or Portuguese for a chapter English did not have.
+
+- **One source per language.** In **Admin → Providers**, MangaDex is one card, its languages behind **Manage**. English
+  is always on; each language you tap on becomes a source of its own, *MangaDex (ES-419)* say, at once and with no
+  restart, with its own Newest and Popular in Discover and its chapters in that language only. A series you add from
+  it is in that language. Turning off a language that series came from asks first: they keep their chapters and get
+  no new ones until it is back, and Health says which switch it is.
+- **English is unchanged**, the same source with the same search and fallback, except one thing: Discover's MangaDex
+  **Newest** is now the newest chapters in the language (English for English), where it used to list a title as new
+  when a chapter came out in any language.
+- **One rate limit for all of them.** Every MangaDex request goes through one pace, a quarter of a second apart, and
+  when MangaDex asks Uchiyomi to slow down, with a 429 or by saying none are left, every language waits as long as
+  it says, downloads included. A request that would wait more than ten seconds is given up rather than queued, and
+  costs the source no cooldown.
+- **Sites that do not say their language.** Most sites added by address, and some source packs, declare no language.
+  A new setting beside **Add a site** says which language they are in: English unless you choose another.
+
+### Every automatic follow keeps to the series' language
+
+A Spanish source followed by an English series fills it with Spanish chapters. Now the add dialog's *Also check the
+other sources*, the hunt for a missing chapter, Find other sources (automatic or reviewed) and Find missing chapters
+never follow, search or offer a source in another language than the series; a source in every language counts as any
+of them, and a series' own source always passes. Following one by hand from an older list is refused with both
+languages named, and with **Add it as an edition**, which opens the add dialog on that language. Borrowed chapter
+names come in the series' own language too.
+
+### Full paths, for @Kedryn
+
+- **Where a series and a chapter are on disk** ([#136](https://github.com/AngeloSha/uchiyomi/issues/136)). An admin
+  sees a series' folder, in full, under *Edit details* (**Folder on the server**), and a chapter's file in its ⋯ menu
+  (**Copy file path**); one tap copies it and says what it copied.
+
+### Mark caught up
+
+- For a series already in your library, **Mark caught up** (an admin's, in *Edit details* beside Auto-update) stops
+  the updater fetching what is already out, the whole back catalogue, and keeps it fetching every new chapter, as
+  *Nothing yet* does for a series you add. It says what it does before it does it, and **Undo** puts back the floor
+  the series had. Chapters already here stay; older ones can still be fetched from the chapter list. Asked for by
+  **@p3t3t3** on [#72](https://github.com/AngeloSha/uchiyomi/discussions/72).
+
+### The chapter select bar says what it removes
+
+- The series page's select bar greyed out *Remove* until chapters were ticked, and it read as the way to remove the
+  series. The bar is up from the moment you tap Select, its key says what it acts on (*Remove 3 chapters*), and with
+  nothing ticked it says *Tick chapters to remove them*, beside **Remove the whole series**, the series' own Remove.
+
+### Health: Folders scanned twice
+
+- **@Kedryn** ([#134](https://github.com/AngeloSha/uchiyomi/discussions/134)) mounted his manga at `/library` with
+  Uchiyomi's downloads folder inside it, so the library scan read every downloaded chapter a second time, as a series
+  with no source beside the one with its source, and nothing said why. A new Health check, *Folders scanned twice*,
+  warns while one folder is inside the other, by their paths or as the last scan met it, names where, and says how
+  to fix it: mount them side by side. The install guide has a new
+  [Volumes](docs/INSTALL.md#volumes) section with the compose lines, and the desktop app words it in its own terms.
+
+### Also
+
+- **Earlier searches reopen.** Each earlier Find other sources search is a key in the results sheet that opens it in
+  place, *Back to the latest search* above it, so a review whose matches are still waiting is not lost once another
+  search runs. A search stopped during its first series no longer reads *1 of 4 series* on the Server tasks card;
+  only the series it searched count. *Skipped* has its own key for series (*Skipped series*) and for a match
+  (*Skipped for good*), so Spanish, French and Portuguese agree each with what it names.
+- **Shuffle on a short series.** A series of eight chapters or fewer, ten pages or fewer each, had every page read
+  whatever the shuffle, so **New banner** drew the same four panels and said *Banner changed*. It now chooses among
+  panels about as striking, reaches further down only when nothing near is left, and says *This is the only banner
+  this series’ pages give.* when there is no other.
+- **The hunt reads a chapter's parts the way updates do.** A site that numbers a chapter's parts its own way (its
+  11.1 and 11.6 for your 11 and 11.5) lists that chapter, as v0.50.0 taught the updater, so the hunt for a missing part
+  takes it from there at once.
+- **Singulars and translations.** The last nine counts that read wrong at one in languages that agree a word with its
+  number (*1 seleccionados*, *1 supprimés*) now agree: selected, deleted, saved, filed by hand, not here yet, the two
+  kinds of skipped chapter, and Downloads' two delete confirmations. Still English until now, and translated: Admin →
+  Extensions' paragraph, its out-of-date banner and every toast; the series page's favourite button and save notices;
+  *Deleted 1 file*; *Delete 1 chapter from the server?*; and *Check for new chapters now*.
+- **The desktop app's server-mode check** in CI failed now and then (macOS on v0.50.0, Windows on v0.51.0's pull
+  request) while everything it printed was right. The app was fine: on a first visit the web app reloads once when its
+  offline worker takes over, and the check's wait for the sign-in form could lose its grip across that reload. It
+  now decides on the page that stays.
+
+### Security updates
+
+- `brace-expansion` 5.0.12 ([#139](https://github.com/AngeloSha/uchiyomi/pull/139)), for two high-severity advisories
+  and a medium-severity one, all denials of service on crafted brace patterns. The server reaches it only through
+  `@fastify/static`, which expands one fixed pattern over the web app's files at start, so no request ever did.
+
+### Upgrading
+
+- **The database** gets one migration on first start, and it only adds: `lib_series.lang` (the language a series is
+  in) and `lib_series.work_id` (the work an edition belongs to), with an index that allows one edition per language
+  in a work, and `server_settings.mangadex_langs` and `unstated_lang`. A data migration then states the language of
+  each MangaDex series from its own chapters, so a title that came in through English's fallback and is in Spanish
+  says so. v0.51.0 still starts on a migrated database: every new column is empty or has a default, and it never
+  reads them. There, a series added from a MangaDex language other than English reads *Source not installed*, kept
+  rather than lost, until you come back to v0.52.0.
+- **New source ids:** `mangadex-<code>` for each MangaDex language you switch on (`mangadex-es-419`,
+  `mangadex-pt-br`); `mangadex` stays English.
+- Nothing to change in compose files, and no new environment variables; the MangaDex languages and the language of
+  sites that do not say are settings, kept in the database.
+- **For scripts** ([api.md](docs/api.md)):
+  - New routes: `GET /api/sources/edition-candidates?seriesId=` (the languages a series could be added in, and with
+    `&lang=` the search there), `POST /api/admin/series/:id/editions` (link two series as editions) and
+    `DELETE /api/admin/series/:id/edition` (unlink one).
+  - `POST /api/sources/add` takes `edition: {of, lang?, ofLang?}`; its 409 `duplicate` offers `edition: {of,
+    heldLangs, lang}` when the source's language is not one the library holds the title in, and it refuses with
+    `edition_exists`, `edition_hidden` or `edition_lang`.
+  - Series payloads carry `lang`, `workId` and `edition` (admins also `langStated`, `langAuto`, the series' `paths`
+    and each chapter's `path`); `POST /api/series/search` takes `collapseEditions`; Discover's answers carry
+    `libraryLangs` and each provider's `lang`, and `inLibrary` now means held in that source's language.
+  - `PATCH /api/admin/series/:id` takes `lang` and `chapterFloor: 'caught_up'` (answering `{floor, previous}`), and
+    a merge inside a work is refused as `same_work`. `PATCH /api/admin/settings` takes `mangadexLangs` and
+    `unstatedLang`, and `GET` returns `mangadex_langs`, `unstated_lang` and `mangadex_available`.
+  - A follow refused for its language answers 409 `language_differs` with `edition: {of, lang}`, from the manual
+    follow and from a review's follow. `GET /api/admin/sources/find?runId=` reads an earlier run; Shuffle can answer
+    `{ok: true, seed, same: true}`; Health has a new check, `folders-twice`.
+  - A chapter copy's `lang` from MangaDex is the app's code (`es-419`, no longer `es-la`), as its sources are named.
+
 ## v0.51.0 — 2026-10-02
 
 **A series AniList has no banner for now gets one made from its own pages: four striking panels from different

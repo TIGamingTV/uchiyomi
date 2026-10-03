@@ -12,6 +12,7 @@ import { runtime } from '../lib/runtime';
 import { persistScan, libraryIdFor, LIBRARY_ROOT, DL_ROOT, setBookDates, setBookMeta } from '../lib/library';
 import { containedPath, allWritable } from '../lib/fsGuard';
 import { deleteSeries, restoreSeries, mergeSeries, getSeriesRow, deleteSeriesFiles, renameSeriesFolder, forgetSeries, diskSpelling } from '../lib/libraryAdmin';
+import { editionFollowing, linkEdition, unlinkEdition, workRows } from '../lib/editions';
 import { toStoredRel, trimTrailingSlashes } from '../lib/relPath';
 import { runFingerprintBackfill, fingerprintRemaining, fpState } from '../lib/fingerprintJob';
 import { runPageHashBackfill, pageHashRemaining, phState } from '../lib/pageHashJob';
@@ -38,30 +39,35 @@ import {
   listExtensions, refreshExtensions, setExtensionState, sourcesOfExtension, getRepos, setRepos, altRepoUrl,
   parseRepoInput, repoKey, contributedBy, engineReason, REPO_MESSAGES, type ExtensionInfo,
 } from '../lib/sources/suwayomi/extensions';
-import { getHiddenLangs, setSourcesEnabled, adoptExtensionSources, langOverview } from '../lib/sources/suwayomi/langs';
-import { lastSuwayomiLoad } from '../lib/sources/suwayomi/register';
+import { getHiddenLangs, setSourcesEnabled, adoptExtensionSources, langOverview, turnOnExtensionSources } from '../lib/sources/suwayomi/langs';
+import { lastSuwayomiLoad, rememberMissing } from '../lib/sources/suwayomi/register';
 import { engineStatusReport, connectEngineSolver } from '../lib/extensionEngine';
 import { env } from '../env';
 import { readFile, writeFile, mkdir, rm, rename, stat } from 'fs/promises';
 import { dirname, resolve } from 'path';
 import sharp from 'sharp';
-import { ART_DIR, artFile, artOverview } from '../lib/seriesArt';
+import { ART_BODY_LIMIT, ART_DIR, artFile, artOverview } from '../lib/seriesArt';
 import { writePreflight } from '../lib/fsGuard';
 // Admin stats report on the whole library by definition; this route is already behind requireAdmin.
 import { NO_LIBRARIES, SYSTEM_CTX, visibleToAll, sanitiseAdultList, sanitiseSourceIds, invalidateAdultFilter, browsableIds, viewCtxFor, hideAdult } from '../lib/visibility';
 import { cleanSourceOrder, invalidateSourcePrefs } from '../lib/sourcePrefs';
 import { borrowNamesFor, clearBorrowedNames } from '../lib/borrowNames';
-import { addSeriesFromSource, findBestMatch, resolveCandidate, norm, jobBusy, startDownloadJob, FILL_MAX_CHAPTERS, REFRESH_BUDGET_MS } from './sources';
+import { addSeriesFromSource, findBestMatch, resolveCandidate, norm, jobBusy, startDownloadJob, clearLatestCache, FILL_MAX_CHAPTERS, REFRESH_BUDGET_MS } from './sources';
 import { confirmsTitle } from '../lib/confirmTitle';
 import { chapterFileRel } from '../lib/downloader';
 import { REFETCH_BAK } from '../lib/fsAtomic';
 import type { SourceChapter } from '../lib/sources/types';
 import { getPlan, followable } from '../lib/fill';
+import { followGuard, seriesLanguage, sourceLanguage } from '../lib/seriesLang';
+import { say, saidOf } from '../lib/said';
 import { prefsSchema, readGlobalPrefs, readSeriesPrefs, effectivePrefsFor } from '../lib/scanlatorPrefs';
 import { groupsOf, normGroup } from '../lib/releases';
 import { groupStats, emptyGroupStat, type StatCopy } from '../lib/groupStats';
 import { copyToChapter, type ListingCopy } from '../lib/seriesListing';
 import { seriesSourcesFor } from '../lib/seriesSources';
+import { switchMainSource } from '../lib/mainSource';
+import { mainUses, retireSource } from '../lib/retireSource';
+import { sourcesOverview } from '../lib/sourcesOverview';
 import { titlesFromBackup, entriesFromBackup, type BackupEntry } from '../lib/tachibk';
 import { linkSeries, seedTrackerFloor } from '../lib/trackers';
 import { ADAPTERS, PROVIDERS, LIST_STATUSES, TRACKER_LIST_MAX, type Provider, type LibraryEntry } from '../lib/trackerProviders';
@@ -70,6 +76,8 @@ import { findingOf, runHealthChecks } from '../lib/health';
 import { IGNORABLE_CHECKS, ignoreFinding, unignoreFinding } from '../lib/healthIgnore';
 import { readHealthSummary, scheduleHealthSummaryRefresh, storeHealthSummary } from '../lib/healthSummary';
 import { titlesFromMangadexList, entriesFromMangadexList } from '../lib/mangadexList';
+import { MANGADEX_LANGS, canonLang, mdLang, setUnstatedLang } from '../lib/lang';
+import { cleanMangadexLangs, mangadexLangs, setMangadexLangs, syncMangadexSources } from '../lib/sources/mangadexLangs';
 import { fetchAniListArt, fetchAniListCandidates, fetchAnimeBanner } from '../lib/anilist';
 import { READING_DIRECTIONS } from '../lib/komgaDto';
 import { learnDirection, directionFromAniListMatch } from '../lib/readingDirection';
@@ -176,6 +184,12 @@ async function linkImportedSeries(
   if (!row.tracker || !row.external_id || !PROVIDERS.includes(row.tracker as Provider)) return false;
   const provider = row.tracker as Provider;
   await linkSeries(seriesId, row.external_id, row.backup_title, userId, provider);
+  // Every language edition of its work is the same entry (v0.52.0): linked too, so progress syncs from whichever is
+  // read. The floor is seeded once, here: lib/trackers.ts pushOne holds the entry's floor over all of them.
+  const siblings = await q<{ id: string }>(
+    `SELECT o.id FROM lib_series s JOIN lib_series o ON o.work_id = s.work_id AND o.id <> s.id
+      WHERE s.id = $1 AND s.work_id IS NOT NULL AND o.merged_into IS NULL`, [seriesId]).catch(() => [] as Array<{ id: string }>);
+  for (const sib of siblings) await linkSeries(sib.id, row.external_id, row.backup_title, userId, provider);
   await seedTrackerFloor(userId, seriesId, provider, row.progress ?? 0);
   return true;
 }
@@ -434,6 +448,9 @@ const scrubResult = <R extends { skips?: RepairSkip[] } | null | undefined>(r: R
 /** The run kinds the status route always estimates: the Health page's three chips, its cards and the nightly. */
 const ESTIMATED_KINDS = ['full', 'fix_short', 'fill', 'retry', 'steps:solver', 'steps:short', 'steps:gaps', 'steps:failures', 'steps:failures:now'];
 
+/** The most extensions GET /api/admin/extensions/catalog answers at once, and how many it answers when not asked. */
+export const CATALOG_PAGE_MAX = 400;
+
 export default async function adminRoutes(app: FastifyInstance) {
   app.addHook('preHandler', authenticate);
   app.addHook('preHandler', requireAdmin);
@@ -488,6 +505,7 @@ export default async function adminRoutes(app: FastifyInstance) {
   const SETTINGS_COLS = 'server_name, allow_registration, updater_hours, extension_hours, extension_auto_update, '
     + 'update_check, install_ping, install_ping_last, scanlator_prefs, cleanup_read, cleanup_read_days, backup_hour, auto_follow_on_failure, '
     + 'repair_enabled, komga_ghost_chapters, adult_genres, adult_sources, source_prefs, group_upgrade, borrow_names, '
+    + 'mangadex_langs, unstated_lang, '
     + ARCHIVE_SETTINGS_COLS;
   // `extensions_configured` is not a column: extension_hours has a NOT NULL default, so its presence says
   // nothing about whether there is an engine to check. The settings page needs to know, or it offers two
@@ -505,6 +523,9 @@ export default async function adminRoutes(app: FastifyInstance) {
       cleanup_read_due: await dueCountCached(row?.cleanup_read_days ?? 30).catch(() => null),
       // The slow archive's disk floor is set against this (#117): GiB free under the download root, null unknown.
       archive_free_gb: await archiveFreeGb().catch(() => null),
+      // v0.52.0 (#123): every language MangaDex is offered in, English first -- what Admin → Providers' picker
+      // offers. `mangadex_langs` beside it is the ones besides English that are on.
+      mangadex_available: MANGADEX_LANGS.map((l) => l.code),
     };
   };
   /**
@@ -553,7 +574,7 @@ export default async function adminRoutes(app: FastifyInstance) {
       sample: !row?.secret,
     };
   });
-  app.patch('/api/admin/settings', async (req) => {
+  app.patch('/api/admin/settings', async (req, reply) => {
     const b = z.object({
       serverName: z.string().min(1).max(64).optional(),
       allowRegistration: z.boolean().optional(),
@@ -603,9 +624,34 @@ export default async function adminRoutes(app: FastifyInstance) {
        * default. Off takes back the names it gave every series that follows this switch.
        */
       borrowNames: z.boolean().optional(),
+      /**
+       * MangaDex in other languages (v0.52.0, #123): the languages besides English that are on, replaced whole, as
+       * app codes from lib/lang.ts MANGADEX_LANGS ("es-419", "pt-BR"; MangaDex's own "es-la" is read as es-419).
+       * Applied live: each language turned on becomes its own source, each turned off goes. English is always on,
+       * so it is refused here, like a code MangaDex is not offered in.
+       */
+      mangadexLangs: z.array(z.string().min(1).max(20)).max(100).optional(),
+      /**
+       * The language of sources and series that do not say (lib/lang.ts unstatedLang): English unless this server's
+       * sites are in another. The same-language guard on automatic follows reads it.
+       */
+      unstatedLang: z.string().min(1).max(35).optional(),
       // The slow archive's pause and pacing (#117, lib/archive.ts): the window's two ends together or not at all.
       ...ARCHIVE_SETTINGS_SHAPE,
     }).superRefine(archiveWindowPair).parse(req.body);
+    // The languages are checked before anything is written: a refused field writes nothing, as for every other.
+    if (b.mangadexLangs) {
+      const unknown = b.mangadexLangs.find((c) => !mdLang(c));
+      if (unknown !== undefined) {
+        return reply.code(400).send({ error: 'unknown_language', message: `MangaDex is not offered in "${unknown}".` });
+      }
+      if (b.mangadexLangs.some((c) => canonLang(c) === 'en')) {
+        return reply.code(400).send({ error: 'english_always_on', message: 'English is always on: list only the other languages.' });
+      }
+    }
+    if (b.unstatedLang !== undefined && !canonLang(b.unstatedLang)) {
+      return reply.code(400).send({ error: 'unknown_language', message: `"${b.unstatedLang}" is not one language.` });
+    }
     if (b.serverName !== undefined) await q('UPDATE server_settings SET server_name = $1, updated_at = now() WHERE id = 1', [b.serverName]);
     if (b.allowRegistration !== undefined) await q('UPDATE server_settings SET allow_registration = $1, updated_at = now() WHERE id = 1', [b.allowRegistration]);
     if (b.updaterHours !== undefined) await q('UPDATE server_settings SET updater_hours = $1, updated_at = now() WHERE id = 1', [b.updaterHours]);
@@ -646,6 +692,26 @@ export default async function adminRoutes(app: FastifyInstance) {
       await q('UPDATE server_settings SET source_prefs = $1::jsonb, updated_at = now() WHERE id = 1',
         [JSON.stringify({ priority: cleanSourceOrder(b.sourcePrefs.priority) })]);
       invalidateSourcePrefs();
+    }
+    if (b.mangadexLangs !== undefined) {
+      const before = mangadexLangs();
+      const next = cleanMangadexLangs(b.mangadexLangs);
+      await q('UPDATE server_settings SET mangadex_langs = $1::jsonb, updated_at = now() WHERE id = 1', [JSON.stringify(next)]);
+      // Live: the list in memory, then the registry to match it -- a language on is searchable on the next request.
+      setMangadexLangs(next);
+      const { removed } = syncMangadexSources();
+      // Discover's pages are cached per source for ten minutes: drop them, so a language switched off is not served
+      // from the cache and one switched on is asked at once.
+      clearLatestCache();
+      // A language switched off freezes its series; the header's Health mark should say so now, not at the next look.
+      if (removed.length) scheduleHealthSummaryRefresh();
+      if (before.join() !== next.join()) await logAudit('settings.mangadex_langs', { userId: userIdOf(req), detail: { from: before, to: next }, req });
+    }
+    if (b.unstatedLang !== undefined) {
+      const lang = canonLang(b.unstatedLang)!;
+      await q('UPDATE server_settings SET unstated_lang = $1, updated_at = now() WHERE id = 1', [lang]);
+      // The guard compares synchronously (lib/lang.ts): the next follow decision reads the new language.
+      setUnstatedLang(lang);
     }
     await applyArchiveSettings(b);
     await logAudit('settings.update', { userId: userIdOf(req), detail: b, req });
@@ -1019,6 +1085,11 @@ export default async function adminRoutes(app: FastifyInstance) {
   // a JSON file; the source pack's custom plugin instantiates the adapters from it on reload. ----
   // readSites/writeSites moved to lib/sources/customSites so the watchdog can follow a moved site too.
   const slug = (s: string) => s.toLowerCase().replace(/[^a-z0-9]+/g, '').slice(0, 40);
+  /** A source some series still has as its main source cannot be retired or removed (v0.54.0): how many, in words. */
+  const inUse = (main: number) => {
+    const said = say('retire.inUse', { n: main });
+    return { error: 'in_use', main, message: said.text, messageSaid: saidOf(said) };
+  };
 
   app.get('/api/admin/sources/custom', async () => ({ content: await readSites() }));
   app.post('/api/admin/sources/custom', async (req, reply) => {
@@ -1077,8 +1148,13 @@ export default async function adminRoutes(app: FastifyInstance) {
     const src = getSource(id);
     return reply.send({ ok: true, id, base: site.base, smoke: src ? await smokeTest(src) : null });
   });
-  app.delete('/api/admin/sources/custom/:id', async (req) => {
+  // Refused while the site is some series' main source (v0.54.0): it was removed at once, with no check, and every series
+  // from it froze -- "no longer installed". Replace moves them first. Reintroduce by dropping the guard: "the custom
+  // site's delete is refused while it is in use" in retireSource.int.test.ts removes it.
+  app.delete('/api/admin/sources/custom/:id', async (req, reply) => {
     const { id } = req.params as { id: string };
+    const main = await mainUses(id);
+    if (main > 0) return reply.code(409).send(inUse(main));
     await writeSites((await readSites()).filter((s) => s.id !== id));
     await reloadAll();
     await logAudit('source.custom_remove', { userId: userIdOf(req), detail: { id }, req });
@@ -1093,6 +1169,13 @@ export default async function adminRoutes(app: FastifyInstance) {
   // ones again. sourcePrefs is the series' own source order (lib/sourcePrefs.ts), which REPLACES the server's;
   // null, or an empty list, clears it. borrowNames switches chapter-name borrowing (lib/borrowNames.ts) for this
   // series, null to follow the server. Each field is written on its own, so a body naming one leaves the rest.
+  //
+  // v0.52.0: `lang` states the language the series is in (lib/seriesLang.ts), null to infer it again -- refused for an
+  // edition, since every row in a work states its language, and for a language another edition of its work holds.
+  // `chapterFloor` is "Mark caught up" (discussion #72): 'caught_up' floors the series just above the newest chapter
+  // the sources list or the library holds -- the "Nothing yet" add's floor (routes/sources.ts), so the back catalogue
+  // is never fetched and every later release is -- and a number or null puts back the floor the answer reported as
+  // `previous`, which is the Undo.
   app.patch('/api/admin/series/:id', async (req, reply) => {
     const { id } = req.params as { id: string };
     const b = z.object({
@@ -1100,15 +1183,57 @@ export default async function adminRoutes(app: FastifyInstance) {
       scanlatorPrefs: prefsSchema.nullable().optional(),
       sourcePrefs: z.object({ priority: z.array(z.string().min(1).max(120)).max(100) }).nullable().optional(),
       borrowNames: z.boolean().nullable().optional(),
+      lang: z.string().min(1).max(35).nullable().optional(),
+      chapterFloor: z.union([z.literal('caught_up'), z.number().min(0).max(1e6), z.null()]).optional(),
     }).strict().safeParse(req.body);
     if (!b.success) return reply.code(400).send({ error: 'bad_request' });
     if (b.data.autoUpdate === undefined && b.data.scanlatorPrefs === undefined && b.data.sourcePrefs === undefined
-        && b.data.borrowNames === undefined) {
+        && b.data.borrowNames === undefined && b.data.lang === undefined && b.data.chapterFloor === undefined) {
       return reply.code(400).send({ error: 'bad_request', message: 'Nothing to change.' });
     }
     const row = await getSeriesRow(id);
     if (!row) return reply.code(404).send({ error: 'not_found' });
+    // Every refusal before the first write: the fields below are written one by one.
+    const lang = b.data.lang == null ? null : canonLang(b.data.lang);
+    if (b.data.lang != null && !lang) return reply.code(400).send({ error: 'bad_lang', message: 'That is not a language code.' });
+    if (b.data.lang !== undefined) {
+      const work = await workRows(id);
+      if (lang === null && work.length > 1) {
+        return reply.code(409).send({ error: 'edition_lang', message: 'An edition always says which language it is in. Unlink it first to make it automatic.' });
+      }
+      const other = lang ? work.find((r) => r.id !== id && r.lang === lang) : undefined;
+      if (other) return reply.code(409).send({ error: 'edition_exists', message: `"${other.title}" is already this work's edition in that language.`, existing: { id: other.id, title: other.title, lang } });
+    }
+    let caughtUp: { floor: number | null; previous: number | null } | undefined;
+    if (b.data.chapterFloor !== undefined) {
+      const prev = await one<{ floor: string | null; top: number | null }>(
+        `SELECT s.chapter_floor AS floor,
+                (SELECT max(n) FROM (SELECT l.number::float8 AS n FROM series_listing l WHERE l.series_id = s.id
+                                     UNION ALL
+                                     SELECT COALESCE(ov.number, bk.number)::float8 FROM lib_books bk LEFT JOIN book_overrides ov ON ov.book_id = bk.id
+                                      WHERE bk.series_id = s.id) x) AS top
+           FROM lib_series s WHERE s.id = $1`, [id]);
+      const previous = prev?.floor == null ? null : Number(prev.floor);
+      if (b.data.chapterFloor === 'caught_up' && prev?.top == null) {
+        return reply.code(409).send({ error: 'nothing_listed', message: 'No chapter of this series is listed or here yet. Check for new chapters first.' });
+      }
+      // A hair above the newest number, as the "Nothing yet" add floors: `chapter_floor` is inclusive from below.
+      caughtUp = { floor: b.data.chapterFloor === 'caught_up' ? Number(prev!.top) + 0.001 : b.data.chapterFloor, previous };
+    }
     const detail: Record<string, unknown> = { id };
+    if (b.data.lang !== undefined) {
+      // The unique index is the last word: an edition linked in the same moment can still take the language.
+      const ok = await q('UPDATE lib_series SET lang = $2 WHERE id = $1', [id, lang]).then(() => true, (e) => {
+        if ((e as { code?: string })?.code === '23505') return false;
+        throw e;
+      });
+      if (!ok) return reply.code(409).send({ error: 'edition_exists', message: 'Another edition of this work is already in that language.' });
+      detail.lang = lang;
+    }
+    if (caughtUp) {
+      await q('UPDATE lib_series SET chapter_floor = $2 WHERE id = $1', [id, caughtUp.floor]);
+      detail.chapterFloor = caughtUp;
+    }
     if (b.data.autoUpdate !== undefined) {
       await q('UPDATE lib_series SET auto_update = $2 WHERE id = $1', [id, b.data.autoUpdate]);
       detail.autoUpdate = b.data.autoUpdate;
@@ -1136,7 +1261,10 @@ export default async function adminRoutes(app: FastifyInstance) {
       else await clearBorrowedNames({ seriesId: id }).catch(() => 0);
     }
     await logAudit('series.settings', { userId: userIdOf(req), detail, req });
-    return { ok: true, ...(b.data.autoUpdate !== undefined ? { autoUpdate: b.data.autoUpdate } : {}) };
+    return {
+      ok: true, ...(b.data.autoUpdate !== undefined ? { autoUpdate: b.data.autoUpdate } : {}),
+      ...(b.data.lang !== undefined ? { lang } : {}), ...(caughtUp ? { chapterFloor: caughtUp } : {}),
+    };
   });
 
   /**
@@ -1282,7 +1410,13 @@ export default async function adminRoutes(app: FastifyInstance) {
     if (plan.seriesId !== id) return reply.code(400).send({ error: 'bad_request', message: 'That plan is for another series.' });
     const cand = plan.candidates.find((c) => c.source === source && c.sourceSeriesId === sourceSeriesId);
     if (!cand) return reply.code(400).send({ error: 'not_in_plan', message: 'That source was not one of the options.' });
-    if (cand.pinned) return reply.code(409).send({ error: 'is_primary', message: 'That is already the series’ own source.' });
+    // The plan's own mark, and the series' main source NOW (v0.54.0): a plan lives five minutes, and a Make main in
+    // between can make one of its candidates the main source -- following that would list every chapter twice.
+    // Reintroduce by checking `cand.pinned` alone: "a fill plan made before a switch cannot follow the series' own
+    // main source" in seriesSources.int.test.ts is answered 200, with a row naming the main.
+    if (cand.pinned || source === (await one<{ source_id: string | null }>('SELECT source_id FROM lib_series WHERE id = $1', [id]))?.source_id) {
+      return reply.code(409).send({ error: 'is_primary', message: 'That is already the series’ own source.' });
+    }
     // The one rule, shared with the add-time auto-follow (lib/fill.ts followable(): coverage at or over
     // MIN_COVERAGE with a verdict that says the numbering lines up), so the two paths cannot disagree
     // about what may be followed.
@@ -1300,6 +1434,26 @@ export default async function adminRoutes(app: FastifyInstance) {
     }
     if (!getSource(source) || await isDisabled(source).catch(() => false)) {
       return reply.code(409).send({ error: 'source_unavailable', message: 'That source is not available right now.' });
+    }
+    // The same-language guard's backstop (v0.52.0, #123), once the source is known to be there (one that is not
+    // declares no language). The fill scan never offers a source in another language, so only a plan from before the
+    // series' language changed reaches this: refused with both languages and the way to have both, an edition --
+    // `edition` is the add route's own `{of, lang}`. Reintroduce by dropping it: "the manual follow refuses a stale
+    // plan's source in another language" in languageGuard.int.test.ts follows it.
+    // When the work holds an edition in that language already, the way on is that edition (`existing`): the sentence
+    // says to follow it there, and the web's key opens it instead of adding a second. Reintroduce by always offering a
+    // new edition: "the refusal points at the edition the work holds in that language" in languageGuard.int.test.ts.
+    if (!(await followGuard(id))(source)) {
+      const theirs = sourceLanguage(source);
+      const ours = (await seriesLanguage(id)).lang;
+      const existing = await editionFollowing(id, source, SYSTEM_CTX);
+      const said = existing
+        ? say('follow.languageDiffersEdition', { theirs, ours, edition: existing.lang })
+        : say('follow.languageDiffers', { theirs, ours });
+      return reply.code(409).send({
+        error: 'language_differs', message: said.text, messageSaid: saidOf(said),
+        edition: { of: id, lang: theirs, ...(existing ? { existing } : {}) },
+      });
     }
     const row = await getSeriesRow(id);
     if (!row) return reply.code(404).send({ error: 'not_found' });
@@ -1331,6 +1485,34 @@ export default async function adminRoutes(app: FastifyInstance) {
     // refreshes the listing itself before it picks a copy.
     void updateSeries(id, 0).catch(() => {});
     return { ok: true, sources: list };
+  });
+
+  /**
+   * Make a source the series follows its main source (v0.54.0, lib/mainSource.ts): the Sources sheet's Make main.
+   * Body `{sourceId, old?}`: `old` is what becomes of the old main -- `auto` (the default) keeps it as the last
+   * follower while it still carries the series (usable or cooling), `keep` and `drop` decide. 200 `{ok, from, to, old:
+   * kept|dropped, langPinned?, sources}`; 404 `not_found`; 409 with the refusal's code, its English and its said code
+   * (`is_main`, `not_followed`, `posting_order`, `renumber_pending`, `busy`, `source_unavailable`, `moved`, and
+   * `language_differs` with `edition {of, lang, existing?}`, as the follow route answers it).
+   */
+  app.post('/api/admin/series/:id/main-source', async (req, reply) => {
+    const { id } = req.params as { id: string };
+    const b = z.object({ sourceId: z.string().min(1).max(200), old: z.enum(['auto', 'keep', 'drop']).optional() }).strict().safeParse(req.body ?? {});
+    if (!b.success) return reply.code(400).send({ error: 'bad_request', message: 'Name the source ({sourceId}), and optionally what becomes of the old main ({old}).' });
+    const out = await switchMainSource(id, b.data.sourceId, {
+      old: b.data.old ?? 'auto', ctx: await viewCtxFor(userIdOf(req), roleOf(req)), userId: userIdOf(req), via: 'manual', req,
+    });
+    if ('refused' in out) {
+      if (out.refused === 'not_found' || !out.said) return reply.code(404).send({ error: 'not_found' });
+      return reply.code(409).send({
+        error: out.refused, message: out.said.text, messageSaid: saidOf(out.said), ...(out.edition ? { edition: out.edition } : {}),
+      });
+    }
+    // Read before the refresh starts, as the follow's answer is (above): the switch is not a check.
+    const list = await seriesSourcesFor(id);
+    // The listing again, through the new main: its chapters show on the series page now, not at the next sweep.
+    void updateSeries(id, 0).catch(() => {});
+    return { ok: true, from: out.from, to: out.to, old: out.old, ...(out.langPinned ? { langPinned: out.langPinned } : {}), sources: list };
   });
 
   app.delete('/api/admin/series/:id/sources/:sourceId', async (req, reply) => {
@@ -1478,6 +1660,13 @@ export default async function adminRoutes(app: FastifyInstance) {
       if (row.deleted_at) return reply.code(400).send({ error: 'deleted', message: `The ${which} series is hidden. Restore it first.` });
       if (row.merged_into) return reply.code(400).send({ error: 'merged', message: `The ${which} series was already merged into another one.` });
     }
+    // Two language editions of one work are two languages' chapters (v0.52.0): merged, the list would hold both under
+    // one number each, in whichever language came first. Reintroduce by dropping this: "a merge inside one work is
+    // refused" in editions.int.test.ts answers 200 and moves the chapters.
+    const works = await q<{ work_id: string | null }>('SELECT work_id FROM lib_series WHERE id = ANY($1)', [[id, into.id]]);
+    if (works.length === 2 && works[0].work_id && works[0].work_id === works[1].work_id) {
+      return reply.code(409).send({ error: 'same_work', message: 'These are two language editions of one work. Unlink one first if they really are the same edition.' });
+    }
 
     const r = await mergeSeries(id, into.id);
     await logAudit('series.merge', {
@@ -1486,6 +1675,55 @@ export default async function adminRoutes(app: FastifyInstance) {
       req,
     });
     return r;
+  });
+
+  /**
+   * Link two series already in the library as language editions of one work (v0.52.0, #72): Health's "Link as
+   * editions" on a duplicate pair in two languages. `lang` states :id's language and `withLang` `with`'s, each where
+   * the series does not state one (otherwise what it is inferred to be). A series already in a work brings the work:
+   * the other joins it. Refused when both are in one language (merge them instead), when the language is taken in
+   * the work, and when each is already in a different work.
+   */
+  app.post('/api/admin/series/:id/editions', async (req, reply) => {
+    const { id } = req.params as { id: string };
+    const b = z.object({
+      with: z.string().min(1).max(64), lang: z.string().min(1).max(35).optional(), withLang: z.string().min(1).max(35).optional(),
+    }).strict().safeParse(req.body);
+    if (!b.success) return reply.code(400).send({ error: 'bad_request', message: 'Which series should it be linked with?' });
+    if (b.data.with === id) return reply.code(400).send({ error: 'same_series', message: 'A series cannot be an edition of itself.' });
+    const [mine, theirs] = await Promise.all([workRows(id), workRows(b.data.with)]);
+    const a = mine.find((r) => r.id === id);
+    const w = theirs.find((r) => r.id === b.data.with);
+    if (!a || !w) return reply.code(404).send({ error: 'not_found' });
+    if (a.hidden || w.hidden) return reply.code(400).send({ error: 'deleted', message: 'One of the two is removed from the library. Put it back first.' });
+    if (mine.length > 1 && theirs.length > 1) {
+      return mine.some((r) => r.id === w.id)
+        ? reply.code(409).send({ error: 'same_work', message: 'These two are already editions of one work.' })
+        : reply.code(409).send({ error: 'other_work', message: 'Each is already an edition of another work. Unlink one of them first.' });
+    }
+    // What each will state: the language asked for where the series states none, else its own.
+    const langA = a.stated ? a.lang : canonLang(b.data.lang) ?? a.lang;
+    const langW = w.stated ? w.lang : canonLang(b.data.withLang) ?? w.lang;
+    if (langA === langW) return reply.code(409).send({ error: 'same_lang', message: 'Both are in the same language: merge them instead.' });
+    // The one in a work stays where it is and the other joins it.
+    const [joiner, of, joinerLang, ofLang] = mine.length > 1 ? [w, a, langW, langA] : [a, w, langA, langW];
+    const taken = (mine.length > 1 ? mine : theirs).find((r) => r.id !== of.id && r.lang === joinerLang);
+    const r = taken ? 'taken' as const : await linkEdition(joiner.id, { of: of.id, lang: joinerLang, ofLang });
+    if (r === 'taken') return reply.code(409).send({ error: 'edition_exists', message: 'That language already has its edition in this work.' });
+    if (r === 'gone') return reply.code(404).send({ error: 'not_found' });
+    await logAudit('series.edition_link', { userId: userIdOf(req), detail: { id: joiner.id, title: joiner.title, of: of.id, ofTitle: of.title, lang: r.lang }, req });
+    return { ok: true, workId: r.workId, lang: r.lang };
+  });
+
+  /** Take a series out of its work (v0.52.0): it stays in the library on its own; a work left with one edition dissolves. */
+  app.delete('/api/admin/series/:id/edition', async (req, reply) => {
+    const { id } = req.params as { id: string };
+    const row = await getSeriesRow(id);
+    if (!row) return reply.code(404).send({ error: 'not_found' });
+    const r = await unlinkEdition(id);
+    if (!r) return reply.code(409).send({ error: 'not_an_edition', message: 'That series is not an edition of another.' });
+    await logAudit('series.edition_unlink', { userId: userIdOf(req), detail: { id, title: row.title, workId: r.workId }, req });
+    return { ok: true };
   });
 
   app.put('/api/admin/series/:id/meta', async (req, reply) => {
@@ -1546,18 +1784,33 @@ export default async function adminRoutes(app: FastifyInstance) {
     // genres all failed the same way, under a message that only said "Could not save". `?? null` because
     // the field is nullish: absent and null both mean "inherit whatever ComicInfo said".
     const sentDirection = b.data.readingDirection !== undefined;
-    await q(
-      `INSERT INTO series_overrides (series_id, title, summary, author, status, genres, age_rating, adult_exempt, reading_direction, updated_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $10, now())
-       ON CONFLICT (series_id) DO UPDATE SET title = $2, summary = $3, author = $4, status = $5,
-         genres = $6, age_rating = $7,
-         adult_exempt = COALESCE($8, series_overrides.adult_exempt),
-         reading_direction = CASE WHEN $9::boolean THEN $10 ELSE series_overrides.reading_direction END,
-         updated_at = now()`,
-      [id, norm(b.data.title), norm(b.data.summary), norm(b.data.author), norm(b.data.status),
-       normGenres(b.data.genres), b.data.ageRating ?? null, b.data.adultExempt ?? null,
-       sentDirection, b.data.readingDirection ?? null],
-    );
+    await tx(async (qq) => {
+      await qq(
+        `INSERT INTO series_overrides (series_id, title, summary, author, status, genres, age_rating, adult_exempt, reading_direction, updated_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $10, now())
+         ON CONFLICT (series_id) DO UPDATE SET title = $2, summary = $3, author = $4, status = $5,
+           genres = $6, age_rating = $7,
+           adult_exempt = COALESCE($8, series_overrides.adult_exempt),
+           reading_direction = CASE WHEN $9::boolean THEN $10 ELSE series_overrides.reading_direction END,
+           updated_at = now()`,
+        [id, norm(b.data.title), norm(b.data.summary), norm(b.data.author), norm(b.data.status),
+         normGenres(b.data.genres), b.data.ageRating ?? null, b.data.adultExempt ?? null,
+         sentDirection, b.data.readingDirection ?? null],
+      );
+      // The 18+ rating is the WORK's (v0.52.0, #72): written onto every other language edition in the same
+      // transaction, so a capped account can never open the Spanish copy of a work rated 18+ in English, nor the 18+
+      // switch tidy one edition away and leave the other. Only the rating and "Always show": a title or a summary is
+      // each edition's own. Reintroduce by dropping this: "rating one edition 18+ hides the other from a capped
+      // account" in editions.int.test.ts opens the sibling.
+      await qq(
+        `INSERT INTO series_overrides (series_id, age_rating, adult_exempt)
+         SELECT o.id, $2, $3 FROM lib_series s JOIN lib_series o ON o.work_id = s.work_id AND o.id <> s.id
+          WHERE s.id = $1 AND s.work_id IS NOT NULL
+         ON CONFLICT (series_id) DO UPDATE SET age_rating = EXCLUDED.age_rating,
+           adult_exempt = COALESCE(EXCLUDED.adult_exempt, series_overrides.adult_exempt), updated_at = now()`,
+        [id, b.data.ageRating ?? null, b.data.adultExempt ?? null],
+      );
+    });
     await logAudit('series.meta_override', { userId: userIdOf(req), detail: { id }, req });
     return { ok: true };
   });
@@ -2391,8 +2644,9 @@ export default async function adminRoutes(app: FastifyInstance) {
     return { ok: true };
   });
 
-  // Set/replace a cover or background: paste a URL, upload an image (base64 data URL), or reset to automatic.
-  app.put('/api/admin/series/:id/art', { bodyLimit: 12 * 1024 * 1024 }, async (req, reply) => {
+  // Set/replace a cover or background: paste a URL, upload an image (base64 data URL), or reset to automatic. The body
+  // limit fits the largest picture Edit details takes once it is base64 (lib/seriesArt.ts ART_BODY_LIMIT).
+  app.put('/api/admin/series/:id/art', { bodyLimit: ART_BODY_LIMIT }, async (req, reply) => {
     const { id } = req.params as { id: string };
     const b = z.object({
       kind: z.enum(['cover', 'banner']),
@@ -2568,6 +2822,15 @@ export default async function adminRoutes(app: FastifyInstance) {
     const on = new Set(
       (await q<{ source_id: string }>('SELECT source_id FROM suwayomi_sources WHERE enabled = true')).map((r) => r.source_id),
     );
+    // How many series came from each source (v0.53.0), switched on or not: Admin → Extensions says it beside each of an
+    // extension's languages, and what removing the extension leaves without updates. By the same rule the Languages
+    // overview counts by, keyed on the engine's id (`lib_series.source_id` holds 'sw:' + it).
+    const used = new Map(
+      (await q<{ source_id: string; n: number }>(
+        `SELECT s.source_id, count(*)::int AS n FROM lib_series s
+          WHERE s.source_id LIKE 'sw:%' AND ${visibleToAll('s')} GROUP BY s.source_id`,
+      )).map((r) => [r.source_id.slice('sw:'.length), r.n]),
+    );
     const needle = (term || '').trim().toLowerCase();
     const content = remote
       .map((s) => ({
@@ -2578,6 +2841,7 @@ export default async function adminRoutes(app: FastifyInstance) {
         supportsLatest: !!s.supportsLatest,
         enabled: on.has(String(s.id)),
         pkgName: s.extension?.pkgName ?? null,
+        used: used.get(String(s.id)) ?? 0,
       }))
       .filter((s) => (!needle || s.name.toLowerCase().includes(needle)) && (!lang || s.lang === lang) && (!pkg || s.pkgName === pkg))
       .sort((a, b) => Number(b.enabled) - Number(a.enabled) || a.name.localeCompare(b.name));
@@ -2603,6 +2867,9 @@ export default async function adminRoutes(app: FastifyInstance) {
     if (!b.success) return reply.code(400).send({ error: 'bad_request' });
     if (needExt(reply)) return;
     const { ids = [], langs = [] } = b.data;
+    // A source of an extension installed in the engine's own page since the last registration has no row yet, and
+    // the switch below only flips rows: recorded first, or switching it on was a quiet no-op (v0.53.0).
+    await rememberMissing(ids);
     const r = await setSourcesEnabled({ ids, langs, enabled: b.data.enabled });
     const load = await reloadAll();
     await logAudit(b.data.enabled ? 'source.extension_enable' : 'source.extension_disable', {
@@ -2651,7 +2918,15 @@ export default async function adminRoutes(app: FastifyInstance) {
   // in this codebase and nothing is fetched until one is added.
   app.get('/api/admin/extensions/catalog', async (req, reply) => {
     if (needExt(reply)) return;
-    const { q: term, lang, installed, nsfw } = req.query as { q?: string; lang?: string; installed?: string; nsfw?: string };
+    const { q: term, lang, installed, nsfw, updates, offset: rawOffset, limit: rawLimit } = req.query as {
+      q?: string; lang?: string; installed?: string; nsfw?: string; updates?: string; offset?: string; limit?: string;
+    };
+    // A page of the matches (v0.53.0): `offset` from 0, `limit` up to CATALOG_PAGE_MAX, which is also the default -- the
+    // first 400, as the route always answered. ⚠️ It answered ONLY those: on a 1,300-extension repository the panel said
+    // "Showing 400 of 570 matches -- narrow the search", and an extension past the 400th could not be reached by
+    // scrolling (discussion #121). Admin → Extensions now asks for the next page as it scrolls.
+    const offset = Math.min(1_000_000, Math.max(0, Math.floor(Number(rawOffset)) || 0));
+    const limit = Math.min(CATALOG_PAGE_MAX, Math.max(1, Math.floor(Number(rawLimit)) || CATALOG_PAGE_MAX));
     let all;
     try {
       all = await listExtensions();
@@ -2659,10 +2934,13 @@ export default async function adminRoutes(app: FastifyInstance) {
       return reply.code(502).send({ error: 'unreachable', message: (e as Error)?.message || 'Could not reach the extension server.' });
     }
     const needle = (term || '').trim().toLowerCase();
-    const filtered = all
+    const matching = all
       .filter((e) => (!needle || e.name.toLowerCase().includes(needle) || e.pkgName.toLowerCase().includes(needle)))
       .filter((e) => (!lang || lang === 'all' ? true : e.lang === lang))
       .filter((e) => (installed === 'true' ? e.installed : true))
+      // `updates` (v0.53.0): only the extensions with a newer version waiting.
+      .filter((e) => (updates === 'true' ? e.hasUpdate : true));
+    const filtered = matching
       // adult extensions are hidden unless asked for — this is a household server by default, and they
       // otherwise dominate the top of an alphabetical list
       .filter((e) => (nsfw === 'true' ? true : !e.nsfw || e.installed))
@@ -2670,15 +2948,23 @@ export default async function adminRoutes(app: FastifyInstance) {
       .sort((a, b) => Number(b.installed) - Number(a.installed) || Number(b.hasUpdate) - Number(a.hasUpdate) || a.name.localeCompare(b.name));
     const langs = [...new Set(all.map((e) => e.lang).filter(Boolean))].sort() as string[];
     // Serve icons through our own origin; the extension server is not reachable from a browser.
-    const withIcons = filtered.map((e) => ({ ...e, iconUrl: e.iconUrl ? `/img/extensions/icon/${e.pkgName}` : null }));
+    const page = filtered.slice(offset, offset + limit).map((e) => ({ ...e, iconUrl: e.iconUrl ? `/img/extensions/icon/${e.pkgName}` : null }));
     return {
-      content: withIcons.slice(0, 400),
+      content: page,
       total: all.length,
-      shown: Math.min(filtered.length, 400),
+      shown: page.length,
       matched: filtered.length,
+      offset,
+      limit,
       installed: all.filter((e) => e.installed).length,
       updatable: all.filter((e) => e.hasUpdate).length,
-      hiddenAdult: nsfw === 'true' ? 0 : all.filter((e) => e.nsfw && !e.installed).length,
+      // The 18+ extensions the other filters match and the 18+ filter keeps out (v0.53.0; the whole catalogue's before):
+      // what "Nothing matches" can offer to show.
+      hiddenAdult: nsfw === 'true' ? 0 : matching.filter((e) => e.nsfw && !e.installed).length,
+      // The 18+ extensions in the whole catalogue that are not installed, whatever was asked: what Browse leaves out
+      // while Show 18+ extensions is off. The Browse tab counts `total` less these, as its list does -- it said
+      // "Browse 1,304" over a list that ended at "1,118 of 1,118".
+      adultTotal: all.filter((e) => e.nsfw && !e.installed).length,
       langs,
     };
   });
@@ -2735,8 +3021,27 @@ export default async function adminRoutes(app: FastifyInstance) {
   app.post('/api/admin/extensions/catalog/:pkgName', async (req, reply) => {
     if (needExt(reply)) return;
     const { pkgName } = req.params as { pkgName: string };
-    const b = z.object({ action: z.enum(['install', 'uninstall', 'update']) }).safeParse(req.body);
+    const b = z.object({ action: z.enum(['install', 'uninstall', 'update', 'enable']) }).safeParse(req.body);
     if (!b.success) return reply.code(400).send({ error: 'bad_request' });
+
+    // "Turn on its sources" (v0.53.0): an installed extension's sources switched on as its install would have, and the
+    // engine asked for nothing but the list. An extension installed in the engine's own page showed as installed with
+    // every source off, and Remove then Add again was the only way to switch them on (discussion #121).
+    if (b.data.action === 'enable') {
+      let provided: Awaited<ReturnType<typeof sourcesOfExtension>>;
+      try {
+        provided = await sourcesOfExtension(pkgName);
+      } catch (e) {
+        return reply.code(502).send({ error: 'unreachable', message: (e as Error)?.message || 'Could not reach the extension server.' });
+      }
+      if (!provided.length) {
+        return reply.code(409).send({ error: 'no_sources', message: 'That extension is not installed, or provides no source.' });
+      }
+      const turned = await turnOnExtensionSources(provided);
+      await logAudit('extension.enable', { userId: userIdOf(req), detail: { pkgName, on: turned.on }, req });
+      const load = await reloadAll();
+      return { ok: true, sources: provided.length, on: turned.on, hidden: turned.hidden, registered: load.suwayomi };
+    }
 
     // Ask which sources this extension provides BEFORE acting: once it is uninstalled it provides none, and
     // we would leave the rows behind claiming sources that no longer exist.
@@ -3185,11 +3490,13 @@ export default async function adminRoutes(app: FastifyInstance) {
       // is the deleted case above under another name. The rank column keeps the survivor's own title
       // ahead of a merged title that happens to normalise the same (the first hit wins below).
       const have = new Map<string, string>();
+      // Oldest first within a rank (v0.52.0): a title held in two language editions maps to the original, every time,
+      // rather than to whichever row the planner happened to read first.
       for (const r of await q<{ id: string; title: string }>(
-        `SELECT s.id, s.title, 0 AS rank FROM lib_series s WHERE ${visibleToAll('s')}
+        `SELECT s.id, s.title, 0 AS rank, s.created_at FROM lib_series s WHERE ${visibleToAll('s')}
          UNION ALL
-         SELECT t.id, m.title, 1 AS rank FROM lib_series m JOIN lib_series t ON t.id = m.merged_into WHERE ${visibleToAll('t')}
-         ORDER BY rank`,
+         SELECT t.id, m.title, 1 AS rank, t.created_at FROM lib_series m JOIN lib_series t ON t.id = m.merged_into WHERE ${visibleToAll('t')}
+         ORDER BY rank, created_at, id`,
       )) {
         const k = norm(r.title);
         if (k && !have.has(k)) have.set(k, r.id);
@@ -3475,12 +3782,12 @@ export default async function adminRoutes(app: FastifyInstance) {
      * id is looked up the way addSeriesFromSource itself found the row. Null when neither is known, and
      * then nothing is linked -- a link must never be guessed.
      */
-    const seriesIdOf = async (r: { folder?: string; existing?: { title: string; source: string } }): Promise<string | null> => {
+    const seriesIdOf = async (r: { folder?: string; existing?: { title: string; source?: string } }): Promise<string | null> => {
       if (r.folder) {
         return (await one<{ id: string }>(`SELECT s.id FROM lib_series s WHERE s.folder = $1 ORDER BY (${visibleToAll('s')}) DESC LIMIT 1`, [r.folder]))?.id ?? null;
       }
       if (r.existing) {
-        return (await one<{ id: string }>(`SELECT s.id FROM lib_series s WHERE s.title = $1 AND s.source = $2 AND ${visibleToAll('s')} LIMIT 1`, [r.existing.title, r.existing.source]))?.id ?? null;
+        return (await one<{ id: string }>(`SELECT s.id FROM lib_series s WHERE s.title = $1 AND s.source = $2 AND ${visibleToAll('s')} LIMIT 1`, [r.existing.title, r.existing.source ?? '']))?.id ?? null;
       }
       return null;
     };
@@ -3639,6 +3946,13 @@ export default async function adminRoutes(app: FastifyInstance) {
   });
   app.get('/api/admin/sources/check', async () => checkProgress());
 
+  /**
+   * Every source the server knows, of every kind, in one answer (v0.54.0, lib/sourcesOverview.ts): the one Sources
+   * section reads it. `attention` is what it leads with: the sources to Replace, the failing ones nothing uses, and how
+   * many extensions have an update waiting. The extension engine's own state stays GET /api/admin/extensions/status's.
+   */
+  app.get('/api/admin/sources/overview', async () => sourcesOverview());
+
   const testing = new Set<string>();
   app.post('/api/admin/sources/:id/test', async (req, reply) => {
     const { id } = req.params as { id: string };
@@ -3659,6 +3973,22 @@ export default async function adminRoutes(app: FastifyInstance) {
     } finally {
       testing.delete(id);
     }
+  });
+
+  /**
+   * Retire a source no series has as its main source (v0.54.0, lib/retireSource.ts): its follows are dropped with their
+   * listing rows, then `how: 'off'` (the default) switches it off, and `remove` takes a site added by address out of
+   * the list, switches an extension's source off in the extension, and turns anything else (MangaDex, a built-in, a
+   * pack) off -- `done` says which: `turned_off`, `removed` or `switched_off`. 409 `in_use` {main} while it is some
+   * series' main source: Replace it first. Its own route, which Fastify ranks above `/:id/:action` as it ranks `/test`.
+   */
+  app.post('/api/admin/sources/:id/retire', async (req, reply) => {
+    const { id } = req.params as { id: string };
+    const b = z.object({ how: z.enum(['off', 'remove']).optional() }).strict().safeParse(req.body ?? {});
+    if (!b.success) return reply.code(400).send({ error: 'bad_request', message: 'How to retire it: {how: "off" | "remove"}.' });
+    const r = await retireSource(id, { how: b.data.how ?? 'off', userId: userIdOf(req), req });
+    if ('inUse' in r) return reply.code(409).send(inUse(r.inUse));
+    return r;
   });
 
   app.post('/api/admin/sources/:id/:action', async (req, reply) => {

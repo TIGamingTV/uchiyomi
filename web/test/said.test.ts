@@ -42,6 +42,12 @@ const SAMPLE: Record<string, (c: number) => unknown> = {
   label: () => 'Image quality', value: () => 'best', url: () => 'http://solver:8191', host: () => 'aquareader.org',
   transport: () => 'ENOTFOUND', name: () => 'Webtoons', source: () => 'aqua', from: () => 'Aqua', to: () => 'MangaDex',
   title: () => 'Walk Tale', ranges: () => '3-7, 12', fs: () => 'ext4', library: () => 'ext4', downloads: () => 'nfs',
+  // v0.52.0, dupes.languages: two language codes, named in the reader's language on both sides.
+  a: () => 'en', b: () => 'es-419',
+  theirs: () => 'es-419', ours: () => 'en', lib: () => '/library', dl: () => '/library-dl', edition: () => 'es-419',
+  lang: () => 'es-419',
+  // v0.54.0, frozen.failing and frozen.followingDown: each branch of the sentence, one per count.
+  offline: (c) => c === 1, state: (c) => (c === 1 ? 'off' : 'failing'),
 };
 
 /**
@@ -353,6 +359,10 @@ test('a line is joined the reader\'s way, and a code this build does not know le
   assert.equal(saidText([{ code: 'sources.turnedOff' }, { code: 'sources.uses', params: { n: 0 } }]), 'turned off by you; no series use it');
   assert.equal(saidText([{ code: 'sources.inconclusive', params: { stage: 'pages' } }, { code: 'sources.uses', params: { n: 0 }, join: 'dashCap' }]),
     'the last test ran out of time while listing pages — not proof it is broken — No series use it');
+  // v0.53.0, Source health's summary: its two counts side by side, in every language. Reintroduce the join as a clause
+  // ("; "): this reads "3 sources your series use need a look; 5 sources…".
+  assert.equal(saidText([{ code: 'sources.affected', params: { n: 3 } }, { code: 'sources.failingUnused', params: { n: 5 }, join: 'dot' }]),
+    '3 sources your series use need a look · 5 sources nothing uses are failing', 'Source health\'s two counts are not side by side');
   // In Japanese and Arabic, their own marks: "；" and "؛", "（…）", and no space between sentences.
   try {
     setActiveLocale('ja');
@@ -360,8 +370,10 @@ test('a line is joined the reader\'s way, and a code this build does not know le
     assert.equal(joinPart('A。', 'B', 'sentence'), 'A。B');
     assert.equal(joinPart('A。', 'b', 'then'), 'A。b', 'in Japanese, a sentence that opens on a name is joined otherwise');
     assert.equal(joinPart('A', 'B', 'paren'), 'A（B）');
+    assert.equal(joinPart('A', 'B', 'dot'), 'A · B', 'two counts side by side are not a clause');
     setActiveLocale('ar');
     assert.equal(joinPart('أ', 'ب', 'clause'), 'أ؛ ب');
+    assert.equal(joinPart('أ', 'ب', 'dot'), 'أ · ب');
   } finally {
     setActiveLocale('en');
   }
@@ -495,6 +507,8 @@ test('on the desktop app, every platform wording says Uchiyomi, never a containe
   const DESKTOP = [
     'solver.down', 'solver.downNote', 'solver.failingNote', 'cap.note', 'cap.title', 'cap.detail', 'frozen.overLimit',
     'fix.solverCrash', 'fix.solverDown', 'fix.bypassOff', 'fix.engineLogin', 'fix.engineDown', 'fix.solverBroken',
+    // v0.52.0 (#134): the desktop app chooses its folders; nothing is mounted there.
+    'nested.note',
   ];
   for (const code of DESKTOP) {
     const line = saidText({ code, params: { n: 2, cap: 25, source: 'sw:1', url: 'http://127.0.0.1:1/token', error: null } });

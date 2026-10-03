@@ -16,12 +16,12 @@
  * the server's wherever the two are meant to read alike.
  */
 import { t as tr } from './i18n';
-import { activeLocale, cached, durationText, relativeTime } from './format';
+import { activeLocale, cached, durationText, languageName, relativeTime } from './format';
 import { isDesktop } from './desktop';
 import { SOURCE_STATUSES, sourceMark, type ProviderStatus } from './status';
 
 /** How a part joins the one before it (bff lib/said.ts Join). */
-export type Join = 'clause' | 'sentence' | 'then' | 'period' | 'dash' | 'dashCap' | 'paren' | 'colon';
+export type Join = 'clause' | 'sentence' | 'then' | 'period' | 'dash' | 'dashCap' | 'paren' | 'colon' | 'dot';
 
 /** A sentence as the server sends it: its code, what fills it, and how it joins the part before it. */
 export interface Said {
@@ -72,6 +72,8 @@ export function joinPart(a: string, b: string, how: Join | undefined): string {
     case 'dashCap': return `${a} — ${cap(b)}`;
     case 'paren': return cjk() ? `${a}（${b}）` : `${a} (${b})`;
     case 'colon': return `${a}${cjk() ? '：' : ': '}${b}`;
+    // v0.53.0: two counts side by side (Source health's summary), the separator the app writes between facts everywhere.
+    case 'dot': return `${a} · ${b}`;
   }
   return `${a} ${b}`;
 }
@@ -243,7 +245,7 @@ const WORDS: Record<string, (p: P) => string | null> = {
   'numbering.live': (p) => (num(p, 'n') === 1 ? tr('1 series waits for a numbering review') : tr('{n} series wait for a numbering review', { n: num(p, 'n') })),
   'numbering.none': () => tr('No numbering change waits for a review'),
   'numbering.lately': (p) => (num(p, 'n') === 1 ? tr('1 numbered by posting order lately') : tr('{n} numbered by posting order lately', { n: num(p, 'n') })),
-  'numbering.note': () => tr('Some sources give many different posts the same chapter number (Webtoons numbers a post by the episode it belongs to). A new series from such a source is numbered by posting order; one already in your library is renumbered only when you confirm its plan, and downloads nothing until then. Renaming keeps every file, and reading progress stays with its chapter. "Keep the source\'s numbers" records your choice; the source\'s own "Use sequential chapter numbering" setting, under Admin → Extensions, is the other way out.'),
+  'numbering.note': () => tr('Some sources give many different posts the same chapter number (Webtoons numbers a post by the episode it belongs to). A new series from such a source is numbered by posting order; one already in your library is renumbered only when you confirm its plan, and downloads nothing until then. Renaming keeps every file, and reading progress stays with its chapter. "Keep the source\'s numbers" records your choice; the source\'s own "Use sequential chapter numbering" setting, under Admin → Sources, is the other way out.'),
   'numbering.shared': (p) => tr('{name} gives {extras} of {posts} posts a number another post has', { name: sourceName(p), extras: num(p, 'extras'), posts: num(p, 'posts') }),
   'numbering.sharedMost': (p) => tr('{name} gives {extras} of {posts} posts a number another post has ({most} are all {number})', {
     name: sourceName(p), extras: num(p, 'extras'), posts: num(p, 'posts'), most: num(p, 'most'), number: num(p, 'number'),
@@ -301,7 +303,7 @@ const WORDS: Record<string, (p: P) => string | null> = {
   'frozen.live': (p) => (num(p, 'n') === 1 ? tr('1 series has no working source') : tr('{n} series have no working source', { n: num(p, 'n') })),
   'frozen.none': () => tr('Every series has a working source'),
   'frozen.covered': (p) => (num(p, 'n') === 1 ? tr('1 lost its primary but still follows another') : tr('{n} lost their primary but still follow another', { n: num(p, 'n') })),
-  'frozen.engineNote': () => tr('Series that came from extensions wait for the extension engine; Admin → Extensions shows how to bring it back.'),
+  'frozen.engineNote': () => tr('Series that came from extensions wait for the extension engine; Admin → Sources shows how to bring it back.'),
   'frozen.note': () => tr('These read fine, but nothing can fetch new chapters for them and "find missing chapters" will not offer their own source. Switch the source back on, re-add the extension, or re-point the series at a source that carries it.'),
   'frozen.noSource': (p) => (num(p, 'n') === 1 ? tr('1 chapter; no source recorded') : tr('{n} chapters; no source recorded', { n: num(p, 'n') })),
   'frozen.engineDown': (p) => (num(p, 'n') === 1
@@ -322,9 +324,31 @@ const WORDS: Record<string, (p: P) => string | null> = {
   'frozen.uninstalled': (p) => (num(p, 'n') === 1
     ? tr('1 chapter; its source {source} is no longer installed', { source: str(p, 'source') })
     : tr('{n} chapters; its source {source} is no longer installed', { n: num(p, 'n'), source: str(p, 'source') })),
+  // v0.52.0 (#123): a MangaDex language switched off. The language in the reader's own words, never its code.
+  'frozen.mangadexOff': (p) => {
+    const v = { n: num(p, 'n'), language: languageName(str(p, 'lang')) };
+    return v.n === 1 ? tr('1 chapter; MangaDex in {language} is switched off in Admin → Sources', v)
+      : tr('{n} chapters; MangaDex in {language} is switched off in Admin → Sources', v);
+  },
   'frozen.following': (p) => tr('primary {source} gone; still following {names}', { source: p.source == null ? tr('(none)') : str(p, 'source'), names: strs(p, 'names').join(listSep()) }),
+  // v0.54.0: a loaded main source that is failing, or says it is offline; and one switched off or failing that a
+  // follower covers.
+  'frozen.failing': (p) => {
+    const v = { n: num(p, 'n'), source: str(p, 'source') };
+    if (p.offline) return v.n === 1 ? tr('1 chapter; its source {source} says it is offline', v) : tr('{n} chapters; its source {source} says it is offline', v);
+    return v.n === 1 ? tr('1 chapter; its source {source} is failing', v) : tr('{n} chapters; its source {source} is failing', v);
+  },
+  'frozen.followingDown': (p) => {
+    const v = { source: str(p, 'source'), names: strs(p, 'names').join(listSep()) };
+    return p.state === 'off' ? tr('primary {source} switched off; still following {names}', v) : tr('primary {source} failing; still following {names}', v);
+  },
 
   // ---- Source health (#115)
+  // v0.53.0: the summary counts the card's two groups that need a look. 'sources.live', 'none', 'off', 'idle' and
+  // 'unfinished' are no longer sent, and keep their words for a summary an older server stored (bff lib/said.ts).
+  'sources.affected': (p) => (num(p, 'n') === 1 ? tr('1 source your series use needs a look') : tr('{n} sources your series use need a look', { n: num(p, 'n') })),
+  'sources.failingUnused': (p) => (num(p, 'n') === 1 ? tr('1 source nothing uses is failing') : tr('{n} sources nothing uses are failing', { n: num(p, 'n') })),
+  'sources.working': () => tr('All sources are working'),
   'sources.live': (p) => (num(p, 'n') === 1 ? tr('1 source is failing or blocked') : tr('{n} sources are failing or blocked', { n: num(p, 'n') })),
   'sources.unused': () => tr('Nothing is failing that your library uses'),
   'sources.none': () => tr('All sources responding normally'),
@@ -376,6 +400,8 @@ const WORDS: Record<string, (p: P) => string | null> = {
   'dupes.note': () => tr('Detected by two series matching the same AniList entry, so it catches copies added from different sources under different names. Progress tracking works best with one copy of each. Merging is one-way and never automatic: the nightly repair leaves these alone and you confirm each one.'),
   'dupes.same': () => tr('Same AniList entry'),
   'dupes.copies': (p) => tr('{n} copies — merge them one pair at a time', { n: num(p, 'n') }),
+  // v0.52.0 (#72): a pair in two languages; the codes named in the reader's language.
+  'dupes.languages': (p) => tr('The same work in {a} and {b}: link them as editions rather than merging.', { a: languageName(str(p, 'a')), b: languageName(str(p, 'b')) }),
 
   // ---- Impossible chapter numbers
   'outliers.live': (p) => (num(p, 'n') === 1 ? tr('1 series has chapters numbered far beyond the rest') : tr('{n} series have chapters numbered far beyond the rest', { n: num(p, 'n') })),
@@ -539,6 +565,16 @@ const WORDS: Record<string, (p: P) => string | null> = {
   'census.stat': (p) => tr('the scan could not check {where}: {error}', { where: whereText(p), error: str(p, 'error') }),
   'census.loop': (p) => tr('the scan took {where} for a loop: {what}', { where: whereText(p), what: loopedTo(p) }),
 
+  // ---- Folders scanned twice (v0.52.0, #134)
+  'nested.same': () => tr('The downloads folder and the library are one folder, so every downloaded chapter is scanned twice'),
+  'nested.downloadsInside': (p) => tr('The downloads folder is inside the library, at {folder}, so every downloaded chapter is scanned twice', { folder: str(p, 'folder') }),
+  'nested.libraryInside': (p) => tr('The library is inside the downloads folder, at {folder}, so every chapter in it is scanned twice', { folder: str(p, 'folder') }),
+  'nested.byPath': () => tr('Their paths put one inside the other.'),
+  'nested.byScan': () => tr('The last library scan read the same files here a second time.'),
+  'nested.note': (p) => (isDesktop()
+    ? tr('Uchiyomi scans its library folder and the manga folder you added both, so neither may be inside the other: each downloaded chapter then shows up twice. Keep the two side by side; then remove the copies with no source.')
+    : tr('Uchiyomi scans the library ({lib}) and its downloads folder ({dl}) both, so neither may be inside the other: each downloaded chapter then shows up twice, once in a series with its source and once in a series with none. Mount them side by side, each in a folder of its own, and restart Uchiyomi; then remove the copies with no source. The Volumes section of the install guide shows how.', { lib: str(p, 'lib'), dl: str(p, 'dl') })),
+
   // ---- The extension engine (#72)
   'engine.waiting': (p) => (num(p, 'n') === 1
     ? tr('1 series that came from extensions keeps its chapters and gets no new ones until it is back')
@@ -547,12 +583,12 @@ const WORDS: Record<string, (p: P) => string | null> = {
   // "Désactivée" above "le moteur".
   'engine.switchedOff': () => tr('Switched off'),
   'engine.notSetUp': () => tr('Not set up'),
-  'engine.offNote': () => tr('Admin → Extensions shows how to bring it back. Its data is kept while it is off.'),
+  'engine.offNote': () => tr('Admin → Sources shows how to bring it back. Its data is kept while it is off.'),
   'engine.fromExtensions': () => tr('Series from extensions'),
   'engine.notAnswering': (p) => (p.error ? joinPart(tr('Not answering'), str(p, 'error'), 'paren') : tr('Not answering')),
   'engine.retries': () => tr('Uchiyomi asks again every 5 minutes by itself, and its extensions come back without a restart.'),
   'engine.reopen': () => tr('If it stays this way, quit and reopen Uchiyomi, which starts its extension engine again.'),
-  'engine.checkAgain': () => tr('Admin → Extensions shows what to check for your setup, and Check again there asks at once.'),
+  'engine.checkAgain': () => tr('Admin → Sources shows what to check for your setup, and Check again there asks at once.'),
   'engine.notAnsweringTitle': () => tr('Not answering'),
   'engine.asked': (p) => (num(p, 'n') === 1 ? tr('asked 1 time since it stopped answering') : tr('asked {n} times since it stopped answering', { n: num(p, 'n') })),
   'engine.noAnswer': () => tr('no answer at the last try'),
@@ -665,6 +701,27 @@ const WORDS: Record<string, (p: P) => string | null> = {
   'pref.text': (p) => tr('{label} takes text.', { label: str(p, 'label') }),
   'pref.tooLong': (p) => tr('{label} is too long.', { label: str(p, 'label') }),
 
+  // ---- A follow refused for its language (v0.52.0, #123): the two languages by the reader's own names for them.
+  'follow.languageDiffers': (p) => tr('That source is in {theirs} and this series is in {ours}. Add it as an edition in {theirs} instead: each language keeps its own chapters.', {
+    theirs: languageName(str(p, 'theirs')), ours: languageName(str(p, 'ours')),
+  }),
+  // ...when the work holds an edition that may follow the source already: the follow belongs there.
+  'follow.languageDiffersEdition': (p) => tr('That source is in {theirs} and this series is in {ours}. Follow it on the {edition} edition instead.', {
+    theirs: languageName(str(p, 'theirs')), ours: languageName(str(p, 'ours')), edition: languageName(str(p, 'edition')),
+  }),
+
+  // ---- Make main refused (v0.54.0, bff lib/mainSource.ts): the Sources sheet's key and the Replace run's review.
+  'numbering.postingRefusal': () => tr('This series is numbered by posting order, so another source’s chapter numbers do not line up with it.'),
+  'main.isMain': () => tr('That source is already this series’ main source.'),
+  'main.notFollowed': () => tr('This series does not follow that source. Only a source it follows can become its main source.'),
+  'main.renumberPending': () => tr('This series’ chapters are waiting to be renumbered. Review that on the series page first.'),
+  'main.unavailable': () => tr('That source cannot be used right now: it is not installed, it is switched off, or it is not available on this account.'),
+  'main.moved': () => tr('This series’ main source changed meanwhile. Look again.'),
+  // A source retired, or a site removed, while some series still has it as its main source (bff lib/retireSource.ts).
+  'retire.inUse': (p) => (num(p, 'n') === 1
+    ? tr('It is the main source of 1 series. Replace it first.')
+    : tr('It is the main source of {n} series. Replace it first.', { n: num(p, 'n') })),
+
   // ---- A diagnosis's fix (bff lib/sourceDiagnosis.ts FixCode). ADMIN ONLY, like the server's.
   'fix.solverCrash': () => (isDesktop()
     ? tr('The browser inside Uchiyomi\'s built-in Cloudflare helper crashed. Quit and reopen Uchiyomi to restart it.')
@@ -706,10 +763,10 @@ const WORDS: Record<string, (p: P) => string | null> = {
     chapters: () => tr('The extension engine answered, but the extension itself failed while listing chapters.'),
     pages: () => tr('The extension engine answered, but the extension itself failed while listing pages.'),
     images: () => tr('The extension engine answered, but the extension itself failed while downloading images.'),
-  }), tr('Usually the site changed or refused the extension: update the extension (Admin → Extensions), check its settings, or open the site in a browser. The engine\'s own message is shown with the test.'), 'sentence'),
+  }), tr('Usually the site changed or refused the extension: update the extension (Admin → Sources), check its settings, or open the site in a browser. The engine\'s own message is shown with the test.'), 'sentence'),
   'fix.timeout': () => tr('A timeout alone does not say why. Re-test it: that distinguishes a moved domain, a challenge that never completed, and a genuinely slow site.'),
-  'fix.disabled': () => tr('Turn it back on in Admin, Sources, Providers.'),
-  'fix.moved': (p) => tr('The site now redirects to {host}. Update its address in Admin, Sources, Providers.', { host: str(p, 'host') }),
+  'fix.disabled': () => tr('Turn it back on in Admin → Sources.'),
+  'fix.moved': (p) => tr('The site now redirects to {host}. Update its address in Admin → Sources.', { host: str(p, 'host') }),
   'fix.unreachableAt': (p) => tr('The address could not be reached ({error}). Check the URL. The site may be gone.', { error: str(p, 'transport') }),
   'fix.cdnAnswered403': () => tr('The site\'s CDN answered 403 to a direct request. A challenge solver cannot fix that; it is usually a datacentre-IP block.'),
   'fix.nothingToDo': () => tr('Nothing to do. The cooldown widens automatically and clears itself.'),
@@ -724,7 +781,7 @@ const WORDS: Record<string, (p: P) => string | null> = {
     pages: () => tr('The live test failed while listing pages, and the error matches nothing known. It is shown with the test.'),
     images: () => tr('The live test failed while downloading images, and the error matches nothing known. It is shown with the test.'),
   }),
-  'fix.unnumbered': () => tr('The extension lists this source\'s chapters, but none of them with a chapter number, so there is nothing to order, name or download. Look for a numbering option in the extension\'s own settings (Admin → Extensions), or Ignore it here.'),
+  'fix.unnumbered': () => tr('The extension lists this source\'s chapters, but none of them with a chapter number, so there is nothing to order, name or download. Look for a numbering option in the extension\'s own settings (Admin → Sources), or Ignore it here.'),
   'fix.emptySearch': () => tr('It answers without an error but returns nothing, which usually means the site changed its markup or is serving a challenge page. Re-test it to find out which.'),
   'fix.emptyChapters': () => tr('It finds titles, but lists no chapters for the titles it tried, which usually means the chapter list moved or changed its markup. Re-add it with auto-detect, or update the extension.'),
   'fix.emptyPages': () => tr('It lists chapters, but no pages for the chapters it tried, which usually means the reader page changed its markup or hides pages behind a script. Re-add it with auto-detect, or update the extension.'),

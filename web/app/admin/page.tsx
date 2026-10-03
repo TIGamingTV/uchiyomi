@@ -1,5 +1,5 @@
 'use client';
-import { Suspense, useEffect, useRef, useState } from 'react';
+import { Suspense, useEffect, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import { useTabParam } from '@/lib/useTabParam';
 import { AdminSettings } from '@/components/AdminSettings';
@@ -8,14 +8,12 @@ import { api, ApiError, img } from '@/lib/api';
 import { useAuth } from '@/lib/auth';
 import { triggerRefresh } from '@/lib/refresh';
 import { scheduleText, taskResult } from '@/lib/tasks';
-import { joinSentences, sentenceGap } from '@/lib/jobs';
-import { bytes, languageName, relativeTime } from '@/lib/format';
+import { bytes, relativeTime } from '@/lib/format';
 import { shownDeviceName } from '@/lib/device';
 import { useToast } from '@/components/Toast';
 import { ConfirmDialog, Modal, msgOf } from '@/components/ConfirmDialog';
 import { Avatar } from '@/components/Avatar';
-import { IcChevronLeft, IcChevronRight, IcTrash, IcPlus, IcRefresh, IcInfo } from '@/components/icons';
-import { SourcesExplainer } from '@/components/SourcesExplainer';
+import { IcChevronLeft, IcChevronRight, IcTrash, IcPlus, IcRefresh } from '@/components/icons';
 import { CardProgress, FixAllIssues, HealthCardActions, HealthRow, hasCardActions, scanState } from '@/components/HealthActions';
 import { RepairHistory, RepairLiveStrip, RepairTaskLines } from '@/components/RepairLive';
 import { ActionStatus } from '@/components/ActionList';
@@ -23,52 +21,24 @@ import { RepairRunProvider } from '@/lib/useRepairRun';
 import { FindRunProvider } from '@/lib/useFindRun';
 import { FindRunCard } from '@/components/FindSources';
 import { checkTitle } from '@/lib/healthCopy';
-import { checkNote, checkSummary, diagnosisFix, diagnosisReason, itemDetail, itemTitle } from '@/lib/said';
+import { checkNote, checkSummary, itemDetail, itemTitle } from '@/lib/said';
 import { keysFor } from '@/lib/healthKeys';
 import type { ActionState } from '@/lib/actionState';
-import { Backdrop, Img, OnBody } from '@/components/ui';
+import { Backdrop, Img } from '@/components/ui';
 import { SeriesCard } from '@/components/cards';
 import { ConsoleNav } from '@/components/ConsoleNav';
 import { motion, useReducedMotion } from 'framer-motion';
 import { t as tr, keys } from '@/lib/i18n';
 import type { HealthCheck, Series } from '@/lib/types';
-import { groupProviders, providerStatus, type ProviderGroup, type ProviderSrc } from '@/lib/providerGroups';
-import { adultShown } from '@/lib/adult';
-import { bridge, hiddenOnDesktop, isDesktop, visibleGroups, DESKTOP_HIDDEN, type EngineStatus, type UpdateStatus } from '@/lib/desktop';
-import { EngineInstall } from '@/components/EngineInstall';
-import { EngineSetup, EngineReadyFoot } from '@/components/EngineSetup';
-import type { EngineReport } from '@/lib/engineSetup';
-import { ExtensionSettings, useExtensionSettingsParam } from '@/components/ExtensionSettings';
+import { bridge, hiddenOnDesktop, isDesktop, visibleGroups, DESKTOP_HIDDEN, type UpdateStatus } from '@/lib/desktop';
+import { SourcesPanel } from '@/components/SourcesPanel';
+import { OVERVIEW_KEY, OVERVIEW_URL, SOURCES_TAB_ALIASES, splitSources, type SourcesOverview } from '@/lib/sourcesPanel';
 import { StatusEdge, StatusMark } from '@/components/StatusMark';
-import { TONE_SURFACE, engineMark, healthMark, sourceMark, type ProviderStatus } from '@/lib/status';
+import { TONE_SURFACE, healthMark } from '@/lib/status';
 import Link from 'next/link';
 import { healthLinks } from '@/lib/healthLinks';
 import { useLayer } from '@/lib/layers';
-import { checkAllSession, type CheckAllSession, type SourceCheckProgress } from '@/lib/sourceCheckRun';
-import { SourceEvidence } from '@/components/SourceEvidence';
-import { checkAllLabel, healthRowEvidence, sweepToast, testClock, type LiveVerdict, type StageLine, type TestAnswer } from '@/lib/sourceEvidence';
-import { useTicker } from '@/lib/ticker';
-
-/**
- * `/api/sources` as an ADMIN needs it: every source the server has, adult ones included.
- *
- * Since v0.42.0 that route honours the "Show 18+" reveal like any other listing (issue #64), which is right
- * for Discover and wrong here — this console is where a provider is tested, unblocked or switched off, and
- * an admin cannot act on a row that is not on the page. On the install this was written against twelve of
- * fourteen sources are adult, so with the reveal off the Providers tab would show two of them and the tile
- * beside it would say "2".
- *
- * ⚠️ The parameter is added only when the reveal is OFF, never unconditionally: lib/api.ts appends its own
- * `adult=1` when it is on, and two copies of the parameter arrive as an ARRAY, which `hideAdult` on the
- * server reads as "not '1'" — i.e. hidden. Consulted at request time rather than captured, because flipping
- * the reveal invalidates every query and this one is then rebuilt.
- *
- * It also carries its own query key. `['sources']` is the browsing list several screens share, and two
- * shapes under one key is how a revealed answer gets replayed to a screen that asked for a hidden one.
- * A prefix match means the existing `invalidateQueries({ queryKey: ['sources'] })` calls still reach it.
- */
-const allSourcesUrl = () => (adultShown() ? '/api/sources' : '/api/sources?adult=1');
-const ALL_SOURCES_KEY = ['sources', 'all'] as const;
+import { SourceHealthBody } from '@/components/SourceHealthBody';
 
 /**
  * Ten panels, grouped by what an admin is actually doing rather than by what the code is called.
@@ -76,7 +46,7 @@ const ALL_SOURCES_KEY = ['sources', 'all'] as const;
  * The previous shell put all ten in one horizontally scrolling pill row, which is a list rather than an
  * information architecture: "Overview" and "Sessions" were peers, and on a laptop the last three scrolled off
  * the edge where nobody found them. Extensions had no entry at all -- it rendered inside Providers, which is
- * why nobody found that either.
+ * why nobody found that either. Since v0.54.0 the two are one Sources tab.
  */
 const GROUPS = [
   // `keys()` is the identity function; it exists so these reach the translation extractor. ConsoleNav
@@ -85,7 +55,9 @@ const GROUPS = [
   { id: 'server',  label: 'Server',  tabs: keys('Overview', 'Tasks', 'Settings') },
   { id: 'people',  label: 'People',  tabs: keys('Members', 'Sessions', 'Activity') },
   { id: 'content', label: 'Content', tabs: keys('Library', 'Health', 'Art') },
-  { id: 'sources', label: 'Sources', tabs: keys('Providers', 'Extensions') },
+  // v0.54.0: ONE tab for every source, where Providers and Extensions were two halves of one list (SourcesPanel.tsx).
+  // Their old names and links land on it (lib/sourcesPanel.ts SOURCES_TAB_ALIASES).
+  { id: 'sources', label: 'Sources', tabs: keys('Sources') },
 ] as const;
 // The group labels themselves, for the same reason.
 const _GROUP_LABELS = keys('Server', 'People', 'Content', 'Sources');
@@ -111,7 +83,7 @@ function AdminInner() {
   const router = useRouter();
   // In the URL rather than in state: a refresh, the back button and every deep link used to land on
   // Overview, and `/admin/?tab=Settings` is the address the docs can now give (lib/useTabParam.ts).
-  const [tab, setTab] = useTabParam<Tab>(TABS, 'Overview');
+  const [tab, setTab] = useTabParam<Tab>(TABS, 'Overview', SOURCES_TAB_ALIASES);
   // Uchiyomi Desktop has no Members or Sessions (lib/desktop.ts). The rail never lists them, and a deep link
   // or an old bookmark to one lands on Overview rather than on a panel whose every request answers 404.
   // `GROUPS` and the line above stay as they are: only what ConsoleNav receives is filtered.
@@ -124,8 +96,7 @@ function AdminInner() {
     <>
       {tab === 'Overview' && <Overview onTab={setTab} />}
       {tab === 'Members' && <Members />}
-      {tab === 'Providers' && <Providers onTab={setTab} />}
-      {tab === 'Extensions' && <div className="board"><Extensions span="full" /></div>}
+      {tab === 'Sources' && <SourcesPanel />}
       {tab === 'Art' && <ArtReview />}
       {tab === 'Health' && <Health />}
       {tab === 'Library' && <LibraryPanel />}
@@ -285,7 +256,7 @@ function Overview({ onTab }: { onTab: (t: Tab) => void }) {
   // Not asked on desktop, where the route answers 404: there is no Sessions tab for the tile to open.
   const desktop = isDesktop();
   const { data: sessions } = useQuery({ queryKey: ['admin-sessions'], queryFn: () => api<{ content: any[] }>('/api/admin/sessions'), enabled: !desktop });
-  const { data: sources } = useQuery({ queryKey: ALL_SOURCES_KEY, queryFn: () => api<{ content: any[] }>(allSourcesUrl()) });
+  const { data: sources } = useQuery({ queryKey: OVERVIEW_KEY, queryFn: () => api<SourcesOverview>(OVERVIEW_URL) });
 
   const failing = (health?.checks ?? []).filter((c) => c.status !== 'ok');
   const activity: any[] = stats?.activity ?? [];
@@ -353,7 +324,8 @@ function Overview({ onTab }: { onTab: (t: Tab) => void }) {
         <TabTile label={tr('Sessions')} value={String(sessions?.content?.length ?? 0)}
           sub={sessions?.content?.[0] ? relativeTime(sessions.content[0].last_seen) : undefined} onClick={() => onTab('Sessions')} />
       )}
-      <TabTile label={tr('Providers')} value={String(sources?.content?.length ?? 0)} onClick={() => onTab('Providers')} />
+      {/* The sources that are on, as Admin → Sources' "Your sources" counts them. */}
+      <TabTile label={tr('Sources')} value={String(sources ? splitSources(sources.sources).on.length : 0)} onClick={() => onTab('Sources')} />
       {/* Activity's headline is a time rather than a count: "how long since anything happened" is the
           question, and eight rows of audit cannot answer "how many". */}
       <TabTile label={tr('Activity')} value={latest ? relativeTime(latest.at) : '0'}
@@ -539,431 +511,6 @@ function Members() {
   );
 }
 
-/** One row of GET /api/admin/sources: the stored health plus #115's evidence (bff routes/admin.ts). */
-interface AdminSourceRow {
-  source_id: string;
-  last_error?: string | null;
-  consecutive?: number;
-  /** The open, confirmed, current failures per stage. */
-  failing?: Array<{ stage: string; since: string; error: string | null; kind: string; by: string; streak: number }>;
-  /** The last deliberate live check, or null when there has been none. */
-  live?: (LiveVerdict & { code: string | null }) | null;
-  /** One line per stage, what was last seen there. */
-  evidence?: StageLine[];
-}
-
-function Providers({ onTab }: { onTab: (t: Tab) => void }) {
-  const router = useRouter();
-  const toast = useToast();
-  const qc = useQueryClient();
-  const { data: srcs } = useQuery({ queryKey: ALL_SOURCES_KEY, queryFn: () => api<{ content: any[] }>(allSourcesUrl()) });
-  const { data: health } = useQuery({ queryKey: ['admin-sources'], queryFn: () => api<{ content: AdminSourceRow[]; testMs?: number }>('/api/admin/sources'), refetchInterval: 10000 });
-  const hmap = new Map((health?.content || []).map((h) => [h.source_id, h]));
-  // Health reads the same evidence, and the header's mark reads Health's summary: a Test, a block cleared or a
-  // source switched off here must not leave either of them saying what they said before (#115).
-  const invalHealth = () => { qc.invalidateQueries({ queryKey: ['admin-health'] }); qc.invalidateQueries({ queryKey: ['health-summary'] }); };
-  const act = async (id: string, action: string, ok: string) => { try { await api(`/api/admin/sources/${id}/${action}`, { method: 'POST' }); toast(ok, 'success'); qc.invalidateQueries({ queryKey: ['admin-sources'] }); qc.invalidateQueries({ queryKey: ['sources'] }); invalHealth(); } catch { toast('Failed', 'error'); } };
-  const { data: custom } = useQuery({ queryKey: ['admin-custom'], queryFn: () => api<{ content: any[] }>('/api/admin/sources/custom') });
-  const customIds = new Set((custom?.content || []).map((c: any) => c.id));
-  const [reloading, setReloading] = useState(false);
-  const reload = async () => {
-    setReloading(true);
-    try {
-      const r = await api<{ available: number }>('/api/admin/sources/reload', { method: 'POST' });
-      toast(r.available === 1 ? tr('Reloaded — 1 source available') : tr('Reloaded — {n} sources available', { n: r.available }), 'success');
-      qc.invalidateQueries({ queryKey: ['sources'] });
-      qc.invalidateQueries({ queryKey: ['admin-sources'] });
-    } catch { toast(tr('Reload failed'), 'error'); }
-    setReloading(false);
-  };
-  const inval = () => { qc.invalidateQueries({ queryKey: ['sources'] }); qc.invalidateQueries({ queryKey: ['admin-sources'] }); qc.invalidateQueries({ queryKey: ['admin-custom'] }); invalHealth(); };
-  const [eng, setEng] = useState<'auto' | 'madara' | 'manganato' | 'mangathemesia'>('auto');
-  // The (i) beside "Add a site": what a source, an extension and a site by URL are, in the explainer the
-  // reader-facing sheets share. This panel is where the words are first met by whoever runs the server.
-  const [explaining, setExplaining] = useState(false);
-  const [sname, setSname] = useState('');
-  const [sbase, setSbase] = useState('');
-  const [adding, setAdding] = useState(false);
-  type Smoke = { ok: boolean; timedOut?: boolean; checks: { name: string; ok: boolean; detail: string }[] };
-  const [smoke, setSmoke] = useState<{ name: string; res: Smoke } | null>(null);
-  const addSite = async () => {
-    if (!sname.trim() || !sbase.trim()) return;
-    setAdding(true); setSmoke(null);
-    const nm = sname.trim();
-    try {
-      const r = await api<{ engine?: string; smoke?: Smoke }>('/api/admin/sources/custom', { json: { engine: eng, name: nm, base: sbase.trim() } });
-      const eng2 = eng === 'auto' && r.engine ? ` (${r.engine})` : '';
-      if (r.smoke) setSmoke({ name: nm, res: r.smoke });
-      if (r.smoke && r.smoke.ok) toast(`Added ${nm}${eng2} — verified ✓`, 'success');
-      else if (r.smoke) toast(`Added ${nm}${eng2}, but some checks failed — see below`, 'error');
-      else toast(`Added ${nm}${eng2}`, 'success');
-      setSname(''); setSbase(''); inval();
-    }
-    catch (e: any) { toast(msgOf(e, "Couldn't add — check the URL or pick the engine manually"), 'error'); }
-    setAdding(false);
-  };
-  // A live verdict per source, kept until the panel is left. The stored error can be months older than the
-  // running container, so a test result always wins the display.
-  const [sweep, setSweep] = useState<any>(null);
-  const [checking, setChecking] = useState(false);
-  // Where the sweep has got to, from its GET: "Checking 7 of 40 · Manga Ball (EN)" on the button.
-  const [progress, setProgress] = useState<SourceCheckProgress | null>(null);
-  const sweepDone = (r: any) => {
-    setSweep(r);
-    const t = sweepToast(r);
-    toast(t.text, t.type);
-    inval();
-  };
-  // In the background since v0.49.0: started, then followed until it ends (lib/sourceCheckRun.ts). A sweep already
-  // running when the tab opens -- the daily one, or one another tab started -- is followed too, so the button shows
-  // where it is instead of offering a second run the server would refuse. ONE owner of its answer per visit, and
-  // none once the tab is left (checkAllSession): a press kept polling after a tab switch, and the next visit's
-  // follower then gave the same notice a second time.
-  const checkRun = useRef<CheckAllSession | null>(null);
-  useEffect(() => {
-    const run = checkAllSession(api, {
-      progress: (p) => { setChecking(true); setProgress(p); },
-      done: sweepDone,
-      failed: (e) => toast(msgOf(e, tr('Could not run the check')), 'error'),
-      idle: () => { setChecking(false); setProgress(null); },
-    });
-    checkRun.current = run;
-    void run.follow();
-    return () => run.leave();
-    // Once per visit to the tab: the session owns the rest.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-  /** Run the daily watchdog on demand. Slow on purpose: every source is probed one at a time. */
-  const checkAll = () => {
-    setChecking(true);
-    void checkRun.current?.press();
-  };
-
-  const [tested, setTested] = useState<Map<string, TestAnswer & { probe?: { finalUrl?: string } }>>(new Map());
-  const [testingId, setTestingId] = useState<string | null>(null);
-  // When the running Test began, for its clock against the server's own limit (`testMs`): a Test can take most
-  // of a minute on a slow or protected site, and a button that only said "Testing…" for that long read as stuck.
-  const [testFrom, setTestFrom] = useState(0);
-  const now = useTicker(!!testingId);
-  const testSource = async (id: string) => {
-    setTestingId(id);
-    setTestFrom(Date.now());
-    try {
-      const r = await api<TestAnswer & { probe?: { finalUrl?: string } }>(`/api/admin/sources/${encodeURIComponent(id)}/test`, { method: 'POST' });
-      setTested((m) => new Map(m).set(id, r));
-      toast(r.ok ? tr('That source is working') : (diagnosisReason(r.diagnosis) || tr('That source is still failing')), r.ok ? 'success' : 'error');
-      inval();
-    } catch (e: any) {
-      toast(msgOf(e, tr('Could not test that source')), 'error');
-    }
-    setTestingId(null);
-  };
-  /** The one-click half of a moved site: the probe already found where it went. */
-  const moveSite = async (id: string) => {
-    const to = tested.get(id)?.probe?.finalUrl;
-    if (!to) return;
-    const origin = (() => { try { return new URL(to).origin; } catch { return null; } })();
-    if (!origin) return;
-    try {
-      const r = await api<any>(`/api/admin/sources/custom/${encodeURIComponent(id)}`, { method: 'PATCH', json: { base: origin } });
-      toast(r.smoke?.ok ? `Moved to ${origin}, verified` : `Moved to ${origin}`, r.smoke?.ok ? 'success' : 'error');
-      setTested((m) => { const n = new Map(m); n.delete(id); return n; });
-      inval();
-    } catch (e: any) { toast(msgOf(e, 'Could not update the address'), 'error'); }
-  };
-
-  const removeSite = async (id: string) => { try { await api(`/api/admin/sources/custom/${id}`, { method: 'DELETE' }); toast('Removed', 'success'); inval(); } catch { toast('Failed', 'error'); } };
-
-  // The public status, overlaid with what only the admin rows know: a confirmed failure at a step reads
-  // 'failing' instead of the 'ok' the public status keeps until a cooldown (#115).
-  const list = ((srcs?.content || []) as ProviderSrc[]).map((s) => ({ ...s, status: providerStatus(s.status as any, hmap.get(s.id)) }));
-  // One card per extension PACKAGE rather than per source: a multi-language extension is one install that
-  // exposes one source per language, and 3Hentai alone put twenty-nine near-identical cards here, enabled
-  // or not. A package with a single variant, and every engine, pack and custom site, renders the card it
-  // always did. Which packages are unfolded lives here, not in storage: collapsed is the useful default and
-  // the panel is opened to look, not to keep.
-  const groups = groupProviders(list);
-  const [unfolded, setUnfolded] = useState<Set<string>>(new Set());
-  const toggleGroup = (key: string) => setUnfolded((prev) => { const n = new Set(prev); if (n.has(key)) n.delete(key); else n.add(key); return n; });
-
-  /**
-   * What is known about this source, through the one component Health's rows use as well (SourceEvidence): the
-   * Test that just ran here, else what the server kept -- the last Test or daily check and the stage lines -- so a
-   * reload does not wipe the verdict. Then the cooldown's raw error, last and small. Shared by the full card and
-   * the compact variant row, so a language variant inside a folded package can be tested and read the same way.
-   *
-   * ⚠️ "Working normally." comes only from a Test that passed (lib/sourceEvidence.ts answerView). It used to be
-   * the fallback for any diagnosis without a reason, which put it under a failed Search (#115).
-   */
-  function evidenceOf(s: ProviderSrc, st: ProviderStatus) {
-    const h = hmap.get(s.id);
-    const t = tested.get(s.id);
-    const unwell = st === 'blocked' || st === 'rate_limited' || st === 'down' || st === 'quiet';
-    const cooldown = h?.last_error && unwell
-      ? <p className="truncate text-[11px] text-fog-600" title={h.last_error}>{h.consecutive}× · {h.last_error}</p>
-      : null;
-    if (t) {
-      return (
-        <>
-          <SourceEvidence answer={t} onMove={customIds.has(s.id) ? () => moveSite(s.id) : undefined} />
-          {cooldown}
-        </>
-      );
-    }
-    const failing = !!h?.failing?.length;
-    if (h && (h.live || failing)) {
-      return (
-        <>
-          {/* A card whose last check passed and that fails nowhere needs one line, not four. */}
-          <SourceEvidence lines={h.evidence} tested={h.live} failing={failing} compact={!failing && h.live?.state === 'pass'} />
-          {cooldown}
-        </>
-      );
-    }
-    return cooldown && <div className="mt-1.5">{cooldown}</div>;
-  }
-  /** Test / Clear block / Enable-Disable, plus the two custom-site buttons when the source is one. */
-  function controlsOf(s: ProviderSrc, st: string) {
-    return (
-      <>
-        <button onClick={() => testSource(s.id)} disabled={testingId === s.id} data-source-test={s.id} className="btn-key tabular-nums">
-          {testingId === s.id ? testClock(now - testFrom, health?.testMs) : tr('Test')}
-        </button>
-        {(st === 'blocked' || st === 'rate_limited' || st === 'down') && <button onClick={() => act(s.id, 'unblock', 'Cleared')} className="btn-key">{tr('Clear block')}</button>}
-        <button onClick={() => act(s.id, st === 'disabled' ? 'enable' : 'disable', st === 'disabled' ? 'Enabled' : 'Disabled')} className="btn-key">{st === 'disabled' ? 'Enable' : 'Disable'}</button>
-        {customIds.has(s.id) && <button onClick={() => removeSite(s.id)} className="ms-auto text-xs text-red-300 hover:underline">{tr('Remove')}</button>}
-      </>
-    );
-  }
-  // A glyph and the words, not a capsule around the server's own token: "ok" and "rate-limited" were shown
-  // as sent, in English in every language, and a blocked source and a healthy one differed only in tint.
-  const statusMark = (st: ProviderStatus) => <StatusMark {...sourceMark(st)} />;
-
-  /** The card every source has always had: one source, its status, its diagnosis, its controls. */
-  function sourceCard(s: ProviderSrc) {
-    const st: ProviderStatus = s.status ?? 'ok';
-    return (
-      <div key={s.id} data-source-card={s.id} className="card grad-border p-4">
-        <div className="flex items-center gap-2">
-          <span className="flex-1 text-sm text-fog-100">{s.name}{customIds.has(s.id) && <span className="ms-2 rounded bg-ink-700 px-1.5 py-0.5 text-[10px] text-fog-400">custom</span>}</span>
-          {statusMark(st)}
-        </div>
-        {evidenceOf(s, st)}
-        <div className="mt-2 flex flex-wrap gap-1.5">{controlsOf(s, st)}</div>
-      </div>
-    );
-  }
-
-  /**
-   * One extension package with several language variants: a header that says how many languages, how many
-   * are on and the unhappiest status among them (so a blocked language colours the card even folded), and
-   * on unfold one compact row per variant carrying the same controls the full card has. Rows wrap rather
-   * than scroll: at 390 px the language, status and count sit on one line and the buttons drop below.
-   */
-  function packageCard(g: ProviderGroup) {
-    const isOpen = unfolded.has(g.key);
-    return (
-      <div key={g.key} className="card grad-border p-4">
-        <button type="button" onClick={() => toggleGroup(g.key)} aria-expanded={isOpen} className="flex w-full items-center gap-2 text-start">
-          <span className="min-w-0 flex-1 text-sm text-fog-100">
-            {g.name}
-            <span className="ms-2 text-[11px] text-fog-500">{tr('{n} languages', { n: g.languages.length })} · {tr('{n} on', { n: g.on })}</span>
-          </span>
-          {statusMark(g.worst)}
-          <span className="shrink-0 text-xs text-fog-500">{isOpen ? '▴' : '▾'}</span>
-        </button>
-        {isOpen && (
-          <ul className="mt-2 divide-y divide-ink-800">
-            {g.sources.map((s) => {
-              const st: ProviderStatus = s.status ?? 'ok';
-              return (
-                <li key={s.id} className="py-2">
-                  <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
-                    <span className="w-14 shrink-0 font-mono text-[11px] uppercase text-fog-200" title={s.name}>{s.lang || '—'}</span>
-                    {statusMark(st)}
-                    <span className="text-[11px] text-fog-500">{s.used === 1 ? tr('1 series') : tr('{n} series', { n: s.used ?? 0 })}</span>
-                    <span className="ms-auto flex flex-wrap gap-1.5">{controlsOf(s, st)}</span>
-                  </div>
-                  {evidenceOf(s, st)}
-                </li>
-              );
-            })}
-          </ul>
-        )}
-      </div>
-    );
-  }
-
-  return (
-    <div className="board">
-      <div className="full flex flex-wrap items-center justify-between gap-3">
-        <p className="text-sm text-fog-400">{tr('{n} sources in {m} providers', { n: list.length, m: groups.length })}</p>
-        <div className="flex gap-1.5">
-          {/* The same sweep that runs daily on its own, so what you see here is what happens unattended. */}
-          <button onClick={checkAll} disabled={checking} data-source-check-all className="btn-key tabular-nums">
-            {checking ? checkAllLabel(progress) : `🔍 ${tr('Check all now')}`}
-          </button>
-          {/* Translated like its neighbour: it stayed English beside a translated "Check all now". */}
-          <button onClick={reload} disabled={reloading} className="btn-key">{reloading ? tr('Reloading…') : `↻ ${tr('Reload sources')}`}</button>
-        </div>
-      </div>
-      {sweep && (
-        <div className="full rounded-xl border border-ink-700 bg-ink-850/60 p-3">
-          <p className="text-xs text-fog-300">
-            {sweep.sources.length === 1 ? tr('Checked 1 source.') : tr('Checked {n} sources.', { n: sweep.sources.length })}{' '}
-            {sweepToast(sweep).text}
-          </p>
-          {sweep.sources.filter((v: any) => v.action).map((v: any) => (
-            // The SOURCE moved; Uchiyomi followed it ("{name}: followed its move" had the source follow itself).
-            <p key={v.id} className="mt-1 text-[11px] text-emerald-300">✓ {v.name}: {tr('moved to a new address, which Uchiyomi now uses')}</p>
-          ))}
-          {sweep.needsAttention.map((v: any) => (
-            <p key={v.id} className="mt-1 text-[11px] text-fog-400"><span className="text-fog-200">{v.name}</span>: {diagnosisFix(v) || diagnosisReason(v)}</p>
-          ))}
-          {/* Our own deadline, not a verdict on the site: named, never counted as failing. */}
-          {(sweep.inconclusive || []).map((v: any) => (
-            <p key={v.id} className="mt-1 text-[11px] text-fog-500"><span className="text-fog-300">{v.name}</span>: {tr('could not finish in time — not proof it is broken')}</p>
-          ))}
-        </div>
-      )}
-
-      {/* Add a site (Madara / Manganato engines — most manga aggregators) */}
-      <div className="card grad-border wide p-4">
-        <div className="mb-2 flex items-center gap-1.5">
-          <p className="text-xs font-semibold uppercase tracking-wider text-fog-500">{tr('Add a site')}</p>
-          {/* 32px to tap, the same as the sheets' (i); the negative margins keep the eyebrow row 20px tall so
-              the label does not drop. At h-5 this was a 20px target on a phone, a quarter the size of the
-              (i) one tap away in the Sources sheet. */}
-          <button type="button" onClick={() => setExplaining(true)} aria-label={tr('What are sources and extensions?')}
-            className="-my-1.5 grid h-8 w-8 place-items-center rounded-full text-fog-500 transition hover:text-fog-200">
-            <IcInfo width={14} height={14} />
-          </button>
-        </div>
-        <div className="flex flex-wrap gap-2">
-          <select value={eng} onChange={(e) => setEng(e.target.value as any)} className="field w-auto">
-            <option value="auto">{tr('Auto-detect')}</option>
-            <option value="madara">{tr('Madara (WordPress)')}</option>
-            <option value="mangathemesia">{tr('MangaThemesia')}</option>
-            <option value="manganato">{tr('Manganato')}</option>
-          </select>
-          <input value={sname} onChange={(e) => setSname(e.target.value)} placeholder={tr('Name')} className="field min-w-[110px] flex-1" />
-          <input value={sbase} onChange={(e) => setSbase(e.target.value)} placeholder="https://site.com" autoCapitalize="none" className="field min-w-[170px] flex-[2]" />
-          <button onClick={addSite} disabled={adding || !sname.trim() || !sbase.trim()} className="btn-key btn-key-primary">{adding ? 'Adding…' : 'Add'}</button>
-        </div>
-        <p className="mt-1.5 text-[11px] text-fog-500">Just paste a site&apos;s homepage URL — the engine is auto-detected (or pick it). Picked up instantly, no restart. Works for sites on the Madara, MangaThemesia, or Manganato engines.</p>
-        {smoke && (
-          <div className={`mt-2.5 rounded-xl border p-2.5 ${smoke.res.ok ? 'border-emerald-600/30 bg-emerald-600/10' : 'border-amber-600/30 bg-amber-600/10'}`}>
-            <p className="mb-1.5 text-[11px] font-semibold uppercase tracking-wider text-fog-400">
-              {smoke.res.ok ? `✓ ${smoke.name} verified — search, chapters & pages all work`
-                : smoke.res.timedOut ? `${smoke.name}: verification timed out — slow or heavily protected site (added anyway)`
-                : `${smoke.name}: some checks failed — this site may be only partly supported`}
-            </p>
-            <ul className="space-y-1">
-              {smoke.res.checks.map((c, i) => (
-                <li key={i} className="flex items-start gap-2 text-xs">
-                  <span className={c.ok ? 'text-emerald-400' : 'text-red-400'}>{c.ok ? '✓' : '✗'}</span>
-                  <span className="text-fog-200">{c.name}</span>
-                  <span className="text-fog-500">— {c.detail}</span>
-                </li>
-              ))}
-            </ul>
-          </div>
-        )}
-      </div>
-
-      {/* Extension sources live on their own tab; this is the door to it. The whole Extensions card used to
-          render here as well as there, so the catalogue's search field, its language list and its 1,400 rows
-          appeared twice in the console and the `Search extensions` field sat on the Providers tab. */}
-      <ExtensionsLink onTab={onTab} />
-
-      {/* Import a list of titles. One entry point, the reviewed flow on its own page: the textarea that used
-          to sit under it here added the FIRST cross-source hit with no review, which is the "wrong manga" an
-          admin then had to find and remove. POST /api/admin/import still exists for scripts (docs/api.md). */}
-      <div className="card grad-border wide p-4">
-        <p className="mb-2 text-xs font-semibold uppercase tracking-wider text-fog-500">{tr('Import a list')}</p>
-        <p className="mb-3 text-[11px] text-fog-500">
-          {tr('Bring your library over from another app: import a list → review matches → add. A Mihon / Tachiyomi backup, a public MangaDex list, or pasted titles; every match is shown before anything is added.')}
-        </p>
-        <button onClick={() => router.push('/admin/import/')} className="btn-key btn-key-primary w-full">
-          {tr('Import and review matches →')}
-        </button>
-      </div>
-
-      {list.length === 0 ? (
-        <div className="card grad-border full p-6 text-center">
-          <p className="text-sm font-semibold text-fog-100">{tr('No sources installed')}</p>
-          {/* Desktop has no SOURCES_DIR to mount anything at: its ways to a source are this tab and the engine. */}
-          {isDesktop() ? (
-            <p className="mx-auto mt-1 max-w-md text-xs text-fog-500">{tr('Add a site above, or download the extension engine under Extensions and turn on an extension source. With none, Uchiyomi reads only the library you already own.')}</p>
-          ) : (
-            <p className="mx-auto mt-1 max-w-md text-xs text-fog-500">Mount a compiled source pack at the server&apos;s <code className="rounded bg-ink-800 px-1 py-0.5">SOURCES_DIR</code>, then hit Reload. With none installed, Uchiyomi reads only the library you already own.</p>
-          )}
-        </div>
-      ) : (
-        <>
-          {groups.map((g) => (g.sources.length === 1 ? sourceCard(g.sources[0]) : packageCard(g)))}
-        </>
-      )}
-
-      {explaining && <SourcesExplainer onClose={() => setExplaining(false)} />}
-    </div>
-  );
-}
-
-/**
- * What the desktop shell says about the extension engine download, or null anywhere but the desktop app's
- * own window (the server build, a browser tab, the desktop app in server mode) -- so every caller's other arm
- * is exactly what it rendered before. Follows the shell's progress events while mounted.
- */
-function useDesktopEngineState(): EngineStatus['state'] | null {
-  const [st, setSt] = useState<EngineStatus['state'] | null>(null);
-  useEffect(() => {
-    const b = bridge();
-    if (!b?.engine) return;
-    let live = true;
-    b.engine.status?.().then((x) => { if (live) setSt(x?.state ?? null); }).catch(() => {});
-    const off = b.engine.onStatus?.((x) => { if (live) setSt(x?.state ?? null); });
-    return () => { live = false; if (typeof off === 'function') off(); };
-  }, []);
-  return st;
-}
-
-/**
- * The Providers tab's door to the Extensions tab: one line of status and a chevron, the whole card a
- * button. It reads the same status query the Extensions tab does (same key, same url), so the count here
- * is the count there, and a click is a tab switch rather than a navigation -- the `?tab=` in the URL
- * follows it.
- */
-function ExtensionsLink({ onTab }: { onTab: (t: Tab) => void }) {
-  const { data: status } = useQuery({ queryKey: ['ext-status'], queryFn: () => api<ExtStatus>('/api/admin/extensions/status') });
-  const engine = useDesktopEngineState();
-  const down = !!status && (!status.configured || !status.reachable);
-  const sub = !status ? tr('Loading…')
-    // ⚠️ On desktop the engine is a download nobody has made yet, and "isn't running" read as a fault on the
-    // very first visit. The shell knows which it is; the server only knows it cannot reach it.
-    : down && engine === 'absent' ? tr('Not installed yet — download it under Extensions')
-    : down && engine === 'downloading' ? tr('Downloading the extension engine…')
-    : down && engine === 'installing' ? tr('Installing the extension engine…')
-    : down && (engine === 'starting' || engine === 'running') ? tr('Starting the extension engine…')
-    : down && engine === 'failed' ? tr('The extension engine could not be installed.')
-    // #72: why, on the server build: switched off on purpose, never set up, or set up and not answering.
-    : down && status.off === 'switch' ? tr('Extensions are turned off')
-    : down && status.off === 'unset' ? tr('No extension engine is set up')
-    : down ? tr('The extension engine isn’t answering')
-    : status.enabled === 1 ? tr('1 source enabled')
-    : tr('{n} sources enabled', { n: status.enabled ?? 0 });
-  return (
-    <button type="button" onClick={() => onTab('Extensions')}
-      className="card grad-border wide flex w-full items-center gap-3 p-4 text-start transition hover:bg-ink-800/60">
-      <span className="min-w-0 flex-1">
-        <span className="block text-xs font-semibold uppercase tracking-wider text-fog-500">{tr('Extensions')}</span>
-        <span className="block text-sm text-fog-200">{sub}</span>
-      </span>
-      <IcChevronRight width={18} height={18} aria-hidden className="shrink-0 text-fog-500 rtl:-scale-x-100" />
-    </button>
-  );
-}
-
 // ---- Art Review: see every series' art at a glance, fix the ugly ones in two clicks ----
 interface ArtRow { id: string; title: string; books_count: number; has_banner: boolean; has_cover: boolean; override_banner: boolean; override_cover: boolean; override_v: number | null }
 interface ArtCandidate { origin: string; title: string; banner: string | null; cover: string | null }
@@ -1022,7 +569,8 @@ function ArtReview() {
           <button key={r.id} onClick={() => setOpen(r)} className="card overflow-hidden p-0 text-start transition hover:border-accent/40">
             <div className="relative h-16 w-full overflow-hidden bg-ink-900">
               {/* eslint-disable-next-line @next/next/no-img-element */}
-              <img src={`/img/series/${encodeURIComponent(r.id)}/backdrop?rv=${bust[r.id] || 0}`} alt="" className="h-full w-full object-cover" loading="lazy" />
+              {/* As the series page shows it (v0.53.0): a banner sharp, a stand-in cover blurred -- the art being judged. */}
+              <img src={`/img/series/${encodeURIComponent(r.id)}/backdrop?style=banner&rv=${bust[r.id] || 0}`} alt="" className="h-full w-full object-cover" loading="lazy" />
               {!r.has_banner && !r.override_banner && <span className="absolute end-1 top-1 rounded bg-red-600/80 px-1.5 py-0.5 text-[9px] font-bold text-white">NO BANNER</span>}
             </div>
             <div className="flex items-center gap-2 p-2">
@@ -1058,16 +606,16 @@ function ArtPicker({ row, onClose, onApplied }: { row: ArtRow; onClose: () => vo
     setBusy(true);
     try {
       await api(`/api/admin/series/${row.id}/art`, { method: 'PUT', json: { kind, mode: 'url', url } });
-      toast(`${kind === 'banner' ? 'Banner' : 'Cover'} updated`, 'success');
+      toast(kind === 'banner' ? tr('Banner updated') : tr('Cover updated'), 'success');
       onApplied();
-    } catch { toast('Failed to apply', 'error'); }
+    } catch { toast(kind === 'banner' ? tr('Could not change the banner') : tr('Could not change the cover'), 'error'); }
     setBusy(false);
   };
   const reset = async (kind: 'cover' | 'banner') => {
     if (busy) return;
     setBusy(true);
-    try { await api(`/api/admin/series/${row.id}/art`, { method: 'PUT', json: { kind, mode: 'reset' } }); toast('Reset to automatic', 'success'); onApplied(); }
-    catch { toast('Failed', 'error'); }
+    try { await api(`/api/admin/series/${row.id}/art`, { method: 'PUT', json: { kind, mode: 'reset' } }); toast(kind === 'banner' ? tr('Banner reset to automatic') : tr('Cover reset to automatic'), 'success'); onApplied(); }
+    catch { toast(tr('Failed'), 'error'); }
     setBusy(false);
   };
   return (
@@ -1627,7 +1175,7 @@ function LibrariesSection() {
               </p>
               <p className="truncate text-[11px] text-fog-600">
                 {l.n} {tr('series')}
-                {l.pinned > 0 && <> · {tr('{n} filed by hand', { n: l.pinned })}</>}
+                {l.pinned > 0 && <> · {l.pinned === 1 ? tr('1 filed by hand') : tr('{n} filed by hand', { n: l.pinned })}</>}
                 {/* Who may open it is per-person access, which desktop does not have (one person, no members). */}
                 {!desktopLibs && <>{' · '}{!anyMembers ? tr('admins only') : l.members.length ? tr('{n} can open it', { n: l.members.length }) : tr('nobody can open it')}</>}
               </p>
@@ -1792,7 +1340,9 @@ function LibraryPanel() {
     try {
       const res = await api<{ files: number; bytes: number }>(`/api/admin/series/${r.id}/delete-files`,
         { method: 'POST', json: { confirm: r.title } });
-      toast(`Deleted ${res.files} file(s), ${(res.bytes / 1048576).toFixed(1)} MB`, 'success');
+      // Counted in pairs and translated (v0.52.0): "Deleted 1 file(s)" was the one English toast left on this panel.
+      const size = `${(res.bytes / 1048576).toFixed(1)} MB`;
+      toast(res.files === 1 ? tr('Deleted 1 file, {size}', { size }) : tr('Deleted {n} files, {size}', { n: res.files, size }), 'success');
       setPurge(null);
       qc.invalidateQueries({ queryKey: ['admin-deleted'] });
     } catch (e: any) {
@@ -2041,7 +1591,14 @@ function Health() {
               </button>
               {c.id === 'update' && <DesktopUpdateNote />}
 
-              {isOpen && (
+              {/* v0.53.0: Source health draws a body of its own -- the sources the library depends on first, one line
+                  and one key each, the rest folded, and its glossary at its foot (components/SourceHealthBody.tsx). */}
+              {isOpen && c.id === 'sources' && (
+                <div id={`health-${c.id}-details`} className="border-t border-ink-800/70">
+                  <SourceHealthBody check={c} />
+                </div>
+              )}
+              {isOpen && c.id !== 'sources' && (
                 <div id={`health-${c.id}-details`} className="border-t border-ink-800/70">
                   <HealthCardActions check={c} />
                   {c.note && <p data-health-note dir="auto" className="px-4 pt-3 text-[11px] leading-relaxed text-fog-500">{checkNote(c)}</p>}
@@ -2055,7 +1612,9 @@ function Health() {
                         // arrow is held to the last word by a no-break space).
                         links={healthLinks(c.id, it).map((l) => (
                           <Link key={l.href} href={l.href} className="line-clamp-2 max-w-[11rem] break-words text-end text-xs text-accent hover:underline"
-                            title={l.label} aria-label={l.label ? `${tr('Open')}: ${l.label}` : undefined}>
+                            title={l.label} aria-label={l.label ? `${tr('Open')}: ${l.label}` : undefined}
+                            // A page off the app (the install guide, v0.52.0) opens beside it, never in place of it.
+                            {...(/^https?:\/\//.test(l.href) ? { target: '_blank', rel: 'noopener noreferrer' } : {})}>
                             {l.label ? `${tr('Open')} · ${l.label}` : tr('Open')}{'\u00a0'}›
                           </Link>
                         ))}>
@@ -2064,10 +1623,6 @@ function Health() {
                             or in an Arabic page a sentence's full stop and closing bracket land at its start. */}
                         <p dir="auto" className="break-words text-sm text-fog-100">{itemTitle(it)}</p>
                         <p dir="auto" className="text-[11px] text-fog-500">{itemDetail(it)}</p>
-                        {/* #115: the stage lines and the fix, through the component Providers uses too, and only
-                            where they say something (healthRowEvidence). Among the row's words, above its keys: the
-                            source rows have no Open link beside them, so the lines take the row's full width. */}
-                        {c.id === 'sources' && <SourceEvidence {...healthRowEvidence(it)} />}
                       </HealthRow>
                     ))}
                   </div>
@@ -2113,488 +1668,6 @@ function DesktopUpdateNote() {
       ) : u.url ? (
         <a href={u.url} target="_blank" rel="noopener noreferrer" className="chip shrink-0 text-xs">{tr('Download')}</a>
       ) : null}
-    </div>
-  );
-}
-
-/** The engine's own fields (why it is off, the retry, the platform, its Cloudflare helper) are EngineReport's. */
-interface ExtStatus extends EngineReport {
-  enabled?: number; known?: number;
-  /** what search actually reaches; differs from `enabled` by `skipped` when SUWAYOMI_MAX_SOURCES bites */
-  registered?: number; skipped?: number; cap?: number; hiddenLangs?: string[];
-}
-interface ExtLang { lang: string | null; sources: number; enabled: number; used: number; hidden: boolean }
-interface CatalogExt { pkgName: string; name: string; lang: string | null; versionName: string | null; iconUrl: string | null; installed: boolean; hasUpdate: boolean; obsolete: boolean; nsfw: boolean }
-interface Catalog { content: CatalogExt[]; total: number; matched: number; shown: number; installed: number; updatable: number; hiddenAdult: number; langs: string[] }
-
-/**
- * A refused "Add a repository" in the viewer's language.
- *
- * The server answers a stable `error` code with an English `message` (bff routes/admin.ts, the repos route);
- * the known codes are translated here, and the engine's own `reason` -- never translatable, and the most
- * useful words in the toast -- is appended as it came. An unknown code shows the server's message as it is.
- * ⚠️ Until v0.45.0 the add read neither: every refusal was "Could not add that repository".
- */
-function repoAddError(e: unknown): string {
-  let j: { error?: string; reason?: string; removed?: boolean } = {};
-  try { j = JSON.parse((e as ApiError)?.body || '{}'); } catch { /* not JSON: the generic line below */ }
-  const said = j.reason ? ` ${tr('The engine said: {reason}', { reason: j.reason })}` : '';
-  switch (j.error) {
-    case 'bad_url': return tr('That doesn’t look like a repository address. It usually ends in index.min.json.');
-    case 'github_page': return tr('That is a GitHub page, not the repository itself. Paste the repository’s index.min.json link instead.');
-    case 'exists': return tr('That repository is already added.');
-    case 'empty':
-      return tr('That address gave no extensions, so it was not kept. Check that it is the repository’s index.min.json link, not a web page — or it may only list extensions you already have.')
-        + said + (j.removed === false ? ` ${tr('It could not be taken back out — press Remove next to it.')}` : '');
-    case 'engine_refused': return tr('The extension engine refused that address: {reason}', { reason: j.reason ?? '' });
-    case 'unreachable': return tr('Could not reach the extension engine: {reason}', { reason: j.reason ?? '' });
-    default: return msgOf(e, tr('Could not add that repository'));
-  }
-}
-
-/**
- * Browse and install Mihon / Tachiyomi extensions.
- *
- * Installing one switches its sources on in the same action — having to find them again in a second list is
- * exactly the friction this replaced. Uchiyomi never hosts extensions: the catalogue comes from repositories
- * the operator adds here, and the extension server does the fetching.
- */
-function Extensions({ span = '' }: { span?: string }) {
-  const toast = useToast();
-  const qc = useQueryClient();
-  const [q2, setQ2] = useState('');
-  const [lang, setLang] = useState('');
-  const [onlyInstalled, setOnlyInstalled] = useState(false);
-  const [showAdult, setShowAdult] = useState(false);
-  const [busy, setBusy] = useState<string | null>(null);
-  const [repoUrl, setRepoUrl] = useState('');
-  const [addingRepo, setAddingRepo] = useState(false);
-  // null = nobody has touched the toggle yet, and the row follows the list (reposOpen below); a click is the
-  // person's choice from then on.
-  const [showRepos, setShowRepos] = useState<boolean | null>(null);
-  // The count the last add brought, for the next-step line under the row (it outlives the toast on purpose).
-  const [justAdded, setJustAdded] = useState<number | null>(null);
-  // The last refusal, kept under the input until the address is edited: a toast lasts 3.2 s, and "check that
-  // it is the index.min.json link, not a web page" is two sentences someone needs while fixing the paste.
-  const [repoError, setRepoError] = useState<string | null>(null);
-  const [showLangs, setShowLangs] = useState(false);
-  const [hiding, setHiding] = useState<ExtLang | null>(null);
-  // An extension's own settings (#116), from a row's Settings or the `?settings=` deep link.
-  const [settingsFor, setSettingsFor] = useExtensionSettingsParam();
-
-  const { data: status } = useQuery({ queryKey: ['ext-status'], queryFn: () => api<ExtStatus>('/api/admin/extensions/status') });
-  // Fetched only while the block is open: it is the full source list joined with usage counts, and most
-  // visits to this panel never open it.
-  const { data: langData } = useQuery({
-    queryKey: ['ext-langs'],
-    queryFn: () => api<{ langs: ExtLang[] }>('/api/admin/extensions/sources'),
-    enabled: showLangs && !!status?.configured && !!status?.reachable,
-  });
-  const { data: repos } = useQuery({
-    queryKey: ['ext-repos'],
-    queryFn: () => api<{ content: string[] }>('/api/admin/extensions/repos'),
-    enabled: !!status?.configured && !!status?.reachable,
-  });
-  // Open by itself while there are none: the input IS the next step, and nothing else on the tab works yet.
-  const reposOpen = showRepos ?? (!!repos && repos.content.length === 0);
-  const { data: cat, isFetching } = useQuery({
-    queryKey: ['ext-catalog', q2, lang, onlyInstalled, showAdult],
-    queryFn: () => api<Catalog>(`/api/admin/extensions/catalog?q=${encodeURIComponent(q2)}&lang=${encodeURIComponent(lang)}${onlyInstalled ? '&installed=true' : ''}${showAdult ? '&nsfw=true' : ''}`),
-    enabled: !!status?.configured && !!status?.reachable,
-  });
-
-  if (!status) return null;
-
-  // Uchiyomi Desktop: the engine is a download on first use, not a container -- until the server can reach
-  // it, the card is the download (components/EngineInstall.tsx). The server build never takes this branch.
-  if (isDesktop() && !(status.configured && status.reachable)) return <EngineInstall span={span} />;
-
-  if (!status.configured) {
-    // Off (EXTENSION_ENGINE=0), or no engine set up at all: how to add it on this platform (#72).
-    return <EngineSetup status={status} span={span} />;
-  }
-
-  const refreshAll = () => {
-    qc.invalidateQueries({ queryKey: ['ext-catalog'] });
-    qc.invalidateQueries({ queryKey: ['ext-status'] });
-    qc.invalidateQueries({ queryKey: ['ext-repos'] });
-    qc.invalidateQueries({ queryKey: ['sources'] });
-  };
-
-  const act = async (e: CatalogExt, action: 'install' | 'uninstall' | 'update') => {
-    setBusy(e.pkgName);
-    try {
-      const r = await api<{ sources: number; hidden?: number }>(`/api/admin/extensions/catalog/${encodeURIComponent(e.pkgName)}`, { json: { action } });
-      refreshAll();
-      qc.invalidateQueries({ queryKey: ['ext-langs'] });
-      toast(action === 'uninstall' ? `Removed ${e.name}`
-        : action === 'update' ? `Updated ${e.name}`
-        : `Added ${e.name}${r.sources ? ` — ${r.sources} source${r.sources === 1 ? '' : 's'} ready to search` : ''}`
-          + (r.hidden ? ` · ${r.hidden} left off (hidden languages)` : ''), 'success');
-    } catch (err: any) { toast(msgOf(err, `Could not ${action} ${e.name}`), 'error'); }
-    setBusy(null);
-  };
-
-  /**
-   * Update everything at once. The per-row button stays: this is for the common case of coming back after a
-   * week and finding several at once, which is otherwise several trips through a 1,400-row list.
-   */
-  const updateAll = async () => {
-    setBusy('__updateall');
-    try {
-      const r = await api<{ updated: string[]; failed: { name: string; reason: string }[] }>(
-        '/api/admin/extensions/update-all', { json: {} },
-      );
-      refreshAll();
-      if (r.failed.length) {
-        // Naming the first one and why beats a count: the reason is usually the repository's, not ours.
-        toast(`Updated ${r.updated.length}. Could not update ${r.failed[0].name}: ${r.failed[0].reason}`, 'error');
-      } else {
-        toast(r.updated.length
-          ? `Updated ${r.updated.length} extension${r.updated.length === 1 ? '' : 's'}`
-          : 'Everything is already up to date', 'success');
-      }
-    } catch (err: any) { toast(msgOf(err, 'Could not update extensions'), 'error'); }
-    setBusy(null);
-  };
-
-  const refreshRepos = async () => {
-    setBusy('__refresh');
-    try {
-      const r = await api<{ count: number }>('/api/admin/extensions/refresh', { json: {} });
-      refreshAll();
-      toast(r.count === 1 ? tr('Refreshed — 1 extension available') : tr('Refreshed — {n} extensions available', { n: r.count }), 'success');
-    } catch { toast(tr('Could not refresh the list'), 'error'); }
-    setBusy(null);
-  };
-
-  /**
-   * The server decides what a paste means (an Add-to-Mihon link, a missing https://, a GitHub page) and keeps a
-   * repository only when it yielded extensions, so a 200 here always carries `added` > 0: the count THIS
-   * repository brought, never the catalogue's size.
-   */
-  const addRepo = async () => {
-    if (!repoUrl.trim()) return;
-    setAddingRepo(true);
-    setJustAdded(null);
-    setRepoError(null);
-    try {
-      const r = await api<{ url: string; corrected: boolean; added: number }>('/api/admin/extensions/repos', { json: { url: repoUrl.trim() } });
-      setRepoUrl('');
-      // Stay open on the row just used, even though the list is no longer empty.
-      setShowRepos(true);
-      setJustAdded(r.added);
-      refreshAll();
-      const file = r.url.replace(/[?#].*$/, '').split('/').filter(Boolean).pop() ?? r.url;
-      toast((r.added === 1 ? tr('Added — 1 extension from this repository') : tr('Added — {n} extensions from this repository', { n: r.added }))
-        + (r.corrected ? ` · ${tr('saved as {file}', { file })}` : ''), 'success');
-    } catch (e: unknown) {
-      const why = repoAddError(e);
-      setRepoError(why);
-      toast(why, 'error');
-    }
-    setAddingRepo(false);
-  };
-
-  const removeRepo = async (url: string) => {
-    try {
-      await api('/api/admin/extensions/repos', { method: 'DELETE', json: { url } });
-      refreshAll();
-      setJustAdded(null);
-      toast(tr('Repository removed'), 'success');
-    } catch (e: unknown) { toast(msgOf(e, tr('Could not remove it')), 'error'); }
-  };
-
-  /**
-   * Hide or show one language: every source in it in one call, and the choice remembered for the next
-   * install. A hide that would freeze series goes through the confirm dialog first (see the render below).
-   */
-  const toggleLang = async (l: ExtLang, enabled: boolean) => {
-    const name = l.lang ?? 'none';
-    // Only a language with a code has the button (a source with none is reached by id), so this names a language.
-    const lang = languageName(name);
-    setBusy(`__lang:${name}`);
-    try {
-      const r = await api<{ changed: number; skipped: number }>('/api/admin/extensions/sources/bulk', { json: { langs: [l.lang], enabled } });
-      refreshAll();
-      qc.invalidateQueries({ queryKey: ['ext-langs'] });
-      // One sentence per count, in the reader's words (they were English in every language before v0.49.1).
-      const said = enabled
-        ? (r.changed === 1 ? tr('Showing {lang} — 1 source on', { lang }) : tr('Showing {lang} — {n} sources on', { lang, n: r.changed }))
-        : (r.changed === 1 ? tr('Hidden {lang} — 1 source off', { lang }) : tr('Hidden {lang} — {n} sources off', { lang, n: r.changed }));
-      const over = r.skipped === 1 ? tr('1 not switched on: over the source limit') : tr('{n} not switched on: over the source limit', { n: r.skipped });
-      toast(r.skipped ? `${said} · ${over}` : said, 'success');
-    } catch (e: any) { toast(msgOf(e, enabled ? tr('Could not show {lang}', { lang }) : tr('Could not hide {lang}', { lang })), 'error'); }
-    setBusy(null);
-    setHiding(null);
-  };
-
-  // The Languages panel's counts and the cap overflow line, one key per count: English in every language, and "1
-  // sources" in English, before v0.49.1.
-  const hiddenN = status.hiddenLangs?.length ?? 0;
-  const overCap = !status.skipped ? ''
-    : status.skipped === 1 ? tr('1 enabled source is not registered — over the limit of {cap}.', { cap: status.cap ?? 0 })
-    : tr('{n} enabled sources are not registered — over the limit of {cap}.', { n: status.skipped, cap: status.cap ?? 0 });
-
-  const list = cat?.content || [];
-
-  return (
-    <div className={`card grad-border p-4 ${span}`}>
-      <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
-        <p className="text-xs font-semibold uppercase tracking-wider text-fog-500">{tr('Extensions')}</p>
-        <div className="flex items-center gap-2">
-          <StatusMark {...engineMark(status.reachable, status.version)} />
-          {status.reachable && (
-            <button onClick={refreshRepos} disabled={busy === '__refresh'} className="btn-key">
-              {busy === '__refresh' ? tr('Refreshing…') : `↻ ${tr('Refresh')}`}
-            </button>
-          )}
-        </div>
-      </div>
-
-      {!status.reachable ? (
-        // Set up, and not answering: what to check on this platform, the retry and Check again (#72).
-        <EngineSetup status={status} bare />
-      ) : (
-        <>
-          <p className="mb-2 text-[11px] leading-relaxed text-fog-500">
-            The same extensions Mihon and Tachiyomi use. Adding one switches its sources on straight away, so it&apos;s
-            searchable from Discover immediately.
-          </p>
-
-          {/* repositories — where the catalogue comes from. ⚠️ It used to start collapsed even with none, so a
-              first visit showed "add a repository above" pointing at a closed row with no input in sight. */}
-          <div className="mb-2 rounded-lg border border-ink-700/60 bg-ink-850/40 p-2">
-            <button onClick={() => setShowRepos(!reposOpen)} aria-expanded={reposOpen} className="flex w-full items-center justify-between text-start">
-              <span className="text-[11px] text-fog-300">
-                {repos?.content.length
-                  ? (repos.content.length === 1
-                    ? (cat?.total === 1
-                      ? tr('1 extension repository · 1 extension available')
-                      : tr('1 extension repository · {m} extensions available', { m: cat?.total ?? 0 }))
-                    : (cat?.total === 1
-                      ? tr('{n} extension repositories · 1 extension available', { n: repos.content.length })
-                      : tr('{n} extension repositories · {m} extensions available', { n: repos.content.length, m: cat?.total ?? 0 })))
-                  : tr('No extension repository yet — add one to see extensions')}
-              </span>
-              <span className="text-[11px] text-fog-500">{reposOpen ? tr('Hide') : tr('Manage')}</span>
-            </button>
-            {reposOpen && (
-              <div className="mt-2 space-y-1.5">
-                {(repos?.content || []).map((u) => (
-                  <div key={u} className="flex items-center gap-2">
-                    <span className="min-w-0 flex-1 truncate font-mono text-[10px] text-fog-400">{u}</span>
-                    <button onClick={() => removeRepo(u)} className="shrink-0 text-[11px] text-red-300 hover:underline">{tr('Remove')}</button>
-                  </div>
-                ))}
-                <div className="flex gap-2 pt-1">
-                  <input value={repoUrl} onChange={(e) => { setRepoUrl(e.target.value); setRepoError(null); }} placeholder="https://…/index.min.json"
-                    onKeyDown={(e) => { if (e.key === 'Enter' && !addingRepo) void addRepo(); }}
-                    aria-label={tr('Repository address')} autoCapitalize="none" autoCorrect="off" spellCheck={false} inputMode="url"
-                    className="min-w-0 flex-1 rounded-lg border border-ink-700 bg-ink-850 px-2.5 py-1.5 text-xs text-fog-100 outline-hidden focus:border-accent" />
-                  <button onClick={addRepo} disabled={addingRepo || !repoUrl.trim()} className="btn-key btn-key-primary">
-                    {addingRepo ? tr('Checking…') : tr('Add')}
-                  </button>
-                </div>
-                {/* The add can take a while (the engine re-reads every repository, up to four times, then tries
-                    the one alternative address), and a silent "Checking…" for a minute reads as a hang. */}
-                {addingRepo && (
-                  <p role="status" aria-live="polite" className="text-[10px] leading-relaxed text-fog-400">
-                    {tr('Checking the repository — this can take up to a minute.')}
-                  </p>
-                )}
-                {repoError && !addingRepo && (
-                  <p role="alert" className="text-[11px] leading-relaxed text-red-300">{repoError}</p>
-                )}
-                <p className="text-[10px] leading-relaxed text-fog-600">
-                  {tr('An extension repository is a list of extensions that someone publishes. Uchiyomi doesn’t host any, so you add one you trust.')}{' '}
-                  {tr('Paste the same address you added in Mihon ({path}); a repository’s “Add to Mihon” link works too.', { path: tr('More → Settings → Browse → Extension repos') })}
-                </p>
-              </div>
-            )}
-          </div>
-
-          {/* The step after a first repository is choosing extensions, and the trap in it is the source limit:
-              an extension carries one source per language, so a few multi-language ones fill it before the
-              banner below ever explains why search reaches fewer than were switched on. */}
-          {justAdded !== null && (
-            <div role="status" className="mb-2 flex flex-wrap items-center gap-2 rounded-lg border border-accent/30 bg-accent/10 px-2.5 py-2">
-              <p className="min-w-0 flex-1 text-[11px] leading-snug text-fog-200">
-                {tr('Next: choose extensions from the list below and press Add on each one you want.')}{' '}
-                <span className="text-fog-400">{tr('Tip: hide the languages you don’t read first — only {n} sources can be switched on at once.', { n: status.cap ?? 25 })}</span>
-              </p>
-              <button onClick={() => setShowLangs(true)} className="btn-key">{tr('Choose languages')}</button>
-            </div>
-          )}
-
-          {/* languages — a standing instruction, applied now and on every later install */}
-          <div className="mb-2 rounded-lg border border-ink-700/60 bg-ink-850/40 p-2">
-            <button onClick={() => setShowLangs(!showLangs)} className="flex w-full items-center justify-between text-start">
-              <span className="text-[11px] text-fog-300">
-                <span>{tr('Languages')}</span>
-                <span className="text-fog-500"> · {hiddenN === 1 ? tr('1 hidden') : tr('{n} hidden', { n: hiddenN })}</span>
-              </span>
-              <span className="text-[11px] text-fog-500">{showLangs ? tr('Hide') : tr('Manage')}</span>
-            </button>
-            {showLangs && (
-              <div className="mt-2 space-y-1.5">
-                {(langData?.langs || []).map((l) => {
-                  const name = l.lang ?? 'none';
-                  const on = l.enabled > 0;
-                  const working = busy === `__lang:${name}`;
-                  const counts = [
-                    l.sources === 1 ? tr('1 source') : tr('{n} sources', { n: l.sources }),
-                    tr('{n} on', { n: l.enabled }),
-                    l.used === 1 ? tr('1 series') : tr('{n} series', { n: l.used }),
-                  ].join(' · ');
-                  return (
-                    <div key={name} className="flex items-center gap-2">
-                      <span className="min-w-0 flex-1 truncate text-[11px] text-fog-300">
-                        <span className={l.hidden ? 'text-fog-500' : 'text-fog-100'} title={l.lang ?? undefined}>{l.lang === null ? tr('No language') : languageName(name)}</span>
-                        <span className="text-fog-500"> · {counts}</span>
-                      </span>
-                      {/* Sources that declare no language cannot be selected by one -- the server reaches those rows by id
-                          only -- so the row is counts without a button. A language with nothing on can only be shown. */}
-                      {l.lang === null ? (
-                        <span className="shrink-0 text-[10px] text-fog-600">{tr('no language declared')}</span>
-                      ) : (
-                        <button
-                          onClick={() => (on ? (l.used > 0 ? setHiding(l) : toggleLang(l, false)) : toggleLang(l, true))}
-                          disabled={working}
-                          className={`btn-key ${on ? '' : 'btn-key-primary'}`}>
-                          {/* Their own keys: the bare "Hide"/"Show" are the app's collapse toggles ("收起"/"展开"). */}
-                          {working ? '…' : on ? tr('Hide {lang}', { lang: languageName(name) }) : tr('Show {lang}', { lang: languageName(name) })}
-                        </button>
-                      )}
-                    </div>
-                  );
-                })}
-                {langData && !langData.langs.length && (
-                  <p className="text-[10px] text-fog-600">{tr('No extension sources yet — add an extension and its languages appear here.')}</p>
-                )}
-                {!langData && <p className="text-[10px] text-fog-600">{tr('Loading…')}</p>}
-                <p className="text-[10px] leading-relaxed text-fog-600">
-                  {tr('Hiding a language switches its sources off and keeps them off when you add the next extension. Series from a hidden language stay readable but stop updating until you show it again.')}
-                </p>
-              </div>
-            )}
-          </div>
-
-          {/* ⚠️ On <body>: this panel is a `.card`, whose backdrop blur makes it the containing block of a `fixed`
-              dialog -- only the panel dimmed, and on a tall one the dialog landed off-screen (the web2 review's scan
-              found it the last dialog left inside a card). One sentence per count, in the reader's words. */}
-          {hiding && (
-            <OnBody>
-              <ConfirmDialog
-                title={tr('Hide {lang}?', { lang: languageName(hiding.lang ?? 'none') })}
-                body={joinSentences(hiding.enabled === 1
-                  ? tr('Hiding {lang} turns off 1 source.', { lang: languageName(hiding.lang ?? 'none') })
-                  : tr('Hiding {lang} turns off {n} sources.', { lang: languageName(hiding.lang ?? 'none'), n: hiding.enabled }), hiding.used === 1
-                  ? tr('1 series from {lang} will stop updating until you show the language again, but stay readable.', { lang: languageName(hiding.lang ?? 'none') })
-                  : tr('{n} series from {lang} will stop updating until you show the language again, but stay readable.', { lang: languageName(hiding.lang ?? 'none'), n: hiding.used }))}
-                confirmLabel={tr('Hide {lang}', { lang: languageName(hiding.lang ?? 'none') })}
-                busy={busy === `__lang:${hiding.lang ?? 'none'}`}
-                onConfirm={() => toggleLang(hiding, false)}
-                onClose={() => setHiding(null)}
-              />
-            </OnBody>
-          )}
-
-          {/* The cap overflow used to be one line in the boot log: the panel counted the sources that were on,
-              search reached fewer, and nothing showed the difference. */}
-          {!!overCap && (
-            <div className="mb-2 flex items-center gap-2 rounded-lg border border-amber-500/30 bg-amber-500/10 px-2.5 py-2">
-              <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-amber-400" />
-              <p className="min-w-0 flex-1 text-[11px] leading-snug text-amber-200">
-                {overCap}
-                {/* SUWAYOMI_MAX_SOURCES is an environment variable of the Docker install; desktop has no .env to raise it
-                    in. The name is copied into the sentence, never translated. */}
-                <span className="text-amber-200/60">{sentenceGap(overCap)}{isDesktop()
-                  ? tr('Hide languages you don’t read.')
-                  : tr('Hide languages you don’t read, or raise {name}.', { name: 'SUWAYOMI_MAX_SOURCES' })}</span>
-              </p>
-            </div>
-          )}
-
-          {/* Out of date is a thing to be told, not a thing to go looking for. The per-row Update button was
-              only ever visible to someone already scrolling the installed list. */}
-          {!!cat?.updatable && (
-            <div className="mb-2 flex items-center gap-2 rounded-lg border border-amber-500/30 bg-amber-500/10 px-2.5 py-2">
-              <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-amber-400" />
-              <p className="min-w-0 flex-1 text-[11px] leading-snug text-amber-200">
-                {cat.updatable === 1 ? '1 extension is out of date' : `${cat.updatable} extensions are out of date`}
-                <span className="text-amber-200/60"> · a newer version is available from its repository</span>
-              </p>
-              <button onClick={updateAll} disabled={!!busy}
-                className="btn-key border-amber-500/40 bg-amber-500/20 text-amber-100 hover:border-amber-400/70 hover:text-amber-50">
-                {busy === '__updateall' ? 'Updating…' : 'Update all'}
-              </button>
-            </div>
-          )}
-
-          {/* search + filters */}
-          <div className="mb-2 flex flex-wrap items-center gap-2">
-            <input value={q2} onChange={(e) => setQ2(e.target.value)} placeholder={tr('Search extensions…')}
-              className="min-w-[150px] flex-1 rounded-lg border border-ink-700 bg-ink-850 px-2.5 py-1.5 text-xs text-fog-100 outline-hidden focus:border-accent" />
-            <select value={lang} onChange={(e) => setLang(e.target.value)}
-              className="rounded-lg border border-ink-700 bg-ink-850 px-2 py-1.5 text-xs text-fog-100 outline-hidden focus:border-accent">
-              <option value="">{tr('All languages')}</option>
-              {(cat?.langs || []).map((l) => <option key={l} value={l}>{l}</option>)}
-            </select>
-            <button onClick={() => setShowAdult(!showAdult)}
-              className={`rounded-full px-2.5 py-1 text-[11px] transition ${showAdult ? 'bg-accent text-white' : 'bg-ink-700 text-fog-300 hover:text-fog-100'}`}>
-              18+
-            </button>
-            <button onClick={() => setOnlyInstalled(!onlyInstalled)}
-              className={`rounded-full px-2.5 py-1 text-[11px] transition ${onlyInstalled ? 'bg-accent text-white' : 'bg-ink-700 text-fog-300 hover:text-fog-100'}`}>
-              Added{status.enabled ? ` (${cat?.installed ?? 0})` : ''}
-            </button>
-          </div>
-
-          {cat && cat.matched > cat.shown && (
-            <p className="mb-1 text-[10px] text-fog-600">Showing {cat.shown} of {cat.matched} matches — narrow the search to see the rest.</p>
-          )}
-
-          <div data-lenis-prevent className="max-h-96 space-y-1 overflow-y-auto">
-            {list.map((e) => (
-              <div key={e.pkgName} className="flex items-center gap-2 rounded-lg border border-ink-700/60 bg-ink-850/40 px-2.5 py-1.5">
-                {e.iconUrl
-                  ? <img src={e.iconUrl} alt="" width={22} height={22} className="h-[22px] w-[22px] shrink-0 rounded" loading="lazy" />
-                  : <span className="h-[22px] w-[22px] shrink-0 rounded bg-ink-700" />}
-                <div className="min-w-0 flex-1">
-                  <p className="truncate text-xs text-fog-100">
-                    {e.name}
-                    {e.nsfw && <span className="ms-1.5 rounded bg-red-500/15 px-1 py-0.5 text-[9px] text-red-300">18+</span>}
-                    {e.obsolete && <span className="ms-1.5 rounded bg-amber-500/15 px-1 py-0.5 text-[9px] text-amber-300">obsolete</span>}
-                  </p>
-                  <p className="text-[10px] text-fog-600">{e.lang || 'all'}{e.versionName ? ` · v${e.versionName}` : ''}</p>
-                </div>
-                {e.hasUpdate && (
-                  <button onClick={() => act(e, 'update')} disabled={busy === e.pkgName}
-                    className="btn-key border-amber-500/40 bg-amber-500/15 text-amber-200 hover:border-amber-400/70 hover:text-amber-100">
-                    {busy === e.pkgName ? '…' : 'Update'}
-                  </button>
-                )}
-                {e.installed && (
-                  <button onClick={() => setSettingsFor({ pkgName: e.pkgName, name: e.name })} className="btn-key">{tr('Settings')}</button>
-                )}
-                <button onClick={() => act(e, e.installed ? 'uninstall' : 'install')} disabled={busy === e.pkgName}
-                  className={`btn-key ${e.installed ? 'btn-key-danger' : 'btn-key-primary'}`}>
-                  {busy === e.pkgName ? '…' : e.installed ? 'Remove' : 'Add'}
-                </button>
-              </div>
-            ))}
-            {!list.length && !isFetching && (
-              <p className="py-2 text-[11px] text-fog-600">
-                {cat?.total ? tr('Nothing matches that search.') : tr('No extensions yet — add a repository above to see what’s available.')}
-              </p>
-            )}
-            {isFetching && !list.length && <p className="py-2 text-[11px] text-fog-600">{tr('Loading…')}</p>}
-          </div>
-          <EngineReadyFoot status={status} desktop={isDesktop()} />
-        </>
-      )}
-      {settingsFor && status.reachable && <ExtensionSettings target={settingsFor} onClose={() => setSettingsFor(null)} />}
     </div>
   );
 }
