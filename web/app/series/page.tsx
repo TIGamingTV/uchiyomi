@@ -16,6 +16,7 @@ import { ConfirmDialog, Modal, msgOf } from '@/components/ConfirmDialog';
 import { useAuth, canDownload } from '@/lib/auth';
 import { IcChevronLeft, IcHeart, IcStar, IcPlay, IcDownload, IcCloudDownload, IcCheck, IcTrash, IcMoments, IcHourglass, IcRefresh } from '@/components/icons';
 import { t as tr, keys } from '@/lib/i18n';
+import { SERIES_TYPES, seriesTypeKey } from '@/lib/seriesTypes';
 import { deletedText, selectedText, skippedBookmarkedText, skippedNotOursText } from '@/lib/counted';
 import { reasonText, type Said } from '@/lib/said';
 import { offlineOutcome } from '@/lib/notices';
@@ -109,6 +110,18 @@ function autoDirectionLabel(d: Series['detectedDirection']): string {
   return tr('Automatic — {direction}, from the source', { direction });
 }
 
+/**
+ * The "Automatic" type, saying what automatic means now and what said so (bff lib/seriesType.ts): a genre, the source,
+ * AniList, or a Webtoon genre with nothing better.
+ */
+function autoTypeLabel(d: Series['detectedType']): string {
+  if (!d) return tr('Automatic — not known');
+  const type = tr(seriesTypeKey(d.type));
+  if (d.from === 'genre' || d.from === 'webtoon') return tr('Automatic — {type}, from the genres', { type });
+  if (d.from === 'anilist') return tr('Automatic — {type}, from AniList', { type });
+  return tr('Automatic — {type}, from the source', { type });
+}
+
 function SeriesEditModal({ id, series, onClose, onSaved }: { id: string; series: Series; onClose: () => void; onSaved: () => void }) {
   // On the notices' layer stack (lib/layers.ts), as Modal is: this hand-rolled dialog toasts while open
   // ("Could not save"), and a notice placed as if nothing were open would sit on its lower buttons.
@@ -139,6 +152,9 @@ function SeriesEditModal({ id, series, onClose, onSaved }: { id: string; series:
   // detected into a hand-set override on the first unrelated save, and a later, better signal could never
   // reach the series again.
   const [direction, setDirection] = useState<string>(series.overrides?.readingDirection ?? '');
+  // What kind of comic it is: the notice-chapter switches in Settings go by it. '' is automatic, seeded from the
+  // override only, for the reason the direction is.
+  const [seriesType, setSeriesType] = useState<string>(series.overrides?.seriesType ?? '');
   const [busy, setBusy] = useState(false);
   const addGenre = (raw: string) => {
     const t = raw.trim().replace(/,$/, '').trim();
@@ -162,7 +178,7 @@ function SeriesEditModal({ id, series, onClose, onSaved }: { id: string; series:
   const saveText = async () => {
     setBusy(true);
     try {
-      await api(`/api/admin/series/${id}/meta`, { method: 'PUT', json: { title, summary, author, status, genres, ageRating: ageRating === '' ? null : Number(ageRating), adultExempt, readingDirection: direction || null } });
+      await api(`/api/admin/series/${id}/meta`, { method: 'PUT', json: { title, summary, author, status, genres, ageRating: ageRating === '' ? null : Number(ageRating), adultExempt, readingDirection: direction || null, seriesType: seriesType || null } });
       toast(tr('Saved'), 'success');
       onSaved();
     } catch (e) { toast(msgOf(e, tr('Could not save')), 'error'); }
@@ -301,6 +317,12 @@ function SeriesEditModal({ id, series, onClose, onSaved }: { id: string; series:
           {DIRECTIONS.map(([v, label]) => <option key={v} value={v}>{tr(label)}</option>)}
         </select>
         <p className="mt-1 text-[11px] text-fog-500">{tr('What “Series default” in the reader follows. Automatic takes it from the chapter files, then the source, then AniList.')}</p>
+        <label className="mb-1 mt-3 block text-xs font-semibold uppercase tracking-wider text-fog-500">{tr('Series type')}</label>
+        <select value={seriesType} onChange={(e) => setSeriesType(e.target.value)} className={fld} data-series-type>
+          <option value="">{autoTypeLabel(series.detectedType)}</option>
+          {SERIES_TYPES.filter((v) => v !== 'unknown').map((v) => <option key={v} value={v}>{tr(seriesTypeKey(v))}</option>)}
+        </select>
+        <p className="mt-1 text-[11px] text-fog-500">{tr('What the notice-chapter switches in Settings go by. Automatic takes it from the genres, then the source, then AniList.')}</p>
         <label className="mb-1 mt-3 block text-xs font-semibold uppercase tracking-wider text-fog-500">{tr('Genres')}</label>
         <div className="flex flex-wrap gap-1.5 rounded-lg border border-ink-700 bg-ink-900/60 p-2">
           {genres.map((g) => (
