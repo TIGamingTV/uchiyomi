@@ -2,6 +2,9 @@ import type { PoolClient } from 'pg';
 import { pool, one } from './db';
 import { env } from '../env';
 import { MANGADEX_LANGS } from './lang';
+import { typeFromGenres, SERIES_TYPE_FROM } from './seriesTypeSignals';
+import { cleanGenres } from './genres';
+import { REFILE_FAILURES_SQL } from './chapterFailures';
 
 // NOTE: gen_random_uuid() is in Postgres core (v13+); no pgcrypto extension needed.
 // (The supabase/postgres image's event triggers reject CREATE EXTENSION under a custom role.)
@@ -650,13 +653,16 @@ CREATE TABLE IF NOT EXISTS book_overrides (
   updated_at timestamptz NOT NULL DEFAULT now()
 );
 -- Chapter number and title are DERIVED, not stored. Title is the filename minus its extension, and number
--- is numFromName(), which takes the FIRST number it finds. So "Vol 2 Ch 5.cbz" is chapter 2: it sorts
--- between 1 and 3 in the reader, and 2 is what gets reported to AniList. There is no filename parser that
--- is right for every collection, so the escape hatch is a manual, per-chapter override.
+-- is read from the filename by the row's name_rule (lib/naming.ts numberByRule). Rule 1 is numFromName(),
+-- which takes the FIRST number it finds. So "Vol 2 Ch 5.cbz" is chapter 2: it sorts between 1 and 3 in the
+-- reader, and 2 is what gets reported to AniList. There is no filename parser that is right for every
+-- collection, so the escape hatch is a manual, per-chapter override.
 --
 -- Deliberately manual. Re-parsing every filename with a smarter rule would silently renumber hundreds of
 -- chapters at once, and a renumbered COMPLETED chapter changes what a tracker is told (see
--- tracker_progress above for why that direction is dangerous).
+-- tracker_progress above for why that direction is dangerous). Which is why the smarter rule that did come
+-- (v0.55.2, rule 2, "Vol 2 Ch 5.cbz" is 5) reads only the files the scanner meets from then on: every row
+-- keeps the rule it was first scanned with (lib_books.name_rule, in the v0.55.2 block below).
 --
 -- Keyed on book id, which is minted per (root, file), so deleting a file and re-adding it elsewhere loses
 -- the override -- exactly as series_overrides loses a series' art. The FK is inline and VALID from birth
@@ -1386,6 +1392,90 @@ UPDATE lib_series SET work_id = NULL WHERE merged_into IS NOT NULL AND work_id I
 UPDATE lib_series s SET work_id = NULL
  WHERE s.work_id IS NOT NULL
    AND (SELECT count(*) FROM lib_series w WHERE w.work_id = s.work_id AND w.merged_into IS NULL) <= 1;
+
+-- v0.55.0: what the nightly runs (server.ts): 'repair', the safe repair, as every release before, or 'autofix', Health's
+-- Fix everything (lib/autofix.ts). Its runs are repair_runs rows of kind 'autofix', so there is no table. One column with
+-- a default: v0.54.x boots on this schema and never reads it, and going back runs its own nightly repair as it always did.
+ALTER TABLE server_settings ADD COLUMN IF NOT EXISTS nightly_mode text NOT NULL DEFAULT 'repair';
+
+-- v0.55.1 (#148): a library holds one or more folders. One row per folder, and a folder belongs to one library at most;
+-- a series belongs to the library holding the longest folder its own folder is in, across every library's folders
+-- (lib/library.ts libraryIdFor). The default library 'lib' holds none: its empty path still means "everything no other
+-- library holds". libraries.path stays, holding the library's FIRST folder, the one the admin listed first: v0.55.0
+-- reads only that column, so after a rollback it boots on this schema, never meets the table, and still files new
+-- folders by each library's first one.
+CREATE TABLE IF NOT EXISTS library_paths (
+  library_id text NOT NULL REFERENCES libraries(id) ON DELETE CASCADE,
+  path       text PRIMARY KEY
+);
+CREATE INDEX IF NOT EXISTS library_paths_library_idx ON library_paths (library_id);
+-- Seeded from libraries.path, and put right at every boot after a rollback (in steady state both match nothing).
+-- A library whose first folder is not among its rows was re-pathed by v0.55.0, which knew only that one folder: its
+-- rows are what it held before, and they go. Then every library holds its own first folder -- v0.55.0 created or
+-- re-pathed it there, checking only libraries.path for a duplicate, and has filed that folder into it since -- taking
+-- it from a library that held it as a further folder.
+DELETE FROM library_paths lp USING libraries l
+ WHERE l.id = lp.library_id AND l.path <> ''
+   AND NOT EXISTS (SELECT 1 FROM library_paths x WHERE x.library_id = l.id AND x.path = l.path);
+INSERT INTO library_paths (library_id, path)
+SELECT id, path FROM libraries WHERE path <> '' AND id <> 'lib'
+    ON CONFLICT (path) DO UPDATE SET library_id = EXCLUDED.library_id
+ WHERE library_paths.library_id <> EXCLUDED.library_id;
+
+-- v0.55.2 (#147): notice chapters (lib/noticeChapters.ts, lib/seriesType.ts). Sources post notices for readers as
+-- a short chapter N.x after their latest chapter N; the admin may hide every chapter numbered with a fraction that
+-- has 3 pages or fewer, per series type, and override that per series. series_type: manga, manhwa, manhua, webtoon or comic as learned (NULL =
+-- unknown), with series_type_from naming the evidence (lib/seriesTypeSignals.ts SERIES_TYPE_FROM);
+-- series_overrides.series_type is the admin's word. lib_series.hide_notices: the series' own switch, NULL = its
+-- type's. server_settings.hide_notice_types: the types whose notice chapters are hidden, empty = off (the default).
+-- All nullable or defaulted, so the previous release boots on this schema and simply shows every chapter.
+ALTER TABLE lib_series       ADD COLUMN IF NOT EXISTS series_type      text;
+ALTER TABLE lib_series       ADD COLUMN IF NOT EXISTS series_type_from text;
+ALTER TABLE lib_series       ADD COLUMN IF NOT EXISTS hide_notices     boolean;
+ALTER TABLE series_overrides ADD COLUMN IF NOT EXISTS series_type      text;
+ALTER TABLE server_settings  ADD COLUMN IF NOT EXISTS hide_notice_types jsonb NOT NULL DEFAULT '[]'::jsonb;
+-- The chapters whose file number has a fraction, by series: the few rows a notice can be among (lib/noticeChapters.ts
+-- mayBeNotice, hiddenBookCount), so the hidden counts and the read-progress roll-ups do not visit every chapter of
+-- the library while a switch is on (about 1,800 of 48,000 on the owner's). Partial and small; nothing else reads it.
+CREATE INDEX IF NOT EXISTS lib_books_fraction_idx ON lib_books (series_id) WHERE number <> floor(number);
+
+-- v0.55.2 (#150): chapter numbers from file names, for libraries collected by hand. name_rule is the rule that reads a
+-- chapter's number out of its file name (lib/naming.ts numberByRule): 1, the first number in the name, as every chapter
+-- was read until now; 2, chapterFromName (a chapter word, then an issue's #, never a year in brackets nor a volume's
+-- number), for every file the scanner meets from this release on. A row keeps the rule it was born with, and every scan
+-- reads its file by that rule (lib/library.ts persistScan): nothing already in a library is renumbered. The default
+-- makes every existing row rule 1. v0.55.1 boots on this schema: it never names the column, so a file it adds is rule
+-- 1, and its scan reads every file by the first number again -- rule-2 rows included -- until v0.55.2's next scan reads
+-- those by rule 2 once more.
+ALTER TABLE lib_books ADD COLUMN IF NOT EXISTS name_rule smallint NOT NULL DEFAULT 1;
+-- number_end: the last chapter of a file that holds several, "Batman 01-07 (1987).cbz" -- number 1, number_end 7 --
+-- written by the scan for a rule-2 file, NULL for one chapter (lib/chapterRanges.ts says what each reader does with
+-- one). Deliberately no CHECK that it is above number: a v0.55.1 scan after a rollback rewrites number by the first
+-- number in the name and never meets this column, and a CHECK would make that UPDATE, and its folder, fail. A stored
+-- end not above the number is read as no range instead, until v0.55.2's next scan writes both again.
+ALTER TABLE lib_books ADD COLUMN IF NOT EXISTS number_end real;
+
+-- v0.55.2 (#147 beside #150): when a chapter row was first scanned. Updates counts what came since a reader last
+-- looked in chapter rows and, while a notice switch is on, leaves out the hidden notices among the rows that came
+-- (lib/enrich.ts newSinceSeen) -- which it can only tell apart by when they came. Taken by number, a file collected
+-- late below the series' top (a 01-07 omnibus beside a hidden 44.5) was the notice, and swallowed. The scan's
+-- INSERT takes the default and its ON CONFLICT never names the column, so a row keeps the time it first came. Rows
+-- from before this release all carry the time of the upgrade and tie, ordered by number as before. v0.55.1 boots on
+-- this schema: it never names the column, and its INSERTs take the default.
+ALTER TABLE lib_books ADD COLUMN IF NOT EXISTS created_at timestamptz NOT NULL DEFAULT now();
+
+-- v0.55.3 (#147, TIGamingTV): which chapters the notice switches hide (lib/noticeChapters.ts). true, the default, is
+-- v0.55.2's rule: a chapter numbered with a fraction that has 3 pages or fewer, counted. false is the rule #147 was first
+-- written with: every chapter numbered with a fraction, of the types and the series switched on. v0.55.2 boots on this
+-- schema and never reads it: it hides by the page rule, which is what the default says.
+ALTER TABLE server_settings ADD COLUMN IF NOT EXISTS hide_notice_short_only boolean NOT NULL DEFAULT true;
+
+-- v0.55.4 (discussion #150): Rescan everything (lib/rescan.ts), the Tasks panel's on-demand look for the chapters whose
+-- files are gone from your own folders. Its last Apply and what it did, persisted like Verify chapter files' run above,
+-- so the Tasks line still says it after a restart; the preview's plan lives in memory only. Both nullable: v0.55.3
+-- boots on this schema and never names them.
+ALTER TABLE server_settings ADD COLUMN IF NOT EXISTS rescan_last_run    timestamptz;
+ALTER TABLE server_settings ADD COLUMN IF NOT EXISTS rescan_last_result jsonb;
 `;
 
 // Serialises migrate() across processes. CREATE TABLE IF NOT EXISTS is not safe to run concurrently:
@@ -1544,6 +1634,75 @@ const DATA_MIGRATIONS: { id: string; run: (c: PoolClient) => Promise<void> }[] =
           WHERE s.id = t.series_id AND s.lang IS NULL`,
         [MANGADEX_LANGS.map((l) => l.md), MANGADEX_LANGS.map((l) => l.code)],
       );
+    },
+  },
+
+  // v0.55.2 (#147), notice chapters: the type of every series whose genres name one (lib/seriesTypeSignals.ts
+  // typeFromGenres), so the per-type switches mean something on the first boot rather than after every series is
+  // rescanned. typeFromGenres itself, in JS rather than a copy of its rule in SQL, so the two cannot disagree: a
+  // genre menu naming several origins, or a lone "Manga", types nothing here either. The admin's genre override
+  // counts, as everywhere. Only series nothing has typed yet: one read and one UPDATE.
+  {
+    id: 'v0.55.2-series-type-from-genres',
+    run: async (c) => {
+      const rows = (await c.query<{ id: string; genres: string[] | null }>(
+        `SELECT s.id, COALESCE(o.genres, s.genres) AS genres
+           FROM lib_series s LEFT JOIN series_overrides o ON o.series_id = s.id WHERE s.series_type IS NULL`)).rows;
+      const typed = rows.flatMap((r) => { const t = typeFromGenres(r.genres); return t ? [{ id: r.id, ...t }] : []; });
+      if (!typed.length) return;
+      await c.query(
+        `UPDATE lib_series s SET series_type = v.type, series_type_from = v.src
+           FROM unnest($1::text[], $2::text[], $3::text[]) AS v(id, type, src)
+          WHERE s.id = v.id AND s.series_type IS NULL`,
+        [typed.map((t) => t.id), typed.map((t) => t.type), typed.map((t) => t.from)],
+      );
+    },
+  },
+
+  // v0.55.3, failures follow the series: every failed chapter filed under a source its series no longer uses -- neither
+  // its main source nor one it follows -- is filed under its main source, its tries starting again, as a main-source
+  // switch does from now on (lib/chapterFailures.ts REFILE_FAILURES_SQL, the same statement, so the two cannot
+  // disagree). Live, Replace had left 32 such rows under AllManga for two series now on Natomanga. One UPDATE, and no
+  // column: a v0.55.2 rollback reads the rows as any others, and its next failure of the chapter writes its own status.
+  {
+    id: 'v0.55.3-failures-follow-the-series',
+    run: async (c) => { await c.query(REFILE_FAILURES_SQL, [null]); },
+  },
+
+  // v0.55.5: a site's whole genre menu out of the genres a series carries (lib/genres.ts cleanGenres, the same function
+  // the engine, the add and the scan now pass every genre list through, so the four cannot disagree). The Manganato
+  // engine read every genre link on a Natomanga page, the site's 59-link menu among them: twelve live series held all
+  // 69 genres, Hentai and Smut too. The scanned genres, and an admin's override as well: Edit details sends every field
+  // on any save since v0.53.0, so a series anyone retitled holds the menu there -- and a menu's run is nobody's choice.
+  // Then each series cleaned is typed from what is left, by learnSeriesType's rule (never over a stronger provenance):
+  // a menu names three origins, so typeFromGenres typed none of them. No column: a v0.55.4 rollback reads clean genres.
+  {
+    id: 'v0.55.5-genres-without-site-menu',
+    run: async (c) => {
+      const cleaned: string[] = [];
+      for (const [table, key] of [['lib_series', 'id'], ['series_overrides', 'series_id']] as const) {
+        const rows = (await c.query<{ id: string; genres: string[] }>(
+          `SELECT ${key} AS id, genres FROM ${table} WHERE EXISTS (SELECT 1 FROM unnest(genres) g WHERE lower(btrim(g)) = 'ongoing')`)).rows;
+        for (const r of rows) {
+          const genres = cleanGenres(r.genres);
+          if (genres.length === r.genres.length) continue;
+          await c.query(`UPDATE ${table} SET genres = $2 WHERE ${key} = $1`, [r.id, genres]);
+          cleaned.push(r.id);
+        }
+      }
+      if (!cleaned.length) return;
+      const rows = (await c.query<{ id: string; genres: string[] | null }>(
+        `SELECT s.id, COALESCE(o.genres, s.genres) AS genres
+           FROM lib_series s LEFT JOIN series_overrides o ON o.series_id = s.id WHERE s.id = ANY($1)`, [[...new Set(cleaned)]])).rows;
+      for (const r of rows) {
+        const t = typeFromGenres(r.genres);
+        if (!t) continue;
+        await c.query(
+          `UPDATE lib_series SET series_type = $2, series_type_from = $3
+            WHERE id = $1 AND COALESCE(array_position($4::text[], series_type_from), 0) <= array_position($4::text[], $3::text)`,
+          [r.id, t.type, t.from, SERIES_TYPE_FROM],
+        );
+      }
     },
   },
 

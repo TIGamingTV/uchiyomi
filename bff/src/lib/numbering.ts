@@ -49,6 +49,7 @@ import { logAudit } from './audit';
 import { updateSeries, runsInside } from './updater';
 import { scheduleHealthSummaryRefresh } from './healthSummary';
 import { say, saidOf, type Part, type Said } from './said';
+import { isRange } from './chapterRanges';
 
 /** How a series' chapters are numbered: by the source, or by posting order. NULL in the row is "automatic". */
 export type NumberingMode = 'source' | 'posting_order';
@@ -306,11 +307,15 @@ interface Built {
  * the plan is busy too.
  */
 async function buildRenumber(s: SeriesForPlan, sourceId: string, raw: readonly SourceChapter[], mode: RenumberMode, waiting = false): Promise<Built> {
+  // A file holding a range of chapters (v0.55.2, lib/chapterRanges.ts) is left out of every plan: it is no post, and a
+  // rename to `Chapter <n>.cbz` would throw away the name that says which chapters it holds. It keeps its file and its
+  // numbers whatever the series is numbered by. Reintroduce by planning it: "a renumber leaves a range file alone" in
+  // chapterRanges.int.test.ts finds it renamed.
   const books = await q<{ id: string; root: string; file: string; number: number; ov: number | null; title: string | null; chapter_name: string | null;
     chapter_name_source: string | null; published_at: Date | null; source_chapter_id: string | null; picked_at: Date | null; pruned_at: Date | null }>(
     `SELECT b.id, b.root, b.file, b.number::float8 AS number, o.number::float8 AS ov, b.title, b.chapter_name, b.chapter_name_source,
             b.published_at, b.source_chapter_id, b.picked_at, b.pruned_at
-       FROM lib_books b LEFT JOIN book_overrides o ON o.book_id = b.id WHERE b.series_id = $1`, [s.id]);
+       FROM lib_books b LEFT JOIN book_overrides o ON o.book_id = b.id WHERE b.series_id = $1 AND NOT ${isRange('b')}`, [s.id]);
   // Tried, not trusted from permission bits: a share can report writable and refuse the rename (lib/fsGuard.ts).
   const roots = new Map<string, boolean>();
   for (const b of books) if (!roots.has(b.root)) roots.set(b.root, (await writePreflight(b.root).catch(() => ({ ok: false }))).ok);
@@ -745,7 +750,7 @@ export const CHECKING_NOW = 'This series is being checked right now. Try again w
  * chapter row to move at all. Otherwise the plan is answered and nothing changes.
  */
 export async function settleNumbering(
-  s: SeriesForPlan, sourceId: string, raw: readonly SourceChapter[], opts: { confirm?: boolean } = {},
+  s: SeriesForPlan, sourceId: string, raw: readonly SourceChapter[], opts: { confirm?: boolean | 'clean' } = {},
 ): Promise<Settled> {
   const mode = s.numbering_pending;
   if (!mode) return { state: 'none', numbering: s };
@@ -779,7 +784,11 @@ export async function settleNumbering(
     // itself" in numberingRoutes.int.test.ts reads renumber_pending.
     const noop = mode === 'remap' && built.plan.reasons.every((r) => r === 'tracker')
       && !built.plan.parked.length && built.plan.moves.every((m) => m.via === 'none');
-    if (rows > 0 && !opts.confirm && !noop) return { state: 'needs_review', numbering: s, plan: built.plan, tracker: built.tracker };
+    // v0.55.0: Fix everything confirms only a plan marked clean HERE, from the listing this apply reads -- never one an
+    // earlier look found clean. Reintroduce by treating 'clean' as a confirmation: "only a clean plan is applied" in
+    // autofix.int.test.ts renames the files of a plan that would push numbers to a tracker.
+    const confirmed = opts.confirm === 'clean' ? built.plan.clean : !!opts.confirm;
+    if (rows > 0 && !confirmed && !noop) return { state: 'needs_review', numbering: s, plan: built.plan, tracker: built.tracker };
     try {
       await applyRenumber(s, built);
     } catch (e) {

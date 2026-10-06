@@ -449,6 +449,152 @@ test("migrate: v0.52.0's data migration states a MangaDex series' language from 
   }
 });
 
+test("migrate: v0.55.2's data migration types a series from its genres, and only one nothing has typed", { skip }, async () => {
+  // Notice chapters are switched per series type (lib/noticeChapters.ts), so every series whose genres say what it is
+  // has a type at the first boot. Each: its genres, the admin's genres (null for none), the type it already had and
+  // from where, and the admin's own type (series_overrides.series_type).
+  const SEED: Record<string, [string[], string[] | null, [string, string] | null, string | null]> = {
+    't-st-genre': [['Action', 'Manhwa'], null, null, null],
+    't-st-webtoon': [['Webtoon', 'Romance'], null, null, null],
+    't-st-none': [['Action'], null, null, null],
+    't-st-menu': [['Manga', 'Manhwa', 'Manhua', 'Action'], null, null, null],
+    't-st-lone-manga': [['Manga', 'Action'], null, null, null],
+    't-st-admin-genres': [['Action'], ['Manhua'], null, null],
+    't-st-typed': [['Manhwa'], null, ['manga', 'source'], null],
+    't-st-admin-type': [['Manhwa'], null, null, 'comic'],
+  };
+  const ids = Object.keys(SEED);
+  try {
+    for (const [id, [genres, ovGenres, typed, ovType]] of Object.entries(SEED)) {
+      await q(`INSERT INTO lib_series (id, source, title, folder, genres, series_type, series_type_from) VALUES ($1, 'test', 'T', $1, $2, $3, $4)`,
+        [id, genres, typed?.[0] ?? null, typed?.[1] ?? null]);
+      if (ovGenres || ovType) await q(`INSERT INTO series_overrides (series_id, genres, series_type) VALUES ($1, $2, $3)`, [id, ovGenres, ovType]);
+    }
+    // Reintroduce the PR's id ('notice-chapters-series-type-from-genres'): this stamp is not the one migrate() checks,
+    // the migration does not run again, and t-st-genre stays untyped. An id is permanent once it has shipped.
+    await q(`DELETE FROM schema_migrations WHERE id = 'v0.55.2-series-type-from-genres'`);
+    await migrate();
+    const rows = await q<{ id: string; t: string | null; ov: string | null }>(
+      `SELECT s.id, s.series_type || '/' || s.series_type_from AS t, o.series_type AS ov
+         FROM lib_series s LEFT JOIN series_overrides o ON o.series_id = s.id WHERE s.id = ANY($1)`, [ids]);
+    assert.deepEqual(Object.fromEntries(rows.map((r) => [r.id, [r.t, r.ov]])), {
+      't-st-genre': ['manhwa/genre', null],
+      't-st-webtoon': ['webtoon/webtoon', null],
+      't-st-none': [null, null],
+      // typeFromGenres' own rule, not a copy of it in SQL: a genre menu, or "Manga" alone, is no evidence.
+      // Reintroduce the SQL table (the first origin named wins): manhwa/genre and manga/genre.
+      't-st-menu': [null, null],
+      't-st-lone-manga': [null, null],
+      // The admin's genres are the series' genres, as everywhere.
+      't-st-admin-genres': ['manhua/genre', null],
+      // Only a series nothing has typed: MangaDex said manga, and a genre does not get to say otherwise here.
+      // Reintroduce by dropping "s.series_type IS NULL": manhwa/genre.
+      't-st-typed': ['manga/source', null],
+      // The evidence is filled in beside the admin's word, never over it: their comic is still what applies.
+      't-st-admin-type': ['manhwa/genre', 'comic'],
+    }, 'the data migration typed the wrong series, or the wrong way');
+    assert.equal((await q(`SELECT 1 FROM schema_migrations WHERE id = 'v0.55.2-series-type-from-genres'`)).length, 1,
+      'the data migration did not run, or did not stamp itself');
+  } finally {
+    await q(`DELETE FROM lib_series WHERE id = ANY($1)`, [ids]);
+  }
+});
+
+test("migrate: v0.55.3's data migration files a failed chapter under its series' main source when the series no longer uses its own", { skip }, async () => {
+  // The owner's library (2026-10-04): Replace had moved two series off AllManga onto Natomanga, and their 32 failed
+  // chapters stayed filed under AllManga (attempts reset to 0 by v0.54.0's switch) -- listed there by Health, and
+  // "chapters no source can download" at the end of every Fix everything run. Each row: its series' main source, the
+  // sources it follows, the source the row is filed under, and its tries.
+  const SEED: Record<string, [string | null, string[], string, number]> = {
+    // The owner's: neither the main source nor followed -- the new main's now.
+    't-ff-orphan': ['t-ff-nato', [], 't-ff-allmanga', 0],
+    't-ff-capped': ['t-ff-nato', ['t-ff-kakalot'], 't-ff-allmanga', 3],
+    // Its own source, failing or not: a row under the main source, or under a source it follows, stays as it is.
+    // Reintroduce by dropping the main-source test (`f.source_id <> s.source_id`): t-ff-main's row reads `moved`, its
+    // tries reset. By dropping the series_sources test: t-ff-follower's row moves.
+    't-ff-main': ['t-ff-allmanga', [], 't-ff-allmanga', 3],
+    't-ff-follower': ['t-ff-nato', ['t-ff-allmanga'], 't-ff-allmanga', 2],
+    // No main source to give it to: left where it is.
+    't-ff-nomain': [null, [], 't-ff-allmanga', 1],
+  };
+  const ids = Object.keys(SEED);
+  try {
+    for (const [id, [main, follows, under, attempts]] of Object.entries(SEED)) {
+      await q(`INSERT INTO lib_series (id, source, title, folder, source_id, source_series_id) VALUES ($1, 'test', 'T', $1, $2, $3)`,
+        [id, main, main ? `${main}|${id}` : null]);
+      for (const f of follows) await q(`INSERT INTO series_sources (series_id, source_id, source_series_id) VALUES ($1, $2, $3)`, [id, f, `${f}|${id}`]);
+      await q(`INSERT INTO chapter_failures (series_id, number, source_id, status, reason, attempts, at, first_at)
+               VALUES ($1, 7, $2, 'error', 'no page urls', $3, now() - interval '1 day', now() - interval '3 days')`, [id, under, attempts]);
+    }
+    // Reintroduce by leaving the step out of DATA_MIGRATIONS: every row stays under t-ff-allmanga.
+    await q(`DELETE FROM schema_migrations WHERE id = 'v0.55.3-failures-follow-the-series'`);
+    await migrate();
+    const rows = await q<{ series_id: string; source_id: string; status: string; reason: string; attempts: number; old: boolean }>(
+      `SELECT series_id, source_id, status, reason, attempts, first_at < now() - interval '2 days' AS old FROM chapter_failures WHERE series_id = ANY($1)`, [ids]);
+    assert.deepEqual(Object.fromEntries(rows.map((r) => [r.series_id, [r.source_id, r.status, r.reason, r.attempts, r.old]])), {
+      't-ff-orphan': ['t-ff-nato', 'moved', 'no page urls', 0, true],
+      't-ff-capped': ['t-ff-nato', 'moved', 'no page urls', 0, true],
+      't-ff-main': ['t-ff-allmanga', 'error', 'no page urls', 3, true],
+      't-ff-follower': ['t-ff-allmanga', 'error', 'no page urls', 2, true],
+      't-ff-nomain': ['t-ff-allmanga', 'error', 'no page urls', 1, true],
+    }, 'the data migration filed the wrong rows, or the wrong way');
+    assert.equal((await q(`SELECT 1 FROM schema_migrations WHERE id = 'v0.55.3-failures-follow-the-series'`)).length, 1,
+      'the data migration did not run, or did not stamp itself');
+  } finally {
+    await q(`DELETE FROM lib_series WHERE id = ANY($1)`, [ids]);
+  }
+});
+
+test("migrate: v0.55.5's data migration takes a site's genre menu out of a series' genres and its override, and types what is left", { skip }, async () => {
+  // The owner's library (2026-10-06): twelve series held Natomanga's whole 59-genre menu after their own genres, read
+  // twice -- "Fantasy, Action, ..., Fantasy, Action, ..., All, Completed, Ongoing, Action, Adaptation, Adult, ...".
+  const MENU = ['All', 'Completed', 'Ongoing', 'Action', 'Adult', 'Hentai', 'Manga', 'Manhua', 'Manhwa', 'Smut', 'Webtoons'];
+  // Each row: the scanned genres, the override's (undefined: no override row), and the stored type and its provenance.
+  const SEED: Record<string, [string[], string[] | undefined, string | null, string | null]> = {
+    // Cleaned, then typed by its own genres: the menu names three origins, so nothing typed it before.
+    't-gm-typed': [['Action', 'Manhwa', 'Action', 'Manhwa', ...MENU], undefined, null, null],
+    // Cleaned; its own genres name no origin, so it stays untyped.
+    't-gm-untyped': [['Fantasy', 'Demons', 'Fantasy', 'Demons', ...MENU], undefined, null, null],
+    // Cleaned; its own Webtoon genre ranks below the source that typed it, which stands (learnSeriesType's rule).
+    't-gm-ranked': [['Drama', 'Webtoon', ...MENU], undefined, 'manhua', 'source'],
+    // The override holds the menu too (Edit details froze it there on a save): cleaned, the scanned genres as well.
+    't-gm-override': [['Drama', ...MENU], ['Drama', 'Romance', ...MENU], null, null],
+    // No menu: an "Ongoing" alone is a genre like any other, and nothing changes.
+    't-gm-clean': [['Action', 'Ongoing'], undefined, null, null],
+  };
+  const ids = Object.keys(SEED);
+  try {
+    for (const [id, [genres, override, type, from]] of Object.entries(SEED)) {
+      await q(`INSERT INTO lib_series (id, source, title, folder, genres, series_type, series_type_from) VALUES ($1, 'test', 'T', $1, $2, $3, $4)`,
+        [id, genres, type, from]);
+      if (override) await q(`INSERT INTO series_overrides (series_id, genres) VALUES ($1, $2)`, [id, override]);
+    }
+    // Reintroduce by leaving the step out of DATA_MIGRATIONS: every menu stays.
+    await q(`DELETE FROM schema_migrations WHERE id = 'v0.55.5-genres-without-site-menu'`);
+    await migrate();
+    const read = async () => Object.fromEntries((await q<{ id: string; genres: string[]; o: string[] | null; series_type: string | null; series_type_from: string | null }>(
+      `SELECT s.id, s.genres, o.genres AS o, s.series_type, s.series_type_from FROM lib_series s
+         LEFT JOIN series_overrides o ON o.series_id = s.id WHERE s.id = ANY($1)`, [ids])).map((r) => [r.id, [r.genres, r.o, r.series_type, r.series_type_from]]));
+    const want = {
+      't-gm-typed': [['Action', 'Manhwa'], null, 'manhwa', 'genre'],
+      't-gm-untyped': [['Fantasy', 'Demons'], null, null, null],
+      't-gm-ranked': [['Drama', 'Webtoon'], null, 'manhua', 'source'],
+      't-gm-override': [['Drama'], ['Drama', 'Romance'], null, null],
+      't-gm-clean': [['Action', 'Ongoing'], null, null, null],
+    };
+    assert.deepEqual(await read(), want, 'the data migration cleaned the wrong rows, or the wrong way');
+    assert.equal((await q(`SELECT 1 FROM schema_migrations WHERE id = 'v0.55.5-genres-without-site-menu'`)).length, 1,
+      'the data migration did not run, or did not stamp itself');
+    // Run again, nothing changes.
+    await q(`DELETE FROM schema_migrations WHERE id = 'v0.55.5-genres-without-site-menu'`);
+    await migrate();
+    assert.deepEqual(await read(), want, 'a second run changed something');
+  } finally {
+    await q(`DELETE FROM series_overrides WHERE series_id = ANY($1)`, [ids]);
+    await q(`DELETE FROM lib_series WHERE id = ANY($1)`, [ids]);
+  }
+});
+
 test('migrate: an edition v0.51.0 merged away after a rollback gives its language back at the next boot', { skip }, async () => {
   // The rollback drill's find: v0.51.0's merge sets merged_into and leaves work_id and lang alone, so the absorbed
   // French row kept its slot in lib_series_work_lang_idx, and v0.52.0 then refused a new French edition of the
@@ -514,6 +660,127 @@ test('migrate: the archive compares its bounds in the listing\'s own type', { sk
       await c.query(`INSERT INTO archive_queue (series_id, boundary) VALUES ('t-archive-bound', 45.3)`);
       const { rows } = await c.query(`SELECT 45.3::real < boundary AS below FROM archive_queue WHERE series_id = 't-archive-bound'`);
       assert.equal(rows[0].below, false, 'a listed 45.3 counts as below a boundary of 45.3');
+    } finally {
+      await c.query('ROLLBACK');
+    }
+  });
+});
+
+test('migrate: v0.55.1 adds library_paths, seeded from libraries.path, and a v0.55.0 rollback is put right at boot', { skip }, async () => {
+  // #148: a library holds several folders, one library_paths row each. libraries.path stays and holds the first, which
+  // is all v0.55.0 reads -- so a rollback boots on this schema, and the table must be right again when v0.55.1 boots
+  // back after v0.55.0 has created, re-pathed or deleted libraries knowing only that column.
+  const IDS = ['t-lp-a', 't-lp-b', 't-lp-c', 't-lp-d', 't-lp-e'];
+  const rows = async () => Object.fromEntries((await q<{ library_id: string; paths: string[] }>(
+    `SELECT library_id, array_agg(path ORDER BY path) AS paths FROM library_paths WHERE library_id = ANY($1) GROUP BY library_id`,
+    [IDS])).map((r) => [r.library_id, r.paths]));
+  try {
+    // A single-folder library as every install has them today: the boot seeds its row. Reintroduce by dropping the
+    // INSERT ... SELECT from libraries: "an existing library's folder is not seeded" fails.
+    await q(`INSERT INTO libraries (id, name, path) VALUES ('t-lp-a', 'A', 'Lp/A')`);
+    await migrate();
+    assert.deepEqual(await rows(), { 't-lp-a': ['Lp/A'] }, 'an existing library\'s folder is not seeded');
+    assert.equal((await q(`SELECT 1 FROM library_paths WHERE library_id = 'lib'`)).length, 0,
+      'the default library holds a folder: its empty path is "everything no other library holds"');
+
+    // v0.55.1's own state, as the routes leave it: libraries.path is the first of several folders.
+    await q(`INSERT INTO libraries (id, name, path) VALUES ('t-lp-b', 'B', 'Lp/B'), ('t-lp-c', 'C', 'Lp/C'), ('t-lp-d', 'D', 'Lp/D'), ('t-lp-e', 'E', 'Lp/E')`);
+    await q(`INSERT INTO library_paths (library_id, path) VALUES
+               ('t-lp-a', 'Lp/A2'), ('t-lp-b', 'Lp/B'), ('t-lp-b', 'Lp/B2'), ('t-lp-c', 'Lp/C'), ('t-lp-c', 'Lp/Shared'),
+               ('t-lp-d', 'Lp/D'), ('t-lp-e', 'Lp/E'), ('t-lp-e', 'Lp/E2')`);
+    const steady = await rows();
+    // Idempotent: two more boots change nothing.
+    await migrate();
+    await migrate();
+    assert.deepEqual(await rows(), steady, 'a boot changed a v0.55.1 library\'s folders');
+
+    // Now v0.55.0 runs for a while. It re-paths A (its only folder, as far as it knows), files a new library F under a
+    // folder C holds as a further one (it checks only libraries.path for a duplicate), and deletes D.
+    await q(`UPDATE libraries SET path = 'Lp/Z' WHERE id = 't-lp-a'`);
+    await q(`INSERT INTO libraries (id, name, path) VALUES ('t-lp-f', 'F', 'Lp/Shared')`);
+    IDS.push('t-lp-f');
+    await q(`DELETE FROM libraries WHERE id = 't-lp-d'`);
+    await migrate();
+    assert.deepEqual(await rows(), {
+      // Reintroduce by dropping the DELETE: A keeps Lp/A and Lp/A2 beside Lp/Z, folders v0.55.0 took away from it.
+      't-lp-a': ['Lp/Z'],
+      't-lp-b': ['Lp/B', 'Lp/B2'],
+      // Reintroduce ON CONFLICT DO NOTHING: F holds no folder at all, and C keeps the one F has been filing since.
+      't-lp-c': ['Lp/C'],
+      't-lp-f': ['Lp/Shared'],
+      't-lp-e': ['Lp/E', 'Lp/E2'],
+    }, 'a library v0.55.0 changed does not hold what v0.55.0 left it holding');
+    // D's rows went with it (ON DELETE CASCADE): v0.55.0's DELETE FROM libraries never meets the table.
+    assert.equal((await q(`SELECT 1 FROM library_paths WHERE library_id = 't-lp-d'`)).length, 0);
+    const again = await rows();
+    await migrate();
+    assert.deepEqual(await rows(), again, 'the reconcile is not idempotent');
+
+    // What a v0.55.0 writer has to supply is unchanged: libraries gained no required column, and the new table has
+    // only its two.
+    const required = await q<{ column_name: string }>(
+      `SELECT column_name FROM information_schema.columns
+        WHERE table_schema = 'public' AND table_name = 'library_paths' AND is_nullable = 'NO' AND column_default IS NULL
+        ORDER BY column_name`);
+    assert.deepEqual(required.map((r) => r.column_name), ['library_id', 'path']);
+  } finally {
+    await q(`DELETE FROM libraries WHERE id = ANY($1)`, [IDS]);
+  }
+});
+
+test('migrate: lib_books.created_at is when a row was first scanned, and v0.55.1 keeps writing its rows', { skip }, async () => {
+  // Updates tells the rows that came since a reader looked apart by it (lib/enrich.ts newSinceSeen). NOT NULL with a
+  // default: v0.55.1 boots on this schema and INSERTs without naming it. Reintroduce it without the default: the
+  // v0.55.1 INSERT below fails, and so does every scan v0.55.1 makes after a rollback.
+  const cols = await q<{ data_type: string; column_default: string | null; is_nullable: string }>(
+    `SELECT data_type, column_default, is_nullable FROM information_schema.columns
+      WHERE table_schema = 'public' AND table_name = 'lib_books' AND column_name = 'created_at'`);
+  assert.deepEqual(cols.map((c) => [c.data_type, c.column_default, c.is_nullable]), [['timestamp with time zone', 'now()', 'NO']],
+    'created_at is not NOT NULL DEFAULT now(): a v0.55.1 INSERT would leave it empty, or fail');
+  await withClient(async (c) => {
+    await c.query('BEGIN');
+    try {
+      await c.query(`INSERT INTO lib_series (id, source, title, folder) VALUES ('t-made', 'test', 'T', 'T!made-m/T')`);
+      // Exactly the INSERT v0.55.1's scan makes.
+      await c.query(`INSERT INTO lib_books (id, series_id, source, file, number, title, mtime, root)
+                     VALUES ('t-made-b', 't-made', 'test', 'T!made-m/T/Chapter 1.cbz', 1, 'Chapter 1', 0, '/library')`);
+      const { rows } = await c.query(`SELECT created_at = now() AS now FROM lib_books WHERE id = 't-made-b'`);
+      assert.equal(rows[0].now, true, 'a v0.55.1 row does not carry the time it came');
+    } finally {
+      await c.query('ROLLBACK');
+    }
+  });
+});
+
+test('migrate: v0.55.2 reads every chapter already in a library by rule 1, and v0.55.1 keeps writing its rows', { skip }, async () => {
+  // #150: lib_books.name_rule says which rule reads a row's number out of its file name (lib/naming.ts numberByRule).
+  // Every row that exists when the column arrives is rule 1, the first number, as it always was; v0.55.1 boots on
+  // this schema and INSERTs without naming the column, so whatever it adds is rule 1 too. Reintroduce DEFAULT 2:
+  // "a v0.55.1 row" reads 2, and the next scan renumbers every chapter v0.55.1 added.
+  // number_end, a range's last chapter, is nullable with no default and no CHECK: v0.55.1's scan rewrites `number` and
+  // never meets it, and a CHECK against `number` would fail that UPDATE and its whole folder (lib/chapterRanges.ts).
+  const cols = await q<{ column_name: string; data_type: string; column_default: string | null; is_nullable: string }>(
+    `SELECT column_name, data_type, column_default, is_nullable FROM information_schema.columns
+      WHERE table_schema = 'public' AND table_name = 'lib_books' AND column_name IN ('name_rule', 'number_end')
+      ORDER BY column_name`);
+  assert.deepEqual(cols.map((c) => [c.column_name, c.data_type, c.column_default, c.is_nullable]),
+    [['name_rule', 'smallint', '1', 'NO'], ['number_end', 'real', null, 'YES']]);
+  const checks = await q(`SELECT conname FROM pg_constraint WHERE conrelid = 'lib_books'::regclass AND contype = 'c'
+                             AND pg_get_constraintdef(oid) LIKE '%number_end%'`);
+  assert.deepEqual(checks, [], 'a CHECK on number_end would refuse what a v0.55.1 scan writes');
+  await withClient(async (c) => {
+    await c.query('BEGIN');
+    try {
+      await c.query(`INSERT INTO lib_series (id, source, title, folder) VALUES ('t-rule', 'test', 'T', 'T!rule-m/T')`);
+      // Exactly the INSERT v0.55.1's scan makes.
+      await c.query(`INSERT INTO lib_books (id, series_id, source, file, number, title, mtime, root)
+                     VALUES ('t-rule-b', 't-rule', 'test', 'T!rule-m/T/Vol 2 Ch 5.cbz', 2, 'Vol 2 Ch 5', 0, '/library')`);
+      const { rows } = await c.query(`SELECT name_rule, number_end FROM lib_books WHERE id = 't-rule-b'`);
+      assert.equal(rows[0].name_rule, 1, 'a v0.55.1 row is not rule 1');
+      assert.equal(rows[0].number_end, null, 'a v0.55.1 row holds a range');
+      // ...and its scan's UPDATE of a rule-2 range row, `number` rewritten under an untouched end, goes through.
+      await c.query(`UPDATE lib_books SET number_end = 7 WHERE id = 't-rule-b'`);
+      await c.query(`UPDATE lib_books SET number = 1987 WHERE id = 't-rule-b'`);
     } finally {
       await c.query('ROLLBACK');
     }

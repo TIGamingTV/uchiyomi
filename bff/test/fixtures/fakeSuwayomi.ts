@@ -120,6 +120,11 @@ export interface FakeExtension {
   hasUpdate: boolean;
   obsolete: boolean;
   versionCode: number;
+  /** The addresses its repository's index gives its apk and jar (v0.55.1's ranking reads them); none when unseeded. */
+  apkUrl?: string | null;
+  jarUrl?: string | null;
+  /** How often its apk and jar were downloaded, as the fake's /__github releases list says it (v0.55.1). */
+  downloads?: { apk: number; jar: number };
 }
 export interface FakeSeed {
   sources: Array<Partial<FakeSource> & Pick<FakeSource, 'id' | 'name' | 'lang' | 'pkgName'> & {

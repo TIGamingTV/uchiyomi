@@ -237,10 +237,13 @@ below, because the engine has to re-read its repositories before "an update is a
 `GET /api/admin/sources/overview` (admin, since v0.54.0) is every source the server knows, of every kind, in one
 answer -- the one Sources section's list: `{sources, attention}`. Each source is `{id, name, kind: builtin|mangadex|
 site|extension|pack, lang, pkgName? (extensions), standing, offBy, state, stage, cooldown, offline, main, followed,
-withBackup, lastTestedAt, icon, address? (sites)}`: `state`, `stage`, `cooldown` and `offBy` are Source health's own
-(`ok` when Health has nothing to say), `standing` the series' Sources sheet's, `main` the series whose main source it
+withBackup, lastTestedAt, icon, address? (sites), overLimit?}`: `state`, `stage`, `cooldown` and `offBy` are Source
+health's own (`ok` when Health has nothing to say), `standing` the series' Sources sheet's, `main` the series whose main source it
 is, `followed` the series that follow it without it being their main, `withBackup` of `main` the series a working
-follower would take over (the Replace preview's count), `offline` a confirmed site-offline notice. `attention` is
+follower would take over (the Replace preview's count), `offline` a confirmed site-offline notice, and `overLimit`
+(since v0.55.1) `{limit}` on an extension's source the last registration left out because `SUWAYOMI_MAX_SOURCES` was
+full -- switched on, offered by the engine, not loaded: not broken, and nothing Replace fixes (Health's frozen row for
+its series offers `free_slot` by the same record, and the web's sheet says so with no Replace). `attention` is
 `{replace, failingUnused, updates}`: the sources off or failing that are some series' main source, the findings on
 sources no series uses (Health's `unused` group), and installed extensions with an update waiting. The sources in
 `attention` come first, then by `main + followed`, then by name; switched-off sources last. The engine's own state
@@ -507,6 +510,22 @@ narrows the set described above and never widens it: an adult source without `ad
 limit, or an id that does not exist asks nobody and answers the empty shape. The entry is still keyed by the
 term alone, so a narrowed search reads whatever a full one already heard, and the other way round.
 
+Since v0.55.4 ([#158](https://github.com/AngeloSha/uchiyomi/discussions/158)) `&rating=all|safe|adult` filters the
+answer for 18+: `safe` (Discover's *Hide 18+*) leaves out every result known to be 18+, `adult` (*18+ only*) keeps only
+those, and `all` (the default; anything else reads as it) keeps everything. A result is 18+ when its source is (an
+extension that declares itself adult, or one on the source list of Admin → Settings → 18+ filter), when MangaDex rates
+the title erotica or pornographic, or when one of its genres is on the 18+ filter's genre list (trimmed and case-blind,
+as the library compares them). It is not 18+ when MangaDex rates it safe or suggestive, or when it names genres, the
+genre list has some, and none of them match; otherwise it is unknown — kept under `all` and `safe`, left out of
+`adult`. A card is 18+ when any of its providers is — except that, since v0.55.5, a provider that is 18+ only because
+its extension declares itself adult counts only when every provider of the card is such a one (the flag covers a whole
+site, and general sites carry it too) — else safe when any is. Each card, each provider and (with
+`groupBy=source`) each result carries `rating: adult | safe` when known, and nothing when not. The filter runs on the
+caller's own answer before the 30-card cap, never on the shared entry. An account whose age limit is below 18 is held
+to `safe` whatever it asks, and so is every request without `adult=1`: with Show 18+ off the search hides 18+ titles
+from sources that are not adult themselves too (MangaDex's erotica, a genre on the list), which it did not before
+v0.55.4. The answer's top-level `rating` says which filter it applied.
+
 `GET /api/sources/detail` is cached for ten minutes per source and series (it was ninety seconds), and
 concurrent requests for the same pair — the add dialog's pre-warm and the pick that follows it — collapse
 into one outbound fetch. A failed lookup is never cached, so an immediate retry asks the source again.
@@ -517,8 +536,9 @@ into one outbound fetch. A failed lookup is never cached, so an immediate retry 
 curl -H "Authorization: Bearer $TOK" https://your-server/api/admin/health
 ```
 
-Returns the same checks as the admin Health tab: chapter gaps, truncated downloads, duplicate series,
-impossible chapter numbers, failing sources, the last library scan (`library-scan`: folders it could not index,
+Returns the same checks as the admin Health tab: chapter gaps (since v0.55.0 counted between plausible numbers only:
+a chapter numbered far beyond the rest is the impossible-number check's, never a gap of thousands -- the repair's gap
+step counts the same way), truncated downloads, duplicate series, impossible chapter numbers, failing sources, the last library scan (`library-scan`: folders it could not index,
 and since v0.48.2 folders it could not look into at all), and since v0.48.2 `downloads-missing`: every chapter
 file in the downloads folder that is not in the library, per folder, with the reason when the scan knows it, and
 since v0.50.0 `saved-twice`: series where two sources' splits of one chapter are both on disk, each item with
@@ -536,6 +556,56 @@ Useful as a nightly cron that emails you only when `status` isn't `ok`.
 ignoring it: the finding is then reported greyed (`ignored`, `info`), stays quiet while what it is about (a gap's
 missing runs, a folder's files) is part of what was ignored, and its ignore is forgotten once it has been gone
 for a week. Short chapters use confirm-short, which already records the same judgement.
+
+**Fix everything** (since v0.55.0). `POST /api/admin/health/autofix` (`{}`) starts one background run that drives
+every Health card it can to green -- 202 `{ok, runId}`, or 409 `{error: 'busy', running}` beside another run
+(`autofix`), a repair (`repair`), a Find or Replace (`find`) or a chapter sweep (`sweep`); a repair and a Find started
+beside it are refused in turn (`POST /api/admin/sources/find` answers 409 `autofix_running`). Its ten phases, in
+order, reuse what Health's own keys run: `preflight` (the engine and the solver), `scan` (the library scan and the
+page count), `solver` (the repair's solver step, interrupted renumbers finished, the engine's Cloudflare helper
+connected when Health's engine row offers it and `FLARESOLVERR_URL` is set), `sources` (failing, inconclusive and
+blocked sources Tested, a block cleared only after a passing Test -- since v0.55.1 a source whose row is a rate limit
+is not Tested and a rate limit's cooldown is never cleared; Replace with turnOff for every source some series
+has as its main that is off, failing or uninstalled -- never for a setting or behind a solver that is down; failing
+sources nothing uses retired), `duplicates` (two-language pairs linked as editions; same-language copies merged only
+when their AniList entry, language and titles or chapter lists agree, keeping the copy that still updates), `numbering`
+(a renumbering plan applied only when the plan built at the apply is clean), `chapters` (the repair's failures, short
+and gap steps, uncapped but paced; since v0.55.1 it leaves alone every source cooling down or rate-limited when it
+begins -- `status` stays `rate_limited` until a download succeeds -- resetting none of its failed chapters and listing,
+fetching or searching nothing through it; what such a source holds back, and every chapter a rate limit failed, is
+`clears` (`autofix.clears.cooldown` {name}, `at` the cooldown's end while one runs), never `needsYou`), `extensions`
+(extensions installed in the series' language for series no source carries or gaps nobody had, only that language's
+source switched on, kept only when a series now reads through it; since v0.55.1 one at a time with no cap unless
+`AUTOFIX_INSTALLS` sets one, until every such series is carried or the run's time is spent -- the next run continues
+down the list -- in this order: the series' own translation groups naming the package, then its downloads a day (its
+apk and jar on the repository's GitHub releases, read at most once a day, the last answer kept while GitHub cannot be
+reached; since v0.55.3 over at most the week since their release, which is when a release is downloaded, so a site
+many read is no longer ranked under a webcomic rebuilt last week; no package is ever skipped for its count), then its
+version code, then its name; an 18+ package only for a series rated 18+, after the others; never a
+package already searched in vain for that series within 30 days; a package that carries none removed at once, before
+the next is installed), `files` (the later copy of a chapter saved twice deleted when the kept copy is complete,
+impossible chapter numbers deleted, with the delete route's guards) and `recheck`. It never presses Ignore.
+`GET /api/admin/health/autofix` answers `{run, last}` -- the live run and the newest finished one -- and
+`GET /api/admin/health/autofix/:runId` one run; `POST /api/admin/health/autofix/stop` stops it at its next safe point
+(`{ok, stopping}`), never inside a merge, a delete or a renumber. A run is `{id, status, startedAt, finishedAt?, by,
+phase, phaseIndex, stopping?, current?, summary?, log?}` (`stopping` from Stop until its safe point, for every
+viewer), every sentence a `Said` (`autofix.*` codes): `summary` is `{green, again, done, clears, needsYou}` -- `green`
+when nothing but Needs you is left, `again` when something a run could still change is left (what this one did not
+get to: stopped, or out of time, searches, Tests or installs -- `clears` says "the next Fix everything continues"),
+`done` one line per kind of thing done (at most twelve, with `items`), `clears` what ends by itself (with `at`),
+`needsYou` what only a person can do, each with its one action (`{kind: 'health', check}`, `{kind: 'open', href}` or
+`{kind: 'settings', key}`), and only once every phase that works on that card ran to its end. Runs are kept in the
+repair history (`GET /api/admin/tasks/repair/runs`, kind `autofix`, with `result` `{phaseIndex, summary, log}`) and
+audited as `library.autofix`. A line that names a series by title carries `params.seriesIds`, the series it names, and
+`current` carries `seriesIds` beside its `title` (since v0.55.1): for an admin who hides 18+, here and on the routes
+above, a line or a title naming a series their 18+ switch hides is left out -- judged on the series as it stands, a
+merged-away one included -- and so is one written before v0.55.1, with no ids, whatever it names. While one runs,
+`GET /api/sources/jobs` carries its card to admins (kind `autofix`, `done`/`total` its phases, `step` the phase).
+Settings' `nightlyMode` (`repair` | `autofix`) chooses what the nightly runs. Since v0.55.1 the extensions phase says
+what it did in one `done` line, `autofix.done.tried` {n, names, more} (the packages tried, naming those kept) or, when
+it kept none, `autofix.done.triedNone` {n} (`autofix.done.installed` and `autofix.done.uninstalled` stay for runs kept
+from before). What a run keeps of the packages it searched in vain, for the next runs (`tried`, naming the series each
+was searched for), is in no route's answer.
 
 `GET /api/admin/health/summary` (since v0.48.0) is the cheap question the app's header asks: the last report
 boiled down to `{at, worst, count, headline, key, checks}`, answered from what the Health tab or the server's
@@ -587,7 +657,7 @@ the two destructive ones, `delete` and `merge`, are the two the nightly repair n
 **Source health and the extension engine** (since v0.49.0). The `sources` check reads the per-stage evidence
 (#115): each of its items adds `evidence` (one line per stage, `search`, `chapters`, `pages`, `images`, each
 `{stage, state: 'ok' | 'fail' | 'unknown', at, by: 'test' | 'sweep' | 'traffic', kind: 'error' | 'empty' |
-'unnumbered', error}`), `tested` (the last Test or daily check: `{at, by, state: 'pass' | 'fail' | 'inconclusive',
+'unnumbered' | 'site_offline' | 'rate_limited', error}`), `tested` (the last Test or daily check: `{at, by, state: 'pass' | 'fail' | 'inconclusive',
 stage}`), `diagnosis` (`{code, reason, fix}`, the admin half) and `series` (how many series use the source), and
 its `title` is the source's name (its id only when no name is known). A confirmed failure — a failed live check, or
 three failures in a row at one stage from traffic — is a finding whether or not a series uses the source, and an
@@ -620,6 +690,41 @@ source has an extension's logo, which `GET /img/sources/icon/:id` serves. The su
 *Nothing is failing that your library uses* while quiet rows are listed. The status is decided as before: `warn`
 while any finding remains.
 
+**A rate limit is a cooldown, never a failure** (since v0.55.1). A stage failure in the words of an HTTP 429 (*0/32
+pages downloaded (HTTP 429)*, *too many requests*, the words `classify` files as `rate_limited`) is recorded with
+`kind: 'rate_limited'` in the per-stage evidence, and one recorded before as `error` is read the same way. It is
+never a current failure: its `sources` row is `blocked` with `cooldown.status: 'rate_limited'` (`until` null once the
+cooldown ran out or a passing Test cleared it, while the evidence stays open until a download succeeds), it never
+offers `replace_source`, the source's `standing` is `cooling` (so it still carries its series and is never a
+`frozen-series` cause), and `GET /api/admin/sources` leaves it out of `failing`. The downloader's stored words for a
+refused chapter name the refusal it blamed -- *HTTP 429*, *HTTP 403* -- never a worse page status beside it.
+
+**Failed chapters follow the series** (since v0.55.3). A failed chapter (one row of the ledger Health's
+`chapter-failures` check reads) that is filed under a source its series no longer uses -- neither its main source nor
+one it follows -- is filed under the series' main source, its attempts back to 0, its first failure (`firstAt`) and
+its reason kept, its status `moved` (`failures.detail`'s `status`, worded *from a source the series no longer uses*):
+when a main-source switch drops the old main (`POST /api/admin/series/:id/main-source`, a Replace run, Fix
+everything), when a source is unfollowed (`DELETE /api/admin/series/:id/sources/:sourceId`) or retired, when Replace
+drops a dead follower to make room, and once at the upgrade for the rows already left behind. A switch's
+`series.main_source` audit line carries `failuresMoved`. Before, the rows stayed under the old source: Health listed
+them there, Fix everything's failures step skipped a source failing at its pages, and its end called them chapters
+no source can download. A `moved` row on a source that is rate-limited, in a cooldown or downloading at a raised
+pace (`slowed`, below) waits as a 429's does: a source whose every row waits is `info`, and Fix everything says it
+clears by itself, never `needsYou`.
+
+**A site that keeps refusing is downloaded slowly, for hours** (since v0.55.3). A 429 raises the download pace level
+of the source's rate key (one more per 429, up to four): one chapter at a time, and gaps doubled per level between
+chapters and between pages. A level is held at least an hour after it changed, and comes off one step at a time only
+after ten chapters in a row came down whole with no 429 at it; one nothing downloads from loses a step every three
+days. A 429 is a rest every chapter on the key waits out, and a chapter running beside a refused one slows down with
+it. Sources whose pages come from one image server share one rate key (Natomanga and Mangakakalot: two sites, one
+image CDN), learned from the page addresses as chapters are fetched, except a proxy's (the extension engine's).
+Health's `sources` row for such a source carries `slowed: true` and the detail `sources.paced` (*Downloading slowly:
+the site asked for fewer requests*); one with nothing else to say is listed for it alone, `info`, in the `quiet` group,
+with the state `slowed` (also a state of `GET /api/admin/sources/overview`). The slow archive waits on the hour after
+a 429 (`waiting.why: 'pace'`), no longer on the level: past it, it goes on at its own pace, never faster than the
+raised one. Cooldowns are as before, per source.
+
 **Chapter numbering and the slow archive** (since v0.49.0). A new check, `numbering` (#116, *Chapter numbering*),
 lists the series whose numbering has something to say, each item with `seriesId` and `sourceId` (the numbering
 source, `sw:<id>` for an extension). Findings: a numbering change waiting for review — the detector's proposal
@@ -641,7 +746,8 @@ sources the series follows), instead of leaving them to the archive.
 
 `GET /api/admin/sources` (admin) is every source's stored health, and since v0.49.0 adds, per source, `live`
 (the last Test or daily check: `{at, by, state, stage, code, checks}`, or `null`), `failing` (the stages whose
-failure is open, confirmed and not stale: `{stage, since, at, error, kind, by, streak}`) and `evidence` (the
+failure is open, confirmed and not stale: `{stage, since, at, error, kind, by, streak}`; since v0.55.1 never a rate
+limit, which is a cooldown) and `evidence` (the
 same stage lines as Health), plus a top-level `testMs`. The public `status` it carries is unchanged: Admin →
 Providers shows *Failing* by overlaying `failing` on it, while `GET /api/sources` stays one answer for every
 account.
@@ -659,6 +765,16 @@ rescans at most once a minute server-wide — within a minute it answers `{scann
 owned mode. Anyone else gets `{scanned: true, libraries}`: the counts are the whole library's, libraries a member
 cannot open included. Both refresh the stored Health summary the header reads (coalesced, at most once every
 30 s).
+
+Since v0.55.6 ([#150](https://github.com/AngeloSha/uchiyomi/discussions/150)) `POST /api/refresh` answers within 15
+seconds (`REFRESH_FIRST_ANSWER_MS`), well under a proxy's own limit: a big library on a slow disk can scan for minutes,
+and a proxy that gave up on the request read as *Scan failed* while the scan went on. A scan that takes longer goes on,
+and the answer is `{scanned: true, running: true, since, libraries}`; one that fails answers `{scanned: false, reason:
+'error'}`, with the server's `message` for an admin. `GET /api/refresh` follows it: `{running}` for anyone, and for an
+admin also `now` (the server's clock), `progress` while one runs (`{startedAt, phase, done, total}`, the phase one of
+`waiting` — for a renumber or *Rescan everything* to let it start — `walking`, `indexing` (folder `done` of `total`)
+and `finishing`), `last` (the last completed scan's `{at, series, books, ms, skipped}`) and `failed` (`{at, message}`,
+when the last scan failed outright). `POST /api/admin/library/scan` still answers when its scan ends.
 
 ## 18+ libraries and sources
 
@@ -726,6 +842,57 @@ and the genres and sources an admin named, appear in `/api/v1/libraries` and the
 pages and progress resolve by id whatever it says, and the age cap is a permission and is unaffected. The
 flag changes nothing on `/api/*` proper, where `?adult=1` remains the reveal.
 
+## Notice chapters
+
+Many sources post announcements for readers as a short chapter numbered after the latest with a fraction: 100.5.
+An admin can hide them per series type. `PATCH /api/admin/settings {hideNoticeTypes: [...]}` takes any of
+`manga`, `manhwa`, `manhua`, `webtoon`, `comic` and `unknown`, replaced whole. It is read back as
+`hide_notice_types`, and an empty list (the default) is off. A single series overrides its type's switch with
+`PATCH /api/admin/series/:id {hideNotices: true | false | null}`, where `null` follows the type. The answer
+carries `hideNotices`, `hideNoticesEffective` and `hiddenNotices`: how many notice chapters that hides now, downloaded
+or only listed.
+
+Since v0.55.3 (#147) `PATCH /api/admin/settings {hideNoticeShortOnly: false}` changes the rule they hide by (*Only hide
+short ones (3 pages or fewer)*, on by default, read back as `hideNoticeShortOnly`, and carried for admins on `GET
+/api/series/:id` so a client can say which rule a series' switch hides by). Off, every chapter numbered with a fraction
+is a notice, of the types and the series switched on -- real chapters a site split into parts included, whatever
+their pages -- and neither the updater nor the slow archive downloads a fractional chapter of a series that hides
+them. A file holding a range of chapters is never a notice either way. *What is a notice* below is the rule while it
+is on.
+
+A series' type is `seriesType` on `GET /api/series/:id` for admins (`unknown` when nothing is known), with
+`detectedType {type, from}` naming the evidence. Most trusted first, the evidence is:
+
+1. `genre`: a genre naming one origin. A genre list naming several (a site's whole genre menu) is no evidence,
+   and neither is `Manga` alone, which many sites file everything under.
+2. `source`: MangaDex's original language.
+3. `anilist`: the country of origin.
+4. `webtoon`: a Webtoon genre with nothing better.
+
+`PUT /api/admin/series/:id/meta {seriesType}` overrides the type, and `null` goes back to automatic.
+
+**What is a notice.** A chapter whose effective number (the admin's renumber when there is one) is not a whole
+number, and whose page count is known and is 3 or fewer. A saved chapter's own counted pages decide; a chapter not
+counted yet (a page count is stamped when somebody opens it, or by the nightly repair) goes by the most pages any
+copy its sources list says it has. A longer one is a chapter in parts (78.1 … 78.9) and stays, and so does one
+nobody knows the length of. A number only the sources list is judged by what they say. A file holding a range of
+chapters (`numberEnd`, `Chapter 12.5-13.cbz`) is never a notice, however few its pages, unless an admin's number
+(Edit number & title) makes it one chapter.
+
+For a series that hides them, every notice is left out of everything:
+
+- **Chapter reads:** the chapter list, `GET /api/books/:id` (404), next and previous, pages, the offline manifest,
+  Continue Reading, Updates, history and bookmarks.
+- **Counts:** `booksCount` and the unread, read and new counts.
+- **Listings:** the series page's missing-chapter rows, groups and versions.
+- **External surfaces:** OPDS, the Komga-compatible API and the tracker push.
+- **Downloads:** the updater, the slow archive and `source_missing`. Neither the updater nor the slow archive
+  downloads one its sources list as that short; a fractional chapter they say nothing about is fetched like any
+  chapter, and hidden once it is counted.
+
+Nothing is deleted, and the listing keeps every number. Turning a switch off applies on the next request, and
+the next check downloads what it no longer hides.
+
 ## Rate limiting
 
 The API isn't rate-limited for authenticated users; the limits are on getting in. `POST /auth/login` takes
@@ -785,7 +952,7 @@ GET    /api/random                GET    /api/genres
 GET    /api/genres/overview       GET    /api/libraries
 GET    /api/library/sources       GET    /api/adult-filter
 GET    /api/updates               POST   /api/updates/seen
-POST   /api/refresh
+POST   /api/refresh               GET    /api/refresh
 GET    /api/series/:id            GET    /api/series/:id/books
 GET    /api/series/:id/similar    GET    /api/series/:id/color
 POST   /api/series/search         GET    /api/leaderboard
@@ -801,13 +968,16 @@ DELETE /api/series/:id/listing-progress
 **Filtering the library by source** (since v0.49.2; the filters are @TIGamingTV's, PR #124). On the owned
 backend, `POST /api/series/search` accepts two more conditions: `mainSource` (the source a series was added from,
 by id) and `anySource` (that, or a source it follows as a fallback). Both take `is` / `isNot`, and a source whose
-extension is gone still filters.
-`GET /api/library/sources` lists `{id, name, main, any, installed}` for every source the viewer's library
-comes from, busiest first: `main` counts the series added from it, `any` the series that read from it at all.
-It is counted over what the viewer may list, so the numbers match the filtered grid, and it is empty on a
-Komga backend. `name` is the one Health uses: the loaded source's, else the name the extension engine gave it,
-else the id; `installed` is false while a source is not loaded (its extension gone or switched off, or the
-engine down).
+extension is gone still filters. Since v0.55.1 (#149) a third, `hasMainSource`, in Komga's boolean shape
+(`{operator: isTrue|isFalse}`, no value): `isFalse` is the series with no main source at all -- folders added by hand,
+and anything never matched to a site -- whatever sources they follow. Any other operator is 400 `unsupported_filter`.
+`GET /api/library/sources` answers `{content, none}`: `content` lists `{id, name, main, any, installed}` for every
+source the viewer's library comes from, busiest first -- `main` counts the series added from it, `any` the series
+that read from it at all -- and `none` (since v0.55.1) counts the series with no main source, what `hasMainSource:
+isFalse` returns. Both are counted over what the viewer may list, so the numbers match the filtered grid; on a Komga
+backend `content` is empty and `none` 0. `name` is the one Health uses: the loaded source's, else the name the
+extension engine gave it, else the id; `installed` is false while a source is not loaded (its extension gone or
+switched off, or the engine down).
 
 **Language editions of one work** (since v0.52.0, #72). Blue Lock in English and in Spanish are two series —
 each with its own folder, chapters, sources and reading progress — linked as editions of one work. Every series
@@ -828,7 +998,9 @@ state a series' language with `PATCH /api/admin/series/:id {lang}`. The age rati
 work's, a merge inside one work is refused (`same_work`), and a work left with one edition — by an unlink, a
 merge or a forget — dissolves. The Komga-compatible API and OPDS keep every edition a series of its own and
 title it with its code, "Blue Lock (ES-419)", while a sibling is in the caller's sight; a tracker push never
-goes below what another series on the same tracker entry has sent.
+goes below what another series on the same tracker entry has sent. Since v0.55.0 `POST /api/admin/series/:id/merge`
+carries the absorbed series' main source to the survivor as a source it follows, when that source still works, is in
+the survivor's language and fits under the follower cap (`carried` names it, or is null).
 
 **Mark caught up** (since v0.52.0, from discussion #72). `PATCH /api/admin/series/:id {chapterFloor:
 'caught_up'}` floors a series just above the newest chapter its sources list or the library holds, as a
@@ -873,6 +1045,10 @@ below will touch) — and `pruned` — the file was deleted by the read-chapter 
 row is a tombstone: reading progress is still attached, but there are no pages behind it. A pruned chapter
 is listed by `GET /api/series/:id/books` (with the flag) and skipped everywhere a chapter is *served*:
 `next`, Continue reading, the OPDS feed, the offline plan; its download manifest answers **410** `pruned`.
+Since v0.55.4 it also carries `prunedReason: 'deleted' | 'missing' | null` — why the file is gone, null while it
+has one: `'deleted'` by *Delete files*, or by *Rescan everything* for a file gone from a library built by hand
+(`owned` false: the web says *File no longer on disk*, not *Deleted from the server*); `'missing'` by *Verify
+chapter files*; null for the read-chapter cleanup, a chapter's own delete, or a mark from before v0.37.0.
 
 Since v0.40.0 every chapter object also carries `missingPages: number[] | null`: 1-based indices whose
 images are repair placeholders in a partial chapter. `GET /api/books/:id/pages` keeps those entries in
@@ -880,6 +1056,14 @@ place and adds `missing: true`; a page may be both `missing` and `junk`, and a r
 missing placeholder. `GET /api/books/:id/download-manifest` copies the same optional `missing: true` onto
 each affected entry in `pages`, so offline readers preserve the evidence. A complete chapter has
 `missingPages: null` and no page-level `missing` keys.
+
+Since v0.55.2 every chapter object carries `numberEnd: number | null`: the last chapter of a file that holds
+several, read from a name like `Batman 01-07 (1987).cbz` (USAGE, *How a chapter's number is read*), null for one
+chapter. `number` and `metadata.numberSort` stay the start, 1 there, which is where the book sorts, and
+`metadata.number` says the whole range, `"1–7"`. An admin's number (`PUT /api/admin/books/:id/meta`) gives the file
+that one number and `numberEnd: null`. Every number from the start to the end counts as held: no gap, ghost or
+fetch is offered inside it, and finishing the file tells the trackers its end. The download manifest's `number` is
+the same display string.
 
 **Chapters the sources have that you don't.** `GET /api/series/:id/listing` answers
 `{checkedAt, content: [Ghost]}`: every chapter number the series' sources listed at the last check (the
@@ -1029,6 +1213,15 @@ cannot see. Same permission gate as the fill:
 `canDownload: false` is refused by the whole `/api/sources` surface, and a source outside the account's
 age cap answers **403**. Progress is on `GET /api/sources/jobs` under the series' `folder`.
 
+Since v0.55.4 ([#158](https://github.com/AngeloSha/uchiyomi/discussions/158)) a fetch by `numbers` is spread over the
+sources the series follows when they carry the same release of a chapter (the same scanlation group; or no group named,
+the same language and page counts that agree): each chapter is taken from the one this job has asked least, a source
+downloading at full speed before one a 429 has slowed, and up to three chapters come in at once, one per image server
+(two sites whose pages come from one server count as one). A source that is switched off, in a cooldown, refusing this
+job or outside the account's age cap is never taken this way. A `pick` never moves, nor a number once picked by name
+(`lib_books.picked_at`), nor anything for a series numbered by posting order or with its own source order. A chapter
+that fails is filed under the source it was asked from.
+
 **Download progress.** Since v0.40.0 a job may carry `switched: [{number, from, to, why?}]`, one entry for
 each chapter completed from a different followed source after its first copy failed. `why` is
 `"rate_limited"` when that was the reason for the switch; it may be absent for an ordinary failure. It may
@@ -1166,6 +1359,8 @@ DELETE /api/downloads/:bookId     GET    /api/books/:id/download-manifest
 ```
 GET    /api/admin/stats           GET    /api/admin/health
 GET    /api/admin/health/summary  POST   /api/admin/health/ignore
+POST   /api/admin/health/autofix  GET    /api/admin/health/autofix
+GET    /api/admin/health/autofix/:runId POST /api/admin/health/autofix/stop
 GET    /api/admin/settings        PATCH  /api/admin/settings
 GET    /api/admin/notify-targets  POST   /api/admin/notify-targets
 PATCH  /api/admin/notify-targets/:id DELETE /api/admin/notify-targets/:id
@@ -1177,6 +1372,7 @@ GET    /api/admin/sessions        DELETE /api/admin/sessions/:id
 GET    /api/admin/audit           GET    /api/admin/tasks
 POST   /api/admin/tasks/:id/run   POST   /api/admin/library/scan
 GET    /api/admin/tasks/repair/status  GET    /api/admin/tasks/repair/runs
+GET    /api/admin/tasks/rescan/status  POST   /api/admin/tasks/rescan/apply
 POST   /api/admin/update          POST   /api/admin/update/:id
 GET    /api/sources/popular      GET    /img/sources/icon/:id
 DELETE /api/sources/jobs/:folder  POST   /api/sources/jobs/:folder/cancel
@@ -1237,6 +1433,31 @@ POST   /api/admin/import/batches/:id/run
 PATCH  /api/admin/import/candidates/:cid
 ```
 
+**Overview.** `GET /api/admin/stats` is what the admin header and Overview show: `libraries`, `seriesTotal`,
+`members`, `cacheBytes`, `lastScan`, `backlog` {chapters, series}, `database` (`embedded` or `external`) and each
+member's recent reading (`activity`). Since v0.55.4 ([#150](https://github.com/AngeloSha/uchiyomi/issues/150)) it also
+answers `version`, the running version as the server's own package.json says it, or null when that cannot be read; the
+foot of the admin menu prints it. Whether a newer one exists is Health's `update` check (`GET /api/admin/health`), which
+the page reads from its own copy of that answer: this route asks GitHub nothing.
+
+**Libraries.** A library is declared on one or more folders under the library root (since v0.55.1, #148): `POST
+/api/admin/libraries {name, paths, ageRating?}`, where `paths` is every folder it holds and `path` alone still means
+one; `PATCH /api/admin/libraries/:id` takes the same fields, `paths` replacing the list whole, and `members`. Each
+folder is checked as `path` always was, the same folder twice is held once, and a folder belongs to one library at
+most: **409** `duplicate` names the first folder another library holds (`path`) and that library (`library: {id,
+name}`), and nothing is saved. `GET /api/admin/libraries` gives each library its `paths`, the first first -- the one
+`path` names, and the only one a v0.55.0 server reads after a rollback -- then the rest by name; a PATCH of a library
+that does not exist is **404** `not_found`. Every save moves the series it reaches in its own transaction: each series
+that is not filed by hand (`POST /api/admin/series/:id/library`) and sits under a folder the library held before the
+save or holds after it goes to the library holding the longest folder its own folder is in, across every library's
+folders, or to the default library `lib`. `DELETE /api/admin/libraries/:id` also moves what the library holds by hand,
+which is filed by hand nowhere after that: it goes where its folder says, and the folder rule takes it from then on.
+All three answer `moved`, the number of series that changed library. `GET
+/api/admin/libraries/preview?paths=…&paths=…` runs the same statement without saving and answers `{path, paths,
+series, sample}` (the series an admin can see, and up to 20 of their titles), and **409** for a folder another library
+holds; with `&id=` it is an edit of that library, counting what would leave it as well as what would come in. A folder
+is matched by its name: `_` and `%` in it are not wildcards.
+
 **Server settings.** `GET /api/admin/settings` is the one row: `server_name`, `allow_registration`,
 `updater_hours`, `extension_hours`, `extension_auto_update`, `update_check`, `install_ping`, `install_ping_last`,
 `cleanup_read`, `cleanup_read_days`, `backup_hour`, `scanlator_prefs`, `auto_follow_on_failure`,
@@ -1251,6 +1472,7 @@ backup — the pending timer is re-armed at once, so the change applies to the n
 after; `GET /api/admin/tasks` shows the backup's `schedule` as `daily at HH:00` from the same column),
 `scanlatorPrefs` and `sourcePrefs` (both below), `groupUpgrade` (the repair's group upgrades, off by default),
 `borrowNames` (chapter names from another source, off by default; switching it off clears the names it wrote),
+`hideNoticeTypes` (notice chapters, below),
 `autoFollowOnFailure`, and `repairEnabled` (the nightly library repair, on by
 default — switching it off stops the schedule only, since nothing it does deletes, merges or renumbers
 anything). Since v0.52.0 it also takes `mangadexLangs` and `unstatedLang`: `mangadexLangs` is the MangaDex
@@ -1405,7 +1627,7 @@ compared case-insensitively with spaces and punctuation ignored. The server-wide
 `scanlator_prefs` on `GET /api/admin/settings`, written whole through `PATCH /api/admin/settings
 {scanlatorPrefs}` (`priority` up to 50 names, `blocked` up to 200, `patienceDays` an integer 0–30 or
 `null`; the default is nothing ranked, nothing blocked, two days). A series can carry its own through
-`PATCH /api/admin/series/:id`, whose body is now `{autoUpdate?, scanlatorPrefs?, sourcePrefs?, borrowNames?, lang?, chapterFloor?}` — at least one, no other
+`PATCH /api/admin/series/:id`, whose body is now `{autoUpdate?, scanlatorPrefs?, sourcePrefs?, borrowNames?, lang?, chapterFloor?, hideNotices?}` — at least one, no other
 fields, each written on its own, and `scanlatorPrefs: null` clears the series' set. The two merge:
 **blocked is the union**, a series **priority replaces** the global list, and a series `patienceDays` of
 `null` **falls back** to the global one. A copy whose known groups are all blocked is dropped before the
@@ -1597,6 +1819,36 @@ and `lastResult` are persisted in `server_settings.verify_last_run` / `verify_la
 not turn the last run into "not run yet"; a run that threw stores a NULL result, so no stale healthy line
 comes back. A shutdown stops it between batches; what it had marked stays marked, because it was true.
 
+**Rescan everything.** `POST /api/admin/tasks/rescan/run` (since v0.55.4, discussion #150; the Tasks panel's
+*Rescan everything*) starts a **preview** and changes nothing: a library scan first, then one stat per live chapter
+row's own file under the library and the download folder (never a hidden or merged series', nor one mid-renumber),
+detached like Verify — it answers `{ok: true, started: true}` or `{ok: false, error: 'busy'}`. `GET
+/api/admin/tasks/rescan/status` is the run, live, and the plan it ends with (polled every 2 s while one runs): `{running:
+'preview' | 'apply' | null, phase: 'scan' | 'look' | 'pair' | 'numbers' | 'mark' | 'renumber' | null, done, of,
+startedAt, error, plan, last, lastRun}`. Per root it applies Verify's whole-batch rule and 90 % rule (`plan.unmounted
+[{root, missing?, of?}]`); only ENOENT is a gone file (`plan.unchecked` counts the rest, left alone); a gone row in
+your own folder whose fingerprint matches a live row's is *moved or renamed* and kept (`plan.moved`, `movedList`); the
+download folder's gone rows are only counted (`plan.downloads`, Verify's to mark); and `plan.emptied` / `emptiedList`
+are the series with every live chapter gone. `plan.numbers` is the opt-in: each series whose numbers the v0.55.2
+file-name rules would change, with `chapters`, `readers`, `overrides`, `tracked`, `up`, `down` and `examples` —
+posting-order and mid-renumber series left out. Lists name only series the viewer may list. `POST
+/api/admin/tasks/rescan/apply {plan, renumber?: seriesId[]}` applies it, detached, refused as `{ok: false, error}`
+with `busy`, `no_plan`, `stale` (replaced, or older than 30 minutes), `applied`, `not_in_plan`, or the job it would
+run beside (`sweep_running`, `autofix_running`, `repair_running`, `verify_running`, `cleanup_running`,
+`scan_running`). A series a download is writing into or a check is reading as it reaches it (a Fetch and its lanes,
+the slow archive's chapter, Fetch newest, a repair) is left alone — neither marked nor renumbered, counted in `busy` —
+and every other series it changes is held busy until it is done, so no Fetch (409 `busy`), archive chapter or Fetch
+newest starts in it meanwhile. Under `withScansHeld` each planned row is checked again (same id and file, still live, file still
+gone, no live fingerprint twin, the library folder still holding a file the preview saw) and marked pruned with
+`pruned_reason = 'deleted'` — held, so the sweep never fetches it back — and the covers and counts of the series it
+touched are recomputed; then the ticked series are renumbered in one transaction (name_rule 2, number, number_end; a
+number set by hand and a `'missing'` row are kept), with nothing pushed to any tracker. It never erases a row, touches
+a file, marks the download folder, relabels a row already pruned, hides a series or changes a tracker floor, read
+mark, favourite or rating. The result (`{marked, back, changed, moved, busy, downloads, emptied, unmounted,
+renumbered: {series, chapters}, ms, stopped?}`) is the `rescan` entry of `GET /api/admin/tasks`, persisted in
+`server_settings.rescan_last_run` / `rescan_last_result`; audit `library.rescan`, and `library.rescan_numbers` when
+the opt-in renumbered something. Never at boot or on a schedule.
+
 **Repair the library.** `POST /api/admin/tasks/repair/run` (since v0.41.0; the Tasks panel's *Repair
 library*, and the *Fix* / *Fill now* / *Retry now* keys and the *Reset the solver* action on the Health tab —
 *It's fine* is the separate `confirm-short` route below) runs the nightly repair now. It is **detached**, like `update` and `verify`, and answers **200**
@@ -1738,8 +1990,9 @@ judgement already made, and the sweep already merges its chapters, so the switch
 and the label, not which chapters arrive. The pair moves under the series row's lock and the promoted row leaves the
 followers. `old` says what becomes of the old main: `auto` (the default) keeps it as the last follower while it still
 carries the series (`standing` usable or cooling) and the follower cap has room; `keep` and `drop` decide. A dropped
-old main takes its listing rows with it, as an unfollow does, and the chapters capped against it get their tries back
-for the new main. A series whose language was only inferred from its main source is pinned to that language when
+old main takes its listing rows with it, as an unfollow does, and the chapters it failed are filed under the new main
+with their tries back (since v0.55.3, *Failed chapters follow the series*; before, they got their tries back under
+the old one). A series whose language was only inferred from its main source is pinned to that language when
 the new main would say otherwise (`langPinned`), so the language guard, its editions and Komga's `language` do not
 change by the way. Its last-check figures, folder, cover, reading direction and floor stay. It answers `{ok, from, to,
 old: kept|dropped, langPinned?, sources}` (read before the listing refresh it starts through the new main), **404**
@@ -1748,8 +2001,9 @@ takes its chapters from its numbering source alone), `renumber_pending`, `busy` 
 refresh is inside the series), `source_unavailable` (not loaded, switched off, or beyond the admin's age reach),
 `moved` (the main changed meanwhile) or `language_differs` (with `edition`, as the follow route answers it). Audited
 as `series.main_source` with `via: manual`. Each entry of `sources` (here, in the follow and unfollow answers and in
-`GET /api/series/:id`) carries `standing`: `usable`, `cooling`, `failing` (a confirmed failure at the chapter list,
-the pages or the images, or the site's own offline notice), `off` (switched off) or `not_loaded`.
+`GET /api/series/:id`) carries `standing`: `usable`, `cooling` (a cooldown, or since v0.55.1 a rate limit at the
+chapter list, the pages or the images), `failing` (a confirmed failure at the chapter list, the pages or the images,
+or the site's own offline notice), `off` (switched off) or `not_loaded`.
 `GET /api/admin/series/:id/check` now reports `waiting` alongside `added`: the number of missing chapters
 held back for a ranked group (omitted when none). The `frozen-series` health check lists a series whose
 primary is gone but which still follows a live source as information rather than a warning.
@@ -1817,7 +2071,12 @@ site's own offline notice; not a cooldown, not a failure at search alone): the r
 (`frozen.failing` {n, source, offline}) and that follows nothing that can update it -- a follower counts only while
 it is usable or cooling down -- with `replace_source` and `find_sources`; a series that still has such a follower is
 `info` (`frozen.followingDown` {source, state, names}) with `replace_source`. A main that is only cooling down is not
-listed.
+listed. Since v0.55.0 a row whose source is dropped by `SUWAYOMI_MAX_SOURCES` (`frozen.overLimit`) carries `free_slot`
+in their place, with `sourceId`: the client opens Admin → Sources on it to free a slot (no server action), since the
+source itself works. Since v0.55.1 that is a source the last registration left out for want of room, the record the
+sources overview's `overLimit` reads; one switched on that the engine no longer offers reads `frozen.uninstalled`. Since v0.55.1 the `source` of every `frozen.*` sentence names the source as the rest of Health
+does -- the loaded source's name, else the name the extension engine gave it, else its id -- where it was the id
+(`sw:2522…` for a source over the limit); `sourceId` stays the key every action uses.
 
 **Review first** (since v0.51.0, #132; @TIGamingTV's idea from PR #133). `POST /api/admin/sources/find` with
 `review: true` runs the same search and the same judgement, follows nothing, and keeps what it found: the run
@@ -1849,9 +2108,13 @@ the best is the one that answered with its list within the week, then the one li
 numbers (in tenths), then the admin's source order, then the one furthest ahead, then the follow order -- a cooling
 one only after every usable one. A series with none is searched for as Find does, its dead followers (failing, not
 loaded, switched off) not counting against the cap and dropped -- worst first, with their listing rows -- only as far
-as a follow needs the room; the first source it follows becomes its main source. A series numbered by posting order
-(`posting_order`), waiting for a renumber (`renumber_pending`), no longer on the source (`moved`), or with a sweep, a
-check or a listing refresh inside it for 30 s (`busy`) is left alone. Each result adds `promoted: {from, fromName,
+as a follow needs the room; the first source it follows becomes its main source. Since v0.55.1 that search asks only
+a source that can update the series (`standing` usable or cooling), so a source failing at the chapter list, the
+pages or the images is neither followed nor made the main source, and the first source it followed that can still
+update it is promoted -- none can, and the series stays with `why: no_answer`; a Replace run Fix everything starts
+never promotes onto, nor searches, a source that run is replacing too (such a follower is `skipped` as `failing`). A
+series numbered by posting order (`posting_order`), waiting for a renumber (`renumber_pending`), no longer on the
+source (`moved`), or with a sweep, a check or a listing refresh inside it for 30 s (`busy`) is left alone. Each result adds `promoted: {from, fromName,
 to, toName, via: follower|search, old: dropped|kept}` (and then no `why`), `skipped: [{sourceId, name, why: off|
 failing|cooling|not_loaded|language|age}]` (the followers passed over) and `dropped: [{sourceId, name}]`. The run reads
 `mode: 'replace'` and `promoted` (counted from its results; in `recent` too), and in full `left` (the series on the
@@ -2175,7 +2438,8 @@ never a guessed *Ongoing*. The `status` filter runs the same table the other way
 series stored as *Completed*. On a chapter, `number`, `metadata.numberSort` and
 the progress endpoint's numbers are **one quantity**, the override-aware chapter number, unrounded: the
 extension makes it the chapter number and Mihon compares and `PUT`s it back in that unit; `metadata.number`
-is the display string. The scanlation group rides as an author with role `translator`, which the extension
+is the display string — `1–7` for a file holding chapters 1 to 7 (since v0.55.2), whose `numberSort` is its start,
+1. The progress endpoint counts such a file's end: finished, it ends the run at 7, and `maxNumberSort` reaches 7. The scanlation group rides as an author with role `translator`, which the extension
 turns back into the scanlator. `media.status` is `READY` for a chapter whose file is on the server and
 `ERROR` for a tombstone (both `READY` under *ghost chapters* below). The full field lists are in [`openapi.yaml`](../bff/openapi.yaml) under
 `KomgaSeries`, `KomgaBook`, `KomgaPageDto`, `KomgaReadProgressV2` and `KomgaUser`, and
@@ -2236,6 +2500,14 @@ first real sync (n ≥ 1) marks a number-0 chapter read on both sides, as Komga 
 ignored. No
 reading event is written, so a sync from the phone does not count towards streaks, the leaderboard or
 Wrapped, exactly like the app's own bulk mark-read. Needs the `write` scope.
+
+**Notice chapters** (opt-in, *Settings → Notice chapters*, `hideNoticeTypes`, off by default). Many sources post
+announcements as a short chapter numbered after the latest with a fraction (100.5). For a series that hides them,
+every such chapter of 3 pages or fewer (with *Only hide short ones* off, since v0.55.3, every chapter numbered with a
+fraction) is absent from this API: not in `/api/v1/series/:id/books`, a 404 by id,
+not counted in `booksCount` or the read counts, and not a ghost. `readProgressV2`'s run skips them, so an unread
+100.5 does not stop `lastReadContinuousNumberSort` at 100. Switching it off lists them again on the next request.
+See *Notice chapters* above.
 
 **Ghost chapters** (opt-in, *Settings → Show missing chapters in Mihon*, `komgaGhostChapters`, off by
 default). Mihon takes a series' chapter total from the list this API answers, so a library running the

@@ -9,8 +9,9 @@
 // working exactly as it does without it.
 import { q } from '../../db';
 import { env } from '../../../env';
+import { visibleToAll } from '../../visibility';
 import { registerAdapter } from '../loader';
-import { listRemoteSources, makeSuwayomiAdapter, type RemoteSource } from './sources';
+import { listRemoteSources, makeSuwayomiAdapter, SW_PREFIX, type RemoteSource } from './sources';
 import { suwayomiConfigured } from './client';
 
 export interface EnabledRow {
@@ -66,6 +67,51 @@ export async function rememberMissing(ids: string[], list: () => Promise<RemoteS
   return found.length;
 }
 
+/**
+ * The engine's ids of the sources some series in the library reads through: as its main source or as a source it
+ * follows, a series hidden or merged away not counting. What registration puts first under the limit.
+ */
+export async function usedSourceIds(): Promise<Set<string>> {
+  const rows = await q<{ id: string }>(
+    `SELECT substr(x.source_id, ${SW_PREFIX.length + 1}) AS id FROM (
+       SELECT s.source_id FROM lib_series s WHERE s.source_id LIKE '${SW_PREFIX}%' AND ${visibleToAll('s')}
+       UNION
+       SELECT ss.source_id FROM series_sources ss JOIN lib_series s ON s.id = ss.series_id AND ${visibleToAll('s')}
+        WHERE ss.source_id LIKE '${SW_PREFIX}%') x`,
+  );
+  return new Set(rows.map((r) => r.id));
+}
+
+/** The engine's source ids at the last load that reached it; null until one has. */
+let offered: Set<string> | null = null;
+
+/**
+ * The engine's ids of the sources the last load left out because SUWAYOMI_MAX_SOURCES was full (v0.55.1): switched on,
+ * offered, and not registered for want of room -- not broken, and nothing Replace would fix. Health's frozen check and
+ * the sources overview both read it, so the over-limit row's Free a slot lands on a sheet that says so. Empty until a
+ * load reaches the engine, and after one that does not: then no extension source is loaded, for the engine's reason.
+ */
+let leftOut = new Set<string>();
+
+/** Whether the last load left this source (`sw:<id>`) out because the source limit was full. */
+export function leftOutByLimit(adapterId: string | null | undefined): boolean {
+  return !!adapterId?.startsWith(SW_PREFIX) && leftOut.has(adapterId.slice(SW_PREFIX.length));
+}
+
+/**
+ * Whether switching these engine sources on keeps every switched-on source under SUWAYOMI_MAX_SOURCES (v0.55.0), the
+ * question Fix everything asks before it switches on the source of an extension it installed (lib/autofix.ts). Counted
+ * as the next registration counts them: the switched-on sources the engine offered at the last load, plus these. A new
+ * source that would not fit is one an unused source already holds the slot of -- or worse, before the used-first order,
+ * one that would push a used source out -- so the answer is no, and nothing is switched on.
+ */
+export async function wouldFit(ids: readonly string[]): Promise<boolean> {
+  const on = await enabledSourceIds();
+  const counted = new Set([...on].filter((id) => !offered || offered.has(id)));
+  for (const id of ids) counted.add(String(id));
+  return counted.size <= env.SUWAYOMI_MAX_SOURCES;
+}
+
 export interface LoadResult {
   configured: boolean;
   reachable: boolean;
@@ -118,6 +164,8 @@ export async function loadSuwayomiSources(
 }
 
 async function load(list: () => Promise<RemoteSource[]>, quiet: boolean): Promise<LoadResult> {
+  // What this load leaves out replaces what the last one did, and a load that registers nothing leaves nothing out.
+  leftOut = new Set();
   if (!suwayomiConfigured()) return { configured: false, reachable: false, available: 0, registered: 0, skipped: 0 };
 
   let remote: RemoteSource[];
@@ -130,19 +178,31 @@ async function load(list: () => Promise<RemoteSource[]>, quiet: boolean): Promis
   }
 
   await remember(remote);
+  offered = new Set(remote.map((s) => String(s.id)));
   const enabled = await enabledSourceIds().catch(() => new Set<string>());
-  const wanted = remote.filter((s) => enabled.has(String(s.id)));
+  // The sources some series reads through first, then the rest, each part in the engine's order (v0.55.0). The limit
+  // used to take the engine's order alone, so an extension switched on later could sort ahead of one a hundred series
+  // update from and push it past SUWAYOMI_MAX_SOURCES: those series froze as "over the source limit" for an install
+  // that had nothing to do with them -- and Fix everything installs extensions by itself. A read that fails orders
+  // nothing, as before. Reintroduce by keeping the engine's order: "the sources series use register first" in
+  // suwayomiRegister.int.test.ts finds the used source skipped.
+  const used = await usedSourceIds().catch(() => new Set<string>());
+  const on = remote.filter((s) => enabled.has(String(s.id)));
+  const wanted = [...on.filter((s) => used.has(String(s.id))), ...on.filter((s) => !used.has(String(s.id)))];
 
   let registered = 0;
   let skipped = 0;
+  const out = new Set<string>();
   for (const s of wanted) {
-    // Cap registrations rather than silently letting search fan out forever. Say what was dropped.
+    // Cap registrations rather than silently letting search fan out forever. Say what was dropped, and which.
     if (registered >= env.SUWAYOMI_MAX_SOURCES) {
       skipped++;
+      out.add(String(s.id));
       continue;
     }
     if (registerAdapter(makeSuwayomiAdapter(s))) registered++;
   }
+  leftOut = out;
   if (skipped) {
     console.warn(
       `[sources] suwayomi: registered ${registered} source(s); skipped ${skipped} over the SUWAYOMI_MAX_SOURCES limit of ${env.SUWAYOMI_MAX_SOURCES}`,

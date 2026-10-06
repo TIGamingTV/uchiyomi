@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // Dependency-free HTTP source used only by the browser walks (v0.40 onwards).
 //
-//   node fakeSource.mjs --name fake-a --port 18150 [--extra v42,v49,v54]
+//   node fakeSource.mjs --name fake-a --port 18150 [--extra v42,v49,v54] [--cloudflare yes]
 //
 // Control it with POST /__script {chapter,page,behaviour}; chapter may be a chapter id, a chapter number
 // (shorthand for walk-tale-N), a SERIES id (for `omit:`), "search" with page 0, or "site" with page 0 (for
@@ -20,6 +20,16 @@
 //                                                                 temporarily offline" page, shaped like the one
 //                                                                 aqua has served since 2026-09-23 (v0.49.1's
 //                                                                 walk491). `ok` on "site" brings the site back.
+//   pages-error                                                   /pages only ("site", page 0): HTTP 500 for every
+//                                                                 chapter's page list while search and chapter lists
+//                                                                 answer -- the owner's AllManga (v0.55.1), whose page
+//                                                                 lists timed out in the engine's WebView for days.
+//
+// --cloudflare yes (v0.55.3, up.sh's E2E_SOLVERS=1, for the backup solver's walk): the site behind a fake Cloudflare.
+// Every request without a solver's `cf_clearance` cookie gets the challenge page (403, logged as route `challenge`);
+// with one, the site answers as it always does, its root (`/`, a small home page) included, and each log row carries
+// the clearance it came with (`clearance`, the solver's name, and `ua`): the app's own image fetches must send the pair
+// of the solver that solved this server (bff lib/sources/flaresolverr.ts cfSession).
 //
 // ⚠️ `offline` answers 200 on purpose, and in HTML: that is what made aqua hard to see. The adapter (bff
 // lib/sources/fake.ts) hands such a page to the product's own offlineNotice, which accepts it only while it is
@@ -40,6 +50,7 @@ const argv = new Map();
 for (let i = 2; i < process.argv.length; i += 2) argv.set(process.argv[i], process.argv[i + 1]);
 const NAME = argv.get('--name') || 'fake-a';
 const PORT = Number(argv.get('--port') || 18150);
+const CLOUDFLARE = argv.get('--cloudflare') === 'yes';
 if (!Number.isInteger(PORT) || PORT < 1 || PORT > 65535) throw new Error(`bad --port ${PORT}`);
 
 // ⚠️ "Walk Gap" runs to 14, not 12, and both fakes carry all fourteen: the walk punches its hole with
@@ -77,6 +88,49 @@ const SWAPS = EXTRA.has('v54')
     sourceId: `swap-${role}-${pass}`, title: `Swap ${role[0].toUpperCase()}${role.slice(1)} ${pass[0].toUpperCase()}${pass.slice(1)}`, first: 1, last: 12,
   })))
   : [];
+// ⚠️ The `fix-*` series are opt-in too (`--extra v55`, on BOTH fakes): autofixWalk.mjs's (v0.55.0, Health's Fix
+// everything), one per thing the run is to fix or leave. Fix Backup and Fix Search are added from fake-a, which then
+// goes offline (Replace moves one to the fake-b it follows, and finds the other on fake-b); the rest are fake-b's: two
+// copies of one series under two titles (Twin Walk, Twin Walk Again), one series in two languages, the chapters a
+// later split saves twice, the impossible numbers, two series numbered by posting order -- twelve posts on two numbers
+// each, the smallest listing the detector calls strong (lib/postingOrder.ts SHARED_NUMBERING) -- a gap no source here
+// lists (Gap Only: fake-b serves it, and the walk scripts `omit:6-7` on it; the fake engine's Gap Scans has all
+// twelve), and two chapters that fail (one before the runs, one after). Twelve chapters where a search must judge them (a primary listing ten or more
+// numbers is judged one way, lib/autoFollow.ts). Gated as the others are: the older walks see what they always did.
+const FIX_POSTS = Array.from({ length: 12 }, (_, i) => ({
+  k: i + 1, number: i < 6 ? 1 : 2, title: `E${i < 6 ? 1 : 2} - Page ${i + 1}`, publishedAt: new Date(Date.UTC(2025, 0, i + 1)).toISOString(),
+}));
+const FIXES = EXTRA.has('v55')
+  ? [
+    { sourceId: 'fix-backup', title: 'Fix Backup', first: 1, last: 12 },
+    { sourceId: 'fix-search', title: 'Fix Search', first: 1, last: 12 },
+    { sourceId: 'twin-walk', title: 'Twin Walk', first: 1, last: 12 },
+    { sourceId: 'twin-again', title: 'Twin Walk Again', first: 1, last: 12 },
+    { sourceId: 'edition-en', title: 'Edition Walk', first: 1, last: 12 },
+    { sourceId: 'edition-es', title: 'Edición Walk', first: 1, last: 12 },
+    { sourceId: 'twice-walk', title: 'Twice Walk', first: 1, last: 6 },
+    { sourceId: 'twice-short', title: 'Twice Short', first: 1, last: 8 },
+    { sourceId: 'odd-walk', title: 'Odd Walk', first: 1, last: 4 },
+    { sourceId: 'odd-mark', title: 'Odd Mark', first: 1, last: 4 },
+    { sourceId: 'num-clean', title: 'Number Clean', first: 1, last: FIX_POSTS.length, posts: FIX_POSTS },
+    { sourceId: 'num-held', title: 'Number Held', first: 1, last: FIX_POSTS.length, posts: FIX_POSTS },
+    { sourceId: 'gap-only', title: 'Gap Only', first: 1, last: 12 },
+    { sourceId: 'fail-walk', title: 'Fail Walk', first: 1, last: 4 },
+    // Added after the runs, its chapter 4 refused: the failure Let me choose's safe repair then retries.
+    { sourceId: 'fail-late', title: 'Fail Late', first: 1, last: 4 },
+  ]
+  : [];
+// ⚠️ v0.55.1: what the owner's first Fix everything run met, for autofixWalk.mjs, each series on the fakes that serve it
+// alone (fake-c and fake-d are `--extra v551`, started by up.sh beside the v55 pair): fake-c answers searches and
+// chapter lists and refuses Limit Walk's images with 429 (Mangakakalot); fake-d's page lists fail (AllManga), and Moved
+// Walk -- on fake-c too -- is what an earlier run moved onto it; fake-d also lists Fix Search, which Replace must never
+// move there. fake-b carries Limit Walk as well, and Pop Walk, which the walk then leaves with no source at all (only an
+// extension carries it, the fifth by popularity). Twelve chapters each: a search judges them one way.
+const OWNER = [
+  ...(EXTRA.has('v55') && NAME === 'fake-b' ? [{ sourceId: 'limit-walk', title: 'Limit Walk', first: 1, last: 12 }, { sourceId: 'pop-walk', title: 'Pop Walk', first: 1, last: 12 }] : []),
+  ...(EXTRA.has('v551') && NAME === 'fake-c' ? [{ sourceId: 'limit-walk', title: 'Limit Walk', first: 1, last: 12 }, { sourceId: 'moved-walk', title: 'Moved Walk', first: 1, last: 12 }] : []),
+  ...(EXTRA.has('v551') && NAME === 'fake-d' ? [{ sourceId: 'moved-walk', title: 'Moved Walk', first: 1, last: 12 }, { sourceId: 'fix-search', title: 'Fix Search', first: 1, last: 12 }] : []),
+];
 const SERIES = [
   { sourceId: 'walk-tale', title: 'Walk Tale', first: 1, last: 12 },
   { sourceId: 'walk-gap', title: 'Walk Gap', first: 1, last: 14 },
@@ -85,6 +139,8 @@ const SERIES = [
   // first/last count POSTS here, which is what chapterFromId checks a post id against.
   ...(POSTS ? [{ sourceId: 'walk-istrevelia', title: 'Walk Istrevelia', first: 1, last: POSTS.length, posts: POSTS }] : []),
   ...SWAPS,
+  ...FIXES,
+  ...OWNER,
 ];
 const byId = new Map(SERIES.map((s) => [s.sourceId, s]));
 
@@ -160,6 +216,10 @@ const OFFLINE_PAGE = Buffer.from(`<!doctype html>
 </html>
 `);
 
+// The fake Cloudflare's challenge, as Cloudflare words it (--cloudflare yes): what a request with no clearance gets.
+const CHALLENGE_PAGE = Buffer.from('<!doctype html><html><head><title>Just a moment...</title></head><body>'
+  + '<h1>Checking your browser before accessing the site.</h1><div id="cf-chl-widget"></div></body></html>');
+
 const scripts = new Map();
 const requestCounts = new Map();
 const log = [];
@@ -195,7 +255,10 @@ async function bodyOf(req) {
   return JSON.parse(Buffer.concat(parts).toString('utf8'));
 }
 function begin(req, url, extra = {}) {
-  const row = { seq: ++sequence, at: Date.now(), method: req.method, path: url.pathname, ...extra };
+  const row = {
+    seq: ++sequence, at: Date.now(), method: req.method, path: url.pathname,
+    ...(req.clearance ? { clearance: req.clearance, ua: String(req.headers['user-agent'] || '') } : {}), ...extra,
+  };
   log.push(row);
   return row;
 }
@@ -222,13 +285,29 @@ const server = http.createServer(async (req, res) => {
       const page = Number(body.page ?? 0);
       const behaviour = String(body.behaviour ?? body.behavior ?? '');
       if (!chapter || !Number.isInteger(page) || page < 0 || page > 12 ||
-          !/^(?:ok|error|offline|tiny-webp|404|short:(?:[1-9]|1[0-2])|omit:\d+-\d+|slow:\d+|429|429:after=\d+,retryAfter=\d+)$/.test(behaviour)) {
+          !/^(?:ok|error|offline|pages-error|tiny-webp|404|short:(?:[1-9]|1[0-2])|omit:\d+-\d+|slow:\d+|429|429:after=\d+,retryAfter=\d+)$/.test(behaviour)) {
         return sendJson(res, 400, { error: 'bad_script' });
       }
       scripts.set(keyOf(chapter, page), behaviour);
       requestCounts.delete(chapter);
       scripts.delete(`${keyOf(chapter, page)}:fired`);
       return sendJson(res, 200, { ok: true, chapter, page, behaviour });
+    }
+
+    // Behind the fake Cloudflare (--cloudflare yes, see the header): nothing without a solver's clearance.
+    if (CLOUDFLARE) {
+      const clearance = /(?:^|;\s*)cf_clearance=([^;]+)/.exec(String(req.headers.cookie || ''))?.[1] ?? null;
+      if (!clearance) {
+        const row = begin(req, url, { route: 'challenge' });
+        finish(row, 403);
+        return sendBytes(res, 403, 'text/html; charset=utf-8', CHALLENGE_PAGE);
+      }
+      req.clearance = clearance;
+      if (req.method === 'GET' && url.pathname === '/') {
+        const row = begin(req, url, { route: 'home' });
+        finish(row, 200);
+        return sendBytes(res, 200, 'text/html; charset=utf-8', Buffer.from(`<!doctype html><title>${SITE_NAME}</title><h1>${SITE_NAME}</h1>`));
+      }
     }
 
     // The whole site down behind its own notice (see the header): every source route, before any of them reads a
@@ -297,6 +376,7 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'GET' && pagesMatch) {
       const chapter = decodeURIComponent(pagesMatch[1]);
       const row = begin(req, url, { route: 'pages', chapter });
+      if (behaviourFor('site', 0) === 'pages-error') { finish(row, 500); return sendJson(res, 500, { error: 'the fake site failed while listing pages' }); }
       const found = chapterFromId(chapter);
       const host = req.headers.host || `127.0.0.1:${PORT}`;
       const short = /^short:(\d+)$/.exec(behaviourFor(chapter, 0));

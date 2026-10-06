@@ -21,7 +21,7 @@ import { reasonText, type Said } from '@/lib/said';
 import { offlineOutcome } from '@/lib/notices';
 import { FindMissingDialog } from '@/components/FindMissingDialog';
 import { normGroup } from '@/lib/scanlators';
-import { GHOST_CAP, mergeRows, whyLabel, runLabel, chunkNumbers, countsAsBehind, MARK_CHUNK, type Row } from '@/lib/chapterRows';
+import { GHOST_CAP, mergeRows, whyLabel, runLabel, chunkNumbers, countsAsBehind, MARK_CHUNK, heldBy, lastOf, wholesHeld, prunedLabel, type Row } from '@/lib/chapterRows';
 import { chParam, landingNumber } from '@/lib/healthLinks';
 import { effectsReduced } from '@/lib/effects';
 import { CHAPTER_PAGE, clampPage, pageCount, pageLabel, pageOf, pageSlice } from '@/lib/chapterPages';
@@ -277,7 +277,8 @@ function RowCaption({ group, via, versions, tone = 'text-fog-500', pruned, lead,
   via?: string | null;
   versions?: number;
   tone?: string;
-  pruned?: boolean;
+  /** A tombstone's chip, in its words (lib/chapterRows.ts prunedLabel); null for a chapter with its file. */
+  pruned?: string | null;
   /**
    * A first part before the group: a ghost's reason ("not here yet", "waiting for Asura Scans · 2 days left"). `full`
    * is the sentence a short reason stands for ("another split" for "another split of a chapter you have"): the title
@@ -312,17 +313,18 @@ function RowCaption({ group, via, versions, tone = 'text-fog-500', pruned, lead,
   if (via) { const t = tr('via {source}', { source: via }); parts.push(<span key="via">{t}</span>); plain.push(t); }
   if (versions && versions >= 2) { const t = tr('{n} versions', { n: versions }); parts.push(<span key="v">{t}</span>); plain.push(t); }
   if (!parts.length && !pruned && !short) return null;
-  const title = [...(pruned ? [tr('Deleted from the server')] : []), ...(short ? [short] : []), ...plain].join(' · ');
+  const title = [...(pruned ? [pruned] : []), ...(short ? [short] : []), ...plain].join(' · ');
   return (
     // One block that truncates as a whole (inline children, no flex): a flex row of shrink-0 parts would
     // run under the date at the end of the row instead of ending in an ellipsis.
     <p className={`mt-0.5 truncate text-[11px] ${tone}`} title={title}>
       {/* Shown even when a copy is saved on this device -- it is still gone from the server, and "yours is
           the last one" is exactly what somebody wants to know before clearing downloads. One wording for
-          every tombstone: the same mark is left by an admin's Delete from server as by the scheduled
-          cleanup, and the row cannot tell which, so "to free space" blamed a job that is off on most
-          installs. */}
-      {pruned && <span className="me-1 rounded-full border border-ink-700 px-1.5 text-[10px] leading-4 text-fog-600">{tr('Deleted from the server')}</span>}
+          every tombstone the server deleted: the same mark is left by an admin's Delete from server as by the
+          scheduled cleanup, and the row cannot tell which, so "to free space" blamed a job that is off on most
+          installs. A file Rescan everything found gone from a library built by hand has words of its own
+          (prunedLabel, v0.55.4): nothing deleted it. */}
+      {pruned && <span className="me-1 rounded-full border border-ink-700 px-1.5 text-[10px] leading-4 text-fog-600">{pruned}</span>}
       {/* Before the group, as a chip and not a caption part: "3 pages missing · Asura Scans" would read as
           the group's fault. The count is the file's -- the reader shows the caption on exactly those pages. */}
       {short && <span className="me-1 rounded-full border border-amber-500/40 bg-amber-500/10 px-1.5 text-[10px] leading-4 text-amber-300">{short}</span>}
@@ -443,7 +445,7 @@ function ChapterRow({ book, downloaded, sourceNames, primarySource, versions, on
             {/* The chapter's own name, when the source gave one that is not just the number again. */}
             {chapterName(book) && <span className="text-fog-500"> · {chapterName(book)}</span>}
           </p>
-          <RowCaption group={book.scanlator} via={altSource} versions={versions} pruned={book.pruned} missing={book.missingPages?.length} />
+          <RowCaption group={book.scanlator} via={altSource} versions={versions} pruned={prunedLabel(book)} missing={book.missingPages?.length} />
           {state === 'reading' && rp && (
             <p className="text-[11px] text-accent">page {rp.page}/{book.media.pagesCount}</p>
           )}
@@ -824,16 +826,17 @@ function SeriesInner() {
 
   // Numbers with a chapter row here: the sheet's chapter chips are solid for these, and a ghost on one of
   // them is a stale listing's, never a row (mergeRows applies the same rule; this keeps the filter's count
-  // honest too).
+  // honest too). A file holding a range holds every number in it (heldBy, v0.55.2).
   const allBooks = useMemo(() => books?.content ?? [], [books]);
-  const haveNumbers = useMemo(() => new Set(allBooks.map((b) => b.number)), [allBooks]);
-  // The whole numbers the series holds something at, for a covered row's caption (GhostRow `wholeHere`).
-  const haveWholes = useMemo(() => new Set([...haveNumbers].map((n) => Math.floor(n))), [haveNumbers]);
+  const haveNumbers = useMemo(() => heldBy(allBooks), [allBooks]);
+  // The whole numbers the series holds something at, for a covered row's caption (GhostRow `wholeHere`): each of a
+  // range's too (wholesHeld).
+  const haveWholes = useMemo(() => wholesHeld(allBooks), [allBooks]);
   // The sheet's solid chips are the LIVE rows only: a tombstone keeps its row (the ghost dedupe above is
   // right to count it -- the number is not "missing", it was deleted on purpose) but has no pages, and a
   // solid chip promises pages. Reintroduce by passing `haveNumbers` to the sheet: the chip for a pruned
   // number is solid, and tapping it lands on "Deleted from the server".
-  const liveNumbers = useMemo(() => new Set(allBooks.filter((b) => !b.pruned).map((b) => b.number)), [allBooks]);
+  const liveNumbers = useMemo(() => heldBy(allBooks.filter((b) => !b.pruned)), [allBooks]);
   const visibleGhosts = useMemo(() => (showGhosts ? ghosts.filter((g) => !haveNumbers.has(g.number)) : []), [showGhosts, ghosts, haveNumbers]);
   // The names the filter offers: the groups route's, or -- when it answered with nothing (a series scanned
   // from disk, a route that is not there) -- whatever the chapters on disk name, so a hand-built library
@@ -1048,7 +1051,9 @@ function SeriesInner() {
   };
   const markChapter = async (b: Book, mode: 'read' | 'unread' | 'previous') => {
     if (mode === 'previous') {
-      const prev = (books?.content ?? []).filter((x) => x.number < b.number && !x.readProgress?.completed);
+      // Every chapter before this one, a file holding a range only when ALL of it is (its end, v0.55.2): marking
+      // before chapter 5 must not mark a `03-07` file's 5 to 7 read.
+      const prev = (books?.content ?? []).filter((x) => lastOf(x) < b.number && !x.readProgress?.completed);
       if (!prev.length) { toast(tr('Nothing before this chapter is unread')); return; }
       // One card, in one language: the result takes the busy card's place (the same key), so both are translated.
       toast(markingText(prev.length), 'info', { busy: true, key: 'mark-read' });

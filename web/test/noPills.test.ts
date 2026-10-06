@@ -78,6 +78,9 @@ const SURFACES = [
   'components/ReplaceDialog.tsx',
   'lib/sourcesPanel.ts',
   'lib/mainSource.ts',
+  // v0.55.0, Health's Fix everything: its key, its dialog (the question, the run, the end) and the words they say.
+  'components/FixEverythingDialog.tsx',
+  'lib/autofix.ts',
 ];
 
 /**
@@ -119,6 +122,9 @@ const SLICES: [string, string, string, string][] = [
   // v0.53.0, Admin → Extensions: the engine's strip, beside the platform picker's chips, which stay. The tab itself is
   // a whole surface above since round 2 took Browse's chips out.
   ['components/EngineSetup.tsx', 'Extensions: the engine strip', 'export function EngineReady(', 'function EngineOffSheet('],
+  // v0.55.1 (#148): a library's dialog, its list of folders and the folder browser that ticks them -- keys where "Use"
+  // was a chip -- beside the Libraries cards' chips and the suggested folders, which stay.
+  ['app/admin/page.tsx', 'Libraries: the folder browser and the library dialog', 'function FolderPicker(', 'function LibrariesSection('],
 ];
 
 const slice = (src: string, from: string, to: string, name: string): string => {

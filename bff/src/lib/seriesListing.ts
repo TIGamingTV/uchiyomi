@@ -21,7 +21,11 @@ import { groupsOf, normGroup } from './releases';
 import { CHAPTER_RETRY_CAP } from './updater';
 import { chapterName } from './library';
 import { HEALED_NAME } from './naming';
+import { holds, isRange } from './chapterRanges';
 import { effectivePrefsFor, readSeriesPrefs } from './scanlatorPrefs';
+import { listedShown } from './noticeChapters';
+import { sameLanguage } from './lang';
+import { sourceLanguage } from './seriesLang';
 
 /**
  * `covered` (v0.50.0, lib/partAlias.ts R2): another site's split of a chapter on disk -- its 78.1 ... 78.9 where 78
@@ -236,6 +240,9 @@ export async function replaceListing(seriesId: string, rows: ListingRow[]): Prom
           WHERE b.series_id = $1 AND s.id = b.series_id
             AND (CASE WHEN s.numbering = 'posting_order'
                       THEN COALESCE((SELECT o.number FROM book_overrides o WHERE o.book_id = b.id), b.number) ELSE b.number END) = v.n
+            -- A file holding a range (lib/chapterRanges.ts) is not the chapter its start lists: no name of one
+            -- (chapterRanges.int.test.ts: "a range file took the name of the chapter its start lists").
+            AND NOT ${isRange('b')}
             AND (b.chapter_name IS NULL OR (b.chapter_name_source IS NOT NULL AND b.chapter_name_source <> $2))
             AND s.numbering_pending IS NULL AND s.renumber_plan IS NULL`,
         params,
@@ -266,6 +273,61 @@ export function copyToChapter(copy: ListingCopy, row: { number: number; title: s
     source: copy.source,
   };
 }
+
+/**
+ * The copies of one number that are the SAME RELEASE as `chosen` (v0.55.4, #158): what a download may take from
+ * another followed source instead, so that a long series is spread over the sites that carry it rather than asked of
+ * one. DannyDynamite39's case is the common one: several aggregators re-host one group's scanlation, and asking them in
+ * turn is both faster and less likely to earn a refusal than asking one of them for everything.
+ *
+ * The chosen copy first, then at most one copy per other source, in the order given (the listing stores them best
+ * first), each on a source in `followed`. A copy is the same release when it names the same groups, compared as sets of
+ * normalised names (normGroup) -- and the same groups is the same priority rank, so the scanlator preference and its
+ * patience are untouched: nothing here can take a copy the release rules would rank below the chosen one for its group.
+ * Aggregators rarely name a group, so a copy that names none matches a chosen copy that names none, and only then; and
+ * since nothing about the group can tell two such copies apart, their page counts must agree wherever both are known.
+ * Either way the language must be the same, exactly (an es-419 scanlation is not an es one): the copy's own, else
+ * what `langOf` says its source publishes in, else the server's unstated language (lib/lang.ts sameLanguage). An
+ * external link (`pages === 0`) is never a release here, and a chosen external copy has no other.
+ *
+ * Pure, over the stored copies: which sources may actually be asked -- loaded, allowed, resting or not -- is the
+ * caller's (the slow archive, lib/archive.ts; the job card, routes/sources.ts startDownloadJob).
+ * Reintroduce by comparing the first group only: "a copy by another group is never the same release" in
+ * seriesListing.test.ts takes the joint release.
+ */
+export function sameRelease(
+  chosen: ListingCopy,
+  copies: readonly ListingCopy[],
+  o: { followed: Iterable<string>; langOf?: (source: string) => string | null | undefined },
+): ListingCopy[] {
+  const out = [chosen];
+  if (chosen.pages === 0) return out;
+  const followed = new Set(o.followed);
+  const keysOf = (c: ListingCopy) => new Set(groupsOf({ groups: c.groups, scanlator: c.scanlator ?? undefined }).map(normGroup).filter(Boolean));
+  const langOf = (c: ListingCopy) => c.lang ?? o.langOf?.(c.source) ?? null;
+  const mine = keysOf(chosen);
+  const lang = langOf(chosen);
+  const seen = new Set([chosen.source]);
+  for (const c of copies) {
+    if (seen.has(c.source) || !followed.has(c.source) || c.pages === 0) continue;
+    const theirs = keysOf(c);
+    if (theirs.size !== mine.size || [...theirs].some((k) => !mine.has(k))) continue;
+    if (!sameLanguage(lang, langOf(c), { exact: true })) continue;
+    if (!mine.size && chosen.pages != null && c.pages != null && chosen.pages !== c.pages) continue;
+    seen.add(c.source);
+    out.push(c);
+  }
+  return out;
+}
+
+/**
+ * sameRelease's `langOf` for a copy whose chapter names no language: the one its source declares, or none for a source
+ * that publishes in many (lib/seriesLang.ts sourceLanguage's 'any').
+ */
+export const declaredLang = (source: string): string | null => {
+  const l = sourceLanguage(source);
+  return l === 'any' ? null : l;
+};
 
 export type GhostWhy = 'missing' | 'held' | 'blocked' | 'failed' | 'floor' | 'archive' | 'covered';
 
@@ -370,7 +432,9 @@ export function waitDaysLeftOf(copies: ListingCopy[], patienceMs: number, now = 
  * admin renumbered to 105 was a ghost at 105 here and a real row at 105 on the Komga surface, and
  * reconciliation (override-aware) moved the mark to the book while this page kept drawing an unmarked ghost.
  * Reintroduce by comparing `b.number = l.number`: "a renumbered chapter is not a ghost on the series page" in
- * listingProgress.int.test.ts finds 105 in the list.
+ * listingProgress.int.test.ts finds 105 in the list. A number inside a file holding a range is that file's
+ * (lib/chapterRanges.ts `holds`); reintroduce the plain equality and "a range file's numbers are no ghosts (the
+ * series page)" in chapterRanges.int.test.ts finds 2 to 7.
  *
  * `userId` names whose marks set `read`; without it no row is marked.
  */
@@ -382,11 +446,15 @@ export async function listingFor(seriesId: string, opts: { floor: number | null;
        FROM series_listing l
        LEFT JOIN chapter_failures f ON f.series_id = l.series_id AND f.number = l.number
        LEFT JOIN listing_progress lp ON lp.user_id = $2 AND lp.series_id = l.series_id AND lp.number = l.number
+       JOIN lib_series s_l ON s_l.id = l.series_id
       WHERE l.series_id = $1
+        -- A notice chapter the admin hides (lib/noticeChapters.ts) is not missing: it is not a chapter here at all.
+        -- Kept in the listing, so switching the hide off shows it again at once.
+        AND ${listedShown('s_l', 'l')}
         AND NOT EXISTS (
           SELECT 1 FROM lib_books b
             LEFT JOIN book_overrides ov ON ov.book_id = b.id
-           WHERE b.series_id = l.series_id AND COALESCE(ov.number, b.number) = l.number)
+           WHERE b.series_id = l.series_id AND ${holds('b', 'ov', 'l.number')})
       ORDER BY l.number`,
     [seriesId, opts.userId ?? null],
   );

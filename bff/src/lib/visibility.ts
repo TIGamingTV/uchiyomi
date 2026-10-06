@@ -10,6 +10,7 @@
 // That duplication is the measure of the risk. Per-library access does not get to become a 24th copy: it is
 // one more clause on `visible()`, and every caller inherits it because they all go through here.
 import { q, one } from './db';
+import { noticeBook } from './noticeChapters';
 
 export interface ViewCtx {
   /** null only for background work that legitimately sees everything: the scanner, the hero pre-warmer. */
@@ -276,6 +277,29 @@ export async function browsableIds(ids: readonly string[], ctx: ViewCtx): Promis
 }
 
 /**
+ * Which of these series this viewer may see NAMED in a record of what was done to them (v0.55.1): Fix everything's lines
+ * and its "Now:" (lib/autofix.ts). The listing rule, `browsable()`, judged on each series' row as it stands -- its
+ * library, rating, genres and "Always show" -- with its own merged or deleted state set aside: a record of a merge names
+ * the series that went, so `browsableIds` would hide every merge it reports, adult or not, where what the rule is asked
+ * here is the viewer's reach (their libraries, age cap and 18+ switch). A series gone from the table altogether cannot be
+ * judged, and is not named. Reintroduce `browsableIds` in its place: "a merge of a series that is not 18+ is still said"
+ * in repairRoutes.int.test.ts finds the line gone.
+ */
+export async function nameableIds(ids: readonly string[], ctx: ViewCtx): Promise<Set<string>> {
+  const list = [...new Set(ids.filter(Boolean))];
+  if (!list.length) return new Set();
+  const p = new Params();
+  const arr = p.add(list);
+  const rows = await q<{ id: string }>(
+    `SELECT s.id FROM (SELECT id, library_id, age_rating, genres, NULL::timestamptz AS deleted_at, NULL::text AS merged_into
+                         FROM lib_series WHERE id = ANY(${arr})) s
+      WHERE ${browsable('s', ctx, p)}`,
+    p.values as any[],
+  ).catch(() => [] as Array<{ id: string }>);
+  return new Set(rows.map((r) => r.id));
+}
+
+/**
  * The predicate for queries that legitimately span every library: the scanner, the updater sweep, health
  * checks, admin reporting. Still respects soft delete and merge, so it is NOT "no filter" -- it is "every
  * library, and nothing that was hidden".
@@ -430,7 +454,9 @@ export async function visibleBookFile(bookId: string, ctx: ViewCtx): Promise<{ f
   return (await one<{ file: string; root: string }>(
     `SELECT b.file, b.root FROM lib_books b
        JOIN lib_series s ON s.id = b.series_id
-      WHERE b.id = ${id} AND ${visible('s', ctx, p)}`,
+      WHERE b.id = ${id} AND ${visible('s', ctx, p)}
+        -- A notice chapter the admin hides (lib/noticeChapters.ts) has no pages to give, as booksSrc has no row.
+        AND NOT ${noticeBook('b.id')}`,
     p.values as any[],
   )) ?? null;
 }

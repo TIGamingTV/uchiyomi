@@ -201,7 +201,8 @@ this standing choice alone; the sheet marks a language you hid here *Hidden in e
 one of them is searched together. The engine's strip counts them (*v2.3.2243 · 12 of 25 sources on*); when more are
 switched on than that, the count turns amber, a line under the strip says how many were left out and how to get under
 the limit, and **Content → Health** lists them under *Extension source limit*. Hiding languages is the cheap way under it. On a Docker install, raising `SUWAYOMI_MAX_SOURCES` is the other;
-the desktop app has no setting for it.
+the desktop app has no setting for it. Since v0.55.0 the sources your series read through (as their main source or one
+they follow) take their places first, so switching another source on never pushes one your library depends on out.
 
 ## An extension's own settings
 
@@ -343,7 +344,9 @@ file.** An install set up before v0.46.0 gets the cap by downloading the current
   is a greyed line otherwise. The row, and the *Cloudflare helper* cell of the strip at the top of **Admin →
   Sources**, offer **Connect**, which sets the engine to the solver Uchiyomi uses (`FLARESOLVERR_URL`) and switches it
   on. Nothing restarts, and the engine keeps it unless its own container names another solver. It is never changed
-  without someone pressing it; with no `FLARESOLVERR_URL` on Uchiyomi both say to set that first. When the engine
+  without someone pressing it; with no `FLARESOLVERR_URL` on Uchiyomi both say to set that first. The engine has one
+  solver: a backup set on Uchiyomi (`FLARESOLVERR_FALLBACK_URL`, since v0.55.3) solves for Uchiyomi's own sources only,
+  so the row reads Uchiyomi's main solver and says its helper is not answering while only the backup is. When the engine
   cannot say what its helper is set to while a source fails with its *Cloudflare bypass currently disabled*, the
   row reads *It cannot use its Cloudflare helper*, with the same **Connect** wherever there is a setting to change
   (an engine too old to report the setting has to be set on its own container).
@@ -522,6 +525,12 @@ this API as well; it is closed source and was not tested here — a report eithe
   direction the server reports the leading run of read chapters: nothing read reports 0, and so does a run
   that ends on — or starts with an unread — number-0 chapter, so an unread *Extra* at the head keeps the run
   behind it from reaching the phone until it is read.
+- **Notice chapters** (*Admin → Settings → Notice chapters*, off by default) are hidden from the phone too.
+  For a series type that is switched on, or a series switched on in its own *Sources & translations* sheet,
+  every chapter numbered with a fraction that has 3 pages or fewer (a notice like 100.5) is left out of the
+  chapter list, the counts and the tracker's progress. An unread notice therefore never holds the read-up-to
+  number or *Completed* back.
+  Switching it off lists them again on the next refresh.
 - Plain HTTP on a LAN works; the cookie is marked Secure only over HTTPS.
 
 ## Where the line is

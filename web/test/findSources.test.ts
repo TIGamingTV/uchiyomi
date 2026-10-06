@@ -216,6 +216,10 @@ test('one run at a time: a key waits, saying why, while another goes; its own ru
   assert.equal(startRefusal(409, 'busy'), busy, 'another run going reads as a failure');
   assert.equal(startRefusal(400, 'empty_scope'), 'No series to search for', 'nothing to search for reads as a failure');
   assert.equal(startRefusal(500, null), null);
+  // v0.55.0: a Find or a Replace pressed while Health's Fix everything runs is 409 `autofix_running` -- which finds and
+  // replaces sources itself. Reintroduce the 409 read first: "beside Fix everything, another search is said" fails.
+  assert.equal(startRefusal(409, 'autofix_running'), 'Fix everything is running; it finds and replaces sources itself',
+    'beside Fix everything, another search is said');
 });
 
 /* ================================================================ the other names */
@@ -416,11 +420,13 @@ test("Server tasks: the run's card is named as a noun, counts its follows, stops
   assert.equal(runProgress(card), '12 of 189 series · 3 sources followed');
   assert.equal(runProgress({ ...card, followed: 1 }), '12 of 189 series · 1 source followed');
   const view = code(read('components/ServerDownloadsView.tsx'));
-  assert.match(view, /const cancelRun = \(kind: string\) => call\(kind === 'find_sources' \? '\/api\/admin\/sources\/find\/stop' : `\/api\/sources\/runs\/\$\{kind\}\/cancel`, 'POST'\);/,
+  // v0.55.0: Fix everything's run, too, stops through its own route (test/autofix.test.ts).
+  assert.match(view, /const cancelRun = \(kind: string\) => \{\s*if \(kind !== 'autofix'\) return call\(kind === 'find_sources' \? '\/api\/admin\/sources\/find\/stop' : `\/api\/sources\/runs\/\$\{kind\}\/cancel`, 'POST'\);/,
     "the run's Stop posts the generic cancel");
   const task = slice(view, 'function TaskRow(', 'function CameInTile(');
-  assert.match(task, /\{find \? tr\('Stopping…'\) : tr\('Stopping after this chapter…'\)\}/, 'a find run stops "after this chapter", or "after this series"');
-  assert.match(task, /\{find \? tr\('Stop'\) : tr\('Cancel'\)\}/);
+  assert.match(task, /const stops = find \|\| r\.kind === 'autofix';/);
+  assert.match(task, /\{stops \? tr\('Stopping…'\) : tr\('Stopping after this chapter…'\)\}/, 'a find run stops "after this chapter", or "after this series"');
+  assert.match(task, /\{stops \? tr\('Stop'\) : tr\('Cancel'\)\}/);
   assert.match(task, /\{find && admin && \(\s*<button type="button" onClick=\{\(\) => setResults\(true\)\}/, 'the card has no way to its results');
   assert.match(task, /\{results && <FindResultsSheet onClose=\{\(\) => setResults\(false\)\} \/>\}/);
 });

@@ -182,6 +182,8 @@ export interface Series {
     adultExempt?: boolean;
     /** The admin's reading direction for this series; null follows `detectedDirection`. Absent before v0.48.0. */
     readingDirection?: SeriesMetadata['readingDirection'] | null;
+    /** The admin's series type (notice chapters); null follows `detectedType`. Absent on older servers. */
+    seriesType?: Exclude<SeriesType, 'unknown'> | null;
   };
   /**
    * Admins only (v0.48.0): what the evidence alone says about the reading direction, and which evidence --
@@ -198,7 +200,25 @@ export interface Series {
   borrowNames?: boolean | null;
   /** Admins only: whether names are borrowed for this series once the server setting is applied. */
   borrowNamesEffective?: boolean;
+  /** Admins only: the type the notice-chapter switches go by -- the override, else the evidence's, else unknown. */
+  seriesType?: SeriesType;
+  /** Admins only: what the evidence alone says the series is, and which evidence. null when nothing has said. */
+  detectedType?: { type: Exclude<SeriesType, 'unknown'>; from: 'genre' | 'source' | 'anilist' | 'webtoon' | null } | null;
+  /** Admins only: this series' own notice-chapter switch; null follows its type's. */
+  hideNotices?: boolean | null;
+  /** Admins only: whether its notice chapters (numbered N.x) are hidden once its type's switch is applied. */
+  hideNoticesEffective?: boolean;
+  /** Admins only: how many of its chapters that hides right now. */
+  hiddenNotices?: number;
+  /**
+   * Admins only (v0.55.3, #147): the rule the notice switches hide by -- true, chapters numbered like 12.5 with 3 pages
+   * or fewer; false, every chapter numbered like 12.5. Settings' "Only hide short ones".
+   */
+  hideNoticeShortOnly?: boolean;
 }
+
+/** What kind of comic a series is (bff lib/seriesTypeSignals.ts), as the notice-chapter switches go by it. */
+export type SeriesType = 'manga' | 'manhwa' | 'manhua' | 'webtoon' | 'comic' | 'unknown';
 
 export interface ReadProgress {
   page: number;
@@ -223,6 +243,11 @@ export interface Book {
   seriesTitle: string;
   name: string;
   number: number;
+  /**
+   * The last chapter of a file holding several (v0.55.2, #150): `Batman 01-07` is `number` 1 and `numberEnd` 7, and
+   * `metadata.number` reads "1–7". Null or absent for one chapter. `number` stays the start: the book's place.
+   */
+  numberEnd?: number | null;
   media: { pagesCount: number; mediaType?: string; status?: string };
   metadata: BookMetadata;
   readProgress?: ReadProgress | null;
@@ -241,6 +266,12 @@ export interface Book {
    * be again. Nothing may offer to open or download it.
    */
   pruned?: boolean;
+  /**
+   * Why a pruned chapter's file is gone (v0.55.4): 'deleted' by Delete files or by Rescan everything, 'missing' by
+   * Verify chapter files, null for the read-chapter cleanup, a chapter's own delete or an older mark. Null or absent
+   * while the chapter has its file, and from a server before v0.55.4. The row's chip is worded by it (prunedLabel).
+   */
+  prunedReason?: 'deleted' | 'missing' | null;
   /**
    * The file lives under the downloads root, i.e. Uchiyomi fetched it and can fetch it again. Only these
    * may be deleted from the server or fetched again: a chapter in a library somebody assembled by hand is
@@ -446,7 +477,10 @@ export type HealthAction =
   | 'link_editions'
   // v0.54.0: move every series whose main source is `sourceId` -- off or failing -- to a working source, in one Replace
   // run (POST /api/admin/sources/find in its replace mode); the source and the frozen-series rows offer it.
-  | 'replace_source';
+  | 'replace_source'
+  // v0.55.0: a frozen series whose source is over the extension engine's source limit. Opens Admin → Sources on that
+  // source, where one nothing uses can be switched off to make room (no server action).
+  | 'free_slot';
 
 /** One step of the nightly repair (`bff/src/lib/repair.ts`), as `POST /api/admin/tasks/repair/run` takes it. */
 export type RepairStep = 'solver' | 'count' | 'failures' | 'short' | 'gaps' | 'groups' | 'names' | 'directions';
@@ -524,12 +558,17 @@ export interface HealthItem {
   offBy?: 'admin' | 'extension' | 'language';
   /** The source has an extension's logo, which /img/sources/icon/:id serves. */
   icon?: boolean;
+  /**
+   * v0.55.3: the source downloads at a raised pace -- one chapter at a time, longer gaps -- because its site, or an image
+   * server it shares with another source, answered 429. On a row of any state; the whole of a `slowed` row.
+   */
+  slowed?: boolean;
 }
 
 /** v0.53.0: the Source health card's groups, in the server's order. */
 export type SourceGroup = 'affected' | 'unused' | 'quiet' | 'off';
 /** v0.53.0: a source row's one state (bff lib/health.ts SourceState). */
-export type SourceState = 'blocked' | 'failing' | 'slow' | 'empty' | 'inconclusive' | 'untested' | 'off';
+export type SourceState = 'blocked' | 'failing' | 'slow' | 'empty' | 'inconclusive' | 'untested' | 'off' | 'slowed';
 
 /** The last attempt at a finding, per check (bff lib/health.ts `HealthOutcome`). */
 export type HealthOutcome =

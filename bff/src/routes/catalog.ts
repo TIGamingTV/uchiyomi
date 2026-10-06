@@ -17,7 +17,7 @@ import { sourceLabel } from '../lib/health';
 import { authenticate, roleOf, userIdOf } from '../lib/auth';
 import { warmHeroBackdrops } from './images';
 import { writeProgress, reachedEnd } from '../lib/progress';
-import { enrichSeries, seriesSeen } from '../lib/enrich';
+import { enrichSeries, newSinceSeen, seenCounts, seriesSeen } from '../lib/enrich';
 import { seriesSourcesFor } from '../lib/seriesSources';
 import { readSeriesPrefs, effectivePrefsFor } from '../lib/scanlatorPrefs';
 import { listingFor, type ListingCopy } from '../lib/seriesListing';
@@ -33,7 +33,9 @@ import { getSource } from '../lib/sources';
 import { cleanSourceOrder } from '../lib/sourcePrefs';
 import { editionInfo } from '../lib/editions';
 import { effectiveLang } from '../lib/seriesLang';
-import { DL_ROOT, LIBRARY_ROOT } from '../lib/library';
+import { DL_ROOT, LIBRARY_ROOT, lastScanFailure, lastScanReport, scanProgress, scanRunning } from '../lib/library';
+import { noticeBook, noticeListed, noticesShortOnly } from '../lib/noticeChapters';
+import { noticeTypes, hiddenCount } from '../lib/noticeSettings';
 import { join } from 'node:path';
 
 
@@ -132,6 +134,13 @@ async function tasteRecs(req: FastifyRequest): Promise<any[]> {
 // How many series the Continue Reading rail carries. 20 hid 33 of the heaviest user's 53 in progress.
 const ON_DECK_LIMIT = 60;
 
+/**
+ * How long POST /api/refresh waits for the library scan before it answers that the scan is still running (v0.55.6):
+ * under every proxy's own limit (nginx 60 s, Cloudflare 100 s), over a small library's whole scan. Read when asked,
+ * so a test can shorten it.
+ */
+const refreshFirstAnswerMs = (): number => Number(process.env.REFRESH_FIRST_ANSWER_MS) || 15_000;
+
 export default async function catalogRoutes(app: FastifyInstance) {
   app.addHook('preHandler', authenticate);
   // Resolve the viewer once per request. Everything below reads it rather than deriving its own, so there
@@ -173,10 +182,16 @@ export default async function catalogRoutes(app: FastifyInstance) {
   // Komga would refuse. Each source is named as Health and Providers name it (#115): the registered adapter, then
   // the name the engine gave an extension source that is not loaded now, then the id. A source that is only ever
   // followed, never a main source, read as a raw `sw:4709…` while the engine was down or the source was off.
+  // `none` (#149): the series with no main source at all, the Main source filter's "No source" -- counted over the same
+  // series as the rest. Beside `content` rather than a row of it: a row is a source, and no id can mean "none" (a site
+  // added by address takes its id from its name). Never counted on Komga, so the chip never offers a condition there.
   app.get('/api/library/sources', async (req) => {
-    if (!OWNED) return { content: [] };
-    const rows = await owned.librarySources(vc(req));
-    return { content: rows.map((r) => ({ id: r.id, name: sourceLabel(r.id, r.engine_name), main: r.main, any: r.any, installed: !!getSource(r.id) })) };
+    if (!OWNED) return { content: [], none: 0 };
+    const [rows, none] = await Promise.all([owned.librarySources(vc(req)), owned.seriesWithoutSource(vc(req))]);
+    return {
+      content: rows.map((r) => ({ id: r.id, name: sourceLabel(r.id, r.engine_name), main: r.main, any: r.any, installed: !!getSource(r.id) })),
+      none,
+    };
   });
 
   // What everyone in the household is reading (cross-user, last 14 days).
@@ -250,7 +265,23 @@ export default async function catalogRoutes(app: FastifyInstance) {
     // ⚠️ The owned library has ONE scan, of every root, whatever library id it is handed (lib/ownedCatalog.ts):
     // one call per library started that whole scan once per library, all at the same time. Komga scans each.
     const targets = NATIVE_PROGRESS ? libs : [libs[0] ?? { id: 'lib' }];
-    const answers = await Promise.all(targets.map((l: any) => komga.scanLibrary(SYSTEM_CTX, l.id).catch(() => null)));
+    const admin = roleOf(req) === 'admin';
+    // Each library's answer, or why its scan failed: v0.49.0 swallowed a failure into "scanned" without counts.
+    const run = Promise.all(targets.map((l: any) => komga.scanLibrary(SYSTEM_CTX, l.id)
+      .then((a: any) => ({ a }), (e: unknown) => ({ a: null, failed: (e as Error)?.message || String(e) }))));
+    void run.then(() => scheduleHealthSummaryRefresh());
+    // v0.55.6 (#150, Kedryn): answered within refreshFirstAnswerMs, the scan going on when it takes longer. A big
+    // library on a slow disk (Unraid's FUSE) scanned for longer than the proxy in front of the server would hold the
+    // request: the proxy cut it off and the button said "Scan failed", every time, while the scan went on. GET
+    // /api/refresh follows the rest (web lib/refresh.ts). Reintroduce by awaiting `run`: "a scan longer than the first
+    // answer is answered running" in repairRoutes.int.test.ts waits the whole scan out.
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const answers = await Promise.race([run, new Promise<null>((r) => { timer = setTimeout(() => r(null), refreshFirstAnswerMs()); })]);
+    clearTimeout(timer);
+    if (!answers) return { scanned: true, running: true, since: new Date(now).toISOString(), libraries: libs.length };
+    const failed = answers.find((x) => 'failed' in x) as { failed: string } | undefined;
+    // The reason is the server's own words, for an admin: a member learns that it failed, not the server's insides.
+    if (failed) return { scanned: false, reason: 'error', ...(admin ? { message: failed.failed } : {}) };
     // v0.49.0: the owned scan's counts, so "Scan library now" can say "212 series, 4,310 chapters, 1 folder
     // skipped" rather than nothing (Komga answers no body: no counts, as before). And the header's summary
     // catches up with what the scan found -- "folders the scan cannot index" is one of its checks.
@@ -260,12 +291,28 @@ export default async function catalogRoutes(app: FastifyInstance) {
     // are the WHOLE library's, restricted and 18+ libraries included: a member limited to one library would
     // learn how big the ones they cannot open are. Reintroduce by dropping the role check: the member half of
     // that test finds a `series` key.
-    const counts = roleOf(req) !== 'admin' ? undefined : answers.find((a: any) => a && typeof a.series === 'number') as
+    const counts = !admin ? undefined : answers.map((x) => x.a).find((a: any) => a && typeof a.series === 'number') as
       { series: number; books: number; ms: number; skipped: number } | undefined;
-    scheduleHealthSummaryRefresh();
     return {
       scanned: true, libraries: libs.length,
       ...(counts ? { series: counts.series, books: counts.books, ms: counts.ms, skipped: counts.skipped } : {}),
+    };
+  });
+
+  // v0.55.6 (#150): the scan POST /api/refresh answered `running` for, followed. Whether one runs, for everyone; for an
+  // admin, how far it has got (lib/library.ts scanProgress), how the last one ended -- its counts, or why it failed --
+  // and the server's clock, so the web compares the server's times with each other and never with its own.
+  app.get('/api/refresh', async (req) => {
+    const running = scanRunning();
+    if (roleOf(req) !== 'admin') return { running };
+    const p = scanProgress();
+    const last = lastScanReport();
+    const failed = lastScanFailure();
+    return {
+      running, now: new Date().toISOString(),
+      ...(p ? { progress: p } : {}),
+      ...(last ? { last: { at: last.at, series: last.series, books: last.books, ms: last.ms, skipped: last.skippedTotal } } : {}),
+      ...(failed ? { failed } : {}),
     };
   });
 
@@ -306,6 +353,8 @@ export default async function catalogRoutes(app: FastifyInstance) {
                       -- the chapter you are part-way through wins
                       (SELECT p.book_id FROM read_progress p
                          WHERE p.user_id = ${uidP} AND p.series_id = r.series_id AND p.completed = false
+                           -- not a notice chapter the admin hides (lib/noticeChapters.ts): it is no chapter to resume
+                           AND NOT ${noticeBook('p.book_id')}
                          ORDER BY p.updated_at DESC LIMIT 1),
                       -- otherwise the lowest-numbered chapter you have not finished
                       (SELECT b.id FROM lib_books b
@@ -313,6 +362,7 @@ export default async function catalogRoutes(app: FastifyInstance) {
                          WHERE b.series_id = r.series_id
                            -- never offer a chapter whose pages were deleted (a tombstone, lib/chapterCleanup.ts)
                            AND b.pruned_at IS NULL
+                           AND NOT ${noticeBook('b.id')}
                            AND NOT EXISTS (
                              SELECT 1 FROM read_progress p2
                               WHERE p2.user_id = ${uidP} AND p2.book_id = b.id AND p2.completed
@@ -372,14 +422,17 @@ export default async function catalogRoutes(app: FastifyInstance) {
     const favIds = favAll.filter((id) => favShown.has(id)).slice(0, 20);
     const favorites = ((await Promise.all(favIds.map((id) => komga.series(vc(req), id).catch(() => null)))).filter(Boolean)) as any[];
 
-    // updates badge: favorites with new chapters since last seen (self-heal missing baselines)
+    // updates badge: favorites with new chapters since last seen (self-heal missing baselines). Counted in every
+    // chapter row, hidden notices included (lib/enrich.ts seenCounts), on both sides.
     const seenMap = await seriesSeen(uid, favorites.map((s) => s.id));
+    const counts = await seenCounts(favorites);
+    const since = await newSinceSeen(seenMap, counts);
     let updatesCount = 0;
     for (const s of favorites) {
       if (seenMap.has(s.id)) {
-        if ((s.booksCount ?? 0) > (seenMap.get(s.id) ?? 0)) updatesCount++;
+        if ((since.get(s.id) ?? 0) > 0) updatesCount++;
       } else {
-        await q(`INSERT INTO series_seen (user_id, series_id, seen_books_count) VALUES ($1, $2, $3) ON CONFLICT (user_id, series_id) DO NOTHING`, [uid, s.id, s.booksCount ?? 0]);
+        await q(`INSERT INTO series_seen (user_id, series_id, seen_books_count) VALUES ($1, $2, $3) ON CONFLICT (user_id, series_id) DO NOTHING`, [uid, s.id, counts.get(s.id) ?? 0]);
       }
     }
 
@@ -414,18 +467,20 @@ export default async function catalogRoutes(app: FastifyInstance) {
   app.get('/api/series/:id', async (req) => {
     const { id } = req.params as { id: string };
     const series = await komga.series(vc(req), id);
-    // opening a series marks its new chapters as seen
+    // opening a series marks its new chapters as seen -- in every chapter row, hidden notices included (lib/enrich.ts
+    // seenCounts)
     await q(
       `INSERT INTO series_seen (user_id, series_id, seen_books_count) VALUES ($1, $2, $3)
        ON CONFLICT (user_id, series_id) DO UPDATE SET seen_books_count = EXCLUDED.seen_books_count, seen_at = now()`,
-      [userIdOf(req), id, series.booksCount ?? 0],
+      [userIdOf(req), id, (await seenCounts([series])).get(id) ?? 0],
     );
     const out: any = (await enrichSeries(req, [series]))[0];
     // apply admin metadata overrides (title/summary shown here; cover/banner are handled by the image server)
     const ov = await one<{ title: string | null; summary: string | null; cover: string | null; banner: string | null;
                           author: string | null; status: string | null; genres: string[] | null;
-                          age_rating: number | null; adult_exempt: boolean | null; reading_direction: string | null; v: string }>(
-      `SELECT title, summary, cover, banner, author, status, genres, age_rating, adult_exempt, reading_direction,
+                          age_rating: number | null; adult_exempt: boolean | null; reading_direction: string | null;
+                          series_type: string | null; v: string }>(
+      `SELECT title, summary, cover, banner, author, status, genres, age_rating, adult_exempt, reading_direction, series_type,
               EXTRACT(EPOCH FROM updated_at) * 1000 AS v FROM series_overrides WHERE series_id = $1`,
       [id],
     );
@@ -442,7 +497,8 @@ export default async function catalogRoutes(app: FastifyInstance) {
       // write back a blank and clear the very override the user opened the modal to keep
       out.overrides = { title: ov.title, summary: ov.summary, cover: ov.cover, banner: ov.banner,
                         author: ov.author, status: ov.status, genres: ov.genres, ageRating: ov.age_rating,
-                        adultExempt: ov.adult_exempt === true, readingDirection: ov.reading_direction };
+                        adultExempt: ov.adult_exempt === true, readingDirection: ov.reading_direction,
+                        seriesType: ov.series_type };
       // The edit modal seeds from the override where one exists, so the effective rating has to reflect it
       // or reopening the modal would show the scanned value and saving would undo the correction.
       if (ov.age_rating != null && out.metadata) out.metadata.ageRating = ov.age_rating;
@@ -461,9 +517,11 @@ export default async function catalogRoutes(app: FastifyInstance) {
     // means the server-wide order applies.
     if (roleOf(req) === 'admin') {
       const f = await one<{ folder: string; source_prefs: { priority?: unknown } | null; borrow_names: boolean | null; server_borrow: boolean | null;
-                            reading_direction: string | null; reading_direction_from: string | null; lang: string | null; source_id: string | null; roots: string[] | null }>(
+                            reading_direction: string | null; reading_direction_from: string | null; lang: string | null; source_id: string | null; roots: string[] | null;
+                            series_type: string | null; series_type_from: string | null; type_override: string | null; hide_notices: boolean | null }>(
         `SELECT folder, source_prefs, borrow_names, (SELECT borrow_names FROM server_settings WHERE id = 1) AS server_borrow,
-                reading_direction, reading_direction_from, lang, source_id,
+                reading_direction, reading_direction_from, lang, source_id, series_type, series_type_from, hide_notices,
+                (SELECT o.series_type FROM series_overrides o WHERE o.series_id = lib_series.id) AS type_override,
                 ARRAY(SELECT DISTINCT b.root FROM lib_books b WHERE b.series_id = lib_series.id AND b.root IS NOT NULL ORDER BY b.root) AS roots
            FROM lib_series WHERE id = $1`, [id]);
       if (f) out.folder = f.folder;
@@ -484,6 +542,17 @@ export default async function catalogRoutes(app: FastifyInstance) {
       // What the evidence says about the reading direction, and which evidence (lib/readingDirection.ts), so
       // the edit modal's "Automatic" can name what it would fall back to. null when nothing has said.
       out.detectedDirection = f?.reading_direction ? { direction: f.reading_direction, from: f.reading_direction_from } : null;
+      // Notice chapters (lib/noticeChapters.ts): the type the switches go by (the admin's, else the evidence's,
+      // else unknown) and what the evidence said, for Edit details; the series' own switch -- null when its type's
+      // applies -- and what applies, with how many chapters that hides right now, for the Sources sheet.
+      const type = f?.type_override ?? f?.series_type ?? 'unknown';
+      out.seriesType = type;
+      out.detectedType = f?.series_type ? { type: f.series_type, from: f.series_type_from } : null;
+      out.hideNotices = f?.hide_notices ?? null;
+      out.hideNoticesEffective = f?.hide_notices ?? (await noticeTypes()).includes(type as any);
+      out.hiddenNotices = out.hideNoticesEffective ? await hiddenCount(id) : 0;
+      // v0.55.3 (#147): the rule the switches hide by -- short ones only, or every fraction -- so the sheet says which.
+      out.hideNoticeShortOnly = noticesShortOnly();
     }
     return out;
   });
@@ -497,20 +566,24 @@ export default async function catalogRoutes(app: FastifyInstance) {
     const favIds = favRows.filter((id) => shown.has(id));
     const favSeries = ((await Promise.all(favIds.map((id) => komga.series(vc(req), id).catch(() => null)))).filter(Boolean)) as any[];
     const seenMap = await seriesSeen(uid, favSeries.map((s) => s.id));
+    // Counted in every chapter row, hidden notices included, on both sides (lib/enrich.ts seenCounts): a notice
+    // switch must neither swallow a favourite's next chapters nor announce its old notices as new.
+    const counts = await seenCounts(favSeries);
+    const fresh = await newSinceSeen(seenMap, counts);
     const out: { series: any; newCount: number }[] = [];
     for (const s of favSeries) {
       if (!seenMap.has(s.id)) {
-        await q(`INSERT INTO series_seen (user_id, series_id, seen_books_count) VALUES ($1, $2, $3) ON CONFLICT (user_id, series_id) DO NOTHING`, [uid, s.id, s.booksCount ?? 0]);
+        await q(`INSERT INTO series_seen (user_id, series_id, seen_books_count) VALUES ($1, $2, $3) ON CONFLICT (user_id, series_id) DO NOTHING`, [uid, s.id, counts.get(s.id) ?? 0]);
         continue;
       }
-      const newCount = Math.max(0, (s.booksCount ?? 0) - (seenMap.get(s.id) ?? 0));
+      const newCount = fresh.get(s.id) ?? 0;
       if (newCount > 0) out.push({ series: (await enrichSeries(req, [s]))[0], newCount });
     }
     // newest chapter date per series: source release date when stamped, else the file's mtime
     if (out.length) {
       const latest = await q<{ series_id: string; latest: string }>(
         `SELECT series_id, max(COALESCE(published_at, to_timestamp(mtime / 1000.0))) AS latest
-         FROM lib_books WHERE series_id = ANY($1) GROUP BY series_id`,
+         FROM lib_books WHERE series_id = ANY($1) AND NOT ${noticeBook('lib_books.id')} GROUP BY series_id`,
         [out.map((o) => o.series.id)],
       );
       const byId = new Map(latest.map((r) => [r.series_id, r.latest]));
@@ -524,11 +597,12 @@ export default async function catalogRoutes(app: FastifyInstance) {
     const uid = userIdOf(req);
     const favIds = (await q<{ series_id: string }>('SELECT series_id FROM favorites WHERE user_id = $1', [uid])).map((r) => r.series_id);
     const favSeries = ((await Promise.all(favIds.map((id) => komga.series(vc(req), id).catch(() => null)))).filter(Boolean)) as any[];
+    const counts = await seenCounts(favSeries);
     for (const s of favSeries) {
       await q(
         `INSERT INTO series_seen (user_id, series_id, seen_books_count) VALUES ($1, $2, $3)
          ON CONFLICT (user_id, series_id) DO UPDATE SET seen_books_count = EXCLUDED.seen_books_count, seen_at = now()`,
-        [uid, s.id, s.booksCount ?? 0],
+        [uid, s.id, counts.get(s.id) ?? 0],
       );
     }
     return { ok: true };
@@ -676,13 +750,17 @@ export default async function catalogRoutes(app: FastifyInstance) {
   app.get('/api/series/:id/groups', async (req) => {
     const { id } = req.params as { id: string };
     await komga.series(vc(req), id);
-    const rows = await q<{ number: number; copies: ListingCopy[] }>('SELECT number, copies FROM series_listing WHERE series_id = $1', [id]);
+    // A notice chapter the admin hides (lib/noticeChapters.ts) is nobody's release here either: a listed number by
+    // what the listing says of it, a file by its own pages.
+    const rows = await q<{ number: number; copies: ListingCopy[] }>(
+      `SELECT l.number, l.copies FROM series_listing l WHERE l.series_id = $1 AND NOT ${noticeListed('l')}`, [id]);
     const copies: StatCopy[] = [];
     for (const r of rows) for (const c of r.copies ?? []) copies.push({ ...c, number: Number(r.number) });
     // Live rows only: a tombstone's group is a file that is no longer here, and "3 on this server" has to
     // count what a reader can open.
     const onDisk = await q<{ number: number; scanlator: string | null }>(
-      'SELECT number, scanlator FROM lib_books WHERE series_id = $1 AND pruned_at IS NULL AND scanlator IS NOT NULL', [id]);
+      `SELECT b.number, b.scanlator FROM lib_books b
+        WHERE b.series_id = $1 AND b.pruned_at IS NULL AND b.scanlator IS NOT NULL AND NOT ${noticeBook('b.id')}`, [id]);
     return { checkedAt: await checkedAtOf(id), content: groupStats(copies, onDisk.map((b) => ({ number: Number(b.number), scanlator: b.scanlator }))) };
   });
 
@@ -707,8 +785,10 @@ export default async function catalogRoutes(app: FastifyInstance) {
   app.get('/api/series/:id/versions', async (req) => {
     const { id } = req.params as { id: string };
     await komga.series(vc(req), id);
+    // Not the versions of a notice the admin hides, by what the listing says of it (lib/noticeChapters.ts).
     const rows = await q<{ number: number; title: string | null; source_id: string; status: string; chosen: { sourceId?: string } | null; copies: ListingCopy[] }>(
-      'SELECT number, title, source_id, status, chosen, copies FROM series_listing WHERE series_id = $1 ORDER BY number', [id]);
+      `SELECT l.number, l.title, l.source_id, l.status, l.chosen, l.copies FROM series_listing l
+        WHERE l.series_id = $1 AND NOT ${noticeListed('l')} ORDER BY l.number`, [id]);
     const books = await q<{ number: number; source_id: string | null; scanlator: string | null; source_chapter_id: string | null; chapter_name: string | null }>(
       'SELECT number, source_id, scanlator, source_chapter_id, chapter_name FROM lib_books WHERE series_id = $1 AND pruned_at IS NULL', [id]);
     const booksOf = new Map<number, typeof books>();

@@ -1158,6 +1158,72 @@ export function defaultSeed() {
   };
 }
 
+/** Gap Scans (v0.55.0): a package not installed, in two languages; its English source carries Gap Only, all twelve. */
+export const GAP_SCANS = Object.freeze({ pkg: 'eu.kanade.tachiyomi.extension.all.gapscans', en: '7000000000000055001', es: '7000000000000055002' });
+
+/**
+ * v0.55.1: what Fix everything tries in order of popularity, for Pop Walk -- a series no source carries and no
+ * translation group names (autofixWalk.mjs). Six English packages, none installed, each with its apk and jar on the
+ * repository's GitHub releases and how often each was downloaded (the fake's /__github answers it, a day after the
+ * release): the most downloaded is Velvet Night, 18+, which carries Pop Walk -- never tried for a series that is not
+ * 18+ -- then the five others, of which only the fifth, Grove Reader, carries it. One source each, in English.
+ */
+export const POP = Object.freeze([
+  { key: 'rose', pkg: 'eu.kanade.tachiyomi.extension.en.velvetnight', name: 'Velvet Night', source: '7000000000000055100', downloads: 90_000, nsfw: true, carries: true },
+  { key: 'one', pkg: 'eu.kanade.tachiyomi.extension.en.cometreader', name: 'Comet Reader', source: '7000000000000055101', downloads: 50_000 },
+  { key: 'two', pkg: 'eu.kanade.tachiyomi.extension.en.deltacomics', name: 'Delta Comics', source: '7000000000000055102', downloads: 40_000 },
+  { key: 'three', pkg: 'eu.kanade.tachiyomi.extension.en.echopages', name: 'Echo Pages', source: '7000000000000055103', downloads: 30_000 },
+  { key: 'four', pkg: 'eu.kanade.tachiyomi.extension.en.fieldscans', name: 'Field Scans', source: '7000000000000055104', downloads: 20_000 },
+  { key: 'five', pkg: 'eu.kanade.tachiyomi.extension.en.grovereader', name: 'Grove Reader', source: '7000000000000055105', downloads: 10_000, carries: true },
+].map((p) => Object.freeze(p)));
+/** Where the POP packages' files are, as a Keiyoushi index points at them: a GitHub release of the repository. */
+const POP_RELEASE = 'https://github.com/keiyoushi/extensions/releases/download/fake-0';
+
+/**
+ * The standard installation with Gap Scans in the repository, not installed: what Health's Fix everything installs by
+ * itself to fill a gap no installed source has (web/test/e2e/autofixWalk.mjs; fakeEngine.mjs --extra v55). Its sources
+ * come FIRST in the engine's order, the POP packages' next, so that under the walk's source limit of two a series on
+ * Webtoons.com is the one left over -- Free a slot's case -- while the packages a run keeps hold their places.
+ */
+export function autofixSeed() {
+  const seed = defaultSeed();
+  const chapters = Array.from({ length: 12 }, (_, i) => 12 - i).map((n) => ({
+    name: `Chapter ${n}`, url: `/gap-only/${n}`, chapterNumber: n, scanlator: 'Gap Scans', uploadDate: EPOCH + n * DAY, pages: 3,
+  }));
+  const src = (id, lang, mangas) => ({
+    id, name: 'Gap Scans', lang, pkgName: GAP_SCANS.pkg, supportsLatest: true, isNsfw: false, baseUrl: 'https://gapscans.example', mangas,
+  });
+  // v0.55.1: Pop Walk's twelve chapters, on the packages that carry it (POP).
+  const popChapters = Array.from({ length: 12 }, (_, i) => 12 - i).map((n) => ({
+    name: `Chapter ${n}`, url: `/pop-walk/${n}`, chapterNumber: n, uploadDate: EPOCH + n * DAY, pages: 3,
+  }));
+  const slug = (p) => p.pkg.split('.').slice(-2).join('.');
+  return {
+    ...seed,
+    sources: [
+      src(GAP_SCANS.en, 'en', [{ title: 'Gap Only', url: '/gap-only', realUrl: 'https://gapscans.example/gap-only', genre: ['Drama'], status: 'ONGOING', chapters }]),
+      src(GAP_SCANS.es, 'es', []),
+      // After Gap Scans' and before the standard installation's: under the walk's limit a series on Webtoons.com is
+      // still the one left over (Free a slot) while the packages a run keeps register first.
+      ...POP.map((p) => ({
+        id: p.source, name: p.name, lang: 'en', pkgName: p.pkg, supportsLatest: true, isNsfw: !!p.nsfw, baseUrl: `https://${slug(p)}.example`,
+        mangas: p.carries ? [{ title: 'Pop Walk', url: '/pop-walk', realUrl: `https://${slug(p)}.example/pop-walk`, genre: ['Drama'], status: 'ONGOING', chapters: popChapters }] : [],
+      })),
+      ...seed.sources,
+    ],
+    extensions: [
+      ...seed.extensions,
+      { pkgName: GAP_SCANS.pkg, name: 'Gap Scans', lang: 'all', versionName: '1.0.0', installed: false, isNsfw: false, repo: 'https://repo.example/repo.json' },
+      ...POP.map((p) => ({
+        pkgName: p.pkg, name: p.name, lang: 'en', versionName: '1.0.0', installed: false, isNsfw: !!p.nsfw, repo: 'https://repo.example/repo.json',
+        apkUrl: `${POP_RELEASE}/tachiyomi-${slug(p)}-v1.0.0.apk`, jarUrl: `${POP_RELEASE}/tachiyomi-${slug(p)}-v1.0.0.jar`,
+        // The apk most, the jar the rest: counted together.
+        downloads: { apk: p.downloads - p.downloads / 4, jar: p.downloads / 4 },
+      })),
+    ],
+  };
+}
+
 // A repository the size of the ones people add: the keiyoushi repository lists more than 1,300 extensions, and
 // Admin → Extensions once stopped at "Showing 400 of 570 matches — narrow the search" on it (discussion #121).
 // The names are made up, two words from the lists below; the languages, the one-in-five multi-language
@@ -1397,6 +1463,9 @@ export function createFakeEngine({ seed = defaultSeed(), schema = loadSchema(), 
       isInstalled: !!e.installed, hasUpdate: !!e.hasUpdate, isObsolete: !!e.obsolete, isNsfw: !!e.isNsfw,
       contentWarning: e.isNsfw ? 'NSFW' : 'SAFE', repo: e.repo ?? null, storeIndexUrl: e.repo ?? null,
       versionCode: e.versionCode, versionCodeLong: String(e.versionCode), apkName: `tachiyomi-${e.pkgName.split('.').slice(-2).join('.')}-v${e.versionName}.apk`,
+      // Modelled, not measured (no network inside the measured container): the addresses a repository's index gives
+      // its files -- Keiyoushi's put them on GitHub Releases -- as seeded, else none.
+      apkUrl: e.apkUrl ?? null, jarUrl: e.jarUrl ?? null,
       source: () => connection(e.installed ? [...st.sources.values()].filter((s) => s.pkgName === e.pkgName).map(sourceView) : []),
     };
   }
@@ -1729,6 +1798,18 @@ export function createFakeEngine({ seed = defaultSeed(), schema = loadSchema(), 
           let body;
           try { body = JSON.parse((await readBody(req)) || '{}'); } catch { return json(res, 400, { error: 'bad_json' }); }
           try { return json(res, 200, catalogue(body)); } catch (e) { return json(res, 400, { error: 'bad_catalogue', message: e.message }); }
+        }
+        // GitHub's releases list for a repository, as GET /repos/{owner}/{repo}/releases answers it (v0.55.1): one release,
+        // published a day ago, with a file for each seeded extension's apk and jar on that repository's releases that has
+        // `downloads`. The app asks it here with GITHUB_API_URL=<this>/__github (up.sh, for the v55 walk): Fix everything
+        // ranks the packages it tries by these counts (lib/extensionRank.ts). Anything else of GitHub's is a 404.
+        const gh = /^\/__github\/repos\/([\w.-]+)\/([\w.-]+)\/releases$/.exec(path);
+        if (req.method === 'GET' && gh) {
+          const at = `https://github.com/${gh[1]}/${gh[2]}/releases/download/`;
+          const assets = [...st.extensions.values()].flatMap((e) => [[e.apkUrl, e.downloads?.apk], [e.jarUrl, e.downloads?.jar]])
+            .filter(([u, n]) => typeof u === 'string' && u.startsWith(at) && Number.isFinite(n))
+            .map(([u, n]) => ({ name: u.slice(u.lastIndexOf('/') + 1), browser_download_url: u, download_count: n }));
+          return json(res, 200, assets.length ? [{ tag_name: 'fake-0', published_at: new Date(Date.now() - DAY).toISOString(), assets }] : []);
         }
         if (req.method === 'GET' && path === '/__state') {
           return json(res, 200, {

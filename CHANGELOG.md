@@ -1,5 +1,396 @@
 # Changelog
 
+## v0.55.6 — 2026-10-06
+
+**A library scan that takes minutes no longer reads "Scan failed": the scan answers at once, and the page follows it
+to its end with how far it has got.**
+
+### Long library scans no longer fail
+
+- **The cause:** *Scan library now* waited for the whole scan before it answered. A big library on a slow disk can
+  take minutes (Unraid shares, a NAS). That's longer than a proxy in front of the server will hold a request: nginx gives
+  up at 60 seconds, Cloudflare at 100. So the button said *Scan failed* every time while the scan went on. Reported by
+  **@Kedryn** ([#150](https://github.com/AngeloSha/uchiyomi/discussions/150)).
+- **Now:** the server answers within 15 seconds, and the page follows the scan until it ends.
+  - The admin home and Health show how far it has got: *Folder 1,200 of 3,400*, a ticking clock, then the counts.
+  - A request a proxy cuts off follows the scan it started instead of failing.
+- **A scan that really fails says why,** in the server's words, instead of a bare *Scan failed*.
+
+### Upgrading
+
+- **Database:** no change. v0.55.5 runs on the same database, so going back is one line of your compose file.
+- **New setting:** `REFRESH_FIRST_ANSWER_MS` (default `15000`), how long *Scan library now* waits before it answers
+  that the scan is still running.
+- **For scripts** ([api.md](docs/api.md)):
+  - `POST /api/refresh` answers `running: true` and `since` when the scan takes longer than that.
+  - It answers `scanned: false, reason: 'error'` when the scan fails, with the server's `message` for an admin.
+  - New `GET /api/refresh` says whether a scan runs, and for an admin its progress and how the last one ended.
+
+## v0.55.5 — 2026-10-06
+
+**Normal titles are no longer counted as 18+: a site that flags itself 18+ no longer marks every title it shares with
+other sites, and Natomanga's series keep their own genres instead of the site's whole genre menu.**
+
+### Fewer false 18+ in Discover search
+
+- **The cause:** each extension says whether its site has adult content, and the extension index flags a whole site when
+  it hosts any adult title. General sites such as **AllManga**, 11toon and Manga Bab carry the flag too.
+- **What went wrong:** since v0.55.4, one flagged site among a title's sources made the whole card 18+. With **Show 18+**
+  on, most manhwa AllManga also carries wore the **18+** mark under *All*, vanished under *Hide 18+* and showed under
+  *18+ only*.
+- **Now:** a site's own flag makes a title 18+ only when no other site carries it. A MangaDex erotica or pornographic
+  rating, a genre on your 18+ list, or a source you named on it still make a title 18+ wherever it is found.
+- **Unchanged:** with Show 18+ off, flagged sites aren't searched at all, and a flagged site's own row of results stays
+  behind 18+.
+
+### Natomanga series keep their own genres
+
+- **The cause:** Natomanga's series pages now carry the site's whole genre menu, and Uchiyomi read every genre link on
+  the page. Some series got all 69 genres, Adult, Hentai and Smut among them; on the owner's library that was 12 series,
+  such as *Return of the War God* and *The Glutton*.
+- **Now:** genres come from the series' own genre row only (Natomanga and Mangakakalot).
+- **Repaired on upgrade:**
+  - series that already hold the menu get their own genres back;
+  - they get a series type where those genres name one, so the notice-chapter switches apply to them;
+  - neither a chapter file still carrying the menu nor a new add from any source brings it back.
+- It hid nothing on its own, since the library hides by genre only for genres on your 18+ list. But those series showed
+  dozens of genre chips and turned up under Hentai.
+
+### Upgrading
+
+- **Database:** no new column. A one-time step cleans genres holding a site's genre menu, in series and in their Edit
+  details overrides, and types those series from what is left. v0.55.4 runs on the same database, so going back is one
+  line of your compose file.
+- **For scripts** ([api.md](docs/api.md)): in `GET /api/sources/search-all`, a provider 18+ only by its extension's
+  flag makes a card 18+ only when every provider is one. Providers still carry `rating: adult` for it.
+
+## v0.55.4 — 2026-10-05
+
+**Easier to find: the version at the foot of the admin menu, "Import your library" where a new library starts, and a
+search that finds settings. Plus *Rescan everything*, downloads that use every source carrying a release, and an 18+
+filter in Discover search.**
+
+### Easier to find
+
+- **The running version is at the foot of the admin menu**, with *up to date* or *update available*, which links to the
+  release. On a phone it ends the admin header.
+- **"Import your library"** appears on an empty Library and on Home's welcome. It takes a Mihon or Tachiyomi backup, a
+  MangaDex list, your AniList, MyAnimeList or Kitsu list, or pasted titles. The Library header also has *Import a list*
+  for admins. Until now it was only under Admin → Sources → Add sources.
+- **The search box (Ctrl+K, or the phone's Search page) also finds pages and settings by name**, in your language and in
+  English: *notice*, *import*, *version*, *solver*, *backup time*, *2FA* and the like. A result opens the page and
+  scrolls to the setting.
+- Asked for by **@Kedryn** ([#150](https://github.com/AngeloSha/uchiyomi/discussions/150)) and **@DannyDynamite39**
+  ([#158](https://github.com/AngeloSha/uchiyomi/discussions/158)).
+
+### Rescan everything
+
+**Admin → Tasks → Rescan everything** re-reads every folder and shows a preview before it changes anything:
+- **Gone:** chapters whose files are gone from your own folders.
+- **Kept:** files that were only moved or renamed (matched by their contents).
+- **Download folder:** chapters missing there, left to *Verify chapter files*.
+- **Empty series:** series with nothing left, each with a link.
+
+On **Apply**, the gone chapters read *File no longer on disk*. Nothing is erased and no file is touched: everyone's
+reading history stays, and a file that comes back is picked up again by the next scan. It refuses a folder that looks
+unmounted, leaves alone files it couldn't read, and checks everything again right before applying.
+
+**Optionally, number chapters again by the v0.55.2 file-name rules,** for the series you tick: chapter words, `#12`,
+years in brackets, ranges like `01-07`. The preview shows each series' changes first, with how many readers and trackers
+they touch, and nothing is sent to a tracker. Asked for by **@Kedryn** ([#150](https://github.com/AngeloSha/uchiyomi/discussions/150)).
+
+### Downloads that use every source carrying a release
+
+- **The slow archive and *Fetch all*** take a series' chapters from every source you follow that carries the same
+  release (the same scanlation group), in turn. Sources on different image servers download side by side.
+- **Sites on one image server count as one**, like Natomanga and Mangakakalot, so turns never double the requests to it.
+- **What never changes source:** a chapter you picked yourself, a series with its own source order, posting-order
+  series, and the regular update check.
+- **In a test with two image servers,** a 12-chapter *Fetch all* took 1.4 minutes instead of 2.8, and each server got
+  half the requests.
+- Asked for by **@DannyDynamite39** ([#158](https://github.com/AngeloSha/uchiyomi/discussions/158)).
+
+### An 18+ filter in Discover search
+
+- **Search results can be filtered:** *All · Hide 18+ · 18+ only*. A result is 18+ when the source says so, when MangaDex
+  rates it erotica or pornographic, or when it carries one of your 18+ genres. Results with no rating stay under *All*
+  and *Hide 18+*. Adult results carry a small *18+* mark.
+- **With Show 18+ off, search now hides adult results** too. Before, MangaDex's erotica still showed.
+- Asked for by **@DannyDynamite39** ([#158](https://github.com/AngeloSha/uchiyomi/discussions/158)).
+
+### Smaller
+
+- **A series whose cover chapter's file is gone** now shows no cover; it used to answer with an error.
+- **A Rescan that changes a series waits for it:** a series with a download or a check running is left alone for the
+  next Rescan, and a Fetch or the archive waits for the Rescan to finish.
+
+### Upgrading
+
+- **Database:** two nullable columns on server settings, `rescan_last_run` and `rescan_last_result`. v0.55.3 runs on the
+  same database, so going back is one line of your compose file.
+- **For scripts** ([api.md](docs/api.md)):
+  - `GET /api/admin/stats` carries `version`.
+  - `POST /api/admin/tasks/rescan/run`, `GET …/rescan/status` and `POST …/rescan/apply` drive the rescan.
+  - `GET /api/sources/search-all` takes `rating=all|safe|adult` and marks results with `rating`.
+  - MangaDex results carry `contentRating`.
+  - A chapter carries `prunedReason`.
+
+## v0.55.3 — 2026-10-05
+
+**A backup Cloudflare solver, gentler downloads from sites that ask for fewer requests, and failed chapters that follow
+their series to a new source.**
+
+### A backup Cloudflare solver
+
+- **`FLARESOLVERR_FALLBACK_URL`** sets a second solver. When the main one doesn't answer a request with a page (it's
+  down, it timed out, it answered with an error or an empty page, or it stays busy), the same request goes to the
+  backup.
+- **Each site goes first to the solver that last solved it,** for 6 hours. Its Cloudflare pass (the cookie and browser
+  identity) is kept per solver, so downloads use the pass of the solver that earned it.
+- **A solver that is only busy is waited for, not blamed.** When a solver answers *too many requests* itself (trawl does
+  when all its browsers are in use), Uchiyomi waits, retries, then asks the backup. It never counts as the site refusing.
+- **trawl is recognised as itself.** Health says *Ready (trawl v1.7.0)* and checks trawl's own releases; before, it was
+  compared with FlareSolverr's and read as a false "update available". [CONFIGURATION.md](docs/CONFIGURATION.md)
+  describes FlareSolverr, trawl and Byparr, with a compose example of trawl as the main solver and FlareSolverr as the
+  backup. On a real library, once trawl had solved a site, its next pages took about 2 s instead of about 12 s.
+- **Health's solver card lists both solvers.** It is amber when one is down and the other keeps solving, and needs
+  attention only when both are down. Fix everything says a down solver clears by itself while the other one works.
+- trawl's own error messages are read for what they mean.
+
+### Gentler with a site that asks for fewer requests
+
+- **Downloads stay slow longer.** After a site's image server answers *too many requests* (HTTP 429), downloads from it
+  stay slower for at least an hour. They speed up one step at a time, after a run of good chapters. Before, they sped up
+  after the first success and were refused again.
+- **One chapter at a time while slowed,** and a refusal pauses every chapter from that site, not just the one refused.
+- **Sources whose pages come from the same image server share one pace,** like Natomanga and Mangakakalot.
+- Health says *Downloading slowly: the site asked for fewer requests* on such a source.
+- **Measured on a test server allowing 60 requests a minute:** 6 of 18 chapters failed before; now 2 of 18 do, and only on
+  the first night. Downloads take about twice as long.
+
+### Failed chapters follow their series
+
+- **When a series moves to another main source,** the chapters that had failed on the old source move with it and are
+  tried again from the new one. A move is a Replace, Make main, Fix everything, or a source being unfollowed or removed.
+  Before, they stayed filed under the old source, where Health counted them as failing and Fix everything listed them as
+  needing you.
+- Chapters already left behind are moved on first start.
+- While the new source is rate-limited or slowed, they show as waiting.
+
+### Fix everything tries the extensions most people read first
+
+- The download counts that order the extension search no longer favour recently updated extensions. The big sites now
+  come first: MangaDex, MangaFire, Asura Scans, Comick, Weeb Central, Mangakakalot and the like. Everything is still tried
+  eventually.
+
+### Notice chapters: "Only hide short ones"
+
+- A new switch under **Admin → Settings → Notice chapters**, **on by default**, keeps today's rule: only chapters numbered
+  like 12.5 with 3 pages or fewer are hidden.
+- Turned off, it hides every chapter numbered like 12.5 of the types switched on, including real chapters a site split
+  into parts.
+- Asked for by **@TIGamingTV** ([#147](https://github.com/AngeloSha/uchiyomi/pull/147)).
+
+### Upgrading
+
+- **Database:** one new column (`server_settings.hide_notice_short_only`, on by default), and a one-time move of failed
+  chapters left under a source their series no longer uses. Both happen by themselves. v0.55.2 runs on the same
+  database, so going back is one line of your compose file.
+- **New optional setting:** `FLARESOLVERR_FALLBACK_URL` (CONFIGURATION.md → *The Cloudflare solver*). Nothing changes
+  until you set it.
+- **For scripts** ([api.md](docs/api.md)):
+  - `GET` and `PATCH /api/admin/settings` carry `hideNoticeShortOnly`.
+  - Source states gain `slowed`.
+  - Health's solver card gains its main and backup rows.
+  - A failed chapter can be `moved`.
+
+## v0.55.2 — 2026-10-04
+
+**Hand-collected comics get the right chapter numbers from their file names, and the notice "chapters" some sites post
+can be hidden.** Both apply only from now on or only when you switch them on: nothing already in your library is
+renumbered, and nobody's read status changes on upgrading.
+
+### Chapter numbers from file names
+
+For files added from now on:
+- **A chapter word wins:** `Vol 3 Chapter 12.cbz` is chapter 12, not 3 (*Ch*, *Chapter*, *Cap*, *Capitolo*,
+  *Capítulo*, *Chapitre*, *Kapitel* and their short forms).
+- **Otherwise `#` makes the number the chapter:** `Batman #12 (1987).cbz` is 12.
+- **A year is never the chapter:** a 4-digit year in `( )` or `[ ]` is skipped. A name with only a year, like
+  `Watchmen (1986).cbz`, gets no chapter number and sorts by name.
+- **A range is one file holding several chapters:** `Batman 01-07.cbz` shows as *Ch. 1–7*. Chapters 2 to 6 don't count
+  as missing, and finishing it tells your tracker 7.
+
+Files the downloader saves (`Chapter 12.cbz`) read exactly as before, and *Edit number & title* still overrides any
+chapter. Suggested by **@Kedryn** ([#150](https://github.com/AngeloSha/uchiyomi/discussions/150)).
+
+### Notice chapters, if you switch them on
+
+- Some sites post an announcement (a hiatus, a delay) as a short chapter numbered after the latest one, like *100.5*.
+  **Admin → Settings → Notice chapters** has a switch for each series type: Manga, Manhwa, Manhua, Webtoon, Comic and
+  other. For each type switched on, chapters numbered like 12.5 with **3 pages or fewer** are hidden from the library,
+  the reader, Updates, OPDS and Mihon, and one a site lists as that short isn't downloaded.
+- Longer ones stay, because those are real chapters a site split into parts, and so does any chapter whose pages
+  haven't been counted yet. Nothing is deleted: switching a type off shows them all again.
+- A series can override its type in its *Sources & translations* sheet, which also shows how many are hidden.
+- *Edit details* has a **Series type**, filled in automatically from the series' genres, then its source, then AniList.
+- All the switches are off by default, and while they're off it costs nothing.
+- Contributed by **@TIGamingTV** ([#147](https://github.com/AngeloSha/uchiyomi/pull/147)). The page rule was added at
+  merge: on a real library, about 170 of 1,759 chapters numbered like 12.5 were notices of 3 pages or fewer, while about
+  1,500 were real chapters of 6 pages or more.
+
+### Upgrading
+
+- **Database changes, all additive and made by themselves:**
+  - new columns on series (`series_type`, `series_type_from`, `hide_notices`) and series overrides (`series_type`);
+  - one on server settings (`hide_notice_types`);
+  - three on chapter files: `name_rule` (which rule read the name, so existing chapters keep theirs), `number_end` (a
+    range's last chapter) and `created_at`;
+  - one index.
+
+  On first start, every series without a type gets one from its genres. v0.55.1 runs on the same database, so going
+  back is one line of your compose file; while it runs it reads every file name the old way.
+- **For scripts** ([api.md](docs/api.md)):
+  - `GET` and `PATCH /api/admin/settings` carry `hideNoticeTypes`.
+  - Series carry `seriesType`, `hideNotices`, `hideNoticesEffective` and `hiddenNotices`.
+  - A chapter that holds a range carries `numberEnd`, and its number reads like *1–7*.
+
+## v0.55.1 — 2026-10-04
+
+**Fix everything no longer mistakes a busy site for a broken one, and it keeps looking for an extension that carries
+your series until it finds one, the most popular first. Libraries can also hold several folders, and the Library can
+show the series with no source.** The first real Fix everything run moved series off a
+site that was only asking for a pause, and moved three of them onto a site that could not load pages. Both causes are
+fixed, and the next run undoes it.
+
+### Fix everything, after its first real run
+
+- **A site asking for a pause is not broken.** When a site answers *too many requests* (HTTP 429), its source now cools
+  down instead of failing: Health shows it as *Rate limited*, with no Replace, Fix everything never moves series off it,
+  and its chapters are listed as waiting for the site's pause (*Clears by itself* at the end of a run, and greyed on
+  Health's *Chapters that would not download*), not as failing.
+- **Replace never moves a series onto a source that cannot download it.** A source whose search works but whose pages
+  fail is never a destination, and one run never moves a series onto a source it is replacing. A series already moved
+  onto such a source is moved again, to one that carries it.
+- **Retries leave a site that asked for a pause alone,** so a run no longer makes its limit worse.
+- **Extensions: no cap, the most popular first.** Fix everything keeps trying extensions, one at a time, until the
+  series is found or the run's time is up, and the next run continues where it stopped. It tries first an extension
+  named after one of the series' own translation groups, then the most downloaded ones, from the extension
+  repository's own download counts on GitHub (read once a day), then the rest. An extension that finds nothing is
+  removed straight away, and it is not tried again for the same series for a month. 18+ extensions are tried only for
+  18+ series. The end says it in one line: *Tried 6 extensions and kept Gap Scans*.
+
+### Libraries with several folders
+
+- **A library can hold several folders** (Admin → Libraries): tick them in the folder browser, where a folder another
+  library holds says so. Saving moves their series in or out at once, and the dialog says how many before. The most
+  specific folder still wins. Suggested by **@Kedryn** ([#148](https://github.com/AngeloSha/uchiyomi/issues/148)).
+
+### "No source" in the Library's filters
+
+- **Main source → No source** lists the series with no source to download from: folders you added by hand, and
+  anything never matched to a site. Suggested by **@Kedryn** ([#149](https://github.com/AngeloSha/uchiyomi/issues/149)).
+
+### Smaller
+
+- Health names every source on *Series that can no longer update* by its name, never an id like `sw:2522…`.
+- A source the engine's source limit left out says so on its sheet (*The engine's limit of 40 sources is full*) and no
+  longer offers Replace. Health tells it apart from an extension that is no longer installed.
+- For an admin who hides 18+, Fix everything's lines now leave out only the 18+ series' names, not every series' name.
+- Deleting a library unpins the series it held by hand, and the move preview reads right in every language.
+- The repository no longer tracks a `web/node_modules` link that v0.55.0 committed by accident, which stopped
+  contributors from pulling.
+
+### Upgrading
+
+- **One new table,** `library_paths` (a library's folders), created and filled by itself. v0.55.0 runs on the same
+  database and files new folders by each library's first folder, so going back is one line of your compose file; the
+  next v0.55.1 start repairs whatever v0.55.0 changed in between.
+- **Settings** ([CONFIGURATION.md](docs/CONFIGURATION.md)): `AUTOFIX_INSTALLS` now defaults to no cap (`0` still
+  switches the extensions part off). New: `GITHUB_API_URL`, where the download counts are read.
+- **What leaves your server:** once a day, Fix everything reads the extension repository's download counts from
+  GitHub, the same place extensions are installed from. Nothing is sent.
+- **For scripts** ([api.md](docs/api.md)):
+  - `POST /api/series/search` takes `hasMainSource` (`isTrue`, `isFalse`), and `GET /api/library/sources` adds `none`.
+  - The libraries routes take and return `paths`, saves answer `moved`, a 409 names the library that holds a folder,
+    and a PATCH of an unknown library answers 404.
+  - `GET /api/admin/sources/overview` marks a source the limit left out with `overLimit`.
+  - Fix everything's lines that name a series carry `seriesIds`, and its history leaves out `tried`.
+  - Source health records a refusal for room as its own kind, `rate_limited`.
+
+## v0.55.0 — 2026-10-03
+
+**Health's Fix all is now Fix everything, and it can do the whole job by itself: Fix it for me works through every
+card until it is green, then says in a few lines what it did and what only you can fix.** Until now Fix all was only
+the repair's four steps. It skipped broken sources, series stuck on a dead source, duplicates, numbering, odd chapter
+numbers and chapters saved twice, and it disappeared when only those were left.
+
+### Fix everything
+
+- **Health** has a **Fix everything** key beside Re-check whenever any card has a finding. It asks one thing:
+  - **Fix it for me** (the default): replaces broken sources, fetches missing and broken chapters, and finds new
+    sources, installing up to 3 extensions if it has to. It also merges duplicate series, deletes chapters saved twice
+    or numbered impossibly, and applies safe renumbering. Those can't be undone, and the sheet says so before Start.
+  - **Let me choose:** the safe repair as before (retries, short chapters, gaps), and the rest card by card.
+- **The run** goes through ten steps, with the step, a progress bar and what it is doing now. **Run in background**
+  keeps it going; it shows on **Server tasks** as *Fixing everything*, and reopening Health's sheet shows the run.
+  **Stop** ends it at the next safe point, never inside a merge, a delete or a renumber.
+- **The end** is short: one headline (**All green**, or *2 need you* with *Everything else is green* under it), up to
+  six lines of what it did (*Moved 184 series off Aqua Manga*, *Fetched 37 missing chapters*, *Installed Asura Scans
+  (found 3 series)*), what only you can fix, each with its one key, and what clears by itself, with a time. The rest
+  is under **Details**. **Run again** shows only when a run could still change something.
+- **Every night** (Admin → Settings) can be the **Safe repair**, as before and still the default, or **Fix
+  everything**. Recent repairs lists Fix everything runs with their headline.
+
+### What it does, and what it never does
+
+- **Sources:** it tests the failing ones and clears a block only after a passing test, then **Replaces** each broken
+  source that some series use as their main source, and turns off the broken ones nothing uses. A cause in your
+  set-up (the engine, the source limit, a hidden language) is never "fixed" by replacing.
+- **Duplicates:** two copies of a series in different languages are linked as editions. Two copies in the same
+  language are merged only when the AniList id, the language and the titles (or most of the chapters) agree. It keeps
+  the copy on a working source, and that copy now follows the other one's main source too.
+- **Numbering:** only plans marked clean are applied. The rest wait for you.
+- **Extensions:** for series no source carries any more, and gaps nobody had, it tries extensions in the series'
+  language, the ones whose name matches the series' own translation groups first. It switches on only that language,
+  keeps a package that found something and removes one that didn't. At most 3 a run.
+- **Files:** it deletes the later copy of a chapter saved twice only when the copy kept is complete and at least as
+  long, and an impossible chapter number with the delete key's own checks. Nothing bookmarked and nothing outside the
+  download folder is ever deleted; those go to *Needs you*.
+- **Never Ignore.** What a run can't fix (the solver or the engine down, folders mounted twice, a chapter no site
+  has) is listed under *Needs you*, never hidden.
+- It refuses to start beside a repair, a Find or Replace, or the sweep, and says which. A Find pressed while it runs
+  says that Fix everything is already finding sources.
+
+### Fixed on the way
+
+- **The nightly gap step** searched the same five biggest gaps every night, so the rest were never looked at. It now
+  takes the least recently checked first, and skips the ones just found missing everywhere.
+- **Chapters before where a series starts** (*Latest N*) were filed as "the sweep will fetch it" and never were. They
+  are now an info line, *before where you started*, not a finding.
+- **Series stuck because of the source limit** offered Replace, which could not help. They now offer **Free a slot**,
+  which opens the source in Admin → Sources.
+- **A newly installed extension could push sources your series use past the engine's source limit**
+  (`SUWAYOMI_MAX_SOURCES`) and freeze them. The sources your series use now always register first.
+- **Merging two copies of a series** dropped the absorbed copy's main source. It is now kept as a source the
+  remaining copy follows.
+- **A chapter numbered impossibly** (a 2024 in a series of 80) showed as a gap of thousands of chapters on Health and
+  sent the gap step searching for them. It is the odd chapter numbers card's alone now.
+
+### Upgrading
+
+- **One new database column,** `server_settings.nightly_mode` (default `repair`), added by itself. v0.54.1 runs on the
+  same database, so going back is one line of your compose file. Nothing changes in compose files.
+- **Optional settings** ([CONFIGURATION.md](docs/CONFIGURATION.md)): `AUTOFIX_MAX_MINUTES` (90), `AUTOFIX_SEARCHES`
+  (60) and `AUTOFIX_INSTALLS` (3; `0` stops it installing extensions).
+- **For scripts** ([api.md](docs/api.md)):
+  - `POST /api/admin/health/autofix` starts a run (409 `busy` with what is running), `GET` answers the live run and
+    the last one, `GET …/:runId` one run, and `POST …/stop` stops it. The summary's lines are said codes.
+  - `GET` and `PATCH /api/admin/settings` carry `nightlyMode` (`repair` or `autofix`).
+  - `GET /api/admin/tasks/repair/runs` lists Fix everything runs as `kind: "autofix"`, and `GET /api/sources/jobs`
+    carries its run card. `POST /api/admin/sources/find` answers 409 `autofix_running` beside one.
+  - Health's stuck-series rows carry `free_slot` for the source limit, and a merge's answer carries `carried`.
+
 ## v0.54.1 — 2026-10-03
 
 ### Byparr works as the Cloudflare solver

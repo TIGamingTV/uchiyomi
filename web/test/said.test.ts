@@ -48,6 +48,12 @@ const SAMPLE: Record<string, (c: number) => unknown> = {
   lang: () => 'es-419',
   // v0.54.0, frozen.failing and frozen.followingDown: each branch of the sentence, one per count.
   offline: (c) => c === 1, state: (c) => (c === 1 ? 'off' : 'failing'),
+  // v0.55.0, gaps.belowFloor: the first chapter a "Latest N" series was started from.
+  start: () => 176,
+  // v0.55.0, Fix everything (bff lib/autofix.ts): a Test's verdict, the series a copy merged into, why a part was skipped.
+  ok: (c) => c === 1, into: () => 'Walk Tale', why: () => 'time',
+  // v0.55.3, solver.ready: which solver answered (bff lib/sources/flaresolverr.ts SolverKind), named before its version.
+  kind: () => 'trawl',
 };
 
 /**
@@ -136,6 +142,52 @@ test('every sentence the server builds has words here, and they read as the serv
   for (const code of [...Object.keys(DIFFERS), ...ONE_DIFFERS]) assert.ok(codes.includes(code), `${code} is no longer a server code: drop it from this test's exceptions`);
 });
 
+test('every line Fix everything sends has words here: each kind of thing done, and each reason a part was passed over', async (t) => {
+  // v0.55.0 (bff lib/autofix.ts). The walk above fills each code's parameters with one sample, and two of the run's
+  // lines get past it: a done line's code is BUILT from its kind (`autofix.done.${kind}`, a cast the typechecker cannot
+  // follow), and `autofix.item.skipped` words its `why` from a table of its own, of which the sample says one. Each
+  // kind and each why the run can send is held here to the server's English. Reintroduce by dropping a `why` from the
+  // web's words (lib/said.ts, 'installs'): "'installs' has no words" fails; a DoneKind without its code fails by name.
+  if (!haveBff) { t.skip('no bff/ beside web/ in this checkout'); return; }
+  const server = (await import(join(BFF, 'said.ts'))) as { SAID_ENGLISH: Record<string, (p: never) => string> };
+  const src = readFileSync(join(BFF, 'autofix.ts'), 'utf8');
+  const union = /export type DoneKind =([^;]+);/.exec(src);
+  assert.ok(union, 'DoneKind is not in bff lib/autofix.ts -- this scan is broken');
+  const kinds = [...union![1].matchAll(/'([a-zA-Z]+)'/g)].map((m) => m[1]);
+  assert.ok(kinds.length >= 20, `only ${kinds.length} kinds read -- this scan is broken`);
+  // doneLines' own words for the kinds it does not build: the rest are `autofix.done.<kind>`.
+  const SPECIAL: Record<string, Array<[string, Record<string, unknown>]>> = {
+    replaced: [['autofix.done.replaced', { n: 3, names: ['Aqua'], more: 0 }]],
+    installed: [['autofix.done.installed', { names: ['Asura Scans'], more: 0, n: 3 }]],
+    uninstalled: [['autofix.done.uninstalled', { names: ['Amber Comics'], more: 0 }]],
+    scanned: [['autofix.done.counted', { n: 3 }], ['autofix.done.scanned', {}]],
+    engineConnected: [['autofix.done.engineConnected', {}]],
+  };
+  for (const kind of kinds) {
+    for (const [code, params] of SPECIAL[kind] ?? [[`autofix.done.${kind}`, { n: 3 }]]) {
+      const fn = server.SAID_ENGLISH[code] as ((p: unknown) => string) | undefined;
+      assert.ok(fn, `done kind '${kind}': the server has no code ${code}`);
+      const web = saidText({ code, params }, '\0');
+      assert.notEqual(web, '\0', `${code} has no words`);
+      assert.equal(web, fn!(params), `${code} reads otherwise than the server`);
+    }
+  }
+  // Every reason the run passes a part over for, from its own calls, and the server's table of them.
+  const sent = [...src.matchAll(/say\('autofix\.item\.skipped', \{ why: '([a-z_]+)' \}\)/g)].map((m) => m[1]);
+  const said = readFileSync(join(BFF, 'said.ts'), 'utf8');
+  const table = /const AUTOFIX_SKIPPED: Record<string, string> = \{([^}]+)\}/.exec(said);
+  assert.ok(table && sent.length >= 4, 'the skipped reasons were not read -- this scan is broken');
+  const known = [...table![1].matchAll(/^\s*([a-z_]+):/gm)].map((m) => m[1]);
+  // A ternary picks two of them (`a.engine === 'none' ? 'no_engine' : 'engine_down'`): the table holds those too.
+  for (const why of new Set([...sent, ...known])) {
+    assert.ok(known.includes(why), `the run passes a part over for '${why}', which the server's table does not word`);
+    const english = (server.SAID_ENGLISH['autofix.item.skipped'] as (p: { why: string }) => string)({ why });
+    const web = saidText({ code: 'autofix.item.skipped', params: { why } }, '\0');
+    assert.notEqual(web, '\0', `'${why}' has no words`);
+    assert.equal(web, english, `'${why}' reads otherwise than the server`);
+  }
+});
+
 test('every diagnosis the server can reach reads as its English: each reason by its code, each fix by its own', async (t) => {
   if (!haveBff) { t.skip('no bff/ beside web/ in this checkout'); return; }
   // Reintroduce by deleting REASON_WORDS.edge_403: "diagnosis 'edge_403' has no reason" fails. Deleting
@@ -169,6 +221,9 @@ test('every diagnosis the server can reach reads as its English: each reason by 
     ['crash', facts('flaresolverr: Error solving the challenge. Message: Service /app/chromedriver unexpectedly exited.')],
     ['down', facts("flaresolverr: HTTPConnectionPool(host='localhost', port=1): Max retries exceeded with url: /session")],
     ['solver timeout', facts('flaresolverr: Error solving the challenge. Timeout after 60.0 seconds.')],
+    // v0.55.3: a solver still busy after its tries and the backup (bff sources/flaresolverr.ts SOLVER_BUSY).
+    ['solver busy', facts('flaresolverr: solver busy (every one of its browsers stayed in use)')],
+    ['ip blocked', facts('flaresolverr: Tier 3 failed (datacenter-ip-blocked (cf_clearance obtained but redirect never completed — needs residential proxy)). Set RESIDENTIAL_PROXY_URL (or pass a proxy per-request) to enable Tier 4 proxy escalation.')],
     ['bypass', facts('suwayomi: java.io.IOException: Cloudflare bypass currently disabled')],
     ['engine login', facts('suwayomi 401')],
     ['engine down', facts('suwayomi unreachable: ECONNREFUSED')],
@@ -351,6 +406,12 @@ test('a line is joined the reader\'s way, and a code this build does not know le
     const params = { status: 'from_a_newer_server', until: ISO, n: 2, series: 1, since: ISO, tries: 3, capped: 0, cap: 5, title: 'Walk Tale', number: 3, reason: null };
     assert.equal(saidText([{ code, params }], 'the English'), 'the English', `${code}: an unknown status is worded`);
   }
+  // v0.55.3, the ledger's own `moved`: a chapter filed under the main source from one the series no longer uses (bff
+  // lib/chapterFailures.ts refileFailures), with why it failed there. Reintroduce by leaving it to statusText: the row's
+  // whole line is the server's English.
+  const moved = { n: 2, series: 1, since: ISO, tries: 0, capped: 0, cap: 5, title: 'Walk Tale', number: 7, status: 'moved', reason: 'no page urls' };
+  assert.match(saidText([{ code: 'failures.detail', params: moved }], 'the English'),
+    /; latest: "Walk Tale" ch 7 \(from a source the series no longer uses: no page urls\)$/, 'a chapter filed under the main source is not worded');
   assert.equal(saidText([{ code: 'sources.status', params: { status: 'rate_limited' } }]), 'Rate-limited');
   assert.equal(saidText(undefined, 'from an older server'), 'from an older server');
   // The joins, as the server's English writes them.
@@ -507,6 +568,9 @@ test('on the desktop app, every platform wording says Uchiyomi, never a containe
   const DESKTOP = [
     'solver.down', 'solver.downNote', 'solver.failingNote', 'cap.note', 'cap.title', 'cap.detail', 'frozen.overLimit',
     'fix.solverCrash', 'fix.solverDown', 'fix.bypassOff', 'fix.engineLogin', 'fix.engineDown', 'fix.solverBroken',
+    // v0.55.3: the desktop helper is never busy and has no backup, but its words would still be a restart, and the
+    // backup's two lines name no container.
+    'fix.solverBusy', 'autofix.clears.mainSolverDown', 'autofix.clears.backupSolverDown',
     // v0.52.0 (#134): the desktop app chooses its folders; nothing is mounted there.
     'nested.note',
   ];

@@ -8,14 +8,16 @@ import { useInfiniteQuery, useQuery, useQueryClient } from '@tanstack/react-quer
 import { api } from '@/lib/api';
 import { Page, Series } from '@/lib/types';
 import { SeriesTile } from '@/components/cards';
-import { IcSearch, IcSparkle, IcPlus } from '@/components/icons';
+import { IcSearch, IcSparkle, IcPlus, IcImport } from '@/components/icons';
 import { PullToRefresh } from '@/components/PullToRefresh';
 import { triggerRefresh } from '@/lib/refresh';
 import { useToast } from '@/components/Toast';
 import { Modal, ConfirmDialog, msgOf } from '@/components/ConfirmDialog';
+import { LibraryFolders } from '@/components/LibraryFolders';
+import { foldersOf } from '@/lib/libraryFolders';
 import { useAuth, canDownload } from '@/lib/auth';
 import { AdultToggle, useAdultFilterConfigured, useAdultShown, useLibraries } from '@/components/AdultToggle';
-import { LibraryFilters, SORTS, READ_STATES, STATUSES, useLibrarySources } from '@/components/LibraryFilters';
+import { LibraryFilters, NO_SOURCE, SORTS, READ_STATES, STATUSES, useLibrarySources } from '@/components/LibraryFilters';
 import { Sheet } from '@/components/ui';
 import { useArchiveEnqueue } from '@/components/ArchiveQueue';
 import { t as tr } from '@/lib/i18n';
@@ -29,14 +31,19 @@ import { findRefusal } from '@/lib/useFindRun';
 import { FindStartDialog } from '@/components/FindSources';
 import { ProgressRing } from '@/components/ProgressRing';
 import { ServerDownloadsView } from '@/components/ServerDownloadsView';
+import { EmptyState } from '@/components/EmptyState';
+import { LibraryStart } from '@/components/LibraryStart';
+import { ART } from '@/lib/art';
 
 /** Build the condition tree from the URL. Empty means no condition at all, which needs no user context. */
 function conditionFrom(read: string, status: string, genres: string[], lib: string, src = '', anysrc = '') {
   const all: any[] = [];
   if (lib) all.push({ libraryId: { operator: 'is', value: lib } });
   // The two source filters (bff ownedCatalog condSql): the source a series was added from, and any source
-  // it reads from -- added from it, or following it as a fallback.
-  if (src) all.push({ mainSource: { operator: 'is', value: src } });
+  // it reads from -- added from it, or following it as a fallback. Main source's "No source" (#149) is a condition of its
+  // own, never `mainSource` with the sentinel: an older server would answer that with an empty grid, not a 400.
+  if (src === NO_SOURCE) all.push({ hasMainSource: { operator: 'isFalse' } });
+  else if (src) all.push({ mainSource: { operator: 'is', value: src } });
   if (anysrc) all.push({ anySource: { operator: 'is', value: anysrc } });
   if (read) all.push({ readStatus: { operator: 'is', value: read } });
   if (status) all.push({ status: { operator: 'is', value: status } });
@@ -61,7 +68,7 @@ function LibraryInner() {
   const src = params.get('src') || '';
   const anysrc = params.get('anysrc') || '';
   const { data: libSources } = useLibrarySources();
-  const sourceName = (id: string) => libSources?.find((x) => x.id === id)?.name || id;
+  const sourceName = (id: string) => (id === NO_SOURCE ? tr('No source') : libSources?.sources.find((x) => x.id === id)?.name || id);
   const { data: allLibs } = useLibraries();
   // The 18+ filter can hide series by genre on an install with no 18+ library; the reveal must still render.
   const adultFilter = useAdultFilterConfigured();
@@ -340,9 +347,18 @@ function LibraryInner() {
 
         <div className="min-w-0 flex-1">
       <header className="safe-top sticky top-0 z-30 bg-ink-950/85 px-5 pb-3 backdrop-blur-xl lg:static lg:bg-transparent lg:px-0 lg:pt-6 lg:backdrop-blur-none">
-        <div className="flex items-center justify-between">
-          <h1 className="font-display text-2xl font-bold tracking-tight lg:text-3xl">{tr('Library')}</h1>
-          <div className="flex items-center gap-2">
+        {/* The title gives way before the keys do: with the admin's import a fourth round key, "Bibliothèque" and
+            "Библиотека" pushed the row 25-29 px past a 320 px screen. */}
+        <div className="flex items-center justify-between gap-3">
+          <h1 className="min-w-0 truncate font-display text-2xl font-bold tracking-tight lg:text-3xl">{tr('Library')}</h1>
+          <div className="flex shrink-0 items-center gap-2">
+            {/* v0.55.4 (#158): the import, for an admin, where "+" and the top bar's Discover add series -- it was four
+                taps deep in Admin → Sources. A labelled key on a wide screen; on a phone a round key among the others. */}
+            {isAdmin && (
+              <Link href="/admin/import/" data-library-import className="btn-key hidden lg:inline-flex">
+                <IcImport width={15} height={15} aria-hidden />{tr('Import a list')}
+              </Link>
+            )}
             {/* The one thing the browse page had that has nowhere else to live. */}
             <button onClick={surprise} title={tr('Surprise me')} aria-label={tr('Surprise me')}
               className="grid h-10 w-10 place-items-center rounded-full border border-ink-700 bg-ink-850/70 text-fog-300 hover:text-fog-100">
@@ -352,6 +368,12 @@ function LibraryInner() {
             <Link href="/search" className="grid h-10 w-10 place-items-center rounded-full border border-ink-700 bg-ink-850/70 text-fog-300 lg:hidden">
               <IcSearch width={20} height={20} />
             </Link>
+            {isAdmin && (
+              <Link href="/admin/import/" data-library-import title={tr('Import a list')} aria-label={tr('Import a list')}
+                className="grid h-10 w-10 place-items-center rounded-full border border-ink-700 bg-ink-850/70 text-fog-300 lg:hidden">
+                <IcImport width={19} height={19} />
+              </Link>
+            )}
             {canDownload(user) && (
               <Link href="/discover" className="grid h-10 w-10 place-items-center rounded-full border border-accent/40 bg-accent-soft text-accent lg:hidden" title={tr('Add new series')}>
                 <IcPlus width={20} height={20} />
@@ -444,13 +466,21 @@ function LibraryInner() {
             ))}
       </div>
 
+      {!isLoading && !items.length && activeCount > 0 && (
+        <p className="px-5 pb-10 pt-6 text-center text-sm text-fog-500">{tr('Nothing matches those filters.')}</p>
+      )}
+      {/* v0.55.4 (#158): an empty library says how to fill it -- import one (admins) or find series in Discover (whoever
+          may add them) -- where it said "Your library is empty." and nothing else. Empty for THIS viewer, with nothing
+          filtered: their 18+ reveal, their library access and a folder not scanned yet all count, and an answer that
+          has not come (or failed) is not "empty". */}
+      {!isLoading && total === 0 && !activeCount && (
+        <EmptyState art={ART.emptyLibrary} title={tr('Your library is empty.')}>
+          <LibraryStart />
+        </EmptyState>
+      )}
+
       <div ref={sentinel} className="h-16" />
       {isFetchingNextPage && <p className="pb-6 text-center text-xs text-fog-500">{tr('Loading more…')}</p>}
-      {!isLoading && !items.length && (
-        <p className="px-5 pb-10 text-center text-sm text-fog-500">
-          {activeCount ? tr('Nothing matches those filters.') : tr('Your library is empty.')}
-        </p>
-      )}
       </>}
         </div>
       </div>
@@ -632,7 +662,7 @@ function MoveToLibrary({ n, busy, onClose, onPick }: {
 }) {
   const { data } = useQuery({
     queryKey: ['admin-libraries'],
-    queryFn: () => api<{ content: { id: string; name: string; path: string; age_rating: number | null }[] }>('/api/admin/libraries'),
+    queryFn: () => api<{ content: { id: string; name: string; path: string; paths?: string[]; age_rating: number | null }[] }>('/api/admin/libraries'),
   });
   return (
     <Modal title={tr('File {n} series', { n })} onClose={onClose}>
@@ -642,7 +672,7 @@ function MoveToLibrary({ n, busy, onClose, onPick }: {
             className="flex w-full items-center justify-between gap-3 rounded-lg px-2.5 py-2 text-start hover:bg-ink-800/60 disabled:opacity-50">
             <span className="min-w-0">
               <span className="block truncate text-sm text-fog-100">{l.name}</span>
-              <span className="block truncate font-mono text-[11px] text-fog-500">{l.path || tr('everything not in another library')}</span>
+              <LibraryFolders paths={foldersOf(l)} className="text-[11px] text-fog-500" />
             </span>
             {l.age_rating != null && <span className="shrink-0 rounded bg-amber-500/15 px-1.5 py-0.5 text-[10px] font-medium text-amber-300">{l.age_rating}+</span>}
           </button>

@@ -10,8 +10,8 @@
 // Two rules, and both of them are somebody else's rule quoted rather than restated:
 //
 //   - `book_overrides.number` wins over `lib_books.number`. The raw number is DERIVED from the filename by
-//     numFromName (see the book_overrides note in lib/migrate.ts), and the override is the manual escape
-//     hatch for when that parse is wrong. A renumber that the rest of the product honours but this query
+//     the row's name rule (lib/naming.ts numberByRule; the book_overrides note in lib/migrate.ts), and the
+//     override is the manual escape hatch for when that parse is wrong. A renumber that the rest of the product honours but this query
 //     does not is a finding that cannot be cleared.
 //   - `heldBooks()` (lib/chapterCleanup.ts) decides what a tombstone means. A cleanup or Delete-files
 //     tombstone is HELD -- the bytes went on purpose and the sweep must not fetch them back every night,
@@ -23,11 +23,21 @@
 // that hole -- the post is gone, and no other site's numbers line up with posting order -- so it counts as held:
 // a gap on the Health page and a search for the repair would be a finding nobody could ever clear.
 //
+// And one more of that kind (v0.55.2, #147): a notice chapter the admin hides (lib/noticeChapters.ts) that only the
+// sources list. The sweep does not fetch it on purpose, so it is never held -- and a chapter that exists only in short
+// parts (1.1 ... 1.9, each a few pages) left a whole-number hole at 1 that every sweep "would fetch" and none ever did.
+// Counted as held, it is what it would be with the switch off, when the sweep fetches it: a chapter of the series.
+//
+// And one about a file (v0.55.2, #150): a file holding a range of chapters, `Batman 01-07`, holds every whole number
+// from its start to its end (lib/chapterRanges.ts), so a hand-collected 01-07 never reads as six missing chapters.
+//
 // The SELECT is exported as well as the helper because the repair reads it per series inside a loop that
 // already holds the row, and because a caller joining it into a larger query must get the same rules rather
 // than a hand-written copy of them.
 import { q } from './db';
 import { heldBooks } from './chapterCleanup';
+import { listedHidden, noticesActive } from './noticeChapters';
+import { rangeEnd } from './chapterRanges';
 
 /**
  * The held numbers of ONE series, as SQL. `$1` is the series id; the alias is the books table's, so a
@@ -37,16 +47,32 @@ import { heldBooks } from './chapterCleanup';
  * gapsOf disagree with itself.
  * Reintroduce the books alone (drop the UNION): "a post the source deleted is a hole, not a gap" in
  * health.int.test.ts reads the hole as a gap.
+ * The second branch is each range's whole numbers after its start, which the first already gives: `01-07` is 1, then
+ * 2 to 7. Reintroduce by dropping it: "a file holding chapters 1 to 7 is no gap" in chapterRanges.int.test.ts finds
+ * a gap of six.
+ * The last part, the hidden notices only the sources list, exists only while something hides (lib/noticeChapters.ts
+ * `active`); reintroduce by dropping it: "a chapter that exists only in short parts" in noticeChapters.int.test.ts
+ * finds a gap at 1, and Fill now leaves it for a sweep that never comes.
  */
 export const HAVE_SQL = (alias = 'b'): string =>
   `SELECT COALESCE(o.number, ${alias}.number)::float8 AS number
      FROM lib_books ${alias} LEFT JOIN book_overrides o ON o.book_id = ${alias}.id
     WHERE ${alias}.series_id = $1 AND ${heldBooks(alias)}
    UNION ALL
+   SELECT generate_series(floor(${alias}.number)::numeric + 1, floor(${rangeEnd(alias, 'o')})::numeric)::float8 AS number
+     FROM lib_books ${alias} LEFT JOIN book_overrides o ON o.book_id = ${alias}.id
+    WHERE ${alias}.series_id = $1 AND ${heldBooks(alias)} AND ${rangeEnd(alias, 'o')} IS NOT NULL
+   UNION ALL
    SELECT hole.number::float8 AS number
      FROM series_post_numbers hole JOIN lib_series hs ON hs.id = hole.series_id
     WHERE hole.series_id = $1 AND hole.gone_at IS NOT NULL AND hs.numbering = 'posting_order'
-      AND hole.source_id = COALESCE(hs.numbering_source, hs.source_id)`;
+      AND hole.source_id = COALESCE(hs.numbering_source, hs.source_id)${noticesActive() ? `
+   UNION ALL
+   SELECT ln.number::float8 AS number
+     FROM series_listing ln JOIN lib_series lns ON lns.id = ln.series_id
+    WHERE ln.series_id = $1 AND ${listedHidden('lns', 'ln')}
+      AND NOT EXISTS (SELECT 1 FROM lib_books lb LEFT JOIN book_overrides lo ON lo.book_id = lb.id
+                       WHERE lb.series_id = ln.series_id AND COALESCE(lo.number, lb.number) = ln.number AND ${heldBooks('lb')})` : ''}`;
 
 /** The held numbers of one series, finite and unsorted -- what gapsOf, assess and the outlier check take. */
 export async function haveNumbers(seriesId: string): Promise<number[]> {

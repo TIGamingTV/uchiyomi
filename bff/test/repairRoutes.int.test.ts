@@ -256,6 +256,58 @@ test('Scan library now answers what it found, and a second press within a minute
   }
 });
 
+test('a scan longer than the first answer is answered running, and GET /api/refresh follows it to its counts (v0.55.6)', { skip }, async () => {
+  // Kedryn (#150): a big library on Unraid scanned for longer than the proxy in front of the server would hold the
+  // request, and the button said "Scan failed" every time while the scan went on. Here the scan is held (a renumber's
+  // hold, lib/library.ts withScansHeld) past a first answer cut to 300 ms. Reintroduce by awaiting the scan in the
+  // route: the POST is answered only once the hold is released, with its counts and no `running`.
+  const catalog = (await import('../src/routes/catalog')).default;
+  const { withScansHeld } = await import('../src/lib/library');
+  const Fastify = (await import('fastify')).default;
+  const jwt = (await import('@fastify/jwt')).default;
+  const c = Fastify();
+  await c.register(jwt, { secret: process.env.JWT_SECRET! });
+  await c.register(catalog);
+  await c.ready();
+  process.env.REFRESH_FIRST_ANSWER_MS = '300';
+  let release: (() => void) | undefined;
+  const holding = withScansHeld(() => new Promise<void>((r) => { release = r; }));
+  const status = async (authorization = adminTok) => (await c.inject({ method: 'GET', url: '/api/refresh', headers: { authorization } })).json();
+  try {
+    runtime.lastScan = 0;
+    // Raced against five seconds: a route that waits the scan out would wait for a hold only this test releases.
+    const posted = c.inject({ method: 'POST', url: '/api/refresh', headers: { authorization: adminTok } }).then((r) => r.json());
+    const a = await Promise.race([posted, new Promise<null>((r) => setTimeout(() => r(null), 5000))]);
+    assert.ok(a, 'answered while the scan was still held, not when it ended');
+    assert.equal(a.running, true, JSON.stringify(a));
+    assert.equal(a.scanned, true);
+    assert.equal(typeof a.since, 'string');
+    const s = await status();
+    assert.equal(s.running, true);
+    assert.equal(s.progress?.phase, 'waiting', 'it says it waits for another task');
+    assert.deepEqual(await status(memberTok), { running: true }, 'a member learns only that a scan runs');
+    release!();
+    await holding;
+    let done = await status();
+    for (let i = 0; i < 300 && (done.running || !done.last || Date.parse(done.last.at) < Date.parse(a.since)); i++) {
+      await new Promise((r) => setTimeout(r, 50));
+      done = await status();
+    }
+    assert.equal(done.running, false, 'the scan ended');
+    assert.ok(Date.parse(done.last.at) >= Date.parse(a.since), 'the last scan is the one the press started');
+    assert.equal(typeof done.last.series, 'number');
+    assert.equal(typeof done.last.books, 'number');
+    assert.ok(!('progress' in done), 'no progress once it has ended');
+    assert.ok(!('failed' in done), 'and nothing failed');
+  } finally {
+    delete process.env.REFRESH_FIRST_ANSWER_MS;
+    release?.();
+    await holding.catch(() => {});
+    runtime.lastScan = 0;
+    await c.close();
+  }
+});
+
 test('a chapter sweep in the way is not the same answer as a repair already running', { skip }, async () => {
   // ⚠️ Two different refusals on purpose. "busy" on a press made during a sweep reads as "the repair is
   // stuck", and the page would tell an admin to wait for the wrong thing.
@@ -366,11 +418,19 @@ test('an admin who hides 18+ reads no adult title in the repair\'s answers', { s
   // `notes` name series by title alone: planted too, or the history's assertion below could not fail (the
   // integration-1 review's probe). Reintroduce by sending notes as stored in the runs route: 'the history' fails.
   const notes = { replaced: [`${TITLE} ch 3 (2 -> 20)`], confirmed: [], followed: [`${TITLE} -> rp-b`], upgraded: [] };
+  // A Fix everything run (v0.55.0) names series in its lines by title alone, as notes do, and Recent repairs reads its
+  // record from the history. Reintroduce by sending it as stored (admin.ts, the runs route): 'the history' fails.
+  const merged = { code: 'autofix.item.merged', params: { from: TITLE, into: `${TITLE} (copy)` } };
+  const autofixResult = {
+    phaseIndex: 9, log: [merged],
+    summary: { green: true, again: false, done: [{ kind: 'merged', n: 1, said: { code: 'autofix.done.merged', params: { n: 1 } }, items: [merged] }], clears: [], needsYou: [] },
+  };
   const planted = await q<{ id: string }>(
     `INSERT INTO repair_runs (id, started_at, finished_at, origin, kind, target, status, ms, result, notes) VALUES
        (gen_random_uuid(), now(), now(), 'nightly', 'full', '{}'::jsonb, 'done', 5, $1::jsonb, $3::jsonb),
-       (gen_random_uuid(), now(), now(), 'manual', 'fill', $2::jsonb, 'done', 5, $1::jsonb, $3::jsonb) RETURNING id`,
-    [JSON.stringify({ skips }), JSON.stringify({ seriesId: AS, label: TITLE }), JSON.stringify(notes)]);
+       (gen_random_uuid(), now(), now(), 'manual', 'fill', $2::jsonb, 'done', 5, $1::jsonb, $3::jsonb),
+       (gen_random_uuid(), now(), now(), 'manual', 'autofix', '{}'::jsonb, 'done', 5, $4::jsonb, NULL) RETURNING id`,
+    [JSON.stringify({ skips }), JSON.stringify({ seriesId: AS, label: TITLE }), JSON.stringify(notes), JSON.stringify(autofixResult)]);
   clearRunDigest();
   const was = { finishedAt: repairState.finishedAt, lastResult: repairState.lastResult };
   repairState.finishedAt = Date.now();
@@ -405,6 +465,12 @@ test('an admin who hides 18+ reads no adult title in the repair\'s answers', { s
     // with the notes dropped for everyone (integration-2 review).
     const revealed = (await runs('?adult=1')).json().content.find((r: any) => r.id === planted[1].id);
     assert.ok(String(revealed?.notes?.replaced?.[0] ?? '').includes(TITLE), 'the notes too, with the reveal on');
+    // The Fix everything row: its lines that name no series stay for both, the ones that do only with the reveal on.
+    const hiddenFix = (await runs(`?id=${planted[2].id}`)).json().content[0];
+    assert.equal(hiddenFix?.result?.summary?.done?.[0]?.said?.code, 'autofix.done.merged', 'PREMISE: the Fix everything row is in the history');
+    assert.deepEqual(hiddenFix.result.log, [], 'the history: a Fix everything run\'s log');
+    const shownFix = (await runs(`?adult=1&id=${planted[2].id}`)).json().content[0];
+    assert.deepEqual(shownFix?.result?.summary?.done?.[0]?.items, [merged], 'a Fix everything run\'s lines, with the reveal on');
   } finally {
     repairState.running = false;
     repairState.live = null;
@@ -412,6 +478,106 @@ test('an admin who hides 18+ reads no adult title in the repair\'s answers', { s
     await q('DELETE FROM repair_runs WHERE id = ANY($1)', [planted.map((r) => r.id)]);
     await q('DELETE FROM lib_series WHERE id = $1', [AS]);
     await q('DELETE FROM libraries WHERE id = $1', [LIB]);
+    clearRunDigest();
+  }
+});
+
+test('Fix everything\'s lines are held to the series they name, for an admin who hides 18+ (v0.55.1)', { skip }, async () => {
+  // v0.55.0 left out every line naming a series by title for an admin without the reveal, adult or not. Each now carries
+  // the ids of the series it names (`seriesIds`), and only a line naming a series that admin's reach hides goes -- in
+  // the history, the run's own route and the newest run's. Judged on the series as it stands: a merge names the series
+  // it merged away, which no listing shows any more. Reintroduce v0.55.0's rule in lib/autofix.ts scrubbed: "a line
+  // naming a series that is not 18+ is kept" fails; nameableIds -> browsableIds in admin.ts nameable: "a merge of a
+  // series that is not 18+ is still said" fails; drop `named` from the newest run's route: "the newest run" fails.
+  const { clearRunDigest } = await import('../src/lib/repairRuns');
+  const LIB = 'rr-adult-lib2', AS = 's_rr_adult2', M = 's_rr_merged', D = 's_rr_deleted_adult';
+  await q(`INSERT INTO libraries (id, name, path, age_rating) VALUES ($1,$1,$1,18) ON CONFLICT (id) DO UPDATE SET age_rating = 18`, [LIB]);
+  await q('DELETE FROM lib_series WHERE id = ANY($1)', [[AS, M, D]]);
+  await q(`INSERT INTO lib_series (id, source, title, folder, library_id) VALUES ($1,'test','Rr Adult Two',$1,$2)`, [AS, LIB]);
+  await q(`INSERT INTO lib_series (id, source, title, folder, library_id, deleted_at) VALUES ($1,'test','Rr Deleted Adult',$1,$2, now())`, [D, LIB]);
+  await q(`INSERT INTO lib_series (id, source, title, folder, merged_into) VALUES ($1,'test','Rr Merged Away',$1,$2)`, [M, S]);
+  const line = (code: string, params: Record<string, unknown>) => ({ code, params });
+  const renumbered = line('autofix.item.renumbered', { title: 'Repair Routes Fixture', seriesIds: [S] });
+  const merged = line('autofix.item.merged', { from: 'Rr Merged Away', into: 'Repair Routes Fixture', seriesIds: [M, S] });
+  const linked = line('autofix.item.linked', { a: 'Rr Adult Two', b: 'Repair Routes Fixture', seriesIds: [AS, S] });
+  const deleted = line('autofix.item.deleted', { title: 'Rr Deleted Adult', n: 2, seriesIds: [D] });
+  const gone = line('autofix.item.renumbered', { title: 'Rr Gone Altogether', seriesIds: ['s_rr_gone'] });
+  const legacy = line('autofix.item.merged', { from: 'Rr Legacy', into: 'Repair Routes Fixture' });
+  const tested = line('autofix.item.tested', { name: 'rr-src', ok: true });
+  const all = [renumbered, merged, linked, deleted, gone, legacy, tested];
+  const record = {
+    phaseIndex: 9, log: all,
+    summary: { green: true, again: false, clears: [], needsYou: [],
+      done: [{ kind: 'merged', n: 1, said: { code: 'autofix.done.merged', params: { n: 1 } }, items: [renumbered, merged, linked] }] },
+  };
+  const [{ id }] = await q<{ id: string }>(
+    `INSERT INTO repair_runs (id, started_at, finished_at, origin, kind, target, status, ms, result)
+     VALUES (gen_random_uuid(), now() + interval '1 minute', now() + interval '1 minute', 'manual', 'autofix', '{}'::jsonb, 'done', 5, $1::jsonb) RETURNING id`,
+    [JSON.stringify(record)]);
+  clearRunDigest();
+  const get = async (url: string) => {
+    const r = await app.inject({ method: 'GET', url, headers: { authorization: adminTok } });
+    assert.equal(r.statusCode, 200, r.body);
+    return r.json();
+  };
+  try {
+    const hidden = (await get(`/api/admin/tasks/repair/runs?id=${id}`)).content[0].result;
+    assert.ok(hidden.log.some((l: any) => l.code === 'autofix.item.renumbered' && l.params.seriesIds?.[0] === S), 'a line naming a series that is not 18+ is kept');
+    assert.ok(hidden.log.some((l: any) => l.code === 'autofix.item.merged' && l.params.from === 'Rr Merged Away'), 'a merge of a series that is not 18+ is still said');
+    assert.deepEqual(hidden.log, [renumbered, merged, tested], 'the history: what is left out is what names an 18+ series, one gone, or carries no ids');
+    assert.deepEqual(hidden.summary.done[0].items, [renumbered, merged], 'the history: the done lines\' items');
+    // The run's own route, and the newest run's: the same rule.
+    assert.deepEqual((await get(`/api/admin/health/autofix/${id}`)).log, [renumbered, merged, tested], 'the run\'s own route');
+    const newest = await get('/api/admin/health/autofix');
+    assert.equal(newest.last?.id, id, 'PREMISE: the planted run is the newest');
+    assert.deepEqual(newest.last.log, [renumbered, merged, tested], 'the newest run');
+    // The same admin with the reveal on reads every line, the 18+ ones and the old one included.
+    assert.deepEqual((await get(`/api/admin/tasks/repair/runs?adult=1&id=${id}`)).content[0].result.log, all, 'the reveal shows every line');
+    assert.deepEqual((await get(`/api/admin/health/autofix/${id}?adult=1`)).log, all);
+  } finally {
+    await q('DELETE FROM repair_runs WHERE id = $1', [id]);
+    await q('DELETE FROM lib_series WHERE id = ANY($1)', [[AS, M, D]]);
+    await q('DELETE FROM libraries WHERE id = $1', [LIB]);
+    clearRunDigest();
+  }
+});
+
+test('a kept Fix everything run\'s `tried`, which names series, is in no answer (v0.55.1)', { skip }, async () => {
+  // Lane C keeps the packages a run searched in vain WITH the series each was searched for (`tried: [{pkg, lang,
+  // series}]`), for the next runs' "never twice in a month" (lib/autofix.ts recentlyTried). The history sent the record as
+  // stored, so every admin -- one who hides 18+ too -- read the ids of every series the run looked for, and nothing in the
+  // web reads it. Reintroduce by sending it as stored (scrubAutofixRecord keeping `tried`): "the history leaves
+  // `tried` out" fails, with the reveal on and off.
+  const { clearRunDigest } = await import('../src/lib/repairRuns');
+  const tried = [{ pkg: 'eu.kanade.tachiyomi.extension.en.rrpackage', lang: 'en', series: [S] }];
+  const record = { phaseIndex: 9, log: [], tried, summary: { green: true, again: false, clears: [], needsYou: [], done: [] } };
+  const [{ id }] = await q<{ id: string }>(
+    `INSERT INTO repair_runs (id, started_at, finished_at, origin, kind, target, status, ms, result)
+     VALUES (gen_random_uuid(), now() + interval '2 minutes', now() + interval '2 minutes', 'manual', 'autofix', '{}'::jsonb, 'done', 5, $1::jsonb) RETURNING id`,
+    [JSON.stringify(record)]);
+  clearRunDigest();
+  const get = async (url: string) => {
+    const r = await app.inject({ method: 'GET', url, headers: { authorization: adminTok } });
+    assert.equal(r.statusCode, 200, r.body);
+    return r.json();
+  };
+  try {
+    for (const url of [`/api/admin/tasks/repair/runs?id=${id}`, `/api/admin/tasks/repair/runs?adult=1&id=${id}`]) {
+      const result = (await get(url)).content[0].result;
+      assert.equal(result.phaseIndex, 9, `PREMISE: the planted record (${url})`);
+      assert.ok(!('tried' in result), `the history leaves \`tried\` out (${url})`);
+    }
+    for (const url of [`/api/admin/health/autofix/${id}`, `/api/admin/health/autofix/${id}?adult=1`]) {
+      assert.ok(!('tried' in (await get(url))), `the run's own route leaves it out (${url})`);
+    }
+    const newest = await get('/api/admin/health/autofix');
+    assert.equal(newest.last?.id, id, 'PREMISE: the planted run is the newest');
+    assert.ok(!('tried' in newest.last), 'and so does the newest run\'s');
+    // Kept all the same: the next run reads it from the row.
+    const [row] = await q<{ result: any }>('SELECT result FROM repair_runs WHERE id = $1', [id]);
+    assert.deepEqual(row.result.tried, tried, 'the record keeps it for the next runs');
+  } finally {
+    await q('DELETE FROM repair_runs WHERE id = $1', [id]);
     clearRunDigest();
   }
 });

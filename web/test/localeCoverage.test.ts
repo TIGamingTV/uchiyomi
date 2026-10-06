@@ -180,6 +180,8 @@ const AGREE: Record<string, string> = {
   goes: 'go', lands: 'land', stays: 'stay', matches: 'match', qualifies: 'qualify', it: 'they', its: 'their', this: 'these',
   // v0.49.1, Health's own sentences (lib/said.ts).
   waits: 'wait', contains: 'contain', uses: 'use', appears: 'appear', shares: 'share', holds: 'hold', belongs: 'belong',
+  // v0.55.4, Rescan everything's renumbering preview (lib/rescan.ts numbersLine).
+  gets: 'get',
 };
 /** A word and the punctuation after it, apart. */
 const split = (w: string) => { const m = /^(.*?)([.,;:!?…)]*)$/u.exec(w)!; return { core: m[1], tail: m[2] }; };
@@ -224,6 +226,8 @@ const IRREGULAR_PAIRS: Record<string, string> = {
   // v0.49.1, Health's own sentences (lib/said.ts): two or three words agree with the count.
   '1 lost its primary but still follows another': '{n} lost their primary but still follow another',
   'left out 1 folder or file it could not read': 'left out {n} folders or files it could not read',
+  // v0.55.1, Health's chapters waiting for a site's pause (lib/said.ts failures.waiting): three words agree.
+  '1 chapter waits for a site that asked for a pause, and is tried again by itself': '{n} chapters wait for a site that asked for a pause, and are tried again by themselves',
   '1 folder belongs to series someone removed, and was left alone; Admin → Library puts a series back.':
     '{n} folders belong to series someone removed, and were left alone; Admin → Library puts a series back.',
   '1 folder is more than {max} levels deep and was not looked into (LIBRARY_MAX_DEPTH)':
@@ -279,7 +283,7 @@ const SHIPPED_UNPAIRED = [
   'This one stops working in {n} days. You can revoke it sooner.',
   '{n} chapters behind across {m} series', '{n} days', '{n} days of reading, {t} chapters in total',
   '{n} of {m} chapters match', '{n} of {m} sources answered · still asking {names}', '{n} of {m} sources answered · still asking {name}',
-  '{n} pairs could not be merged', '{n} pairs merged, {m} chapters moved', '{n} series would move',
+  '{n} pairs could not be merged', '{n} pairs merged, {m} chapters moved',
   '{n} versions', 'quiet — no release in {n} days', 'waiting for {g} · {n} days left',
   'failed {n} times',
   '{n} titles matched', '{n} chapters listed', '{n} chapters listed · none fetched yet',
@@ -287,7 +291,7 @@ const SHIPPED_UNPAIRED = [
   'Fetch {n} chapters again?', '{n} fewer chapters than the current pick',
 ];
 /** What SHIPPED_UNPAIRED may hold at most: lower it with every entry fixed, never raise it. */
-const SHIPPED_UNPAIRED_MAX = 33;
+const SHIPPED_UNPAIRED_MAX = 32;
 
 test('counted strings come in pairs: every "1 chapter" has its "{n} chapters", and back', () => {
   // Reintroduce by deleting the singular of a pair from the app -- `tr('Refreshed — 1 extension available')`

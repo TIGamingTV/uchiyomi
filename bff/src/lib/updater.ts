@@ -26,6 +26,9 @@ import { say } from './said';
 import { withOrigin } from './downloadActivity';
 import { decideNumbering, numberedChapters, resumeRenumber, settleNumbering, NUMBERING_COLUMNS, type Settled } from './numbering';
 import { aliasParts, partRulesApply } from './partAlias';
+import { isListedNotice } from './noticeChapters';
+import { seriesHidesNotices } from './noticeSettings';
+import { heldBy, rangeEnd, rawRangeEnd } from './chapterRanges';
 
 /**
  * Why a series produced nothing this run.
@@ -179,8 +182,18 @@ export interface UpdateOpts {
    * An admin has seen the plan of this series' pending numbering change and confirmed it (lib/numbering.ts
    * requestNumbering): the run applies it even though files are renamed. Nothing else passes it -- a series in
    * a library is never renumbered unattended.
+   * `'clean'` (v0.55.0): Fix everything, which the owner allowed to apply a plan only when the plan built at the apply
+   * is marked `clean` (lib/postingOrder.ts: nothing parked, no guess, no collision, no tracker push, no download
+   * running); any other plan stays held for an admin.
    */
-  confirmRenumber?: boolean;
+  confirmRenumber?: boolean | 'clean';
+  /**
+   * v0.55.1, Fix everything's chapters phase: sources this run leaves alone as if they were in a cooldown -- cooling
+   * down or rate-limited when the phase began (lib/autofix.ts). Never asked for a listing, never downloaded from, never
+   * hunted: the owner's first run re-checked failed chapters through Natomanga and Mangakakalot while they answered
+   * 429, and 28 chapters failed again inside four minutes. Their chapters are the sweep's once the site is ready.
+   */
+  resting?: (sourceId: string) => boolean;
 }
 
 /**
@@ -286,7 +299,7 @@ async function visitSeries(seriesId: string, maxNew: number, opts: UpdateOpts): 
   // The numbering source's own list, untouched: what the detector judges and what posting numbers are given to.
   let rawNumbering: SourceChapter[] | null = null;
   for (const f of followed) {
-    if (await blockedNow(f.source)) { blocked++; continue; }
+    if (opts.resting?.(f.source) || await blockedNow(f.source)) { blocked++; continue; }
     // Looked up again after the awaits above: an extension refresh can unregister an adapter between
     // building the list and asking it, and that is a source that did not answer, not a crash.
     const adapter = getSource(f.source);
@@ -335,7 +348,7 @@ async function visitSeries(seriesId: string, maxNew: number, opts: UpdateOpts): 
       return { ...nothing(s.title, 'renumber_pending'), asked: true, ...(r ? { renumber: r } : {}) };
     };
     if (!rawNumbering?.length || !numberingSource) return held();
-    renumber = await settleNumbering(s, numberingSource, rawNumbering, { confirm: !!opts.confirmRenumber });
+    renumber = await settleNumbering(s, numberingSource, rawNumbering, { confirm: opts.confirmRenumber === 'clean' ? 'clean' : !!opts.confirmRenumber });
     if (renumber.state !== 'applied' && renumber.state !== 'none') return held(renumber);
     // The apply moved chapter_floor and the slow archive's boundary into the new numbers (numbering.ts commit):
     // both are read again, or this run's floor would hold a source number against posting numbers.
@@ -400,7 +413,21 @@ async function visitSeries(seriesId: string, maxNew: number, opts: UpdateOpts): 
   // fetches below the boundary.
   const archiveBoundary = s.archive_boundary == null || opts.ignoreArchiveBoundary ? -Infinity : Number(s.archive_boundary);
   const floor = Math.max(s.chapter_floor == null ? -Infinity : Number(s.chapter_floor), archiveBoundary);
-  const wanted = releases.filter((c) => c.number >= floor);
+  // Notice chapters the admin hides (lib/noticeChapters.ts), for a series whose type or own switch says so: a number
+  // with a fraction that its copies say is NOTICE_MAX_PAGES pages or fewer (the most any copy says, as the listing
+  // reads it). Not fetched, not "behind", not in the count of what the sources list -- the sweep leaves them in the
+  // listing, so the series page and Mihon show them again the moment the switch goes off, and the next sweep fetches
+  // them then. A fractional number its copies say nothing about, or say is longer, is fetched like any chapter: it
+  // may be a real one in parts, and once it is here its own counted pages decide. Reintroduce by dropping `notice`:
+  // "the sweep skips only a notice its source says is short" in noticeChapters.int.test.ts finds 2.5 asked for; by
+  // going back to any fraction, it finds 3.5 and 4.5 never asked.
+  const hidesNotice = await seriesHidesNotices(seriesId);
+  const pagesOf = new Map<number, unknown[]>();
+  if (hidesNotice) {
+    for (const c of tagged) { const l = pagesOf.get(c.number); if (l) l.push(c.pages); else pagesOf.set(c.number, [c.pages]); }
+  }
+  const notice = (n: number) => hidesNotice && isListedNotice(n, pagesOf.get(n) ?? []);
+  const wanted = releases.filter((c) => c.number >= floor && !notice(c.number));
   // What is on disk is never replaced, whoever released it: a copy from a better-ranked group appearing
   // later is not a missing chapter. (A deliberate "replace with the preferred group" would be its own path.)
   // "On disk" includes the tombstones the library keeps on purpose -- a chapter the read-chapter cleanup
@@ -412,17 +439,21 @@ async function visitSeries(seriesId: string, maxNew: number, opts: UpdateOpts): 
   // Override-aware under posting order: a book in a root the renumber could not rename carries its posting number
   // in book_overrides (lib/numbering.ts), and its raw number is the source's, which means another post now.
   // Source-numbered series compare the raw number, as they always have: these numbers came out of a listing.
-  const heldRows = await q<{ number: number; pruned_at: string | null }>(posting
-    ? `SELECT COALESCE(ov.number, b.number) AS number, b.pruned_at FROM lib_books b LEFT JOIN book_overrides ov ON ov.book_id = b.id
+  // A file holding a range (v0.55.2, lib/chapterRanges.ts) holds every number in it, `Batman 01-07` 1 to 7: none of
+  // them is fetched or counted behind. Reintroduce by testing the start alone: "the sweep does not fetch what a
+  // range file holds" in chapterRanges.int.test.ts queues 2 to 7.
+  const heldRows = await q<{ number: number; end: number | null; pruned_at: string | null }>(posting
+    ? `SELECT COALESCE(ov.number, b.number) AS number, ${rangeEnd('b', 'ov')} AS end, b.pruned_at
+         FROM lib_books b LEFT JOIN book_overrides ov ON ov.book_id = b.id
         WHERE b.series_id=$1 AND ${heldBooks('b')}`
-    : `SELECT number, pruned_at FROM lib_books WHERE series_id=$1 AND ${heldBooks()}`, [seriesId]);
-  const have = new Set(heldRows.map((r) => Number(r.number)));
+    : `SELECT b.number, ${rawRangeEnd('b')} AS end, b.pruned_at FROM lib_books b WHERE b.series_id=$1 AND ${heldBooks('b')}`, [seriesId]);
+  const have = heldBy(heldRows);
   // The held numbers a LIVE row stands behind. The sweep needs only `have`; "Fetch newest" tells a
   // number we hold as pages apart from one we hold only as a deliberate tombstone (see the verdict below).
-  const live = new Set(heldRows.filter((r) => r.pruned_at == null).map((r) => Number(r.number)));
+  const live = heldBy(heldRows.filter((r) => r.pruned_at == null));
   // A covered number is another site's split of a chapter (R2, R3): not this sweep's to fetch, and not "behind" either.
   const missing = wanted.filter((c) => !have.has(c.number) && !covered.has(c.number)).sort((a, b) => a.number - b.number);
-  await stampChecked(seriesId, releases.length, missing.length);
+  await stampChecked(seriesId, releases.filter((c) => !notice(c.number)).length, missing.length);
   // The ledger for this series, read once: which chapters have already failed CHAPTER_RETRY_CAP times and
   // are not attempted again by the sweep, and which have been REFUSED twice by the very source that still
   // lists them. The second set is `persistent` for the fallback helper (lib/chapterFallback.ts): a refusal
@@ -478,7 +509,7 @@ async function visitSeries(seriesId: string, maxNew: number, opts: UpdateOpts): 
     // the source that ranks first (R3, whose own parts are the ones to fetch). Reintroduce by taking the top of every
     // release: "Fetch newest takes the newest chapter, not another site's part of one" in updater.int.test.ts finds
     // 78.9 queued for download.
-    const top = releases.filter((c) => !covered.has(c.number))
+    const top = releases.filter((c) => !covered.has(c.number) && !notice(c.number))
       .reduce<SourceChapter | null>((best, c) => (best && best.number >= c.number ? best : c), null);
     const via = top ? (top.source ?? (s.source_id as string)) : '';
     if (!top) newest = { number: null, state: 'unlisted' };
@@ -534,7 +565,7 @@ async function visitSeries(seriesId: string, maxNew: number, opts: UpdateOpts): 
   // Asked only when there is something to download: a listing refresh (maxNew 0) costs no extra query.
   const adult = queue.length > 0 && maxNew > 0 ? await seriesIsAdult(seriesId) : false;
   const sweepRule = await sweepAllowedFor(adult);
-  const allowed = (id: string) => sweepRule(id) && (opts.sourceAllowed?.(id) ?? true);
+  const allowed = (id: string) => sweepRule(id) && (opts.sourceAllowed?.(id) ?? true) && !opts.resting?.(id);
   // No hunt under posting order: a source found for the purpose numbers these posts its own way.
   const huntBudget = opts.hunt === false || opts.newestOnly || posting ? null : (opts.hunt ?? { left: HUNT_MAX_PER_SWEEP });
   const meta = { series: s.title, summary: s.summary, author: s.author, genres: s.genres, url: s.web, status: s.status };

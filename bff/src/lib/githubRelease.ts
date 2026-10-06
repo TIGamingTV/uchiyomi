@@ -2,7 +2,9 @@
  * "What is the newest published release of X?", asked of GitHub, safely.
  *
  * This was written for the Cloudflare solver and is now also used to tell an operator that a newer Uchiyomi
- * exists. Both are the same job with a different repo, so the rules live here once.
+ * exists. Both are the same job with a different repo, so the rules live here once. Since v0.55.1 it also reads how
+ * often an extension repository's release files were downloaded (releaseAssets), so Fix everything tries the popular
+ * extensions first (lib/extensionRank.ts): the same public GET, the same rules.
  *
  * ⚠️ THE ANSWER MUST NEVER MATTER. No network, a rate-limited reply, a tag in a shape nobody predicted:
  * every one of those means "no opinion" -- never an error, never a status of its own, never a reason for a
@@ -22,6 +24,12 @@
 const TTL_MS = 24 * 60 * 60_000;
 /** Long enough to be worth having, short enough that a hanging GitHub cannot hold a health check open. */
 const TIMEOUT_MS = 4000;
+/**
+ * GitHub's API, or what GITHUB_API_URL names in its place (v0.55.1): a mirror, or a test rig's stand-in -- the browser
+ * walk's fake engine answers the releases list there, so Fix everything's popular-first order is driven end to end.
+ * Read once, at load, as the install count's own address is (installPing.ts).
+ */
+const API = (process.env.GITHUB_API_URL || 'https://api.github.com/').replace(/\/+$/, '');
 
 const cache = new Map<string, { at: number; version: string | null }>();
 
@@ -61,7 +69,7 @@ export async function latestRelease(repo: string, now = Date.now()): Promise<str
   if (hit && now - hit.at < TTL_MS) return hit.version;
   let version: string | null = null;
   try {
-    const r = await fetch(`https://api.github.com/repos/${repo}/releases/latest`, {
+    const r = await fetch(`${API}/repos/${repo}/releases/latest`, {
       headers: { accept: 'application/vnd.github+json', 'user-agent': 'uchiyomi' },
       signal: AbortSignal.timeout(TIMEOUT_MS),
     });
@@ -79,7 +87,52 @@ export async function latestRelease(repo: string, now = Date.now()): Promise<str
   return version;
 }
 
+/** One release file: how many times it was downloaded, and when its release was published. */
+export interface ReleaseAsset { downloads: number; publishedAt: string | null }
+
+const assetCache = new Map<string, { at: number; assets: Map<string, ReleaseAsset> | null }>();
+
+/**
+ * Every file of `repo`'s newest hundred releases (`owner/name`), by its download address
+ * (`https://github.com/<owner>/<name>/releases/download/<tag>/<file>`, as an extension repository's index points at
+ * it), or null if we could not find out. Never throws.
+ *
+ * Asked at most once a day per repo, as latestRelease is. ⚠️ A failure keeps the last answer that came, however old --
+ * yesterday's counts still say which extensions people use -- and is not asked again before the day is out either, so
+ * an unreachable GitHub is one request a day, not one a run.
+ */
+export async function releaseAssets(repo: string, now = Date.now()): Promise<Map<string, ReleaseAsset> | null> {
+  const hit = assetCache.get(repo);
+  if (hit && now - hit.at < TTL_MS) return hit.assets;
+  let assets = hit?.assets ?? null;
+  try {
+    const r = await fetch(`${API}/repos/${repo}/releases?per_page=100`, {
+      headers: { accept: 'application/vnd.github+json', 'user-agent': 'uchiyomi' },
+      signal: AbortSignal.timeout(TIMEOUT_MS),
+    });
+    if (r.ok) {
+      const list = (await r.json()) as unknown;
+      if (Array.isArray(list)) {
+        const fresh = new Map<string, ReleaseAsset>();
+        for (const rel of list as Array<{ published_at?: unknown; assets?: unknown }>) {
+          const publishedAt = typeof rel?.published_at === 'string' ? rel.published_at : null;
+          for (const a of Array.isArray(rel?.assets) ? rel.assets as Array<{ browser_download_url?: unknown; download_count?: unknown }> : []) {
+            if (typeof a?.browser_download_url !== 'string') continue;
+            fresh.set(a.browser_download_url, { downloads: Math.max(0, Number(a.download_count) || 0), publishedAt });
+          }
+        }
+        assets = fresh;
+      }
+    }
+  } catch {
+    /* offline, blocked, timed out -- the last answer stands */
+  }
+  assetCache.set(repo, { at: now, assets });
+  return assets;
+}
+
 /** Test seam: drop the memoised answers. */
 export function resetReleaseCache(): void {
   cache.clear();
+  assetCache.clear();
 }

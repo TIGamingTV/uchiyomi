@@ -4,15 +4,18 @@ import { z } from 'zod';
 import { q, one, tx } from '../lib/db';
 import { postingOrderSeries, POSTING_ORDER_REFUSAL } from '../lib/numbering';
 import numberingRoutes from './numbering';
+import { lastNumber } from '../lib/chapterRanges';
 import findSourcesRoutes from './findSources';
 import autoHeroRoutes from './autoHero';
+import rescanRoutes from './rescan';
 import { content as komga } from '../lib/backend';
 import { cacheBytes } from '../lib/imageCache';
 import { runtime } from '../lib/runtime';
-import { persistScan, libraryIdFor, LIBRARY_ROOT, DL_ROOT, setBookDates, setBookMeta } from '../lib/library';
+import { persistScan, libraryIdFor, libraryRows, LIBRARY_ROOT, DL_ROOT, setBookDates, setBookMeta } from '../lib/library';
+import { applyMoves, heldElsewhere, lockLibrarySaves, previewMoves, setFolders, storedFolders, underSql, LIBRARY_MAX_FOLDERS } from '../lib/libraryFolders';
 import { containedPath, allWritable } from '../lib/fsGuard';
-import { deleteSeries, restoreSeries, mergeSeries, getSeriesRow, deleteSeriesFiles, renameSeriesFolder, forgetSeries, diskSpelling } from '../lib/libraryAdmin';
-import { editionFollowing, linkEdition, unlinkEdition, workRows } from '../lib/editions';
+import { deleteSeries, restoreSeries, mergeSeries, mergeRefusal, getSeriesRow, deleteSeriesFiles, renameSeriesFolder, forgetSeries, diskSpelling, deleteChapterFiles } from '../lib/libraryAdmin';
+import { editionFollowing, linkEdition, linkPair, unlinkEdition, workRows } from '../lib/editions';
 import { toStoredRel, trimTrailingSlashes } from '../lib/relPath';
 import { runFingerprintBackfill, fingerprintRemaining, fpState } from '../lib/fingerprintJob';
 import { runPageHashBackfill, pageHashRemaining, phState } from '../lib/pageHashJob';
@@ -21,6 +24,7 @@ import { runUpdateAll, updateSeries, runSweep } from '../lib/updater';
 import { ARCHIVE_SETTINGS_COLS, ARCHIVE_SETTINGS_SHAPE, archiveWindowPair, applyArchiveSettings, archiveFreeGb } from '../lib/archive';
 import { runChapterCleanup, cleanupSettings, dueCountCached, tombstoneBooks } from '../lib/chapterCleanup';
 import { runVerify, verifyState } from '../lib/verifyFiles';
+import { startRescan, rescanState } from '../lib/rescan';
 import { runRepair, repairState, repairLiveSnapshot, REPAIR_HOURS, REPAIR_LIMITS, REPAIR_STEPS, REPAIR_SHORT_MAX, REPAIR_GAPS_MAX, type RepairSkip, type RepairStep } from '../lib/repair';
 import { listRunRecords, runDigest, type RunTarget } from '../lib/repairRuns';
 import { worstCase } from '../lib/repairEstimate';
@@ -30,7 +34,7 @@ import { recordAltTitles } from '../lib/altTitles';
 import { healthAllWithEvidence, setDisabled, clearBlock, pruneOrphanedHealth, isDisabled, blockedNow } from '../lib/sourceHealth';
 import { smokeTest } from '../lib/sourceProbe';
 import { startSourceCheck, checkRunning, checkProgress } from '../lib/sourceWatchdog';
-import { checkSourceLive, recordLiveResult } from '../lib/sourceCheck';
+import { testSource } from '../lib/sourceCheck';
 import { currentFailures, stageLines } from '../lib/sourceEvidence';
 import { runExtensionMonitor, runExtensionCheck, extState, liveStore as extensionStore } from '../lib/extensionMonitor';
 import { readSites, writeSites } from '../lib/sources/customSites';
@@ -49,9 +53,12 @@ import sharp from 'sharp';
 import { ART_BODY_LIMIT, ART_DIR, artFile, artOverview } from '../lib/seriesArt';
 import { writePreflight } from '../lib/fsGuard';
 // Admin stats report on the whole library by definition; this route is already behind requireAdmin.
-import { NO_LIBRARIES, SYSTEM_CTX, visibleToAll, sanitiseAdultList, sanitiseSourceIds, invalidateAdultFilter, browsableIds, viewCtxFor, hideAdult } from '../lib/visibility';
+import { NO_LIBRARIES, SYSTEM_CTX, visibleToAll, sanitiseAdultList, sanitiseSourceIds, invalidateAdultFilter, browsableIds, nameableIds, viewCtxFor, hideAdult } from '../lib/visibility';
 import { cleanSourceOrder, invalidateSourcePrefs } from '../lib/sourcePrefs';
 import { borrowNamesFor, clearBorrowedNames } from '../lib/borrowNames';
+import { sanitiseNoticeTypes } from '../lib/noticeChapters';
+import { seriesHidesNotices, hiddenCount, refreshNoticesActive } from '../lib/noticeSettings';
+import { SERIES_TYPES, isKnownSeriesType, learnTypeFromAniList } from '../lib/seriesType';
 import { addSeriesFromSource, findBestMatch, resolveCandidate, norm, jobBusy, startDownloadJob, clearLatestCache, FILL_MAX_CHAPTERS, REFRESH_BUDGET_MS } from './sources';
 import { confirmsTitle } from '../lib/confirmTitle';
 import { chapterFileRel } from '../lib/downloader';
@@ -66,6 +73,7 @@ import { groupStats, emptyGroupStat, type StatCopy } from '../lib/groupStats';
 import { copyToChapter, type ListingCopy } from '../lib/seriesListing';
 import { seriesSourcesFor } from '../lib/seriesSources';
 import { switchMainSource } from '../lib/mainSource';
+import { refileFailures } from '../lib/chapterFailures';
 import { mainUses, retireSource } from '../lib/retireSource';
 import { sourcesOverview } from '../lib/sourcesOverview';
 import { titlesFromBackup, entriesFromBackup, type BackupEntry } from '../lib/tachibk';
@@ -73,6 +81,7 @@ import { linkSeries, seedTrackerFloor } from '../lib/trackers';
 import { ADAPTERS, PROVIDERS, LIST_STATUSES, TRACKER_LIST_MAX, type Provider, type LibraryEntry } from '../lib/trackerProviders';
 import { open as unseal } from '../lib/secretbox';
 import { findingOf, runHealthChecks } from '../lib/health';
+import { autofixRun, autofixSeriesIds, autofixState, scrubAutofixRecord, scrubAutofixRun, startAutofix, stopAutofix } from '../lib/autofix';
 import { IGNORABLE_CHECKS, ignoreFinding, unignoreFinding } from '../lib/healthIgnore';
 import { readHealthSummary, scheduleHealthSummaryRefresh, storeHealthSummary } from '../lib/healthSummary';
 import { titlesFromMangadexList, entriesFromMangadexList } from '../lib/mangadexList';
@@ -430,6 +439,16 @@ async function listable(req: FastifyRequest, ids: Array<string | undefined>): Pr
   if (!list.length) return new Set();
   return browsableIds(list, await viewCtxFor(userIdOf(req), roleOf(req), { hideAdult: hideAdult(req) }));
 }
+/**
+ * Which of these series this admin may see named in Fix everything's lines and its "Now:" (v0.55.1): their reach, judged
+ * on each series as it stands whatever became of it since -- a merge names the series it merged away (visibility.ts
+ * nameableIds). Asked only for an admin who hides 18+: with the reveal on, an admin's reach is everything. One query,
+ * and none when there is nothing to ask.
+ */
+async function nameable(req: FastifyRequest, ids: string[]): Promise<Set<string>> {
+  if (!ids.length) return new Set();
+  return nameableIds(ids, await viewCtxFor(userIdOf(req), roleOf(req), { hideAdult: hideAdult(req) }));
+}
 const scrubTarget = (t: RunTarget, ok: Set<string>): RunTarget =>
   (t.seriesId && !ok.has(t.seriesId) ? { ...t, label: undefined } : t);
 const scrubSkips = (skips: RepairSkip[] | undefined, ok: Set<string>): RepairSkip[] =>
@@ -460,6 +479,8 @@ export default async function adminRoutes(app: FastifyInstance) {
   await app.register(findSourcesRoutes);
   // v0.51.0: a new automatic banner for a series, the same way (routes/autoHero.ts).
   await app.register(autoHeroRoutes);
+  // v0.55.4: Rescan everything's preview and plan, the same way (routes/rescan.ts).
+  await app.register(rescanRoutes);
 
   // Owned-library scan (Phase 1): walk the CBZ folder and upsert lib_series/lib_books. Stamps lastScan like
   // POST /api/refresh does (the Tasks row's "last run", and that route's one-a-minute rule), and asks the
@@ -505,15 +526,23 @@ export default async function adminRoutes(app: FastifyInstance) {
   const SETTINGS_COLS = 'server_name, allow_registration, updater_hours, extension_hours, extension_auto_update, '
     + 'update_check, install_ping, install_ping_last, scanlator_prefs, cleanup_read, cleanup_read_days, backup_hour, auto_follow_on_failure, '
     + 'repair_enabled, komga_ghost_chapters, adult_genres, adult_sources, source_prefs, group_upgrade, borrow_names, '
-    + 'mangadex_langs, unstated_lang, '
+    + 'mangadex_langs, unstated_lang, hide_notice_types, '
     + ARCHIVE_SETTINGS_COLS;
   // `extensions_configured` is not a column: extension_hours has a NOT NULL default, so its presence says
   // nothing about whether there is an engine to check. The settings page needs to know, or it offers two
   // controls for a job that can never run.
   const settingsRow = async () => {
     const row = await one<any>(`SELECT ${SETTINGS_COLS} FROM server_settings WHERE id = 1`);
+    // v0.55.0: what the nightly runs, `repair` (the safe repair) or `autofix` (Fix everything). Read apart from the
+    // columns above and said as the contract names it; an unknown value reads as the default.
+    const mode = await one<{ m: string | null }>('SELECT nightly_mode AS m FROM server_settings WHERE id = 1').catch(() => null);
+    // v0.55.3 (#147): "Only hide short ones" -- the notice switches' rule (lib/noticeChapters.ts). Read apart and said
+    // as the contract names it, as nightlyMode is; on unless the column says off.
+    const shortOnly = await one<{ s: boolean | null }>('SELECT hide_notice_short_only AS s FROM server_settings WHERE id = 1').catch(() => null);
     return {
       ...row,
+      nightlyMode: mode?.m === 'autofix' ? 'autofix' : 'repair',
+      hideNoticeShortOnly: shortOnly?.s !== false,
       extensions_configured: suwayomiConfigured(),
       // How many chapters the read-chapter cleanup would delete if it ran now, at the CURRENT day setting.
       // Computed here rather than only in the tasks list because the tasks list does not show the job until
@@ -597,6 +626,12 @@ export default async function adminRoutes(app: FastifyInstance) {
       // renumbers anything. The tick re-reads this column every time, so switching it off takes effect
       // without a restart.
       repairEnabled: z.boolean().optional(),
+      /**
+       * v0.55.0: what the nightly runs -- `repair`, the safe repair (the default, as before), or `autofix`, Health's Fix
+       * everything (lib/autofix.ts). `repairEnabled` still switches the nightly off entirely; the scheduler reads this
+       * every tick, so a change applies to the next run without a restart.
+       */
+      nightlyMode: z.enum(['repair', 'autofix']).optional(),
       // Ghost chapters on the Komga surface (lib/komgaGhosts.ts). Affects nothing this server stores and
       // nothing the web app shows: it widens one API's chapter list so the trackers behind it can count.
       komgaGhostChapters: z.boolean().optional(),
@@ -636,6 +671,20 @@ export default async function adminRoutes(app: FastifyInstance) {
        * sites are in another. The same-language guard on automatic follows reads it.
        */
       unstatedLang: z.string().min(1).max(35).optional(),
+      /**
+       * Notice chapters (lib/noticeChapters.ts): the series types whose notice chapters are hidden everywhere, replaced
+       * whole. A notice is numbered with a fraction (100.5) and has 3 pages or fewer, known -- a longer one, one not
+       * counted yet and a file holding a range of chapters are chapters -- and one its sources list as that short is
+       * not downloaded. Empty is off, the default. A series' own switch (`hideNotices` on PATCH
+       * /api/admin/series/:id) outranks its type's.
+       */
+      hideNoticeTypes: z.array(z.enum(SERIES_TYPES)).max(SERIES_TYPES.length).optional(),
+      /**
+       * v0.55.3 (#147, TIGamingTV): "Only hide short ones (3 pages or fewer)", on by default -- the rule above. Off, every
+       * chapter numbered with a fraction of the types (and series) switched on is a notice, real chapters a site split
+       * into parts included; a file holding a range of chapters never is, either way.
+       */
+      hideNoticeShortOnly: z.boolean().optional(),
       // The slow archive's pause and pacing (#117, lib/archive.ts): the window's two ends together or not at all.
       ...ARCHIVE_SETTINGS_SHAPE,
     }).superRefine(archiveWindowPair).parse(req.body);
@@ -664,6 +713,7 @@ export default async function adminRoutes(app: FastifyInstance) {
     if (b.cleanupRead !== undefined) await q('UPDATE server_settings SET cleanup_read = $1, updated_at = now() WHERE id = 1', [b.cleanupRead]);
     if (b.cleanupReadDays !== undefined) await q('UPDATE server_settings SET cleanup_read_days = $1, updated_at = now() WHERE id = 1', [b.cleanupReadDays]);
     if (b.repairEnabled !== undefined) await q('UPDATE server_settings SET repair_enabled = $1, updated_at = now() WHERE id = 1', [b.repairEnabled]);
+    if (b.nightlyMode !== undefined) await q('UPDATE server_settings SET nightly_mode = $1, updated_at = now() WHERE id = 1', [b.nightlyMode]);
     // The scheduler is re-armed at once, so the change applies to the NEXT run rather than the one after: the
     // timer used to re-read the hour only when it fired (server.ts, the backup block says why).
     if (b.backupHour !== undefined) { await q('UPDATE server_settings SET backup_hour = $1, updated_at = now() WHERE id = 1', [b.backupHour]); runtime.rearmBackup?.(); }
@@ -713,6 +763,19 @@ export default async function adminRoutes(app: FastifyInstance) {
       // The guard compares synchronously (lib/lang.ts): the next follow decision reads the new language.
       setUnstatedLang(lang);
     }
+    if (b.hideNoticeTypes !== undefined) {
+      // Read live by every query (lib/noticeChapters.ts): the next request lists, counts and sweeps by it -- once the
+      // in-process flag that says whether anything hides at all has been read again, here.
+      await q('UPDATE server_settings SET hide_notice_types = $1::jsonb, updated_at = now() WHERE id = 1',
+        [JSON.stringify(sanitiseNoticeTypes(b.hideNoticeTypes))]);
+      await refreshNoticesActive();
+    }
+    if (b.hideNoticeShortOnly !== undefined) {
+      // The rule is written into each query as it is built (lib/noticeChapters.ts), so it is read again here, as the
+      // types' flag is: the next request lists, counts and sweeps by it.
+      await q('UPDATE server_settings SET hide_notice_short_only = $1, updated_at = now() WHERE id = 1', [b.hideNoticeShortOnly]);
+      await refreshNoticesActive();
+    }
     await applyArchiveSettings(b);
     await logAudit('settings.update', { userId: userIdOf(req), detail: b, req });
     return settingsRow();
@@ -730,12 +793,13 @@ export default async function adminRoutes(app: FastifyInstance) {
     scheduleVars: vars,
   });
   app.get('/api/admin/tasks', async (req) => {
-    const s = await one<{ updater_hours: number; backup_hour: number; backup_last_run: string | null; backup_last_result: any; extension_hours: number; extension_auto_update: boolean; extension_last_run: string | null; extension_last_result: any; cleanup_read: boolean; cleanup_read_days: number; cleanup_read_last_run: string | null; cleanup_read_last_result: any; verify_last_run: string | null; verify_last_result: any; repair_enabled: boolean; repair_last_run: string | null; repair_last_result: any }>(
+    const s = await one<{ updater_hours: number; backup_hour: number; backup_last_run: string | null; backup_last_result: any; extension_hours: number; extension_auto_update: boolean; extension_last_run: string | null; extension_last_result: any; cleanup_read: boolean; cleanup_read_days: number; cleanup_read_last_run: string | null; cleanup_read_last_result: any; verify_last_run: string | null; verify_last_result: any; repair_enabled: boolean; repair_last_run: string | null; repair_last_result: any; rescan_last_run: string | null; rescan_last_result: any }>(
       `SELECT updater_hours, backup_hour, backup_last_run, backup_last_result,
               extension_hours, extension_auto_update, extension_last_run, extension_last_result,
               cleanup_read, cleanup_read_days, cleanup_read_last_run, cleanup_read_last_result,
               verify_last_run, verify_last_result,
-              repair_enabled, repair_last_run, repair_last_result
+              repair_enabled, repair_last_run, repair_last_result,
+              rescan_last_run, rescan_last_result
          FROM server_settings WHERE id = 1`,
     );
     // the backup's last run is persisted, so prefer the DB value over the in-memory one (which resets on restart)
@@ -794,6 +858,17 @@ export default async function adminRoutes(app: FastifyInstance) {
         lastRun: verifyState.finishedAt || (s?.verify_last_run ? new Date(s.verify_last_run).getTime() : null),
         lastResult: verifyState.finishedAt ? verifyState.lastResult : (s?.verify_last_result ?? null),
         running: verifyState.running,
+      },
+      // v0.55.4 (#150): the look for chapters whose files are gone from your own folders, previewed, then applied
+      // (lib/rescan.ts). On demand only, like Verify. Its line is the last APPLY's, persisted the same way -- a preview
+      // changes nothing, so there is nothing of it to report here; the panel under the row shows it.
+      {
+        id: 'rescan',
+        name: 'Rescan everything',
+        ...sched('on demand'),
+        lastRun: rescanState.appliedAt || (s?.rescan_last_run ? new Date(s.rescan_last_run).getTime() : null),
+        lastResult: rescanState.appliedAt ? rescanState.lastApplied : (s?.rescan_last_result ?? null),
+        running: !!rescanState.running,
       },
       // The nightly repair (lib/repair.ts). Listed whether it is on or off, and the schedule text says
       // which: unlike the read-chapter cleanup there is no "are you sure" to attach to its Run now, because
@@ -953,11 +1028,15 @@ export default async function adminRoutes(app: FastifyInstance) {
     // Reintroduce by sending them as stored: "an admin who hides 18+ reads no adult title" in
     // repairRoutes.int.test.ts finds the title in the history.
     const noNotes = hideAdult(req);
+    // A Fix everything run's record (v0.55.0) names series in its lines, by title: since v0.55.1 each line with the ids of
+    // the series it names, held to them as its own routes hold it (lib/autofix.ts scrubAutofixRecord), since Recent
+    // repairs reads it from here.
+    const named = noNotes ? await nameable(req, content.flatMap((r) => (r.kind === 'autofix' ? autofixSeriesIds(r.result) : []))) : undefined;
     return {
       content: content.map((r) => ({
         ...r,
         target: scrubTarget(r.target, ok),
-        result: scrubResult(r.result, ok),
+        result: r.kind === 'autofix' ? scrubAutofixRecord(r.result, noNotes, named) : scrubResult(r.result, ok),
         ...(noNotes ? { notes: null } : {}),
       })),
     };
@@ -1010,6 +1089,16 @@ export default async function adminRoutes(app: FastifyInstance) {
         (r) => logAudit('library.verify', { userId, detail: { checked: r.checked, missing: r.missing, readLibraryMissing: r.readLibraryMissing, unmounted: r.unmounted, ms: r.ms }, req }),
         () => {}, // runVerify logs it and clears the result; this only stops an unhandled rejection
       );
+      return { ok: true, started: true };
+    }
+    if (id === 'rescan') {
+      // Never awaited, for Verify's reason (lib/rescan.ts): a scan and one stat per chapter over a share is minutes, and
+      // a request that long dies at the proxy while the walk goes on. The Tasks panel polls
+      // GET /api/admin/tasks/rescan/status for the phase and the plan; startRescan refuses a second preview on top of a
+      // first. Reintroduce by awaiting `run` here: "the preview answers started" in rescan.int.test.ts finds no `started`.
+      const run = startRescan(app.log);
+      if (!run) return { ok: false, error: 'busy' };
+      run.catch(() => {}); // startRescan logs it and records the failure; this only stops an unhandled rejection
       return { ok: true, started: true };
     }
     if (id === 'update') {
@@ -1185,10 +1274,13 @@ export default async function adminRoutes(app: FastifyInstance) {
       borrowNames: z.boolean().nullable().optional(),
       lang: z.string().min(1).max(35).nullable().optional(),
       chapterFloor: z.union([z.literal('caught_up'), z.number().min(0).max(1e6), z.null()]).optional(),
+      // Notice chapters (lib/noticeChapters.ts): this series' own switch, outranking its type's; null follows the type.
+      hideNotices: z.boolean().nullable().optional(),
     }).strict().safeParse(req.body);
     if (!b.success) return reply.code(400).send({ error: 'bad_request' });
     if (b.data.autoUpdate === undefined && b.data.scanlatorPrefs === undefined && b.data.sourcePrefs === undefined
-        && b.data.borrowNames === undefined && b.data.lang === undefined && b.data.chapterFloor === undefined) {
+        && b.data.borrowNames === undefined && b.data.lang === undefined && b.data.chapterFloor === undefined
+        && b.data.hideNotices === undefined) {
       return reply.code(400).send({ error: 'bad_request', message: 'Nothing to change.' });
     }
     const row = await getSeriesRow(id);
@@ -1210,14 +1302,17 @@ export default async function adminRoutes(app: FastifyInstance) {
         `SELECT s.chapter_floor AS floor,
                 (SELECT max(n) FROM (SELECT l.number::float8 AS n FROM series_listing l WHERE l.series_id = s.id
                                      UNION ALL
-                                     SELECT COALESCE(ov.number, bk.number)::float8 FROM lib_books bk LEFT JOIN book_overrides ov ON ov.book_id = bk.id
+                                     SELECT (${lastNumber('bk', 'ov')})::float8 FROM lib_books bk LEFT JOIN book_overrides ov ON ov.book_id = bk.id
                                       WHERE bk.series_id = s.id) x) AS top
            FROM lib_series s WHERE s.id = $1`, [id]);
       const previous = prev?.floor == null ? null : Number(prev.floor);
       if (b.data.chapterFloor === 'caught_up' && prev?.top == null) {
         return reply.code(409).send({ error: 'nothing_listed', message: 'No chapter of this series is listed or here yet. Check for new chapters first.' });
       }
-      // A hair above the newest number, as the "Nothing yet" add floors: `chapter_floor` is inclusive from below.
+      // A hair above the newest number, as the "Nothing yet" add floors: `chapter_floor` is inclusive from below. A file
+      // holding a range is as new as its END (lib/chapterRanges.ts): caught up past `Batman 01-07` is past 7.
+      // Reintroduce the start above: "Mark caught up floors the series above a range file's end" in
+      // chapterRanges.int.test.ts finds the floor at 1.001.
       caughtUp = { floor: b.data.chapterFloor === 'caught_up' ? Number(prev!.top) + 0.001 : b.data.chapterFloor, previous };
     }
     const detail: Record<string, unknown> = { id };
@@ -1260,10 +1355,22 @@ export default async function adminRoutes(app: FastifyInstance) {
       if (on) void borrowNamesFor(id, { force: true }).catch(() => {});
       else await clearBorrowedNames({ seriesId: id }).catch(() => 0);
     }
+    let notices: { hideNotices: boolean | null; hideNoticesEffective: boolean; hiddenNotices: number } | undefined;
+    if (b.data.hideNotices !== undefined) {
+      // Nothing to move: every read applies the switch as it stands (lib/noticeChapters.ts), and the next sweep
+      // fetches what it no longer hides. Answered with what applies now and how many chapters that hides. A series'
+      // own switch alone can turn the hide on, so the flag that says whether anything hides is read again first.
+      await q('UPDATE lib_series SET hide_notices = $2 WHERE id = $1', [id, b.data.hideNotices]);
+      await refreshNoticesActive();
+      detail.hideNotices = b.data.hideNotices;
+      const effective = await seriesHidesNotices(id);
+      notices = { hideNotices: b.data.hideNotices, hideNoticesEffective: effective, hiddenNotices: effective ? await hiddenCount(id) : 0 };
+    }
     await logAudit('series.settings', { userId: userIdOf(req), detail, req });
     return {
       ok: true, ...(b.data.autoUpdate !== undefined ? { autoUpdate: b.data.autoUpdate } : {}),
       ...(b.data.lang !== undefined ? { lang } : {}), ...(caughtUp ? { chapterFloor: caughtUp } : {}),
+      ...(notices ?? {}),
     };
   });
 
@@ -1528,6 +1635,12 @@ export default async function adminRoutes(app: FastifyInstance) {
     // Reintroduce by dropping this DELETE: "unfollowing a source takes its listing rows with it" in
     // chapterActions.int.test.ts still finds the number listed.
     await q('DELETE FROM series_listing WHERE series_id = $1 AND source_id = $2', [id, sourceId]).catch(() => {});
+    // Failures follow the series (v0.55.3, lib/chapterFailures.ts): what this source failed is the main source's to
+    // retry now, filed under it with its tries starting again -- never left under a source the series no longer reads,
+    // where Health listed it and Fix everything called it a person's. Best effort, as the listing's DELETE.
+    // Reintroduce by dropping it: "unfollowing a source files the chapters it failed under the main source" in
+    // mainSource.int.test.ts finds chapter 6 under ms-c, capped.
+    await refileFailures(q, [id]).catch(() => 0);
     // The DELETE is the guarantee; the rewrite is the courtesy. A number both sources listed whose CHOSEN
     // copy was the follower's went with the rows above, so until the next check it is neither a ghost nor
     // fetchable even though the primary lists it. A listing pass with nothing to download (maxNew 0) puts
@@ -1651,23 +1764,22 @@ export default async function adminRoutes(app: FastifyInstance) {
     const { id } = req.params as { id: string };
     const b = z.object({ into: z.string().min(1).max(64) }).safeParse(req.body);
     if (!b.success) return reply.code(400).send({ error: 'bad_request', message: 'Which series should it merge into?' });
-    if (b.data.into === id) return reply.code(400).send({ error: 'same_series', message: 'A series cannot merge into itself.' });
-
-    const from = await getSeriesRow(id);
-    const into = await getSeriesRow(b.data.into);
-    if (!from || !into) return reply.code(404).send({ error: 'not_found' });
-    for (const [row, which] of [[from, 'source'], [into, 'target']] as const) {
-      if (row.deleted_at) return reply.code(400).send({ error: 'deleted', message: `The ${which} series is hidden. Restore it first.` });
-      if (row.merged_into) return reply.code(400).send({ error: 'merged', message: `The ${which} series was already merged into another one.` });
-    }
+    // lib/libraryAdmin.ts mergeRefusal (v0.55.0): the checks in one place, which Fix everything's merges ask too.
     // Two language editions of one work are two languages' chapters (v0.52.0): merged, the list would hold both under
-    // one number each, in whichever language came first. Reintroduce by dropping this: "a merge inside one work is
-    // refused" in editions.int.test.ts answers 200 and moves the chapters.
-    const works = await q<{ work_id: string | null }>('SELECT work_id FROM lib_series WHERE id = ANY($1)', [[id, into.id]]);
-    if (works.length === 2 && works[0].work_id && works[0].work_id === works[1].work_id) {
-      return reply.code(409).send({ error: 'same_work', message: 'These are two language editions of one work. Unlink one first if they really are the same edition.' });
+    // one number each, in whichever language came first. Reintroduce by dropping that check: "a merge inside one work
+    // is refused" in editions.int.test.ts answers 200 and moves the chapters.
+    const no = await mergeRefusal(id, b.data.into);
+    if (no) {
+      switch (no.refused) {
+        case 'same_series': return reply.code(400).send({ error: 'same_series', message: 'A series cannot merge into itself.' });
+        case 'not_found': return reply.code(404).send({ error: 'not_found' });
+        case 'deleted': return reply.code(400).send({ error: 'deleted', message: `The ${no.which} series is hidden. Restore it first.` });
+        case 'merged': return reply.code(400).send({ error: 'merged', message: `The ${no.which} series was already merged into another one.` });
+        case 'same_work': return reply.code(409).send({ error: 'same_work', message: 'These are two language editions of one work. Unlink one first if they really are the same edition.' });
+      }
     }
-
+    const from = (await getSeriesRow(id))!;
+    const into = (await getSeriesRow(b.data.into))!;
     const r = await mergeSeries(id, into.id);
     await logAudit('series.merge', {
       userId: userIdOf(req),
@@ -1690,28 +1802,22 @@ export default async function adminRoutes(app: FastifyInstance) {
       with: z.string().min(1).max(64), lang: z.string().min(1).max(35).optional(), withLang: z.string().min(1).max(35).optional(),
     }).strict().safeParse(req.body);
     if (!b.success) return reply.code(400).send({ error: 'bad_request', message: 'Which series should it be linked with?' });
-    if (b.data.with === id) return reply.code(400).send({ error: 'same_series', message: 'A series cannot be an edition of itself.' });
-    const [mine, theirs] = await Promise.all([workRows(id), workRows(b.data.with)]);
-    const a = mine.find((r) => r.id === id);
-    const w = theirs.find((r) => r.id === b.data.with);
-    if (!a || !w) return reply.code(404).send({ error: 'not_found' });
-    if (a.hidden || w.hidden) return reply.code(400).send({ error: 'deleted', message: 'One of the two is removed from the library. Put it back first.' });
-    if (mine.length > 1 && theirs.length > 1) {
-      return mine.some((r) => r.id === w.id)
-        ? reply.code(409).send({ error: 'same_work', message: 'These two are already editions of one work.' })
-        : reply.code(409).send({ error: 'other_work', message: 'Each is already an edition of another work. Unlink one of them first.' });
+    // lib/editions.ts linkPair (v0.55.0): the rules in one place, which Fix everything's duplicates phase runs too.
+    const r = await linkPair(id, b.data.with, { lang: b.data.lang, withLang: b.data.withLang });
+    if ('refused' in r) {
+      switch (r.refused) {
+        case 'same_series': return reply.code(400).send({ error: 'same_series', message: 'A series cannot be an edition of itself.' });
+        case 'not_found': return reply.code(404).send({ error: 'not_found' });
+        case 'deleted': return reply.code(400).send({ error: 'deleted', message: 'One of the two is removed from the library. Put it back first.' });
+        case 'same_work': return reply.code(409).send({ error: 'same_work', message: 'These two are already editions of one work.' });
+        case 'other_work': return reply.code(409).send({ error: 'other_work', message: 'Each is already an edition of another work. Unlink one of them first.' });
+        case 'same_lang': return reply.code(409).send({ error: 'same_lang', message: 'Both are in the same language: merge them instead.' });
+        case 'edition_exists': return reply.code(409).send({ error: 'edition_exists', message: 'That language already has its edition in this work.' });
+      }
     }
-    // What each will state: the language asked for where the series states none, else its own.
-    const langA = a.stated ? a.lang : canonLang(b.data.lang) ?? a.lang;
-    const langW = w.stated ? w.lang : canonLang(b.data.withLang) ?? w.lang;
-    if (langA === langW) return reply.code(409).send({ error: 'same_lang', message: 'Both are in the same language: merge them instead.' });
-    // The one in a work stays where it is and the other joins it.
-    const [joiner, of, joinerLang, ofLang] = mine.length > 1 ? [w, a, langW, langA] : [a, w, langA, langW];
-    const taken = (mine.length > 1 ? mine : theirs).find((r) => r.id !== of.id && r.lang === joinerLang);
-    const r = taken ? 'taken' as const : await linkEdition(joiner.id, { of: of.id, lang: joinerLang, ofLang });
-    if (r === 'taken') return reply.code(409).send({ error: 'edition_exists', message: 'That language already has its edition in this work.' });
-    if (r === 'gone') return reply.code(404).send({ error: 'not_found' });
-    await logAudit('series.edition_link', { userId: userIdOf(req), detail: { id: joiner.id, title: joiner.title, of: of.id, ofTitle: of.title, lang: r.lang }, req });
+    await logAudit('series.edition_link', {
+      userId: userIdOf(req), detail: { id: r.joiner.id, title: r.joiner.title, of: r.of.id, ofTitle: r.of.title, lang: r.lang }, req,
+    });
     return { ok: true, workId: r.workId, lang: r.lang };
   });
 
@@ -1757,6 +1863,12 @@ export default async function adminRoutes(app: FastifyInstance) {
        * from before this field (a cached PWA) wipe the direction on every retitle.
        */
       readingDirection: z.enum(READING_DIRECTIONS).nullable().optional(),
+      /**
+       * What kind of comic it is (lib/seriesType.ts) -- manga, manhwa, manhua, webtoon, comic -- or null for
+       * "automatic": what the genres, the source or AniList said, unknown when none did. The notice-chapter switches
+       * go by it (lib/noticeChapters.ts). Absent leaves it, null clears it, as readingDirection.
+       */
+      seriesType: z.enum(SERIES_TYPES).nullable().optional(),
     }).safeParse(req.body);
     if (!b.success) return reply.code(400).send({ error: 'bad_request' });
     const norm = (v: string | null | undefined) => { const s = (v ?? '').trim(); return s ? s : null; };
@@ -1784,18 +1896,22 @@ export default async function adminRoutes(app: FastifyInstance) {
     // genres all failed the same way, under a message that only said "Could not save". `?? null` because
     // the field is nullish: absent and null both mean "inherit whatever ComicInfo said".
     const sentDirection = b.data.readingDirection !== undefined;
+    const sentType = b.data.seriesType !== undefined;
+    // "unknown" is the absence of a type, not one: stored as NULL, so "Automatic" and "Unknown" cannot disagree.
+    const type = isKnownSeriesType(b.data.seriesType) ? b.data.seriesType : null;
     await tx(async (qq) => {
       await qq(
-        `INSERT INTO series_overrides (series_id, title, summary, author, status, genres, age_rating, adult_exempt, reading_direction, updated_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $10, now())
+        `INSERT INTO series_overrides (series_id, title, summary, author, status, genres, age_rating, adult_exempt, reading_direction, series_type, updated_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $10, $12, now())
          ON CONFLICT (series_id) DO UPDATE SET title = $2, summary = $3, author = $4, status = $5,
            genres = $6, age_rating = $7,
            adult_exempt = COALESCE($8, series_overrides.adult_exempt),
            reading_direction = CASE WHEN $9::boolean THEN $10 ELSE series_overrides.reading_direction END,
+           series_type = CASE WHEN $11::boolean THEN $12 ELSE series_overrides.series_type END,
            updated_at = now()`,
         [id, norm(b.data.title), norm(b.data.summary), norm(b.data.author), norm(b.data.status),
          normGenres(b.data.genres), b.data.ageRating ?? null, b.data.adultExempt ?? null,
-         sentDirection, b.data.readingDirection ?? null],
+         sentDirection, b.data.readingDirection ?? null, sentType, type],
       );
       // The 18+ rating is the WORK's (v0.52.0, #72): written onto every other language edition in the same
       // transaction, so a capped account can never open the Spanish copy of a work rated 18+ in English, nor the 18+
@@ -1818,11 +1934,14 @@ export default async function adminRoutes(app: FastifyInstance) {
   /**
    * Correct one chapter's number or title.
    *
-   * Chapter numbers are parsed out of filenames by numFromName(), which takes the first number it finds, so
-   * "Vol 2 Ch 5.cbz" is chapter 2. That misorders the reader and is what gets reported to a tracker.
+   * Chapter numbers are parsed out of filenames by the row's name rule (lib/naming.ts numberByRule). Rule 1,
+   * numFromName, takes the first number it finds, so a "Vol 2 Ch 5.cbz" scanned before v0.55.2 is chapter 2.
+   * That misorders the reader and is what gets reported to a tracker. A number set here on a file holding a range
+   * of chapters makes it that one chapter (lib/chapterRanges.ts).
    *
    * Deliberately one chapter at a time. A bulk re-parse with a smarter rule would renumber hundreds at once,
-   * and every renumbered chapter that is already COMPLETED changes what AniList is told. The response
+   * and every renumbered chapter that is already COMPLETED changes what AniList is told -- which is why rule 2
+   * reads only the files the scanner meets from v0.55.2 on. The response
    * reports how many people have finished this chapter so the UI can say so before the change is made
    * rather than after.
    */
@@ -1996,80 +2115,11 @@ export default async function adminRoutes(app: FastifyInstance) {
     if (!b.success) return reply.code(400).send({ error: 'bad_request' });
     const row = await getSeriesRow(id);
     if (!row) return reply.code(404).send({ error: 'not_found' });
-    const ids = [...new Set(b.data.bookIds)];
-    const rows = new Map((await chapterRows(id, ids)).map((r) => [r.id, r]));
-    // The same veto the cleanup applies, for the same reason: a bookmark names a page number INSIDE the
-    // file, so deleting the pages turns it into a pointer at nothing. Progress survives a delete (it is a
-    // count); a bookmark does not, and the admin clicking Delete cannot see whose it is.
-    // Reintroduce by dropping this lookup: "a bookmarked chapter is skipped, and says so" in
-    // chapterActions.int.test.ts finds the file gone.
-    const bookmarked = new Set((await q<{ book_id: string }>(
-      'SELECT DISTINCT book_id FROM bookmarks WHERE book_id = ANY($1)', [ids])).map((r) => r.book_id));
-
-    const skipped: Array<{ id: string; reason: string }> = [];
-    const todo: Array<{ id: string; abs: string }> = [];
-    const root = resolve(DL_ROOT);
-    for (const bid of ids) {
-      const r = rows.get(bid);
-      if (!r) { skipped.push({ id: bid, reason: 'not_found' }); continue; }
-      // Reintroduce by dropping this check: "delete removes the file, keeps the row and the progress, skips
-      // the read library" in chapterActions.int.test.ts fails -- the read library's file is gone.
-      if (r.root !== DL_ROOT) { skipped.push({ id: bid, reason: 'not_owned' }); continue; }
-      if (r.pruned_at) { skipped.push({ id: bid, reason: 'already_pruned' }); continue; }
-      if (bookmarked.has(bid)) { skipped.push({ id: bid, reason: 'bookmarked' }); continue; }
-      const abs = containedPath(DL_ROOT, r.file);
-      // A path that escapes its root is refused, never "cleaned up" -- the health page can argue about it.
-      // So is the root ITSELF: containedPath accepts it, the rm below is recursive, and a row whose file
-      // resolves to `.` (a hand-edited row is the only way today) would take the whole download directory.
-      // Reintroduce by dropping the `abs === root` half: "the download root itself is never a chapter" in
-      // chapterActions.int.test.ts finds the directory gone.
-      if (!abs || abs === root) { skipped.push({ id: bid, reason: 'outside_root' }); continue; }
-      todo.push({ id: bid, abs });
-    }
-    if (todo.length) {
-      const w = await allWritable([DL_ROOT]);
-      if (!w.ok) return reply.code(409).send({ error: 'refused', message: w.reason, fix: w.fix });
-    }
-    let applied = 0;
-    let bytes = 0;
-    for (const t of todo) {
-      const st = await stat(t.abs).catch(() => null);
-      if (st) {
-        try { await rm(t.abs, { recursive: true, force: true }); }
-        catch { skipped.push({ id: t.id, reason: 'unlink_failed' }); continue; }
-        bytes += st.size;
-        // A set-aside copy from a refetch the process died in (`<file>.refetch-bak` beside the landed file,
-        // which reapStaleTemp deliberately leaves alone) must not outlive a deliberate delete of the file:
-        // at the next boot the reaper would see a bak with no original, put it back, and the chapter the
-        // admin deleted would be on disk again, un-marked by the next scan, its space never reclaimed.
-        // Reintroduce by dropping this rm: "a stray set-aside copy goes with the file" in
-        // chapterActions.int.test.ts finds the bak still there.
-        await rm(`${t.abs}${REFETCH_BAK}`, { force: true }).catch(() => {});
-      } else if (!(await stat(dirname(t.abs)).catch(() => null))) {
-        // ⚠️ The file is missing AND so is its folder: that is the volume not being there (an unmounted
-        // share whose empty mount point passed the preflight), not a chapter somebody removed by hand.
-        // Marking on that evidence would tombstone a chapter whose file is fine on the unmounted disk and
-        // throw away everything measured about it; the row is left as it is and the answer says why.
-        // Reintroduce by dropping this branch: "a missing download folder is not a deleted chapter" in
-        // chapterActions.int.test.ts finds pruned_at set.
-        skipped.push({ id: t.id, reason: 'unlink_failed' });
-        continue;
-      }
-      // A file already gone -- its folder still there -- is still marked: the row was claiming bytes that
-      // do not exist.
-      await tombstoneBooks([t.id]);
-      applied++;
-    }
-    // The cover follows the lowest LIVE chapter, the way persistScan and mergeSeries pick it: every
-    // thumbnail falls back to the cover chapter's first page, and a tombstone has none.
-    if (applied) {
-      await q(
-        `UPDATE lib_series SET cover_book_id = (
-           SELECT id FROM lib_books WHERE series_id = $1 ORDER BY (pruned_at IS NOT NULL), number ASC, file ASC LIMIT 1
-         ) WHERE id = $1`, [id]);
-    }
-    await logAudit('series.chapters_delete', { userId: userIdOf(req), detail: { id, title: row.title, bookIds: ids, applied, bytes }, req });
-    return { ok: true, applied, bytes, skipped };
+    // lib/libraryAdmin.ts deleteChapterFiles (v0.55.0): the route's own rules, in one place, which Fix everything's files
+    // phase runs too -- the bookmark veto, the download folder only, the root itself never.
+    const r = await deleteChapterFiles(id, b.data.bookIds, { userId: userIdOf(req), req });
+    if ('refused' in r) return reply.code(409).send({ error: 'refused', message: r.refused.reason, fix: r.refused.fix });
+    return { ok: true, applied: r.applied, bytes: r.bytes, skipped: r.skipped };
   });
 
   /**
@@ -2273,7 +2323,7 @@ export default async function adminRoutes(app: FastifyInstance) {
     if (!series) return reply.code(404).send({ error: 'not_found' });
 
     if (b.data.libraryId === null) {
-      const libs = await q<{ id: string; path: string }>('SELECT id, path FROM libraries');
+      const libs = await libraryRows();
       await q('UPDATE lib_series SET library_id = $2, library_pinned = false WHERE id = $1',
         [id, libraryIdFor(series.folder, libs)]);
       await logAudit('series.library', { userId: userIdOf(req), detail: { id, libraryId: null }, req });
@@ -2307,7 +2357,7 @@ export default async function adminRoutes(app: FastifyInstance) {
     const skipped = b.data.seriesIds.filter((id) => !found.some((f) => f.id === id)).map((id) => ({ id }));
 
     if (b.data.libraryId === null) {
-      const libs = await q<{ id: string; path: string }>('SELECT id, path FROM libraries');
+      const libs = await libraryRows();
       for (const s of found) {
         await q('UPDATE lib_series SET library_id = $2, library_pinned = false WHERE id = $1',
           [s.id, libraryIdFor(s.folder, libs)]);
@@ -2333,6 +2383,11 @@ export default async function adminRoutes(app: FastifyInstance) {
     return r;
   });
 
+  /** The 409 for a folder another library holds: which folder, and whose, named in the message too. */
+  const heldAnswer = (held: { path: string; id: string; name: string }) => ({
+    error: 'duplicate', message: `"${held.name}" already covers ${held.path}.`, path: held.path, library: { id: held.id, name: held.name },
+  });
+
   // ---- libraries ----
   //
   // Declared, never inferred from disk. The obvious rule (each top-level folder is a library) is wrong on a
@@ -2340,8 +2395,11 @@ export default async function adminRoutes(app: FastifyInstance) {
   // library into several named after scrapers. Library zero covers the whole root and always exists.
 
   app.get('/api/admin/libraries', async () => {
-    const rows = await q<{ id: string; name: string; path: string; age_rating: number | null; n: number; pinned: number; members: string[] }>(
+    const rows = await q<{ id: string; name: string; path: string; paths: string[]; age_rating: number | null; n: number; pinned: number; members: string[] }>(
+      // `paths`: every folder it holds (v0.55.1, #148), the first -- `path`, all a v0.55.0 reads -- first, then by name.
       `SELECT l.id, l.name, l.path, l.age_rating,
+              (SELECT coalesce(array_agg(lp.path ORDER BY lp.path <> l.path, lp.path), '{}') FROM library_paths lp
+                WHERE lp.library_id = l.id) AS paths,
               (SELECT count(*)::int FROM lib_series s WHERE s.library_id = l.id AND ${visibleToAll('s')}) AS n,
               (SELECT count(*)::int FROM lib_series s WHERE s.library_id = l.id AND s.library_pinned
                  AND ${visibleToAll('s')}) AS pinned,
@@ -2358,7 +2416,7 @@ export default async function adminRoutes(app: FastifyInstance) {
     // Candidate subdirectories: folders that hold series but are not yet a library. Annotated where the name
     // matches a known source, because that is the case an admin should NOT usually promote.
     const sources = new Set((await q<{ source: string }>('SELECT DISTINCT source FROM lib_series')).map((r) => r.source));
-    const taken = new Set(rows.map((r) => r.path).filter(Boolean));
+    const taken = new Set(rows.flatMap((r) => r.paths));
     // EVERY ancestor of every series folder, not just the first segment. The top level of a real library
     // root holds source names written by the downloader -- which this list then flags as such -- so offering
     // only that level meant the one folder an admin actually wanted was unreachable.
@@ -2384,9 +2442,10 @@ export default async function adminRoutes(app: FastifyInstance) {
 
   // ⚠️ Every typed library path in the four routes below goes through toStoredRel (a `\` typed on Windows is a
   // separator, and the database stores `/`: lib/relPath.ts) and, on the desktop, diskSpelling -- NTFS and
-  // APFS find `manga/seinen` for `Manga/Seinen`, but lib_series.folder and libraries.path are compared as
+  // APFS find `manga/seinen` for `Manga/Seinen`, but lib_series.folder and a library's folders are compared as
   // exact strings with the on-disk spelling, so the typed case would match nothing. Both are identities on
-  // the server.
+  // the server. The folder browser does it here; the preview, create and edit take every folder through
+  // storedFolders (lib/libraryFolders.ts).
 
   /**
    * The folders that actually exist, at any depth.
@@ -2431,7 +2490,7 @@ export default async function adminRoutes(app: FastifyInstance) {
       const rows = await q<{ p: string; n: number }>(
         `SELECT p, count(*)::int AS n
            FROM unnest($1::text[]) AS p
-           JOIN lib_series s ON (s.folder = p OR s.folder LIKE p || '/%') AND ${visibleToAll('s')}
+           JOIN lib_series s ON ${underSql('s.folder', 'p')} AND ${visibleToAll('s')}
           GROUP BY p`,
         [prefixes],
       );
@@ -2448,71 +2507,66 @@ export default async function adminRoutes(app: FastifyInstance) {
     };
   });
 
-  /** What promoting a path WOULD do, without doing it. Same habit as the chapter-override route. */
+  /**
+   * What promoting a path WOULD do, without doing it. Same habit as the chapter-override route.
+   *
+   * The statement the save runs, short of its UPDATE (lib/libraryFolders.ts), or the preview promises something other
+   * than what happens. With `id` it is an edit of that library, and counts what leaves it as well as what comes in.
+   * `paths` (repeated, since v0.55.1) is every folder the library would hold; `path` alone is one. A folder another
+   * library holds is refused as the save refuses it.
+   */
   app.get('/api/admin/libraries/preview', async (req, reply) => {
-    const path = await diskSpelling([LIBRARY_ROOT, DL_ROOT], toStoredRel(String((req.query as { path?: string }).path ?? '')).trim());
-    if (!path) return reply.code(400).send({ error: 'bad_request' });
-    // Exactly the predicate the create and re-path handlers use, or the preview promises something other
-    // than what happens. `library_id = 'lib'` was right when libraries could not nest: it now understates a
-    // nested library by every series the enclosing one holds, and a re-path by all of its own.
-    const claimable = `NOT s.library_pinned
-      AND (s.folder = $1 OR s.folder LIKE $1 || '/%')
-      AND length((SELECT l.path FROM libraries l WHERE l.id = s.library_id)) < length($1::text)
-      AND ${visibleToAll('s')}`;
-    const rows = await q<{ id: string; title: string }>(
-      `SELECT id, title FROM lib_series s WHERE ${claimable} ORDER BY title LIMIT 20`, [path],
-    );
-    const total = await one<{ n: number }>(
-      `SELECT count(*)::int n FROM lib_series s WHERE ${claimable}`, [path],
-    );
-    return { path, series: total?.n ?? 0, sample: rows.map((r) => r.title) };
+    const qs = req.query as { path?: string; paths?: string | string[]; id?: string };
+    const raw = qs.paths !== undefined ? [qs.paths].flat() : qs.path !== undefined ? [qs.path] : [];
+    if (!raw.length || raw.length > LIBRARY_MAX_FOLDERS) return reply.code(400).send({ error: 'bad_request' });
+    const paths = await storedFolders(raw.map(String));
+    if (!paths) return reply.code(400).send({ error: 'bad_path', message: 'Use a folder path relative to your library root.' });
+    const held = await heldElsewhere(q, qs.id || '', paths);
+    if (held) return reply.code(409).send(heldAnswer(held));
+    return { path: paths[0], paths, ...(await previewMoves(q, qs.id || null, paths)) };
   });
 
   app.post('/api/admin/libraries', async (req, reply) => {
     const b = z.object({
       name: z.string().min(1).max(80),
       // relative, posix, no escaping the root. Containment is checked again at the filesystem layer.
-      path: z.string().min(1).max(300),
+      path: z.string().min(1).max(300).optional(),
+      // Every folder it holds (v0.55.1, #148), the first being the one `path` names alone -- what a rollback to v0.55.0
+      // reads. Several, so one library can be "these source folders" without the ones kept apart.
+      paths: z.array(z.string().min(1).max(300)).min(1).max(LIBRARY_MAX_FOLDERS).optional(),
       // Accepted here so creating a rated library is ONE request. The UI used to POST the library and then
       // PATCH the rating, which meant a failed second call left a library that silently showed everything
       // to everyone under a "Created" toast.
       ageRating: z.number().int().min(0).max(18).nullable().optional(),
     }).safeParse(req.body);
     if (!b.success) return reply.code(400).send({ error: 'bad_request' });
-    const typed = toStoredRel(b.data.path).replace(/^\/+/, '').replace(/\/+$/, '').trim();
-    if (!typed || typed.includes('..') || typed.startsWith('/')) {
-      return reply.code(400).send({ error: 'bad_path', message: 'Use a folder path relative to your library root.' });
-    }
-    const path = await diskSpelling([LIBRARY_ROOT, DL_ROOT], typed);
-    // Nesting is allowed. libraryIdFor() resolves the MOST SPECIFIC library containing a folder, so
-    // `Manga/Seinen` inside `Manga` is unambiguous -- and refusing it blocked the obvious thing an admin
-    // wants, which is to carve a big library into parts. Only an exact duplicate is refused, because two
-    // libraries on the same path have no rule to separate them.
-    const dup = await one<{ name: string }>(`SELECT name FROM libraries WHERE path = $1`, [path]);
-    if (dup) {
-      return reply.code(409).send({ error: 'duplicate', message: `"${dup.name}" already covers that folder.` });
-    }
+    const raw = b.data.paths ?? (b.data.path !== undefined ? [b.data.path] : null);
+    if (!raw) return reply.code(400).send({ error: 'bad_request' });
+    const paths = await storedFolders(raw);
+    if (!paths) return reply.code(400).send({ error: 'bad_path', message: 'Use a folder path relative to your library root.' });
     const id = `lib_${randomBytes(8).toString('hex')}`;
-    await tx(async (qq) => {
+    const out = await tx(async (qq) => {
+      await lockLibrarySaves(qq);
+      // Nesting is allowed. libraryIdFor() resolves the MOST SPECIFIC folder containing a series, so
+      // `Manga/Seinen` inside `Manga` is unambiguous -- and refusing it blocked the obvious thing an admin
+      // wants, which is to carve a big library into parts. Only a folder another library holds is refused.
+      // Checked under the lock, so two saves cannot both take one folder.
+      const held = await heldElsewhere(qq, id, paths);
+      if (held) return { held };
       await qq(`INSERT INTO libraries (id, name, path, age_rating) VALUES ($1,$2,$3,$4)`,
-        [id, b.data.name.trim(), path, b.data.ageRating ?? null]);
+        [id, b.data.name.trim(), paths[0], b.data.ageRating ?? null]);
       // Reassignment is deliberate and happens here, not in a scan: the scanner keeps an existing folder in
-      // the library it is already in, precisely so it can never re-mint an id by recomputing.
-      //
-      // Two conditions rather than `library_id = 'lib'`. Claiming from any LESS SPECIFIC library is what
-      // makes nesting work -- a new `Manga/Seinen` takes from `Manga`, and never the other way. Skipping
-      // pinned rows is what makes a hand-move stick: an admin who put one series here on purpose should not
-      // have it taken back by a folder rule they were working around.
-      await qq(
-        `UPDATE lib_series s SET library_id = $1
-          WHERE NOT s.library_pinned
-            AND (s.folder = $2 OR s.folder LIKE $2 || '/%')
-            AND length((SELECT l.path FROM libraries l WHERE l.id = s.library_id)) < length($2::text)`,
-        [id, path],
-      );
+      // the library it is already in, precisely so it can never re-mint an id by recomputing. The longest folder
+      // wins, so a new `Manga/Seinen` takes from `Manga` and never the other way, and a pinned series stays put:
+      // an admin who filed one somewhere on purpose should not have it taken back by a folder rule they were
+      // working around (lib/libraryFolders.ts).
+      const moved = await applyMoves(qq, id, paths);
+      await setFolders(qq, id, paths);
+      return { moved };
     });
-    await logAudit('library.create', { userId: userIdOf(req), detail: { id, path }, req });
-    return { ok: true, id };
+    if (out.held) return reply.code(409).send(heldAnswer(out.held));
+    await logAudit('library.create', { userId: userIdOf(req), detail: { id, paths, moved: out.moved }, req });
+    return { ok: true, id, moved: out.moved };
   });
 
   app.patch('/api/admin/libraries/:id', async (req, reply) => {
@@ -2521,6 +2575,9 @@ export default async function adminRoutes(app: FastifyInstance) {
       name: z.string().min(1).max(80).optional(),
       // Changing the path used to mean delete-and-recreate, which also dropped every access grant on it.
       path: z.string().max(300).optional(),
+      // Every folder it holds, replaced whole (v0.55.1, #148); `path` alone is one. Ignored for the default library,
+      // whose empty path is "everything no other library holds".
+      paths: z.array(z.string().max(300)).min(1).max(LIBRARY_MAX_FOLDERS).optional(),
       // A default its series inherit. null clears it.
       ageRating: z.number().int().min(0).max(18).nullable().optional(),
       // Who may see it. See the note below: this is not simply "insert a row".
@@ -2528,44 +2585,34 @@ export default async function adminRoutes(app: FastifyInstance) {
     }).safeParse(req.body);
     if (!b.success) return reply.code(400).send({ error: 'bad_request' });
 
+    // Folders are checked before anything is written, so a refused save changes nothing.
+    const raw = id === 'lib' ? null : b.data.paths ?? (b.data.path !== undefined ? [b.data.path] : null);
+    const paths = raw && await storedFolders(raw);
+    if (raw && !paths) return reply.code(400).send({ error: 'bad_path', message: 'Use a folder path relative to your library root.' });
+    if (!(await one('SELECT 1 FROM libraries WHERE id = $1', [id]))) return reply.code(404).send({ error: 'not_found' });
+
+    let moved = 0;
+    if (paths) {
+      // In one transaction: what the old folders held that the new ones do not goes to whichever library DOES
+      // hold it, resolved as the scanner would -- not blindly to the default, which would tear a nested library's
+      // contents out of its parent -- and what the new ones hold comes in (lib/libraryFolders.ts).
+      const out = await tx(async (qq) => {
+        await lockLibrarySaves(qq);
+        const held = await heldElsewhere(qq, id, paths);
+        if (held) return { held };
+        const n = await applyMoves(qq, id, paths);
+        await setFolders(qq, id, paths);
+        return { moved: n };
+      });
+      if (out.held) return reply.code(409).send(heldAnswer(out.held));
+      moved = out.moved ?? 0;
+    }
+
     if (b.data.name !== undefined) {
       await q('UPDATE libraries SET name = $2 WHERE id = $1', [id, b.data.name.trim()]);
     }
     if (b.data.ageRating !== undefined) {
       await q('UPDATE libraries SET age_rating = $2 WHERE id = $1', [id, b.data.ageRating]);
-    }
-
-    if (b.data.path !== undefined && id !== 'lib') {
-      const typed = toStoredRel(b.data.path).replace(/^\/+/, '').replace(/\/+$/, '').trim();
-      if (!typed || typed.includes('..') || typed.startsWith('/')) {
-        return reply.code(400).send({ error: 'bad_path', message: 'Use a folder path relative to your library root.' });
-      }
-      const path = await diskSpelling([LIBRARY_ROOT, DL_ROOT], typed);
-      const dup = await one<{ name: string }>('SELECT name FROM libraries WHERE path = $1 AND id <> $2', [path, id]);
-      if (dup) return reply.code(409).send({ error: 'duplicate', message: `"${dup.name}" already covers that folder.` });
-
-      await tx(async (qq) => {
-        // Anything it holds that the new path does not cover goes back to whichever library DOES cover it,
-        // resolved the same way the scanner would -- not blindly to the default, which would tear a nested
-        // library's contents out of its parent.
-        await qq(
-          `UPDATE lib_series s SET library_id = COALESCE((
-             SELECT l.id FROM libraries l
-              WHERE l.id <> $1 AND (l.path = '' OR s.folder = l.path OR s.folder LIKE l.path || '/%')
-              ORDER BY length(l.path) DESC LIMIT 1), 'lib')
-            WHERE s.library_id = $1 AND NOT s.library_pinned
-              AND NOT (s.folder = $2 OR s.folder LIKE $2 || '/%')`,
-          [id, path],
-        );
-        await qq('UPDATE libraries SET path = $2 WHERE id = $1', [id, path]);
-        await qq(
-          `UPDATE lib_series s SET library_id = $1
-            WHERE NOT s.library_pinned
-              AND (s.folder = $2 OR s.folder LIKE $2 || '/%')
-              AND length((SELECT l.path FROM libraries l WHERE l.id = s.library_id)) < length($2::text)`,
-          [id, path],
-        );
-      });
     }
 
     /**
@@ -2609,8 +2656,8 @@ export default async function adminRoutes(app: FastifyInstance) {
       });
     }
 
-    await logAudit('library.update', { userId: userIdOf(req), detail: { id, ...b.data }, req });
-    return { ok: true };
+    await logAudit('library.update', { userId: userIdOf(req), detail: { id, ...b.data, moved }, req });
+    return { ok: true, moved };
   });
 
   app.delete('/api/admin/libraries/:id', async (req, reply) => {
@@ -2618,30 +2665,26 @@ export default async function adminRoutes(app: FastifyInstance) {
     if (id === 'lib') {
       return reply.code(400).send({ error: 'cannot_delete', message: 'The default library cannot be removed.' });
     }
-    await tx(async (qq) => {
-      // Back to whichever library still covers each folder -- the enclosing one for a nested library, the
+    const moved = await tx(async (qq) => {
+      await lockLibrarySaves(qq);
+      // Back to whichever library still holds each folder -- the enclosing one for a nested library, the
       // default otherwise. Sending everything to the default would tear a nested library's contents out of
-      // its parent on delete, which is not what "remove this library" means.
+      // its parent on delete, which is not what "remove this library" means. What it held by hand moves too.
       //
       // The FK is RESTRICT on purpose: read_progress cascades from lib_series, so a cascading library delete
       // would destroy reading history two hops away.
-      await qq(
-        `UPDATE lib_series s SET library_id = COALESCE((
-           SELECT l.id FROM libraries l
-            WHERE l.id <> $1 AND (l.path = '' OR s.folder = l.path OR s.folder LIKE l.path || '/%')
-            ORDER BY length(l.path) DESC LIMIT 1), 'lib')
-          WHERE s.library_id = $1`,
-        [id],
-      );
+      const n = await applyMoves(qq, id, [], true);
       // Whoever was granted this one specifically. Taking their row away can leave them with none at all,
       // and none means every library -- so removing a shelf would quietly hand them the whole collection.
       const granted = await qq<{ user_id: string }>('SELECT user_id FROM user_libraries WHERE library_id = $1', [id]);
       await qq('DELETE FROM user_libraries WHERE library_id = $1', [id]);
       for (const g of granted) await keepRestricted(qq, g.user_id);
+      // Its library_paths rows go with it (ON DELETE CASCADE).
       await qq('DELETE FROM libraries WHERE id = $1', [id]);
+      return n;
     });
-    await logAudit('library.delete', { userId: userIdOf(req), detail: { id }, req });
-    return { ok: true };
+    await logAudit('library.delete', { userId: userIdOf(req), detail: { id, moved }, req });
+    return { ok: true, moved };
   });
 
   // Set/replace a cover or background: paste a URL, upload an image (base64 data URL), or reset to automatic. The body
@@ -2771,6 +2814,7 @@ export default async function adminRoutes(app: FastifyInstance) {
             if ((art as any).mediaId) {
               await linkSeries(t.id, (art as any).mediaId, (art as any).mediaTitle ?? null);
               await learnDirection({ id: t.id }, directionFromAniListMatch(t.title, art as any), 'anilist').catch(() => {});
+              await learnTypeFromAniList({ id: t.id }, t.title, art as any);
             }
             if (art.banner) job.banners++;
             else job.covers++;
@@ -3270,6 +3314,47 @@ export default async function adminRoutes(app: FastifyInstance) {
     return { ok: true };
   });
 
+  // ---- Fix everything (v0.55.0, lib/autofix.ts) ----
+
+  /**
+   * Start Health's Fix everything: one background run, 202 with its id. 409 `busy` with what is going -- `autofix`,
+   * `repair`, `find` or `sweep` -- beside another run, a repair, a Find or Replace, or a chapter sweep. It runs as the
+   * admin who pressed it: their age reach is what its Replace and Find runs may ask, as theirs (#141).
+   */
+  app.post('/api/admin/health/autofix', async (req, reply) => {
+    const b = z.object({}).strict().safeParse(req.body ?? {});
+    if (!b.success) return reply.code(400).send({ error: 'bad_request', message: 'Fix everything takes no options.' });
+    const ctx = await viewCtxFor(userIdOf(req), roleOf(req));
+    const r = startAutofix(userIdOf(req) ?? null, { ctx, origin: 'manual', log: app.log, req });
+    if ('busy' in r) return reply.code(409).send({ error: 'busy', running: r.busy });
+    return reply.code(202).send({ ok: true, runId: r.runId });
+  });
+  /** The run going now, and the newest finished one: what the Health page polls every two seconds while one runs. */
+  app.get('/api/admin/health/autofix', async (req) => {
+    const st = await autofixState();
+    const hide = hideAdult(req);
+    const named = hide ? await nameable(req, [...autofixSeriesIds(st.run), ...autofixSeriesIds(st.last)]) : undefined;
+    return { run: scrubAutofixRun(st.run, hide, named), last: scrubAutofixRun(st.last, hide, named) };
+  });
+  /** One run, live or kept (repair_runs keeps them as it keeps repairs); 404 when none has that id. */
+  app.get('/api/admin/health/autofix/:runId', async (req, reply) => {
+    const { runId } = req.params as { runId: string };
+    if (!runId || runId.length > 64) return reply.code(400).send({ error: 'bad_request' });
+    const r = await autofixRun(runId);
+    if (!r) return reply.code(404).send({ error: 'not_found' });
+    const hide = hideAdult(req);
+    return scrubAutofixRun(r, hide, hide ? await nameable(req, autofixSeriesIds(r)) : undefined);
+  });
+  /**
+   * Stop the run at its next safe point -- between series, steps, sources or pairs, never inside a merge, a delete or a
+   * renumber; its Find or Replace run in flight stops at once. `stopping: false` when nothing is running.
+   */
+  app.post('/api/admin/health/autofix/stop', async (req) => {
+    const stopping = stopAutofix();
+    if (stopping) await logAudit('library.autofix_stop', { userId: userIdOf(req), detail: {}, req });
+    return { ok: stopping, stopping };
+  });
+
   // ---- link existing series to AniList entries so tracker sync has an anchor ----
   // Art was matched long before trackers existed, so those series have cached art but no link. This
   // re-resolves only what's missing, paced for AniList's ~30 req/min limit.
@@ -3291,6 +3376,7 @@ export default async function adminRoutes(app: FastifyInstance) {
           if (m.mediaId) {
             await linkSeries(t.id, m.mediaId, m.mediaTitle ?? null);
             await learnDirection({ id: t.id }, directionFromAniListMatch(t.title, m), 'anilist').catch(() => {});
+            await learnTypeFromAniList({ id: t.id }, t.title, m);
             job.linked++;
           }
           else job.misses++;
@@ -3953,26 +4039,19 @@ export default async function adminRoutes(app: FastifyInstance) {
    */
   app.get('/api/admin/sources/overview', async () => sourcesOverview());
 
-  const testing = new Set<string>();
   app.post('/api/admin/sources/:id/test', async (req, reply) => {
     const { id } = req.params as { id: string };
     const src = getSource(id);
     if (!src) return reply.code(404).send({ error: 'not_found' });
-    if (testing.has(id)) return reply.code(409).send({ error: 'busy', message: 'That source is already being tested.' });
-    testing.add(id);
-    try {
-      // The same function the scheduled sweep runs, so the button and the schedule cannot disagree.
-      const r = await checkSourceLive(src, { by: 'test' });
-      await recordLiveResult(id, r, 'test');
-      await logAudit('source.test', { userId: userIdOf(req), detail: { source: id, ok: r.smoke.ok, code: r.diagnosis.code, state: r.state, stage: r.stage }, req });
-      return reply.send({
-        ok: r.smoke.ok, timedOut: r.smoke.timedOut, checks: r.smoke.checks, probe: r.probe, diagnosis: r.diagnosis,
-        canClear: r.smoke.ok && r.blocked,
-        state: r.state, stage: r.stage, ms: r.smoke.ms, recorded: true,
-      });
-    } finally {
-      testing.delete(id);
-    }
+    // lib/sourceCheck.ts testSource: the check, recorded and audited, one Test of a source at a time -- Fix everything's
+    // Tests included (v0.55.0).
+    const r = await testSource(src, { userId: userIdOf(req), req });
+    if (r === 'busy') return reply.code(409).send({ error: 'busy', message: 'That source is already being tested.' });
+    return reply.send({
+      ok: r.smoke.ok, timedOut: r.smoke.timedOut, checks: r.smoke.checks, probe: r.probe, diagnosis: r.diagnosis,
+      canClear: r.smoke.ok && r.blocked,
+      state: r.state, stage: r.stage, ms: r.smoke.ms, recorded: true,
+    });
   });
 
   /**
@@ -4066,6 +4145,11 @@ export default async function adminRoutes(app: FastifyInstance) {
       // (DATABASE_URL was unset); an install talking to its own database never sees the variable.
       database: process.env.EMBEDDED_DB === '1' ? 'embedded' : 'external',
       activity,
+      // v0.55.4 (#150): what is running, for the foot of the admin menu. "I can't find anymore what version I'm
+      // running" -- it was only Health's Version card, a tab and a scroll away. Null when bff/package.json cannot be
+      // read (lib/appVersion.ts). Whether a newer one exists stays Health's: the page reads its cached `update` check,
+      // so this asks GitHub nothing and an admin who turned update checks off is asked nothing either.
+      version: appVersion(),
     };
   });
 

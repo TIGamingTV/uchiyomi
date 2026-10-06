@@ -18,6 +18,8 @@ import { sanitize } from './downloader';
 import { canonLang, langLabel } from './lang';
 import { effectiveLang, followGuard } from './seriesLang';
 import { Params, visible, type ViewCtx } from './visibility';
+import { noticeShown, visibleBookCount } from './noticeChapters';
+import { lastNumber } from './chapterRanges';
 
 /** The module's q, or a transaction's own (db.ts tx). */
 type Qq = <R = any>(text: string, params?: any[]) => Promise<R[]>;
@@ -128,7 +130,11 @@ export interface EditionRow {
   booksCount: number;
   /** The edition the request is about. */
   current: boolean;
-  /** The viewer's highest finished chapter in this edition, or null: the switcher's "Español · ch. 12". */
+  /**
+   * The viewer's highest finished chapter in this edition, or null: the switcher's "Español · ch. 12". A finished file
+   * holding a range counts its end (lib/chapterRanges.ts); reintroduce the start and "the edition switcher says how
+   * far a reader got through a range file" in chapterRanges.int.test.ts reads 1.
+   */
   lastRead: number | null;
 }
 
@@ -142,10 +148,12 @@ export async function editionInfo(id: string, ctx: ViewCtx, userId: string | nul
   const me = p.add(id);
   const uid = p.add(userId);
   const rows = await q<{ id: string; work_id: string; lang: string | null; source_id: string | null; title: string; books_count: number | null; last_read: number | null }>(
-    `SELECT s.id, s.work_id, s.lang, s.source_id, COALESCE(o.title, s.title) AS title, s.books_count,
-            (SELECT max(COALESCE(ov.number, b.number)) FROM read_progress rp
+    // Both figures leave out the notice chapters the edition hides (lib/noticeChapters.ts), as its own page does.
+    `SELECT s.id, s.work_id, s.lang, s.source_id, COALESCE(o.title, s.title) AS title, ${visibleBookCount('s')} AS books_count,
+            (SELECT max(${lastNumber('b', 'ov')}) FROM read_progress rp
                JOIN lib_books b ON b.id = rp.book_id LEFT JOIN book_overrides ov ON ov.book_id = b.id
-              WHERE rp.user_id = ${uid} AND rp.series_id = s.id AND rp.completed) AS last_read
+              WHERE rp.user_id = ${uid} AND rp.series_id = s.id AND rp.completed
+                AND ${noticeShown('s', 'b', 'ov')}) AS last_read
        FROM lib_series s LEFT JOIN series_overrides o ON o.series_id = s.id
       WHERE s.work_id = (SELECT w.work_id FROM lib_series w WHERE w.id = ${me}) AND ${visible('s', ctx, p)}
       ORDER BY s.created_at, s.id`,
@@ -224,4 +232,39 @@ export async function workRows(id: string, qq: Qq = q): Promise<WorkRow[]> {
     [id],
   );
   return rows.map((r) => ({ id: r.id, title: r.title, lang: effectiveLang(r.lang, r.source_id), stated: canonLang(r.lang) !== null, hidden: r.hidden }));
+}
+
+/** Why two series could not be linked as editions (linkPair). The admin route answers each with its own status. */
+export type LinkPairRefusal = 'not_found' | 'deleted' | 'same_series' | 'same_work' | 'other_work' | 'same_lang' | 'edition_exists';
+
+/**
+ * Link two series already in the library as language editions of one work: POST /api/admin/series/:id/editions and, since
+ * v0.55.0, Fix everything's duplicates phase (lib/autofix.ts) on a duplicate pair in two languages. `lang` states `id`'s
+ * language and `withLang` `withId`'s, each where the series does not state one (otherwise what it is inferred to be). A
+ * series already in a work brings the work: the other joins it. Refused when both are in one language (merge them
+ * instead), when the language is taken in the work, and when each is already in a different work. `joiner` and `of` say
+ * which joined which, for the audit line.
+ */
+export async function linkPair(
+  id: string, withId: string, o: { lang?: string; withLang?: string } = {},
+): Promise<{ ok: true; workId: string; lang: string; joiner: WorkRow; of: WorkRow } | { refused: LinkPairRefusal }> {
+  if (withId === id) return { refused: 'same_series' };
+  const [mine, theirs] = await Promise.all([workRows(id), workRows(withId)]);
+  const a = mine.find((r) => r.id === id);
+  const w = theirs.find((r) => r.id === withId);
+  if (!a || !w) return { refused: 'not_found' };
+  if (a.hidden || w.hidden) return { refused: 'deleted' };
+  if (mine.length > 1 && theirs.length > 1) return { refused: mine.some((r) => r.id === w.id) ? 'same_work' : 'other_work' };
+  // What each will state: the language asked for where the series states none, else its own.
+  const langA = a.stated ? a.lang : canonLang(o.lang) ?? a.lang;
+  const langW = w.stated ? w.lang : canonLang(o.withLang) ?? w.lang;
+  if (langA === langW) return { refused: 'same_lang' };
+  // The one in a work stays where it is and the other joins it.
+  const [joiner, of, joinerLang, ofLang] = mine.length > 1 ? [w, a, langW, langA] : [a, w, langA, langW];
+  const taken = (mine.length > 1 ? mine : theirs).find((r) => r.id !== of.id && r.lang === joinerLang);
+  if (taken) return { refused: 'edition_exists' };
+  const r = await linkEdition(joiner.id, { of: of.id, lang: joinerLang, ofLang });
+  if (r === 'taken') return { refused: 'edition_exists' };
+  if (r === 'gone') return { refused: 'not_found' };
+  return { ok: true, workId: r.workId, lang: r.lang, joiner, of };
 }

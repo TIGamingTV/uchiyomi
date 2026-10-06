@@ -21,7 +21,7 @@
 // The default PHASES are the ones a plain up.sh stack can serve: notices, archive, sources. numbering and engine
 // need the fake extension engine (E2E_ENGINE=fake); its control port is 23000 plus the app port's last three digits
 // (23149 above, as up.sh derives it), which numbering derives by itself and engine takes as ENGINE. PHASES may name
-// only the five phases below: any other name is a failed check, so a typo cannot pass as a green run. The release
+// only the phases below: any other name is a failed check, so a typo cannot pass as a green run. The release
 // plan's other phases live elsewhere: its downloads checks are run.mjs's (the walk up.sh runs by itself), and Health
 // clarity is walk41's.
 //
@@ -108,10 +108,59 @@
 //   off all asks first, a site in use cannot be removed, and the old Providers/Extensions addresses land on Sources
 //   (replaceWalk.mjs). Needs up.sh with E2E_ENGINE=fake and E2E_FAKE_EXTRA=v54, and E2E_NET (up.sh's network) here.
 //
+//   autofix -- v0.55.0, Health's Fix everything: at 1280, 390 and 390 in Arabic, a library with something wrong on every
+//   card the run can fix -- a broken main source, a duplicate and a two-language pair, chapters saved twice, impossible
+//   numbers, two renumbering reviews, a gap only an extension not yet installed carries, a failed chapter -- and what a
+//   person must decide; Fix it for me runs it all, the phases advance, Run in background and back, and the end names
+//   exactly what needs a person, every other Health card green; then Stop at a safe point, the Arabic end, Let me
+//   choose's safe repair, the nightly's choice after a reload, and Free a slot. Since v0.55.1 also what the owner's
+//   first run met: a source whose images answer 429 (never Replaced, never retried, cooling down under what clears by
+//   itself), one whose page lists fail (never a destination, and the series moved onto it moved off), and a series only
+//   the fifth extension by popularity carries (no cap, the 18+ one never for it); and Free a slot's sheet saying the
+//   limit is full (autofixWalk.mjs). Needs up.sh with E2E_ENGINE=fake E2E_FAKE_EXTRA=v55 E2E_MAX_SOURCES=2, and E2E_NET
+//   here.
+//
+//   libraries, nosource -- v0.55.1, #148 and #149, on a plain up.sh stack (librariesWalk.mjs): at 1280, 390 and 390 in
+//   Arabic, a library of three folders ticked in the folder browser -- the preview's number is what moves in, a series
+//   filed by hand stays, the card says "+2 more" -- then one folder taken out moves its series back out; and the
+//   Library's Main source "No source", which shows exactly the series with no main source, with src=- in the address
+//   that a reload keeps.
+//
+//   filenames -- v0.55.2, #150, on a plain up.sh stack with LIB naming its library folder (filenamesWalk.mjs): at 1280,
+//   390 and 390 in Arabic, a folder collected by hand -- `Batman #12 (1987)`, `Vol 3 Chapter 12`, `Watchmen (1986)`,
+//   `Batman 01-07`, `Chapter 12 - Episode #5` -- scanned: the series page says 12, 12, 0, "Ch. 1–7" and 12, Health's
+//   gaps name 8 to 11 and nothing the range holds, reading the range in the reader takes Mihon's read-up-to to 7, and a
+//   rescan changes nothing.
+//
+//   noticechapters -- v0.55.2, #147, on a plain up.sh stack with LIB (noticeChaptersWalk.mjs): at 1280, 390 and 390 in
+//   Arabic, Admin -> Settings -> Notice chapters switches Manhwa on and a hand-collected manhwa's two-page 2.5 leaves
+//   the series page, the reader and every count while its twenty-page 3.5 stays; switched off, all of it is back; and
+//   the Library grid's request takes as long off as it did before the switch was ever on.
+//
+//   solver -- v0.55.3, the backup Cloudflare solver (FLARESOLVERR_FALLBACK_URL), on up.sh's E2E_SOLVERS=1 stack
+//   (solverWalk.mjs): at 1280, 390 and 390 in Arabic, the main solver (greeting as trawl) and the backup (FlareSolverr)
+//   both on Health's card, trawl never held against FlareSolverr's releases; the main stopped -- the card amber, "the
+//   backup is solving", and a site behind a fake Cloudflare still lists and downloads with the backup's clearance and user
+//   agent, Fix everything's end saying it without Needs you; a source downloading slowly after a 429 (Source health's
+//   `slowed` row); and the main back, the card green.
+//
+//   find, rescan, multisource, adultsearch -- v0.55.4 (v554Walk.mjs), each on a stack of its own: find on an EMPTY one
+//   (up.sh with E2E_EMPTY_LIBRARY=1) -- the version at the foot of the admin menu (the header's facts on a phone), the
+//   empty Library's and Home's "Import your library" opening the import page, and search finding Notice chapters (Ctrl+K,
+//   and the phone's Search page) and Rescan everything, each landing on its card; rescan on a plain one with LIB and
+//   E2E_NET -- two files of a folder collected by hand deleted and one renamed, Admin → Tasks → Rescan everything's
+//   preview naming them (the renamed one as moved), Apply marking the two "File no longer on disk" with their read marks
+//   kept and renumbering only the series ticked for the new file-name rules, and a folder with no file behind it refused
+//   as unmounted; multisource on a plain one with E2E_NET -- a release on fake-a and fake-b, chapters picked from fake-b
+//   coming from fake-b alone, and the series page's Fetch all taking the rest from both (the fakes' logs), each once;
+//   adultsearch with E2E_ADULT=1 -- Discover's search with Show 18+ on offers All · Hide 18+ · 18+ only and marks each
+//   18+ result, and with it off shows no chip and no 18+ result. At 1280, 390 and 390 in Arabic (multisource at 1280).
+//
 //   Run order, whatever PHASES lists, is the release plan's (design critic): notices, archive, numbering, sources,
-//   replace, engine. The engine phase resets the fake engine and takes it down, so nothing that needs it can follow; a
-//   sources run that stops half-way leaves fake-a's search failing, which only the engine phase then meets, and it
-//   never searches.
+//   libraries, nosource, filenames, noticechapters, replace, autofix, solver, find, rescan, multisource, adultsearch,
+//   engine. The engine phase resets the fake engine
+//   and takes it down, so nothing that needs it can follow; a sources run that stops half-way leaves fake-a's search
+//   failing, which only the engine phase then meets, and it never searches.
 //
 // Screenshots go to $OUT (default shots49). LOOK at them: every check here is geometry, and geometry passes on
 // a card that is transparent, clipped or unreadable.
@@ -154,7 +203,8 @@ const waitFor = async (fn, ms = 10_000, step = 150) => {
 
 // Only the phases this walk has. Anything else in PHASES -- a typo, or the release plan's name for a phase that
 // lives in another walk -- used to be ignored without a word, and a run of nothing but that read green.
-const KNOWN_PHASES = ['notices', 'archive', 'numbering', 'sources', 'replace', 'engine'];
+const KNOWN_PHASES = ['notices', 'archive', 'numbering', 'sources', 'libraries', 'nosource', 'filenames', 'noticechapters', 'replace', 'autofix', 'solver',
+  'find', 'rescan', 'multisource', 'adultsearch', 'engine'];
 const unknownPhases = PHASES.filter((p) => !KNOWN_PHASES.includes(p));
 check(`PHASES names only phases this walk has (${KNOWN_PHASES.join(', ')})`, !unknownPhases.length,
   `not a phase here: ${unknownPhases.join(', ')} -- the release plan's downloads checks are run.mjs's, Health clarity is walk41's`);
@@ -1389,11 +1439,61 @@ try {
       await sources(w);
     }
   }
+  // v0.55.1: #148, a library of several folders, and #149, "No source" in the Library filter (librariesWalk.mjs; a plain
+  // up.sh stack).
+  if (PHASES.includes('libraries')) {
+    const { librariesWalk } = await import('./librariesWalk.mjs');
+    await librariesWalk({ page, go, shot, check, waitFor, sleep, base: BASE, token: TOKEN });
+  }
+  if (PHASES.includes('nosource')) {
+    const { noSourceWalk } = await import('./librariesWalk.mjs');
+    await noSourceWalk({ page, go, shot, check, waitFor, sleep, base: BASE, token: TOKEN });
+  }
+  // v0.55.2: #150, chapter numbers from the names of a library collected by hand, and #147, notice chapters
+  // (filenamesWalk.mjs, noticeChaptersWalk.mjs; a plain up.sh stack, and LIB naming its library folder).
+  if (PHASES.includes('filenames')) {
+    const { filenamesWalk } = await import('./filenamesWalk.mjs');
+    await filenamesWalk({ page, go, shot, check, waitFor, sleep, base: BASE, token: TOKEN, lib: process.env.LIB });
+  }
+  if (PHASES.includes('noticechapters')) {
+    const { noticeChaptersWalk } = await import('./noticeChaptersWalk.mjs');
+    await noticeChaptersWalk({ page, go, shot, check, waitFor, sleep, base: BASE, token: TOKEN, lib: process.env.LIB });
+  }
   // v0.54.0: Replace a source, Make main, Turn off all and the old tabs' addresses (replaceWalk.mjs; up.sh with
   // E2E_ENGINE=fake E2E_FAKE_EXTRA=v54, and E2E_NET on this command). Before engine, which takes the engine down.
   if (PHASES.includes('replace')) {
     const { replaceWalk } = await import('./replaceWalk.mjs');
     await replaceWalk({ page, go, shot, check, waitFor, sleep, base: BASE, token: TOKEN });
+  }
+  // v0.55.0: Health's Fix everything (autofixWalk.mjs; up.sh with E2E_ENGINE=fake E2E_FAKE_EXTRA=v55 E2E_MAX_SOURCES=2,
+  // and E2E_NET on this command). Before engine, which takes the engine down.
+  if (PHASES.includes('autofix')) {
+    const { autofixWalk } = await import('./autofixWalk.mjs');
+    await autofixWalk({ page, go, shot, check, waitFor, sleep, base: BASE, token: TOKEN });
+  }
+  // v0.55.3: the backup Cloudflare solver, and a source downloading slowly (solverWalk.mjs; up.sh with E2E_SOLVERS=1).
+  if (PHASES.includes('solver')) {
+    const { solverWalk } = await import('./solverWalk.mjs');
+    await solverWalk({ page, go, shot, check, waitFor, sleep, base: BASE, token: TOKEN });
+  }
+  // v0.55.4: the version, the import and search's settings (#150, #158), Rescan everything (#150), downloads from several
+  // sources in turn and the 18+ filter in Discover search (#158) -- v554Walk.mjs, each on its own stack (its header).
+  const v554 = { page, go, shot, check, waitFor, sleep, base: BASE, token: TOKEN, lib: process.env.LIB };
+  if (PHASES.includes('find')) {
+    const { findWalk } = await import('./v554Walk.mjs');
+    await findWalk(v554);
+  }
+  if (PHASES.includes('rescan')) {
+    const { rescanWalk } = await import('./v554Walk.mjs');
+    await rescanWalk(v554);
+  }
+  if (PHASES.includes('multisource')) {
+    const { multisourceWalk } = await import('./v554Walk.mjs');
+    await multisourceWalk(v554);
+  }
+  if (PHASES.includes('adultsearch')) {
+    const { adultSearchWalk } = await import('./v554Walk.mjs');
+    await adultSearchWalk(v554);
   }
   // #72: the extension engine's setup screen and the way back (engineWalk.mjs; up.sh with E2E_ENGINE=fake). Last: it
   // resets the fake engine and takes it down.

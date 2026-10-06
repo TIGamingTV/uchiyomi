@@ -54,11 +54,18 @@
 // after a full Find run left all 195 aqua series on aqua: "i have to go one by one test and find replacement
 // sources". Per series (replaceFor): its best working follower becomes its main source at once (lib/replaceSource.ts
 // ranks them, lib/mainSource.ts switches), with no search; a series with none is searched for as above -- its dead
-// followers not counting against the cap, and dropped only as far as a follow needs the room -- and the source it
-// follows first becomes its main source. Series followers-first, so the instant promotions land first; paced only
-// after a series that searched. Review first proposes instead: each series' followers, or what its search found,
-// with the one it would promote marked, and promoteProposal applies one. `turnOff` turns the replaced source off once
-// the run ends with no series left on it (lib/retireSource.ts). The mode rides in the run's `scope` as `review` does.
+// followers not counting against the cap, and dropped only as far as a follow needs the room -- and the first source it
+// follows that can update it becomes its main source. Series followers-first, so the instant promotions land first;
+// paced only after a series that searched. Review first proposes instead: each series' followers, or what its search
+// found, with the one it would promote marked, and promoteProposal applies one. `turnOff` turns the replaced source off
+// once the run ends with no series left on it (lib/retireSource.ts). The mode rides in the run's `scope` as `review`
+// does.
+//
+// ⚠️ Only a source that can update a series is ever made its main source (v0.55.1; lib/sourceStanding.ts `carries`:
+// usable or cooling). A Replace's search asks no other, so one is neither followed nor promoted, and a run Fix
+// everything starts never moves a series onto a source that run is replacing too (`avoid`). The owner's first Fix
+// everything run moved three series onto AllManga, failing at its page lists, because the first source a search
+// followed was promoted unasked -- and a series off AllManga onto Mangakakalot, replaced a moment before.
 import { randomUUID } from 'node:crypto';
 import type { FastifyRequest } from 'fastify';
 import { q, one, tx } from './db';
@@ -94,9 +101,10 @@ import { renumberRunning } from './numbering';
 import { runsInside } from './updater';
 import { switchMainSource, type MainRefusal } from './mainSource';
 import { retireSource } from './retireSource';
+import { refileFailures } from './chapterFailures';
 import { deadFollowers, rankFollowers, replaceCounts, replaceFacts, type RankedFollower, type SeriesFacts, type SkipWhy } from './replaceSource';
 import { MIN_COVERAGE } from './fill';
-import type { Standing } from './sourceStanding';
+import { carries, standingsOf, type Standing } from './sourceStanding';
 
 /** How long one series may spend searching and judging before what is left of it is `not_tried`. */
 export const FIND_SERIES_WALL_MS = 90_000;
@@ -212,7 +220,8 @@ export type FindMode = 'follow' | 'replace';
 
 interface ActiveRun {
   id: string;
-  userId: string;
+  /** The admin who started it; null for Fix everything's nightly run (v0.55.0), which nobody pressed. */
+  userId: string | null;
   startedAt: number;
   scope: FindScope;
   /** Review first: judge and keep the candidates, follow nothing. */
@@ -226,6 +235,17 @@ interface ActiveRun {
   maxAgeRating: number | null;
   /** The starting admin's view: what a Replace run's switches act as (lib/mainSource.ts). */
   ctx: ViewCtx;
+  /**
+   * v0.55.0, Fix everything's extensions phase: the only sources this run may search -- the one an extension it just
+   * installed provides -- so a run over series every other source was asked about already asks the new one alone.
+   */
+  only: ReadonlySet<string> | null;
+  /**
+   * v0.55.1, Fix everything: the sources its own run is Replacing. A Replace run never makes one of them a series' main
+   * source, nor searches it -- the owner's first run moved a series off AllManga onto Mangakakalot, replaced a moment
+   * before. Null outside Fix everything.
+   */
+  avoid: ReadonlySet<string> | null;
   /** Main sources whose description read failed in this run: not asked again for the next series. */
   dead: Set<string>;
   total: number;
@@ -291,31 +311,46 @@ export async function closeInterruptedFindRuns(): Promise<void> {
  * going in the background. `from` is the request's IP and user agent for the audit line written when it ends.
  * `review`: review first (v0.51.0) -- the same run, which keeps its candidates for an admin instead of following.
  * `mode: 'replace'` (v0.54.0, a source's scope only): move every series off that source; `turnOff` (never with review)
- * then turns it off once none is left on it. Replace and Find share the one run at a time.
+ * then turns it off once none is left on it. Replace and Find share the one run at a time. `avoid` (v0.55.1, Fix
+ * everything's Replace runs): sources a Replace never makes a series' main source, nor searches. `within` (v0.55.1, Fix
+ * everything's extensions phase): only these of the scope's series -- a source's other series are not this run's.
  */
 export async function startFind(
-  scope: FindScope, userId: string, ctx: ViewCtx, from?: FastifyRequest, o: { review?: boolean; mode?: FindMode; turnOff?: boolean } = {},
-): Promise<{ runId: string; total: number } | { busy: string } | { empty: true }> {
+  scope: FindScope, userId: string | null, ctx: ViewCtx, from?: FastifyRequest,
+  o: {
+    review?: boolean; mode?: FindMode; turnOff?: boolean; autofix?: string; only?: readonly string[]; avoid?: readonly string[];
+    within?: readonly string[];
+  } = {},
+): Promise<{ runId: string; total: number } | { busy: string } | { empty: true } | { autofix: true }> {
   const review = o.review === true;
   const mode: FindMode = o.mode === 'replace' && 'sourceId' in scope ? 'replace' : 'follow';
   const turnOff = mode === 'replace' && !review && o.turnOff === true;
+  // v0.55.0: Fix everything runs Find and Replace itself, one run after another (lib/autofix.ts): a run started beside
+  // it would take the one slot it waits on, and work the same series. Its own runs pass its id. Reintroduce by dropping
+  // it: "one Fix everything at a time, and never beside a repair, a Find or a sweep" in autofix.int.test.ts starts one.
+  if (runtime.autofixing && !o.autofix) return { autofix: true };
   const running = findRunning();
   if (running) return { busy: running };
   const id = randomUUID();
   claimed = id;
   try {
-    const list = 'sourceId' in scope
+    const within = o.within ? new Set(o.within) : null;
+    const list = ('sourceId' in scope
       ? await seriesOfMainSource(scope.sourceId, ctx, { followersFirst: mode === 'replace' })
-      : await seriesByIds(scope.seriesIds, ctx);
+      : await seriesByIds(scope.seriesIds, ctx)).filter((s) => !within || within.has(s.id));
     if (!list.length) { claimed = null; return { empty: true }; }
     await closeInterruptedFindRuns();
     // The ids it resolved to, for either kind: what closeInterruptedFindRuns lists as not tried if the process goes
     // away under the run. Reintroduce by storing {sourceId} alone: "a restart lists every series the run never
     // reached as not tried" in findSources.int.test.ts finds no seriesIds in the scope.
     const ids = list.map((s) => s.id);
+    const only = o.only?.length ? new Set(o.only) : null;
+    const avoid = o.avoid?.length ? new Set(o.avoid) : null;
     const stored = {
       ...('sourceId' in scope ? { sourceId: scope.sourceId, seriesIds: ids } : { seriesIds: ids }), ...(review ? { review } : {}),
       ...(mode === 'replace' ? { mode } : {}), ...(turnOff ? { turnOff } : {}),
+      // v0.55.0: Fix everything's own run, and the sources it may search; no column, so v0.54.x boots on the same rows.
+      ...(o.autofix ? { autofix: o.autofix } : {}), ...(only ? { only: [...only] } : {}), ...(avoid ? { avoid: [...avoid] } : {}),
     };
     await q(`INSERT INTO source_find_runs (id, started_by, status, scope, total) VALUES ($1, $2, 'running', $3::jsonb, $4)`,
       [id, userId, JSON.stringify(stored), list.length]);
@@ -332,7 +367,7 @@ export async function startFind(
     let signal!: () => void;
     const stopped = new Promise<void>((r) => { signal = r; });
     const a: ActiveRun = {
-      id, userId, startedAt: Date.now(), scope, review, mode, turnOff, promoted: 0, maxAgeRating: ctx.maxAgeRating, ctx, dead: new Set(),
+      id, userId, startedAt: Date.now(), scope, review, mode, turnOff, promoted: 0, maxAgeRating: ctx.maxAgeRating, ctx, only, avoid, dead: new Set(),
       total: list.length, done: 0, followed: 0, results: [],
       current: null, waiting: null, stop: false, stopped, signal, card,
     };
@@ -603,12 +638,22 @@ async function findFor(
   const lang = await seriesLanguage(s.id);
   const fits = await followGuard(s.id);
   const all = listSources();
+  // A Replace asks only a source that could take the series over (v0.55.1): one that can update it (usable or cooling,
+  // lib/sourceStanding.ts) and that Fix everything is not replacing too. What it follows is what it promotes, and a
+  // source failing at its page lists followed by the search was made the main source of three of the owner's series.
+  // Reintroduce by asking every source: "a series whose only match is on a source failing at its page lists stays
+  // put" in findSources.int.test.ts finds it followed and moved there.
+  const standing = replacing ? await standingsOf(all.map((src) => src.id)) : null;
+  const canTake = (id: string) => !standing || (carries(standing.get(id) ?? 'not_loaded') && !a.avoid?.has(id));
   const order = scanOrder(all.filter((src) => allowed(src.id)), { id: row.source_id ?? '', lang: lang.lang })
     .filter(fits)
     .filter((id) => {
       // The main source ALWAYS: it is the one this run is working around.
       if (id === row.source_id || followers.has(id)) return false;
       if (resting(id)) return false;
+      // Fix everything's run asks only the source its new extension provides (v0.55.0).
+      if (a.only && !a.only.has(id)) return false;
+      if (!canTake(id)) return false;
       return !!getSource(id);
     });
   // Nothing left to ask: `no_source`, never `not_tried`, which is only what a stop, the wall or a restart cut short.
@@ -623,7 +668,8 @@ async function findFor(
     console.warn(`[find] ${s.id}: no source to ask -- ${all.length} loaded, ${all.length - others.length} its own, `
       + `${others.filter((x) => resting(x.id)).length} switched off or cooling down, `
       + `${others.filter((x) => !allowed(x.id)).length} beyond the age cap, `
-      + `${others.filter((x) => !fits(x.id)).length} in another language than ${lang.lang ?? 'the series'}`);
+      + `${others.filter((x) => !fits(x.id)).length} in another language than ${lang.lang ?? 'the series'}`
+      + (standing ? `, ${others.filter((x) => !canTake(x.id)).length} unable to update it or being replaced` : ''));
     return end('no_source', false);
   }
 
@@ -736,15 +782,16 @@ async function findFor(
 
 /**
  * Room under the follower cap for one more follow: as many of the series' dead followers as it takes, worst first
- * (failing, then not loaded, then switched off), each with its listing rows as an unfollow takes them, and each
- * written into `dropped`. The cap is counted as followJudged counts it, every row. Nothing is dropped while there is
- * room.
+ * (failing, then not loaded, then switched off), each with its listing rows as an unfollow takes them and its failed
+ * chapters filed under the main source (v0.55.3), and each written into `dropped`. The cap is counted as followJudged
+ * counts it, every row. Nothing is dropped while there is room.
  */
 async function makeRoom(
   seriesId: string, dead: ReadonlyArray<{ sourceId: string; name: string }>, dropped: Array<{ sourceId: string; name: string }>,
 ): Promise<void> {
   const [{ n }] = await q<{ n: number }>('SELECT count(*)::int AS n FROM series_sources WHERE series_id = $1', [seriesId]);
   let over = Number(n) - MAX_FOLLOWERS + 1;
+  let made = 0;
   for (const d of dead) {
     if (over <= 0) break;
     if (dropped.some((x) => x.sourceId === d.sourceId)) continue;
@@ -753,7 +800,12 @@ async function makeRoom(
     await q('DELETE FROM series_listing WHERE series_id = $1 AND source_id = $2', [seriesId, d.sourceId]).catch(() => {});
     dropped.push({ sourceId: d.sourceId, name: d.name });
     over--;
+    made++;
   }
+  // What the dropped followers failed is the main source's to retry (v0.55.3, lib/chapterFailures.ts), whether or not
+  // the series is then moved: a source the run follows here can still fail to become its main. Reintroduce by dropping
+  // it: "the dead followers Replace drops to make room" in findSources.int.test.ts finds chapter 13 under fs-nowhere.
+  if (made) await refileFailures(q, [seriesId]).catch(() => 0);
 }
 
 /**
@@ -802,8 +854,9 @@ function followerProposals(ranked: RankedFollower[], f: SeriesFacts): FindPropos
  *      waiting (`renumber_pending`), or a run inside it past FIND_BUSY_WAIT_MS (`busy`).
  *   2. Its best working follower becomes its main source (lib/replaceSource.ts ranks them), the replaced source
  *      dropped from it. No search, no pacing: decided from the database.
- *   3. None can: it is searched for as Find does (findFor), its dead followers not counting against the cap, and the
- *      first source it follows becomes its main source. A search that finds nothing says so in Find's words.
+ *   3. None can: it is searched for as Find does (findFor), its dead followers not counting against the cap -- only
+ *      sources that can update it, none Fix everything is replacing too (v0.55.1) -- and the first source it follows
+ *      that can update it becomes its main source. A search that finds nothing says so in Find's words.
  * Review first proposes instead (nothing is written): its followers, or what the search found. `track` hears of a
  * promotion the moment it is made, for an answer a stop cut short.
  */
@@ -842,7 +895,12 @@ async function replaceFor(
 
   const facts = (await replaceFacts([s.id], { maxAgeRating: a.maxAgeRating, numbers: true })).get(s.id);
   if (!facts) return done({ why: 'not_tried' });
-  const { ranked, skipped: passed } = rankFollowers(facts.followers, { numbers: facts.numbers, held: facts.held });
+  const { ranked: all, skipped: rest } = rankFollowers(facts.followers, { numbers: facts.numbers, held: facts.held });
+  // A source Fix everything is replacing too is passed over, as failing: that is why it is being replaced (v0.55.1).
+  // Reintroduce by ranking it: "a Replace run Fix everything starts never promotes onto a source it is replacing too"
+  // in findSources.int.test.ts finds Rho One on fs-a.
+  const ranked = all.filter((f) => !a.avoid?.has(f.sourceId));
+  const passed = [...rest, ...all.filter((f) => a.avoid?.has(f.sourceId)).map((f) => ({ sourceId: f.sourceId, name: f.name, why: 'failing' as const }))];
   skipped = passed;
   // ---- 2: a follower takes over -----------------------------------------------------------------------------------
   if (ranked.length) {
@@ -871,7 +929,11 @@ async function replaceFor(
   }
   const again = await waitOut(a, s.id);
   if (again !== 'clear') return done({ why: again === 'busy' ? 'busy' : 'not_tried', asked: found.asked, refresh: true });
-  const to = progress[0];
+  // The first source it followed that can still update it (v0.55.1): the search asked only such sources, and one may
+  // have started failing since. None can: the series stays, followed, and says the sources did not answer for it.
+  const standing = await standingsOf(progress.map((p) => p.sourceId));
+  const to = progress.find((p) => carries(standing.get(p.sourceId) ?? 'not_loaded') && !a.avoid?.has(p.sourceId));
+  if (!to) return done({ why: 'no_answer', asked: found.asked, refresh: true });
   // Reintroduce by not promoting after a follow: "a series with no working follower is searched, followed and
   // promoted" in findSources.int.test.ts finds it still on the replaced source.
   const out = await switchMainSource(s.id, to.sourceId, { old: 'drop', ctx: a.ctx, userId: a.userId, via: 'replace', runId: a.id, expect: X });
@@ -1245,6 +1307,14 @@ export function setFindTiming(t: { paceMs?: number; wallMs?: number; quietMs?: n
   quietMs = t.quietMs ?? FIND_QUIET_POLL_MS;
   busyMs = t.busyMs ?? FIND_BUSY_WAIT_MS;
 }
+/**
+ * The run going now (or the last one started in this process), ended: what Fix everything awaits after each Replace or
+ * Find it starts (v0.55.0). Not the listing refreshes queued behind it, which go on in the background as they always do.
+ */
+export async function findRunSettled(): Promise<void> {
+  await lastRun.catch(() => {});
+}
+
 /** Tests: the run in flight (or the last one) and the refresh queue behind it, settled. */
 export async function findSettled(): Promise<void> {
   await lastRun.catch(() => {});

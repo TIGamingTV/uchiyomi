@@ -249,7 +249,9 @@ test('both shapes are what they always were, with the progress fields beside the
   const before = calls[FAST];
   const r = await app.inject({ method: 'GET', url: '/api/sources/search-all?q=Shared%20Title&wait=0', headers: tok(ids.plain) });
   const j = r.json();
-  assert.deepEqual(Object.keys(j).sort(), ['asked', 'content', 'pending', 'sources']);
+  // v0.55.4: `rating` beside them, the 18+ filter the answer applied (safe: this request does not show 18+).
+  assert.deepEqual(Object.keys(j).sort(), ['asked', 'content', 'pending', 'rating', 'sources']);
+  assert.equal(j.rating, 'safe');
   const card = j.content.find((g: any) => g.title === 'Shared Title');
   assert.ok(card, 'the shared title was not folded into one card');
   assert.deepEqual(Object.keys(card).sort(), ['inLibrary', 'providers', 'title', 'updatedAt'], 'the card shape changed');
@@ -264,7 +266,7 @@ test('both shapes are what they always were, with the progress fields beside the
 
   const s = await app.inject({ method: 'GET', url: '/api/sources/search-all?q=Shared%20Title&groupBy=source&wait=0', headers: tok(ids.plain) });
   const sj = s.json();
-  assert.deepEqual(Object.keys(sj).sort(), ['asked', 'content', 'pending', 'sources']);
+  assert.deepEqual(Object.keys(sj).sort(), ['asked', 'content', 'pending', 'rating', 'sources']);
   const rail = sj.content.find((g: any) => g.source === FAST);
   assert.ok(rail, 'the fast source has no rail');
   assert.deepEqual(Object.keys(rail).sort(), ['lang', 'name', 'results', 'source'], 'the rail shape changed');
@@ -277,7 +279,7 @@ test('both shapes are what they always were, with the progress fields beside the
 
 test('an empty term answers the same shape without asking anyone', { skip }, async () => {
   const r = await app.inject({ method: 'GET', url: '/api/sources/search-all?q=%20', headers: tok(ids.plain) });
-  assert.deepEqual(r.json(), { content: [], sources: [], pending: 0, asked: 0 });
+  assert.deepEqual(r.json(), { content: [], sources: [], pending: 0, asked: 0, rating: 'safe' });
 });
 
 test('source= narrows the fan-out to that one source, and cannot reach past the caller\'s own set', { skip }, async () => {
@@ -384,4 +386,163 @@ test('the detail lookup is one fetch for a pre-warm and the pick that joins it, 
   routes.clearDetailCache();
   await routes.seriesAndChapters(src, 'd-1');
   assert.equal(calls[DETAIL], 2, 'clearDetailCache left the answer behind');
+});
+
+// ---- the 18+ filter (v0.55.4, #158) --------------------------------------------------------------------------------------
+
+/** A fake answering only `term`, with these results: anything else is an empty answer, so no other test meets it. */
+function probe(id: string, name: string, term: string, items: Array<{ title: string; genres?: string[]; contentRating?: string }>,
+  opts: { isNsfw?: boolean } = {}) {
+  calls[id] = 0;
+  return {
+    id, name, isNsfw: opts.isNsfw,
+    async search(q: string) {
+      calls[id]++;
+      return q === term ? items.map((it, i) => ({ sourceId: `${id}-${i}`, source: id, ...it })) : [];
+    },
+    async getSeries(sid: string) { return { sourceId: sid, source: id, title: sid }; },
+    async listChapters() { return []; },
+    async getPageUrls() { return []; },
+  };
+}
+
+test('every signal rates a result; the filter is the viewer\'s own, and Show 18+ off or an age cap holds it to Hide 18+', { skip }, async (t) => {
+  const { registerAdapter } = await import('../src/lib/sources');
+  const { invalidateAdultFilter } = await import('../src/lib/visibility');
+  const TERM = 'Rating Probe';
+  // MangaDex-like (a rating per title), and a site that names genres; the adult source answers too (`<term> on Adult Source`).
+  registerAdapter(probe('sb-rated', 'Rated Source', TERM, [
+    { title: 'Probe Erotica', contentRating: 'erotica' }, { title: 'Probe Safe', contentRating: 'safe' },
+    { title: 'Probe Suggestive', contentRating: 'suggestive' }, { title: 'Probe Unknown' },
+  ]) as any);
+  registerAdapter(probe('sb-genred', 'Genred Source', TERM, [
+    { title: 'Probe Genre Adult', genres: ['Action', '  zzzsb SMUT '] }, { title: 'Probe Genre Clean', genres: ['Action'] },
+    { title: 'Probe Unknown' },
+  ]) as any);
+  await q(`UPDATE server_settings SET adult_genres = '["ZzzSB Smut"]'::jsonb WHERE id = 1`);
+  invalidateAdultFilter();
+  const ask = async (qs: string, who = ids.plain) => {
+    const r = await app.inject({ method: 'GET', url: `/api/sources/search-all?q=${encodeURIComponent(TERM)}&wait=3000${qs}`, headers: tok(who) });
+    assert.equal(r.statusCode, 200, r.body);
+    return r.json();
+  };
+  const cards = (j: any) => Object.fromEntries(j.content.filter((g: any) => g.title.startsWith('Probe') || g.title.includes('Adult Source'))
+    .map((g: any) => [g.title, g.rating ?? '?']));
+  try {
+    await t.test('rated, each card and provider', async () => {
+      // Reintroduce by dropping the contentRating test in ratingOf: Probe Erotica reads unknown.
+      const j = await ask('&adult=1');
+      assert.equal(j.rating, 'all');
+      assert.deepEqual(cards(j), {
+        'Probe Erotica': 'adult', 'Probe Safe': 'safe', 'Probe Suggestive': 'safe', 'Probe Unknown': '?',
+        'Probe Genre Adult': 'adult', 'Probe Genre Clean': 'safe', 'Rating Probe on Adult Source': 'adult',
+      }, 'every signal rates a result');
+      const unknown = j.content.find((g: any) => g.title === 'Probe Unknown');
+      assert.equal(unknown.providers.length, 2, 'PREMISE: two providers folded into one card');
+      assert.ok(unknown.providers.every((p: any) => !('rating' in p)), 'an unknown provider carries no rating');
+      assert.equal(j.content.find((g: any) => g.title === 'Probe Erotica').providers[0].rating, 'adult');
+    });
+    await t.test('Hide 18+ and 18+ only, unknown in the one and not the other', async () => {
+      assert.deepEqual(cards(await ask('&adult=1&rating=safe')), {
+        'Probe Safe': 'safe', 'Probe Suggestive': 'safe', 'Probe Unknown': '?', 'Probe Genre Clean': 'safe',
+      }, 'Hide 18+ is everything not known to be 18+');
+      assert.deepEqual(cards(await ask('&adult=1&rating=adult')), {
+        'Probe Erotica': 'adult', 'Probe Genre Adult': 'adult', 'Rating Probe on Adult Source': 'adult',
+      }, '18+ only is what is known to be 18+');
+      // Reintroduce by filtering the shared entry (searchAll's cells) instead of the answer: this reads 18+ only too.
+      const all = await ask('&adult=1&rating=all');
+      assert.equal(Object.keys(cards(all)).length, 7, "one viewer's filter changed another's answer");
+      assert.equal(calls['sb-rated'], 1, 'the sources were asked once, whatever the filters');
+      // The rails shape is filtered the same way, and says each result's rating.
+      const rails = await ask('&adult=1&rating=safe&groupBy=source');
+      const rated = rails.content.find((x: any) => x.source === 'sb-rated');
+      assert.deepEqual(rated.results.map((r: any) => [r.title, r.rating ?? '?']), [['Probe Safe', 'safe'], ['Probe Suggestive', 'safe'], ['Probe Unknown', '?']],
+        'the rails are filtered the same way');
+    });
+    await t.test('with Show 18+ off, search hides 18+ too', async () => {
+      // v0.55.4's decision: the switch kept adult SOURCES out of the fan-out, and MangaDex's erotica went on showing.
+      // Reintroduce by deciding the rating from the cap alone: Probe Erotica is shown.
+      const j = await ask('&rating=all');
+      assert.deepEqual(cards(j), { 'Probe Safe': 'safe', 'Probe Suggestive': 'safe', 'Probe Unknown': '?', 'Probe Genre Clean': 'safe' },
+        'with Show 18+ off an 18+ result was shown');
+      assert.equal(j.rating, 'safe', 'the answer says what it applied');
+    });
+    await t.test('a capped account is held to Hide 18+', async () => {
+      // The add checks only the source, so the server holds the cap here. Reintroduce by honouring `rating` whatever
+      // the cap: the capped account's 18+ only answer lists Probe Erotica.
+      const j = await ask('&adult=1&rating=adult', ids.capped);
+      assert.ok(!Object.values(cards(j)).includes('adult'), `a capped account was shown an 18+ result: ${JSON.stringify(cards(j))}`);
+      assert.ok('Probe Safe' in cards(j));
+      assert.equal(j.rating, 'safe', 'the answer says what it applied');
+    });
+  } finally {
+    await q(`UPDATE server_settings SET adult_genres = '[]'::jsonb WHERE id = 1`);
+    invalidateAdultFilter();
+  }
+});
+
+test('filtered before the cap: 18+ only finds every 18+ title, not what the first thirty held (v0.55.4)', { skip }, async () => {
+  // Thirty-six titles, one provider each, the twelve 18+ ones last. Reintroduce the filter after the slice in
+  // groupByTitle: 18+ only answers the six that made the first thirty.
+  const { registerAdapter } = await import('../src/lib/sources');
+  const TERM = 'Cap Probe';
+  const many = (k: string, rating?: string) => Array.from({ length: 12 }, (_, i) => ({ title: `Cap ${k} ${i}`, ...(rating ? { contentRating: rating } : {}) }));
+  registerAdapter(probe('sb-cap1', 'Cap One', TERM, many('one')) as any);
+  registerAdapter(probe('sb-cap2', 'Cap Two', TERM, many('two')) as any);
+  registerAdapter(probe('sb-cap3', 'Cap Three', TERM, many('three', 'erotica')) as any);
+  const three = (j: any) => j.content.filter((g: any) => g.title.startsWith('Cap three')).length;
+  const all = (await app.inject({ method: 'GET', url: `/api/sources/search-all?q=${encodeURIComponent(TERM)}&wait=3000&adult=1`, headers: tok(ids.plain) })).json();
+  assert.equal(all.content.length, 30, 'PREMISE: more titles than the cap');
+  assert.ok(three(all) < 12, `PREMISE: the cap cuts the 18+ titles off (${three(all)} of 12 in the first thirty)`);
+  const j = (await app.inject({ method: 'GET', url: `/api/sources/search-all?q=${encodeURIComponent(TERM)}&wait=0&adult=1&rating=adult`, headers: tok(ids.plain) })).json();
+  assert.equal(three(j), 12, 'filtered before the cap');
+  assert.ok(j.content.every((g: any) => g.rating === 'adult'));
+});
+
+test("a site's own 18+ flag makes a card 18+ only when no unflagged site carries the title (v0.55.5)", { skip }, async () => {
+  // The extension index flags a site that hosts any adult title, so AllManga (EN) carries the flag among thousands of
+  // general titles. v0.55.4 rated a card 18+ when any provider was: every manhwa it shares with Asura or Natomanga was
+  // marked 18+ under All, gone from Hide 18+ and listed under 18+ only.
+  const { registerAdapter } = await import('../src/lib/sources');
+  const { invalidateAdultFilter } = await import('../src/lib/visibility');
+  const TERM = 'Weigh Probe';
+  registerAdapter(probe('sb-aggregator', 'Flagged Aggregator', TERM, [
+    { title: 'Flag Shared' }, { title: 'Flag Only Here' }, { title: 'Flag Two Adult Sites' },
+    { title: 'Flag Erotica Elsewhere' }, { title: 'Flag Safe Elsewhere' }, { title: 'Flag Named Elsewhere' },
+  ], { isNsfw: true }) as any);
+  registerAdapter(probe('sb-plainsite', 'Plain Site', TERM, [
+    { title: 'Flag Shared' }, { title: 'Flag Erotica Elsewhere', contentRating: 'erotica' }, { title: 'Flag Safe Elsewhere', contentRating: 'safe' },
+  ]) as any);
+  registerAdapter(probe('sb-adultsite', 'Adult Site', TERM, [{ title: 'Flag Two Adult Sites' }], { isNsfw: true }) as any);
+  registerAdapter(probe('sb-named', 'Named Site', TERM, [{ title: 'Flag Named Elsewhere' }]) as any);
+  await q(`UPDATE server_settings SET adult_sources = '["sb-named"]'::jsonb WHERE id = 1`);
+  invalidateAdultFilter();
+  const ask = async (qs: string) => {
+    const r = await app.inject({ method: 'GET', url: `/api/sources/search-all?q=${encodeURIComponent(TERM)}&wait=3000&adult=1${qs}`, headers: tok(ids.plain) });
+    assert.equal(r.statusCode, 200, r.body);
+    return r.json();
+  };
+  const cards = (j: any) => Object.fromEntries(j.content.filter((g: any) => g.title.startsWith('Flag')).map((g: any) => [g.title, g.rating ?? '?']));
+  try {
+    const all = await ask('&rating=all');
+    // Reintroduce v0.55.4's "18+ when any provider is" in cardRating: Flag Shared and Flag Safe Elsewhere read adult.
+    assert.deepEqual(cards(all), {
+      'Flag Shared': '?', 'Flag Only Here': 'adult', 'Flag Two Adult Sites': 'adult', 'Flag Erotica Elsewhere': 'adult',
+      'Flag Safe Elsewhere': 'safe', 'Flag Named Elsewhere': 'adult',
+    }, 'a flagged site weighs only where nothing else carries the title');
+    const shared = all.content.find((g: any) => g.title === 'Flag Shared');
+    assert.deepEqual(shared.providers.map((p: any) => [p.source, p.rating ?? '?']).sort(), [['sb-aggregator', 'adult'], ['sb-plainsite', '?']],
+      'each provider still says what its own site declares');
+    assert.deepEqual(Object.keys(cards(await ask('&rating=safe'))).sort(), ['Flag Safe Elsewhere', 'Flag Shared'], 'Hide 18+');
+    assert.deepEqual(Object.keys(cards(await ask('&rating=adult'))).sort(),
+      ['Flag Erotica Elsewhere', 'Flag Named Elsewhere', 'Flag Only Here', 'Flag Two Adult Sites'], '18+ only');
+    // A rail is one site, and nothing vouches for a flagged site's titles there: under Hide 18+ it draws nothing.
+    const rails = await ask('&rating=safe&groupBy=source');
+    assert.ok(!rails.content.some((x: any) => x.source === 'sb-aggregator'), "a flagged site's rail is still 18+");
+    assert.deepEqual(rails.content.find((x: any) => x.source === 'sb-plainsite').results.map((r: any) => r.title).sort(),
+      ['Flag Safe Elsewhere', 'Flag Shared']);
+  } finally {
+    await q(`UPDATE server_settings SET adult_sources = '[]'::jsonb WHERE id = 1`);
+    invalidateAdultFilter();
+  }
 });

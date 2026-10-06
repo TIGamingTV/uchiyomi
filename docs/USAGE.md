@@ -40,6 +40,14 @@ point `LIBRARY_PATH` at it first (`cp .env.example .env`, set `LIBRARY_PATH=/pat
 contains chapters, at any depth. Each chapter is a `.cbz`, a `.cbr`, or a folder of images (an archive may
 carry a `ComicInfo.xml` for metadata).
 
+**Bringing a library over** (since v0.55.4, [#158](https://github.com/AngeloSha/uchiyomi/issues/158)): a new
+server opens on an empty library, and the empty **Library** and Home's **Welcome to Uchiyomi** both lead with **Import
+your library** — from a Mihon or Tachiyomi backup, a MangaDex list, your AniList, MyAnimeList or Kitsu list, or pasted
+titles; it opens the import page described under *Sources* in section 8 — and **Find series in Discover** beside it.
+An admin sees both; someone who may add series sees Discover; anyone else is told to ask whoever runs the server.
+Later, an admin finds the import as **Import a list** in the Library's header, beside where you add series, or by
+typing *import* in search.
+
 Prefer a CLI-seeded admin? Run `bash scripts/setup.sh` from a clone instead — it generates the secrets, creates
 the admin from a password you type, fixes volume ownership, and starts the development stack (`yomi-app`,
 `yomi-db`, `yomi-suwayomi`, `yomi-flaresolverr`). `yomi-app` is the same single container the install ships,
@@ -77,9 +85,12 @@ the left of the grid; on a phone it opens from **Filters** at the top. Genres ar
 how many series each holds, and formats (Manhwa, Manhua, Webtoon…) are kept separate from moods like Horror
 and Romance. Picking two genres shows series that are in **both**. With more than one source in the
 library, two more sections appear: **Main source** shows the series added from a source, and **Any source**
-the series that read from it at all, as their main source or a followed one. For a source that went away, an admin
-can filter by it under **Main source**, then **Select** → **Select all** → **More** → **Find other sources**
-(section 4); *Select all* takes what the grid has loaded, so scroll to the end first. Each cover shows a **NEW** ribbon when
+the series that read from it at all, as their main source or a followed one. **Main source** ends on **No source**
+(since v0.55.1, [#149](https://github.com/AngeloSha/uchiyomi/issues/149)) while some series have no main source —
+folders you added by hand, and anything never matched to a site — and then appears with a single source too. For a
+source that went away, or for the series with none, an admin can filter by it under **Main source**, then **Select** →
+**Select all** → **More** → **Find other sources** (section 4); *Select all* takes what the grid has loaded, so scroll
+to the end first. Each cover shows a **NEW** ribbon when
 there are unread chapters. Click a cover to open the series. The ✦ **Surprise me** button picks one at random from whatever the
 filters currently show.
 
@@ -112,6 +123,16 @@ interface the palette opens empty instead, so the input method composes the whol
 Appearance → Type anywhere to search** switches the typing, and the **/** shortcut with it, off on that device;
 **Ctrl+K** keeps working.
 
+**Search finds pages and settings too** (since v0.55.4). Type two letters or more and, under the series, **Pages and
+settings** lists what the words name: every admin tab, each section of **Admin → Settings**, the profile's tabs and
+cards, the import, and settings by name — *Notice chapters*, *18+ filter*, *Source order*, *Slow archive*, *Backup
+time*, *Delete read chapters*, *Scanlators*, *Check for updates*, the *Cloudflare solver* and the *Version* on Health,
+*Rescan everything* on Tasks, *Language*, *API tokens*, *Two-factor authentication* and more. A name works in your
+language and in English, and so do a few words people type instead (*flaresolverr*, *mihon*, *2fa*). Each row says
+where it is (*Admin → Settings*), and choosing it opens that page on that tab, scrolled to that card once it has
+loaded. Admin pages are listed for admins only, and what the desktop app does not have is not listed there. On a phone,
+the **Search** tab lists the same ones under the series it finds.
+
 ### What counts as a chapter
 
 Point `LIBRARY_PATH` at what you already have. A chapter can be any of:
@@ -130,6 +151,37 @@ chapter**: a reflowable novel has no images in its spine, so it yields no pages 
 rather than adding something that opens to nothing. Uchiyomi is a manga reader, not an ebook library.
 
 Any folder depth works, and `ComicInfo.xml` is read when an archive carries one.
+
+### How a chapter's number is read
+
+Since v0.55.2 a file the scanner meets for the first time is numbered by these rules, in order:
+
+1. **A chapter word and its number win**: `Ch`, `Ch.`, `Chap`, `Chapt`, `Chapter`, `Cap`, `Cap.`, `Capitolo`,
+   `Capítulo`, `Chapitre` or `Kapitel`, in any case, with or without a dot or a space. `Vol 3 Chapter 12.cbz` is
+   chapter 12. Kavita's short form counts too, `v03 c012`, when the `c012` stands on its own; the `(c2c)` tag on
+   Western scans is not chapter 2.
+2. **Else `#` and its number**: `Batman #12 (1987).cbz` is 12.
+3. **Else the first number that is neither a year nor a volume's.** A year is four digits from 1900 to 2099 inside
+   `( )` or `[ ]`, so `Watchmen (1986) 01.cbz` is 1. A volume's number, right after `Vol`, `Volume`, `Tome`, `Band` or
+   a lone `v`, is passed over when another number follows it; `Tome 01.cbr` on its own is still 1.
+4. **A range**: a dash and a larger number right behind the chapter's, with no space around the dash, make one file
+   that holds several chapters. `Batman 01-07 (1987).cbz` holds chapters 1 to 7 and reads *Ch. 1–7*; `Ch. 1–7` works
+   the same way. Never when the second number is a year (`Batman 12-1987`) or the two are part of a date.
+5. **A name with nothing else**, `Watchmen (1986).cbz` or `Oneshot.cbz`, gets no number (0) and sorts by its name.
+
+The files Uchiyomi downloads itself are named `Chapter 12.cbz` and read exactly as before.
+
+**Chapters already in your library keep their numbers.** A chapter scanned before v0.55.2 goes on being read the
+old way, by the first number in its name, so nothing is renumbered behind your back and what your trackers were told
+stays true. A renamed file is a new file to the scanner and is read by the rules above. **Edit a chapter** (section
+4) fixes any number by hand, old or new, and since v0.55.4 **Admin → Tasks → Rescan everything** reads a whole series
+again by these rules when you tick it (*Numbering hand-named files again*, section 8).
+
+A file holding a range is one chapter row, and one file in the series' chapter count. Everything about *which*
+chapters you have counts every number in it: no gap is reported between 1 and 7, the updater does not fetch 2 to 7,
+and the sources' 2 to 7 are not listed as missing. Finishing it tells AniList and the other trackers 7, and *Mark
+caught up* and *Mark previous as read* go by its end. In Mihon it sorts as 1 and is named `1–7`. A renumber by posting
+order leaves it alone; Edit a chapter gives it one number instead.
 
 ---
 
@@ -236,9 +288,10 @@ says how many are in hand. The chips:
   and none of it touches
   your files. Anything you set here survives the next scan; anything you leave blank keeps following what
   the files say.
-- **Edit a chapter** from its row menu, if its number came out wrong. Numbers are read from the filename by
-  taking the first number in it, so `Vol 2 Ch 5.cbz` is read as chapter 2. Correcting it fixes the reading
-  order and what gets reported to a connected tracker.
+- **Edit a chapter** from its row menu, if its number came out wrong. Numbers are read from the filename (see *How
+  a chapter's number is read* in section 3), and a chapter scanned before v0.55.2 by the first number in it, so
+  its `Vol 2 Ch 5.cbz` is chapter 2. Correcting it fixes the reading order and what gets reported to a connected
+  tracker; on a file holding a range of chapters it gives the file that one number.
 - **Auto-update** toggles whether the updater keeps checking this one for new chapters, and **Check now**
   runs that check immediately instead of waiting for the next sweep (it is also in *Sources & translations*,
   as a chip under the *Sources* list).
@@ -551,12 +604,27 @@ they were. Chapters already here stay, and older ones can still be fetched from 
 
 ### When a source or page fails
 
-The downloader learns a source's pace. A 429 makes later chapters use one page worker and longer gaps, and
-the current chapter waits and resumes from its remaining pages. If a normal failure still wins, Uchiyomi
+The downloader learns a source's pace. A 429 makes later chapters use one page worker and longer gaps, one
+chapter at a time, and the current chapter waits and resumes from its remaining pages; a chapter running beside it
+waits as long. Since v0.55.3 the slower pace is kept: at least an hour, and it comes back up a step at a time only
+after ten chapters in a row came down whole at it — a site that kept refusing used to be asked at full speed again
+ten minutes later. Two sources whose pages come from the same image server share one pace (Natomanga and
+Mangakakalot do), and **Admin → Health** says *Downloading slowly: the site asked for fewer requests* on the
+source's row under *Source health* while it lasts. If a normal failure still wins, Uchiyomi
 tries the same chapter on at most two sources the series already follows; the download card says which
 source it switched from and to. It does not switch a version you explicitly picked, and a 403 or 429 is a
 refusal: the source cools down, no partial is saved and no new source is hunted. If the series already
 follows another source with the chapter, that copy may keep the queue moving.
+
+**Several sites, one release.** Since v0.55.4 ([#158](https://github.com/AngeloSha/uchiyomi/discussions/158)), a Fetch
+— *Fetch all {n}*, a chapter's *Fetch*, a *Try again* — of a series that follows more than one source carrying the
+same release (the same scanlation group; or, on sites that name none, the same language and page count) takes its
+chapters from those sources in turn rather than all from one: the one the Fetch has asked least, a site downloading at
+full speed before one that is slowed, and up to three chapters at once, one per image server, so two sites fill the
+series side by side. Two sites whose pages come from one image server count as one. A site that is switched off,
+cooling down, refusing or above your age limit is skipped, and nothing moves for a version you picked by name, for a
+series with its own source order (*Preferring one source*) or for one numbered by posting order. The download card
+counts them as one job. The slow archive takes turns the same way (*Fetching a whole series slowly*, below).
 
 If at least four pages in five arrived after an ordinary page failure, the chapter is kept with a numbered
 placeholder at every missing position rather than thrown away. Its row says how many pages are missing. The
@@ -653,6 +721,18 @@ random pause of 1.5 to 4 seconds between pages, a break drawn at random after ea
 seconds — and now and then a long one of 20 to 45 minutes. That comes to about 96 chapters a day from one site, so
 1,000 take about ten days. Several sites are archived side by side, one chapter in flight on each and at most three
 sites at once; the series queued on one site take turns, so ten of them share its four chapters an hour.
+
+**One release on several sites.** Since v0.55.4 ([#158](https://github.com/AngeloSha/uchiyomi/discussions/158)), a
+series that follows more than one source takes its chapters from them in turn when they carry the same release: the
+same scanlation group, or — on sites that name no group, as most aggregators don't — no group, the same language and
+the same page count wherever both say. While one site is in its break the next chapter comes from another, the one that
+was asked longest ago, so a series on two such sites is archived about twice as fast while each site still sees only
+its own pace. Two sites whose pages come from one image server (Natomanga and Mangakakalot share one) count as one site:
+one chapter at a time between them, and a break or a refusal on either holds both. It never takes another group's copy
+this way, never one from a site above the age limit of whoever queued the series or an 18+ site for a series that is
+not 18+, and never at all for a series with its own source order (*Preferring one source*) or numbered by posting
+order. Its estimate is shared among the sites it takes turns on, and it goes under *Needs attention* for refusals only
+when every one of them keeps refusing.
 
 **What it waits for.** Everything else goes first. It stands aside while the scheduled check, the library repair or
 the daily source check (or *Test all*) runs; while anyone else downloads from the same site or into the same
@@ -1122,6 +1202,17 @@ again.
   With one source chosen in the chip, a search asks **only that source** and the chip stays on screen while
   the results are up, so you can see the search is narrowed and clear it with its × (which searches every
   source again). Switching the toggle to *Newest* or *Popular* goes back to browsing.
+- **Hide 18+ and 18+ only** (since v0.55.4, [#158](https://github.com/AngeloSha/uchiyomi/discussions/158)): with
+  **Show 18+** on, three chips under *Results across your sources* — **All**, **Hide 18+**, **18+ only** — filter the
+  results by what is known of each. A result is 18+ when its provider is ticked in **Admin → Settings → 18+ filter**,
+  when MangaDex rates the title erotica, or when it carries one of the 18+ filter's genres, and such a card wears a small
+  **18+** mark; a MangaDex title rated safe or suggestive is not, nor one whose genres the filter's list does not name.
+  A site whose extension calls itself 18+ makes a title 18+ only when no other site carries it (since v0.55.5): the
+  flag covers a whole site, and general sites such as AllManga carry it for the few adult titles they host. Most
+  extensions say nothing about a title in a search: their results stay under *All* and *Hide 18+* and are left out of
+  *18+ only*. The choice holds for every search until you leave the
+  page. With **Show 18+** off the search shows no 18+ results at all and the chips are not offered, and an account
+  whose age limit is below 18 gets the same, whatever it asks for.
 - **Add:** tap a card and pick which source to add it from — each with its favicon, the first marked *most
   used* (skipped when only one has it). The dialog then opens with *From {source} · Change*. Choose
   **Chapters to fetch now** (All, First N, Latest N, or **Nothing yet — pick chapters later**), toggle
@@ -1330,7 +1421,10 @@ server works out before anything moves:
 
 1. *184 already follow a working source: it becomes their main source.* At once, with no search.
 2. *The other 11 are searched for on your other sources.* One at a time, under their titles and other names, as
-   *Find other sources* does: a match is taken only when its title and chapter numbers line up.
+   *Find other sources* does: a match is taken only when its title and chapter numbers line up. Since v0.55.1 only a
+   source that can update the series is asked — working, or only cooling down after asking Uchiyomi to slow down —
+   so a series is never moved onto a source failing at its chapter or page lists or its images; with none to take
+   it, it stays where it was and says so.
 3. *Example Manga is turned off once nothing uses it.*
 
 A series numbered by posting order keeps its main source, and the dialog says how many. **Turn it off when done**
@@ -1479,7 +1573,14 @@ Providers and Extensions were two; `?tab=Providers` and `?tab=Extensions` lead t
 Every tab has an address — `/admin/?tab=Settings`, `/admin/?tab=Health` and so on — so a refresh, the Back
 button, a bookmark or a language change keeps you on the tab you were on. The first tab, Overview, is plain
 `/admin/`. The same is true of the profile: `/profile/?tab=Settings`, `/profile/?tab=Connections`,
-`/profile/?tab=Account`.
+`/profile/?tab=Account`. A card can be named too, `/admin/?tab=Settings&section=notice-chapters`: the page scrolls to
+it once it has loaded (that is how search's settings land on theirs).
+
+**Which version is running** (since v0.55.4, [#150](https://github.com/AngeloSha/uchiyomi/issues/150)) is the foot of
+the admin menu: *Uchiyomi v0.55.4 · up to date*, or *· update available (v0.55.5)*, which links to that release. On a
+phone it ends the line of facts under the header, and the menu's sheet says it too. Whether a newer one is out is
+Health's **Version** check, the same answer: with **Check for updates** off, or GitHub not answering, the line says the
+version alone. In the desktop app it is the app's own version.
 
 **Server → Overview:** library stats + recent member activity.
 
@@ -1496,13 +1597,38 @@ v0.49.1 the page says the server's findings in your language, with dates and tim
 Since v0.41.0 every finding also carries the key that fixes it, and most of them fix themselves overnight
 without you pressing anything. Since v0.48.3:
 
-- **Fix all issues**, at the top, runs the repair once with every step that has something to do — longer copies
-  for short chapters, gaps, every source's failed chapters tried again now, and the solver. Since v0.49.0 it is a
-  row like the others, with no confirmation after the press: its plan, one line per step with that step's
-  limits, is under *How it works* before you press **Start**, with what it never does (delete, merge, switch
-  off) and, when the solver step is in it, that it ends the cooldowns of the sources that blame the solver. One
-  run takes up to 20 short chapters and 5 series with gaps (the `REPAIR_SHORT_MAX` / `REPAIR_GAPS_MAX` defaults);
-  the nightly carries on with the rest, or press it again.
+- **Fix everything** (since v0.55.0, where *Fix all issues* was), beside **Re-check**, is there whenever any card
+  has a finding. It asks one question:
+  - **Fix it for me** (the default) runs one background run that tries every remedy on every card: it replaces
+    broken sources, fetches missing and broken chapters, finds new sources (installing extensions if it has to, and
+    keeping only those that found something), merges duplicate series, deletes chapters saved twice or numbered
+    impossibly, and applies the renumbering plans that are safe. Since v0.55.1 it tries extensions one at a time, with
+    no limit of its own, until the series are found or its time is up — the next run carries on down the list — the
+    ones your series' translation groups name first, then the most downloaded (the download counts its extension
+    repository publishes on GitHub, read at most once a day; since v0.55.3 counted over the week after each release,
+    when it is downloaded, so MangaDex or Mangakakalot comes before a webcomic rebuilt last week — every extension is
+    still tried, the least downloaded last), then the most recently updated; an 18+ extension only
+    for a series rated 18+, after the others. One that has none of the series is removed straight away, and is not
+    tried for the same series again for a month. The end says it in one line: *Tried 14 extensions and kept Ember
+    Pages*. A site that asked Uchiyomi to slow down is not broken (since v0.55.1): the run never replaces it, never
+    moves a series onto a source that cannot update it, and leaves the chapters a rate limit holds back to clear by
+    themselves. A source the extension source limit left out keeps its series too (it needs a slot, which the end lists
+    under what needs you), while one the engine no longer offers is replaced like any broken source (since v0.55.1).
+    With a backup Cloudflare solver (since v0.55.3) the solver needs you only when neither answers: with one of the two
+    down, every request is still solved, and the end says which one under what clears by itself.
+    Merges and deletes cannot be undone. While it
+    runs you see its step (ten of them), a bar and what it is on, with **Stop** — it stops at the next safe point,
+    never in the middle of a merge, a delete or a renumbering — and **Run in background**; the key then says
+    *Fixing everything*, and so does its card under Library → Downloads → *Server tasks*. At the end it says how
+    many things need you (with *Everything else is green* under it when nothing else is left), or **All green** when
+    nothing does, then up to six lines of what it did (*Moved 184 series off Aqua Manga*, *Fetched 37 missing
+    chapters*…). What a stopped run did not reach is never something that needs you: the next run continues it. Each thing that needs you has its one key — the page it is about, its
+    card here, or Admin → Settings — what clears by itself says when, and the rest is under *Details*. **Run again**
+    is offered only while something a run could still change is left.
+  - **Let me choose** runs the safe repair *Fix all issues* used to run — failed chapters tried again now, longer
+    copies for short chapters, gaps and the solver, the steps some finding offers — and leaves the rest to the
+    cards. One run takes up to 20 short chapters and 5 series with gaps (the `REPAIR_SHORT_MAX` / `REPAIR_GAPS_MAX`
+    defaults); what it did stays under the keys until the next press.
 - **Open** goes to the chapter the finding is about: a short chapter opens in the reader; a gap or an impossible
   number opens the series with its list turned to that chapter and the row lit up (for a gap, the chapter just
   before it).
@@ -1525,7 +1651,8 @@ another tab.
   gaps*, *Try every failed chapter again*, or **Reset** for *Reset the solver (3 sources)*), **Merge all** on
   duplicates, and **Scan now** on *Library scan* and *Downloads missing from the library*, which scans the
   library, says what it found (*Scan done: 38 series, 912 chapters*) and checks the page again. A scan can start
-  once a minute.
+  once a minute. A big library on a slow disk can take minutes: the line follows it (*Folder 1,200 of 3,400*) until
+  it ends (since v0.55.6), and a scan that fails says why.
 - **Each finding has small keys and a status line that stays.** While it works: the step, what it is on and a
   ticking clock, with **Stop** on a repair. Then what it did and *Took 0:42*, or why it was refused (amber) or
   failed (red). It is still there after a reload, because it comes from the kept run rather than from a message.
@@ -1535,6 +1662,16 @@ another tab.
   the source is cooling down and when it can be asked again — and **what the last attempt found**, from what the
   repair stored: *No source has a longer copy*, *Followed {source}*, *No other source lists them*, *Failing since
   {date}* (which a Retry now no longer resets to today).
+- **Chapters a site refused only for room are waiting, not failing** (v0.55.1). When every failing chapter of a source
+  was refused with HTTP 429 (*too many requests*), *Chapters that would not download* lists that source greyed and
+  says *2 chapters wait for a site that asked for a pause, and are tried again by themselves*; the card stays green
+  for it. One chapter failing any other way keeps the source a finding.
+- **Failed chapters follow the series** (v0.55.3). A chapter that failed on a source the series no longer uses — moved
+  off it by **Replace**, **Make main** or Fix everything, unfollowed, or a source turned off — is filed under the
+  series' main source and tried there again from the start, keeping when it first failed; its row reads *from a source
+  the series no longer uses*, with why it failed there. While the main source asks for a pause, or downloads slowly
+  after one, those chapters wait greyed like the ones it refused for room. Before, they stayed under the old source,
+  which nothing asks any more, and every Fix everything listed them as chapters no source can download.
 - **While any repair runs** — yours, another admin's, the nightly — a strip at the top of the page says what it is
   (*Repairing: Gap fill*), who started it, the step (*Step 2 of 4 · Filling gaps · Searching other sources*),
   what it is on, how long it has been going and usually takes, and the searches it has left, with **Stop**, which
@@ -1574,7 +1711,9 @@ on its card that says so.
 
 **What fixes itself.** Once a day — **Admin → Settings → Library housekeeping → Repair the library nightly**,
 on by default, and **Admin → Tasks → Repair library** with a *Run now* — Uchiyomi does the six things that
-are reversible or provable on their own, and two more only when you switch them on, in this order:
+are reversible or provable on their own, and two more only when you switch them on, in this order. Since v0.55.0,
+**Every night**, just under that switch, chooses what runs: this **Safe repair** (the default), or a whole **Fix
+everything**, which does what its key on Health does and can merge, delete and install extensions without asking.
 
 * **clears stale Cloudflare state** when sources are blaming the solver and it answers: the remembered sessions,
   the "could not be solved" marks and those sources' cooldowns; and it forgets any cooldown that lapsed more than
@@ -1606,7 +1745,8 @@ leave the gaps with nothing.
 **Merge** per pair, and **Merge all** for the whole check, behind a confirmation that lists every pair and
 marks the copy that is kept (most chapters, then most readers, then the older row); merging is one way.
 **Impossible chapter numbers** offer **Delete chapters**, also behind a confirmation, and a chapter anyone
-has bookmarked is skipped. There is deliberately no *Fix all* for either.
+has bookmarked is skipped. There is deliberately no *Fix all* for either — only Fix everything's *Fix it for me*
+merges and deletes by itself, because pressing it is choosing that.
 **The same chapter saved twice** (since v0.50.0) lists series where two sites' splits of one chapter are both on
 disk — 335 and 335.5 from one site, 335.1 and 335.6 from another that arrived later — which updates before
 v0.50.0 could download (see *Parts that sites number differently*). It warns while it finds any. Each row names
@@ -1615,8 +1755,9 @@ every row, after a confirmation that lists them. A part another site supplied un
 numbers, which that site lists too, is not a second copy and is not listed. Deleted files stay listed as deleted
 chapters, everyone keeps their reading history, and updates do not fetch them back.
 
-**What the nightly never does.** It never deletes a chapter, never marks one as gone, never merges two
-series and never renumbers anything. It also never runs beside a chapter sweep: whichever starts second
+**What the nightly never does.** The safe repair never deletes a chapter, never marks one as gone, never merges
+two series and never renumbers anything; with **Every night** set to *Fix everything* the nightly is Fix
+everything, which can. It also never runs beside a chapter sweep: whichever starts second
 waits ten minutes. Switching it off stops the schedule only — *Run now* and the buttons below keep working.
 
 **The keys, one set per finding.** *Fix* asks the repair to look at that one chapter now (since v0.49.0 not
@@ -1630,7 +1771,9 @@ that is cooling down or switched off is reset but not asked, and the row says so
 *Turn off* act on a source, with what *Test* found shown under the row. The solver card's **Reset the solver**
 clears the Cloudflare cookies and "could not be solved" marks this server is holding and ends the cooldowns of the
 sources that blame the solver — it says how many — but cannot restart the solver: while the solver is not
-answering, the card says to restart its container (on the desktop app, to quit and reopen Uchiyomi) instead. A
+answering, the card says to restart its container (on the desktop app, to quit and reopen Uchiyomi) instead. With a
+backup solver (`FLARESOLVERR_FALLBACK_URL`, since v0.55.3) the card lists both, *Main solver* and *Backup solver*, and
+says which one is not answering; the reset clears both ([the Cloudflare solver](CONFIGURATION.md#the-cloudflare-solver)). A
 check whose step the nightly can run also gets **Fix all** at the top of its card; on *Chapters that would not
 download* it gives every failed chapter another try now (before v0.49.0 it reset only week-old ones). Everything
 a key starts is the same repair narrowed to one step, so it waits while a chapter sweep is running and says so.
@@ -1665,7 +1808,13 @@ that is merely behind. Since v0.41.0 the same greying covers a failing source **
 install ten of twelve not-ok sources are Discover-only noise nobody can act on — and it counts as a fault
 again the moment something uses it, or it is actually in a cooldown, or (since v0.49.0) its failure is confirmed.
 When an extension server is configured there is one more check, *Extension source limit*, which goes amber when
-more sources are switched on than `SUWAYOMI_MAX_SOURCES` allows to register.
+more sources are switched on than `SUWAYOMI_MAX_SOURCES` allows to register. Since v0.55.0 a series under *Series
+that can no longer update* whose source is over that limit offers **Free a slot** instead of *Replace* — the source
+works, it is only not loaded — which opens that source in **Admin → Sources**, where switching off a source no
+series uses makes room for it. Since v0.55.1 the row names the source as the rest of Health does (the extension's own
+name, not `sw:2522…`), and the source's sheet says why it is not loaded — *The engine’s limit of 25 sources is full.
+Turn off a source you don’t use, or raise SUWAYOMI_MAX_SOURCES.* — with no *Replace*. A source switched on that the
+engine no longer offers at all reads *no longer installed*, with *Replace*, rather than over the limit.
 
 **Source health sees a failing source** (since v0.49.0, [#115](https://github.com/AngeloSha/uchiyomi/issues/115)).
 Before, a source could fail its **Test** while its card said `ok` and this check said *All good*: the Test wrote
@@ -1685,6 +1834,15 @@ sources responding normally* over any of these. The diagnosis tells the engine f
 server did not answer* means only that the engine could not be reached, timed out or refused Uchiyomi's login,
 while an extension that failed on its site, with the engine answering, reads *This source's extension reported an
 error*.
+
+**A rate limit is a cooldown, never a failure** (since v0.55.1). A site that answered *429* — *slow down* — at its
+chapter list, its page list or its images works; it asked Uchiyomi to wait. Its row reads *Rate limited* (until when,
+while the cooldown runs) and never offers **Replace**, its series still count as updating, and **Fix everything**
+leaves it alone: it never replaces it, never Tests it or clears its cooldown, retries none of its failed chapters and
+fetches nothing through it during the run, and lists what it holds back — and every chapter a rate limit failed —
+under what clears by itself, never under what needs you. Before, five refused image downloads in a row read as *Images
+failing*, Fix everything moved the series off a source whose searches and chapter lists answered fine, and its retries
+ran straight into the rate limit again.
 
 **A site that says it is offline** (since v0.49.1). A site that answers with its own maintenance page — a small page
 whose title says *temporarily offline*, *maintenance* or *be back soon*, with none of the site's own markup — reads
@@ -1783,6 +1941,59 @@ server applied the same strict rule, so the button was dead rather than the requ
 title** button now sits beside the box as well, whenever the browser offers a clipboard (over plain `http`
 on a LAN it does not, and the button is then hidden rather than broken).
 
+### Library maintenance: Scan, Verify chapter files and Rescan everything
+
+Three tasks on **Admin → Tasks** look at your chapter files, and each does one thing:
+
+| | What it does | What it never does |
+|---|---|---|
+| **Library scan** | Adds every chapter file it finds and updates the ones it knows. A file that comes back after it was marked gone is picked up again, on the same row. | Remove anything: a chapter whose file is gone stays listed as it was. |
+| **Verify chapter files** | After a database restored without its files (section 12): marks the chapters Uchiyomi *downloaded* whose file is gone, so the next sweep downloads them again onto the same rows. | Mark a chapter in a library you built by hand; it only counts those. |
+| **Rescan everything** (since v0.55.4) | For a library you built by hand: finds the chapters whose file is gone from your own folders, shows you first, and marks them *File no longer on disk* when you press **Apply**. | Erase a chapter, touch a file, hide a series, or change what anyone has read. |
+
+**Rescan everything** ([#150](https://github.com/AngeloSha/uchiyomi/discussions/150)) is for files you deleted, moved
+out or renamed by hand. **Start** scans the library, then looks for every chapter's own file; nothing changes yet. The
+panel under the row says how far it has got, then what **Apply** would do: *37 chapter files are gone from your folders
+· 3 were probably moved or renamed (kept) · 4 in the download folder, left to Verify chapter files · 2 series with
+nothing left*.
+
+- **Gone from your folders** is what Apply marks. The chapter stays in its series, greyed, reading *File no longer on
+  disk* (never *Deleted from the server*: nothing deleted it), and everyone's progress, bookmarks and notes stay on it;
+  the sweep does not fetch it back. Put the file back and the next scan picks it up again on the same row.
+- **Moved or renamed (kept)**: a file renamed in place, or moved into another folder, is a new chapter to the scanner,
+  and its old row looks gone. When the old file's fingerprint matches a file that is there, the old row is kept as it
+  is — the reading history is on it — and listed under *Which ones were probably moved or renamed*.
+- **In the download folder**: chapters Uchiyomi downloaded are *Verify chapter files*' to mark, so that the sweep
+  fetches them again; here they are only counted.
+- **Series with nothing left**: every chapter's file is gone. Each one is a link, and nothing is hidden or removed:
+  open one to *Remove* it, or to merge it with the series its files went to (a renamed folder becomes a new series
+  unless `LIBRARY_REMATCH` is on, see CONFIGURATION.md).
+- A folder (`/library`, `/library-dl`) with no file behind any of its chapters, or with more than nine in ten gone,
+  *looks unmounted*, and nothing under it is touched — the rule *Verify chapter files* follows. A file that could not
+  be checked at all (a permission, a disk error) is never called gone.
+- **Apply** looks at every file again before it marks it, with library scans held off: a file that came back since the
+  preview, or a chapter renamed or renumbered since, is left alone. It is refused when the preview is more than 30
+  minutes old (run it again), and while a chapter sweep, the library repair, *Fix everything*, *Verify chapter files*,
+  *Delete read chapters* or a library scan is running — the message says which. The Tasks line keeps what it did
+  across restarts: *36 chapters marked as no longer on disk · 1 back on disk before Apply, left alone · 2 series
+  renumbered by the new rules*.
+- A series that is downloading or being checked when Apply reaches it — a *Fetch*, the slow archive's next chapter,
+  *Fetch newest*, a check for new chapters — is left alone, neither marked nor renumbered (*1 series had a download or a
+  check running and was left alone*): run it again when that is done. Every other series it changes waits for it: a
+  *Fetch* there says a download is already running, and the slow archive takes its next chapter once Apply has finished.
+- It never runs by itself — not at start-up, not on a schedule — for Verify's reason: a share that is not mounted yet
+  looks exactly like a library with every file gone.
+
+**Numbering hand-named files again (optional).** A chapter scanned before v0.55.2 keeps the first number in its file
+name (section 3), so `Vol 2 Ch 5.cbz` is still chapter 2 and `Batman (1987) #12.cbz` is 1987. The preview lists every
+series the newer rules would renumber, with what that costs: how many chapters change, how many readers finished one of
+them, how many carry a number you set by hand (those keep it), and, for a series linked to a tracker, how many finished
+chapters would go up or down there — with a few examples, `Batman (1987) #12.cbz: 1987 → 12`. Tick the series you want;
+**Apply** renumbers only those, all at once, and the scanner reads them by the new rules from then on. Nothing is sent
+to AniList or the other trackers at that moment: the next chapter a reader finishes in the series sends its number as
+usual — a higher one is taken, and a lower one the tracker refuses, keeping the number it has. A series numbered by
+posting order, or in the middle of a renumber, is not listed.
+
 ### Deleting chapters after they are read
 
 **Admin → Settings → Library housekeeping → Delete read chapters**. Off by default, and turning it on asks
@@ -1876,8 +2087,13 @@ library* rather than being re-added via another source).
 **Libraries:** split one collection into several, then choose per member which ones they can open. This lives
 on **Content → Library**.
 
-A library is **a folder, plus any series you file into it by hand**. Give it a folder by browsing your
-library root or typing the path, and the count of what it would hold appears before you commit.
+A library is **one or more folders, plus any series you file into it by hand**. Give it its folders by
+ticking them as you browse your library root, or by typing a path and pressing **Add**; each chosen folder has
+its own key to take it out again. The count of what would move appears before you commit, summed over every
+folder, and saving moves exactly that. So one library can be "every source folder except the two I keep apart"
+without a library per folder: tick the ones it holds and leave the others to the default library or to
+libraries of their own. A folder belongs to one library at most: one another library holds says whose it is
+in the browser and cannot be ticked. A library's card shows its first folder and how many more it holds.
 
 Libraries are *declared*, not guessed. The obvious alternative -- treating every top-level folder as a
 library -- would be wrong on most existing installs, because that level usually holds the source names the
@@ -1885,7 +2101,8 @@ downloader wrote. Uchiyomi still suggests folders it can see, at any depth, with
 source names sorted last and flagged `source?`.
 
 **Libraries may sit inside one another.** With `Manga` and `Manga/Seinen` both declared, a series under
-`Manga/Seinen` belongs to the inner one: the most specific library wins. Removing the inner one hands its
+`Manga/Seinen` belongs to the inner one: the most specific folder wins, whichever library holds it and however
+many other folders either library holds. Removing the inner one, or taking `Manga/Seinen` out of it, hands its
 series back to `Manga`, not to the default.
 
 **Age rating.** A library can carry one, and everything in it inherits it, so marking a shelf 18+ is one
@@ -1908,7 +2125,9 @@ and popular walls answer nothing, and the search across all your sources does no
 request goes to that site at all. The **Show 18+** button is on Discover too — beside *Newest from your
 sources*, where it stays while you search — and brings the lot back for the rest of the browser session.
 It appears there whenever something is being hidden, so an install with adult providers and no 18+ shelf
-still has the switch. Three things are deliberately left alone, because you named them yourself: opening a
+still has the switch. Since v0.55.4 the search also leaves out 18+ titles from providers that are not 18+ themselves
+while the reveal is off — a MangaDex title rated erotica, a result carrying one of the genres below — and with it on,
+its *Hide 18+* and *18+ only* chips (section 6) sort them out. Three things are deliberately left alone, because you named them yourself: opening a
 provider's own page for a title, adding it, and *Find missing chapters* on a series whose own source is
 adult. Hiding those would stop a series you already own from being filled, which is breaking the library
 rather than tidying a screen.
@@ -1936,8 +2155,9 @@ an explicit list -- so granting a library to an unrestricted member changes noth
 narrows them.
 
 **Filing a series by hand.** Edit any series and set **Library**, or select several on the Library page and
-use **Move to library**. A series filed by hand stays put: rescans, newly created libraries and re-pathing an
-existing one all leave it alone. Set it back to **Automatic** to hand it to the folder rule again.
+use **Move to library**. A series filed by hand stays put: rescans, newly created libraries and changing an
+existing one's folders all leave it alone. Set it back to **Automatic** to hand it to the folder rule again;
+removing the library you filed it into does that too (since v0.55.1).
 
 Nothing changes until you declare something. A fresh install and an upgraded one both start with a single
 library covering the whole root, no reading progress moves, no files are touched, and removing a library
@@ -1985,7 +2205,9 @@ everywhere ends it on the next occasion that device reaches the server.
 
 **Sources:** every source and the ways to add one, from section 7. Its **Add sources** also holds **Import a
 list**, for moving a library over from another app. It is one path: import a list → review the matches → add.
-Pressing it opens the import page (`/admin/import/`), which takes the list four ways:
+Pressing it opens the import page (`/admin/import/`) — as do **Import your library** on an empty Library or Home,
+**Import a list** in the Library's header, and *import* typed in search (since v0.55.4) — which takes the list four
+ways:
 
 ![Import and review matches](shots/admin-import.webp)
 
@@ -2081,7 +2303,8 @@ off under **Admin → Settings → Updates & schedules**; see [extensions.md](ex
 hour is shown here and changed there. **Verify chapter files** is the one task that never
 runs by itself: it is the repair for a database restored without its chapter files, and section 12 says
 when to run it and what it will not do. Like the sweep, it starts in the background and its line shows what
-it found when it is done.
+it found when it is done. **Rescan everything** (since v0.55.4) is its counterpart for a library you built by hand:
+*Library maintenance* above says what it shows before it changes anything, and what it never does.
 
 **Repair library** is the nightly that fixes what Health used to only report (the Health section above lists
 what it does and the two things it never does). Its schedule reads *every 24h · never during a chapter
@@ -2121,13 +2344,67 @@ chapters), the **Backup time (hour, 0–23)** of the nightly backup — change i
 once, so the next run is at the new hour — and, when the extension engine is configured, **Update extensions
 automatically** and its check interval. **Look for failed chapters on other sources** controls the bounded,
 once-a-day source hunt described in section 4 and is on by default. **Library housekeeping**: **Delete read chapters** and its **Wait
-(days)**, below, and **Repair the library nightly** (on by default), the job described under *Health* above. **Scanlators**: the server-wide defaults for choosing between scanlation groups — **Blocked
+(days)**, below, **Repair the library nightly** (on by default), the job described under *Health* above, and
+**Every night** (since v0.55.0): *Safe repair*, or *Fix everything*. **Scanlators**: the server-wide defaults for choosing between scanlation groups — **Blocked
 groups**, which apply to every series, a **Default priority** for series that have no ranking of their own, and
 the **Patience (days)** before a chapter is taken from a group lower down the list; see *Sources & translations*
 in section 4. **Notifications** (since v0.43.0): where new chapters and server problems are sent besides
 this browser — see the next section. Switches save the moment they flip; text and number fields save when you
 leave them or press Enter, and each row says *Saved* beside itself. Only the scanlator lists have a Save
 button (**Save scanlator defaults**), because a half-typed list is not something to save on every keystroke.
+
+### Notice chapters
+
+Many sources post announcements for readers (a hiatus, a season break, a schedule change) as a short chapter
+numbered after the latest one with a fraction: **100.5**, often a page or two. **Admin → Settings → Notice
+chapters** has one switch per series type: **Manga**, **Manhwa**, **Manhua**, **Webtoon**, **Comic** and
+**Unknown / other**. All are off by default. For a type that is switched on, every chapter numbered like 12.5
+that has **3 pages or fewer** is hidden:
+
+- **Everywhere you read.** It is hidden from the chapter list, the reader's next and previous, Continue Reading,
+  Updates, history, bookmarks, OPDS, offline downloads and the Komga-compatible API that the Mihon extension
+  reads. It applies to everyone, admins included.
+- **From the counts.** It is not counted in chapter totals or unread badges, in Mihon's *read up to* and
+  *Completed*, or in what AniList, MyAnimeList and Kitsu are told. An unread 100.5 therefore no longer keeps a
+  series you have read to the end from being finished.
+- **From downloads.** Neither the updater nor the slow archive downloads one its sources list as 3 pages or
+  fewer, and those are not counted as missing.
+
+**Only short ones.** With **Only hide short ones (3 pages or fewer)** on, the default, a chapter numbered with a
+fraction is a notice only when its page count is known and is 3 or fewer: its own pages once it is on this server and counted, else the page count its sources list (MangaDex lists
+one; most sites do not). A longer one is a chapter posted in parts (78.1 … 78.9) and stays, and so does one whose
+length nobody knows yet. A file holding a range of chapters (`Chapter 12.5-13.cbz`, see *How a chapter's number is
+read*) is never a notice, however short. A chapter's pages are counted the first time anyone opens it, and the nightly repair
+counts the rest, so a notice from a site that lists no page counts is downloaded, shown until it is counted, and
+hidden from then on.
+
+**Or every x.5** (since v0.55.3, #147). Switch **Only hide short ones** off and every chapter numbered like 12.5 of
+the types switched on is hidden, whatever its length — including real chapters a site split into parts (78.1 …
+78.9), and the updater downloads none of them while they are hidden. A file holding a range of chapters is still
+never hidden. Switching it back on shows the longer ones again on the next page load, and the next check fetches
+any never downloaded. The series' own switch in **Sources & translations** says which of the two it hides.
+
+Nothing is deleted. Switching a type off shows its notice chapters again on the next page load, with no
+rescan. Any that were never downloaded are fetched at the next check. **Updates** keeps counting only what came
+since you last looked: switching a type on does not swallow a favourite's next chapter, switching it off does
+not announce its old notices as new, and a notice stops being new once its pages are counted.
+
+**Which type a series is** is worked out from, most trusted first:
+
+1. A genre naming its origin (Manhwa, Manhua, Comic, Japanese).
+2. The followed source: MangaDex's original language.
+3. AniList's country of origin.
+4. A Webtoon genre with none of the above.
+
+A series tagged both Manhwa and Webtoon is a manhwa. Genres that name several origins at once (some sites copy
+their whole genre menu, Manga, Manhwa and Manhua, onto every title) say nothing, and neither does Manga on its
+own, which many sites file everything under: the source and AniList decide those. A series nothing speaks for is **Unknown / other**. You
+can set the type by hand under **Series type** in *Edit details* → **Reading**.
+
+**One series** can override its type's switch with **Hide notice chapters** in its **Sources & translations**
+sheet. The sheet also says how many chapters that hides right now, and **Use the server default** puts the
+series back under its type's switch. Use this for a series whose short x.5 chapters are real content (a
+webtoon whose parts are a few long strips each), or to hide one series' notices while its type's switch is off.
 
 ### Notifications
 
@@ -2554,7 +2831,7 @@ source's numbers**; either way the series updates again.
 **The slow archive is not fetching anything.** Library → Downloads says why — under the covers when the whole
 archive is waiting, and on a series' own sheet (tap its cover) otherwise: it is between chapters (at the default
 pace about a quarter of an hour, now and then much longer), another download is using the same site, the site is
-cooling down, asked for a slower pace or refused a chapter, a check or a repair is running, it is outside the hours
+cooling down, asked for a slower pace within the hour or refused a chapter, a check or a repair is running, it is outside the hours
 it may run (the server's local time), or the download disk is below its floor (**Admin → Settings → Downloads**).
 After a restart its first look waits ten minutes.
 

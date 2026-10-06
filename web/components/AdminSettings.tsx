@@ -11,7 +11,9 @@
 // that are edited in several steps and must land as one write. Since v0.43.0 a fifth, Notifications
 // (components/AdminNotifications.tsx), follows them; its dialog saves a whole target at once. After it, the
 // 18+ filter: which genres and sources the "Show 18+" switch hides besides 18+ libraries. Last, the source order:
-// which followed source a new chapter is taken from.
+// which followed source a new chapter is taken from. After that, notice chapters: per series type, whether short
+// chapters numbered with a fraction (12.5, with 3 pages or fewer) are hidden -- or, with "Only hide short ones" off
+// (v0.55.3, #147), every chapter numbered with one.
 //
 // Toasts survive on exactly two rows, and only for the sentence the inline tick cannot say: the install count
 // ("Thank you — counted" / "No longer counted", because opting out destroys the identifier) and the
@@ -24,9 +26,11 @@ import { useToast } from '@/components/Toast';
 import { ConfirmDialog } from '@/components/ConfirmDialog';
 import { Switch } from '@/components/Switch';
 import { IcFilter, IcRefresh, IcSettings, IcSliders, IcTrash } from '@/components/icons';
-import { Disclosure, NumberRow, Row, SETTINGS_GRID, SaveState, Section, SwitchRow, TextRow, useAutosave } from '@/components/settings';
+import { Disclosure, NumberRow, Row, SETTINGS_GRID, SaveState, Section, Segmented, SwitchRow, TextRow, useAutosave } from '@/components/settings';
+import { nightlyModeOf, type NightlyMode } from '@/lib/autofix';
 import { t as tr } from '@/lib/i18n';
-import type { KnownGroup, StoredPrefs } from '@/lib/types';
+import type { KnownGroup, SeriesType, StoredPrefs } from '@/lib/types';
+import { SERIES_TYPES, seriesTypeKey } from '@/lib/seriesTypes';
 import { hasGroup, normGroup, reorder, withoutGroup } from '@/lib/scanlators';
 import { suggestGroups } from '@/lib/groupSuggest';
 import { NotificationsSection } from '@/components/AdminNotifications';
@@ -70,7 +74,52 @@ export function AdminSettings() {
       <DownloadsSection data={data} save={save} />
       <AdultFilterSection data={data} save={save} />
       <SourceOrderSection data={data} save={save} />
+      <NoticeChaptersSection data={data} save={save} />
     </div>
+  );
+}
+
+/**
+ * Notice chapters (bff lib/noticeChapters.ts): one switch per series type. Many sources post an announcement as a
+ * short chapter numbered after the latest with a fraction (100.5); a type switched on here has every such chapter of
+ * 3 pages or fewer hidden from the library, the reader, OPDS and Mihon, and the sweep does not download one a source
+ * lists as that short. Longer x.y chapters, and any not counted yet, are chapters and stay. Off by default, and
+ * nothing is deleted: switching a type off shows them again at once. A series' own switch, in its Sources &
+ * translations sheet, outranks its type's; its type is set in Edit series.
+ *
+ * v0.55.3 (#147, TIGamingTV's switch): "Only hide short ones", on by default, is that page rule; off, every chapter
+ * numbered like 12.5 of the types switched on is hidden, real chapters a site split into parts included -- which its
+ * help says before it is flipped, and the section's own sentence says which rule is in force.
+ *
+ * Held locally and saved whole on every flip, re-seeded from the refetch, for the reason AdultFilterSection says:
+ * two quick flips must not both start from the list as it was before either landed.
+ */
+function NoticeChaptersSection({ data, save }: { data: any; save: Save }) {
+  const [types, setTypes] = useState<SeriesType[]>(() => (Array.isArray(data.hide_notice_types) ? data.hide_notice_types : []));
+  useEffect(() => { setTypes(Array.isArray(data.hide_notice_types) ? data.hide_notice_types : []); }, [data.hide_notice_types]);
+  const flip = async (t: SeriesType, on: boolean) => {
+    const prev = types;
+    const next = SERIES_TYPES.filter((x) => (x === t ? on : prev.includes(x)));
+    setTypes(next);
+    try { await save({ hideNoticeTypes: next }); } catch (e) { setTypes(prev); throw e; }
+  };
+  const shortOnly = data.hideNoticeShortOnly !== false;
+  return (
+    <Section id="notice-chapters" title={tr('Notice chapters')} icon={<IcFilter width={18} height={18} />}
+      description={shortOnly
+        ? tr('Sources often post notices for readers as a short chapter numbered after the latest one, like 100.5. For each type switched on, chapters numbered like 12.5 with 3 pages or fewer are hidden from the library, the reader, OPDS and Mihon; longer ones, and any whose pages are not counted yet, stay. A chapter a source already lists with 3 pages or fewer is not downloaded. Nothing is deleted: switching a type off shows them again. A series can override this in its Sources & translations sheet.')
+        : tr('Sources often post notices for readers as a short chapter numbered after the latest one, like 100.5. For each type switched on, every chapter numbered like 12.5 is hidden from the library, the reader, OPDS and Mihon, and one a source lists is not downloaded. Nothing is deleted: switching a type off shows them again. A series can override this in its Sources & translations sheet.')}>
+      <div data-notice-types>
+        {SERIES_TYPES.map((t) => (
+          <SwitchRow key={t} label={tr(seriesTypeKey(t))} on={types.includes(t)} onChange={(next) => flip(t, next)} />
+        ))}
+      </div>
+      <div data-notice-short-only>
+        <SwitchRow label={tr('Only hide short ones (3 pages or fewer)')}
+          help={tr('Off hides every chapter numbered like 12.5 of the types switched on, including real chapters a site split into parts.')}
+          on={shortOnly} onChange={(next) => save({ hideNoticeShortOnly: next })} />
+      </div>
+    </Section>
   );
 }
 
@@ -134,7 +183,7 @@ function AdultFilterSection({ data, save }: { data: any; save: Save }) {
   };
 
   return (
-    <Section title={tr('18+ filter')} icon={<IcSliders width={18} height={18} />}>
+    <Section id="adult-filter" title={tr('18+ filter')} icon={<IcSliders width={18} height={18} />}>
       <div className="py-3">
         <p className="mb-2 max-w-prose text-[11px] leading-relaxed text-fog-500">
           {tr('Genres to keep off the shelf while “Show 18+” is off. This hides nothing from anyone who goes looking: links, bookmarks, downloads and reading progress are unaffected.')}
@@ -216,7 +265,7 @@ function SourceOrderSection({ data, save }: { data: any; save: Save }) {
   };
 
   return (
-    <Section title={tr('Source order')} icon={<IcRefresh width={18} height={18} />}>
+    <Section id="source-order" title={tr('Source order')} icon={<IcRefresh width={18} height={18} />}>
       <p className="py-3 max-w-prose text-[11px] leading-relaxed text-fog-500">
         {tr('When a series follows more than one source, a new chapter is taken from the highest one here that has it, after your scanlation group preferences. Chapters you already have are never replaced because of it. A series can have its own order in its Sources & translations.')}
       </p>
@@ -324,7 +373,7 @@ function ServerSection({ data, save }: { data: any; save: Save }) {
   });
 
   return (
-    <Section title={tr('Server')} icon={<IcSettings width={18} height={18} />}>
+    <Section id="server" title={tr('Server')} icon={<IcSettings width={18} height={18} />}>
       {/* `required`: the server refuses an empty name (zod min(1)) with a bare 400, so an emptied box goes
           back to the saved name on blur instead of a "Could not save" over nothing. */}
       <TextRow label={tr('Server name')} value={data.server_name ?? ''} maxLength={64} autoComplete="off" required
@@ -391,7 +440,7 @@ function SchedulesSection({ data, save }: { data: any; save: Save }) {
   // A computer is often off at 3 a.m.; the desktop server runs a missed backup the next time it opens.
   const nightly = tr('Nightly, local time. Shown under Tasks.');
   return (
-    <Section title={tr('Updates & schedules')} icon={<IcRefresh width={18} height={18} />}>
+    <Section id="schedules" title={tr('Updates & schedules')} icon={<IcRefresh width={18} height={18} />}>
       <NumberRow label={tr('Library update interval (hours)')} min={1} max={168} value={data.updater_hours ?? 6}
         help={tr('How often every followed series is asked for new chapters.')}
         onSave={(n) => save({ updaterHours: n })} />
@@ -414,6 +463,45 @@ function SchedulesSection({ data, save }: { data: any; save: Save }) {
         help={tr('When a chapter cannot be saved from the sources this series follows, search the others once a day and follow the one that has it')}
         on={data.auto_follow_on_failure !== false} onChange={(next) => save({ autoFollowOnFailure: next })} />
     </Section>
+  );
+}
+
+/**
+ * What the nightly runs (v0.55.0): the safe repair it always ran, or Health's whole Fix everything -- which may merge,
+ * delete, renumber and install extensions, as pressing it on Health does. Saved as it is picked, with the row's own
+ * Saved ✓; the choice moves at once and goes back if the save is refused (SwitchRow's rule). Greyed while the switch
+ * above has the nightly off, which turns it off whatever it would run.
+ */
+export function NightlyModeRow({ mode, off, onPick }: { mode: NightlyMode; off: boolean; onPick: (m: NightlyMode) => Promise<unknown> }) {
+  const { status, run } = useAutosave();
+  const [local, setLocal] = useState<NightlyMode>(mode);
+  // The prop catching up is adopted during render, never in an effect (SwitchRow's "previous prop" pattern).
+  const [seen, setSeen] = useState<NightlyMode>(mode);
+  if (mode !== seen) { setSeen(mode); setLocal(mode); }
+  const pick = async (m: NightlyMode) => {
+    setLocal(m);
+    if (!(await run(() => onPick(m)))) setLocal(mode);
+  };
+  const label = tr('Every night');
+  // Stacked, as Edit details' choices are: beside the control, the two lines of help wrapped to eight in a narrow column.
+  return (
+    <Row label={label} status={status} stacked
+      help={(
+        <>
+          <span className={`block ${local === 'repair' ? 'text-fog-300' : ''}`} data-nightly-help="repair">
+            {tr('Safe repair: retries, short chapters, gaps and the solver; nothing is deleted or merged.')}
+          </span>
+          <span className={`block ${local === 'autofix' ? 'text-fog-300' : ''}`} data-nightly-help="autofix">
+            {tr('Fix everything: also replaces sources, merges, deletes and installs extensions, as Health’s Fix everything does.')}
+          </span>
+        </>
+      )}>
+      <div data-nightly-mode={local}>
+        <Segmented square label={label} value={local} disabled={off}
+          options={[{ value: 'repair', label: tr('Safe repair') }, { value: 'autofix', label: tr('Fix everything') }]}
+          onChange={(m) => { void pick(m); }} />
+      </div>
+    </Row>
   );
 }
 
@@ -456,7 +544,7 @@ function HousekeepingSection({ data, save: patch }: { data: any; save: Save }) {
 
   return (
     <>
-      <Section title={tr('Library housekeeping')} icon={<IcTrash width={18} height={18} />}>
+      <Section id="housekeeping" title={tr('Library housekeeping')} icon={<IcTrash width={18} height={18} />}>
         <Row label={tr('Delete read chapters')} status={status}
           help={tr('Free space by deleting a chapter’s file once everyone who started it has finished it. A chapter someone is partway through is never deleted, and neither is one nobody has read.')}>
           {/* Not a SwitchRow: that one flips at once, and this switch must stay off until the question is
@@ -490,9 +578,14 @@ function HousekeepingSection({ data, save: patch }: { data: any; save: Save }) {
             takes a success sentence as its second argument and a switch has no sentence to give it.
             It sits in housekeeping rather than under schedules because it is library maintenance, and
             below the delete switch because it is the one that never deletes anything. */}
+        {/* v0.55.0: what the nightly runs, the safe repair or a whole Fix everything (NightlyModeRow below). The safe
+            repair's sentence ends "Nothing is deleted or merged without you", which a nightly Fix everything is not. */}
         <SwitchRow label={tr('Repair the library nightly')}
-          help={tr('Once a day: counts pages in files never opened, replaces one- or two-page chapters when a source has a longer copy, searches other sources for missing chapter runs, retries chapters that stopped failing, and resets the Cloudflare solver when sources blame it. Nothing is deleted or merged without you.')}
+          help={nightlyModeOf(data) === 'autofix'
+            ? tr('Once a day, Fix everything runs by itself, as if you had pressed it on Health. What it did is under Health → Recent repairs.')
+            : tr('Once a day: counts pages in files never opened, replaces one- or two-page chapters when a source has a longer copy, searches other sources for missing chapter runs, retries chapters that stopped failing, and resets the Cloudflare solver when sources blame it. Nothing is deleted or merged without you.')}
           on={data.repair_enabled !== false} onChange={(next) => patch({ repairEnabled: next })} />
+        <NightlyModeRow mode={nightlyModeOf(data)} off={data.repair_enabled === false} onPick={(m) => patch({ nightlyMode: m })} />
         {/* The reveal for the cleanup above, and for a followed series nobody has fetched: without it Mihon
             counted a pruned or never-downloaded chapter as zero chapters, and told the trackers so. No
             confirmation — nothing here is deleted or written, and turning it off is exactly as reversible
@@ -658,7 +751,7 @@ function ScanlatorsSection({ data, save }: { data: any; save: Save }) {
   });
   const suggestions = known?.content ?? [];
   return (
-    <Section title={tr('Scanlators')} icon={<IcFilter width={18} height={18} />}
+    <Section id="scanlators" title={tr('Scanlators')} icon={<IcFilter width={18} height={18} />}
       description={tr('When a source lists the same chapter from more than one group, the updater takes the first group ranked here and never a blocked one. Each series can rank its own on its page; blocks made here apply to every series.')}>
       {/* One child, so the section's divide-y draws no line between the two lists. */}
       <div>

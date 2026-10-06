@@ -5,6 +5,8 @@ import { cbzPageDims, DL_ROOT, LIBRARY_ROOT, persistScan } from './library';
 import { ViewCtx, Params, visible, browsable, ADULT_RATING } from './visibility';
 import { cleanDescription } from './htmlText';
 import { effectiveLang } from './seriesLang';
+import { noticeBook, noticeShown, visibleBookCount } from './noticeChapters';
+import { rangeEnd, numberText } from './chapterRanges';
 
 interface Page<T> { content: T[]; totalElements: number; totalPages: number; number: number; size: number; first: boolean; last: boolean }
 function page<T>(content: T[], total: number, p: number, size: number): Page<T> {
@@ -38,7 +40,9 @@ const seriesSrcWith = (gate: Gate, ctx: ViewCtx, p: Params, alias: string) => `(
          COALESCE(o.age_rating, s.age_rating) AS age_rating,
          -- The admin's direction, else what the evidence said (lib/readingDirection.ts), else NULL: unknown.
          COALESCE(o.reading_direction, s.reading_direction) AS reading_direction,
-         s.books_count, s.cover_book_id, s.web, s.created_at, s.latest_mtime,
+         -- The stored count less the notice chapters this series hides (lib/noticeChapters.ts), so every badge,
+         -- filter and sort over it, and the Komga-compatible series Mihon's tracker reads, counts what is listed.
+         ${visibleBookCount('s')} AS books_count, s.cover_book_id, s.web, s.created_at, s.latest_mtime,
          s.auto_update, s.library_id, s.library_pinned,
          -- What the source last said, so "how far behind is this?" is a column rather than a network call.
          -- Kept in step with SERIES_COLS above; see the warning there.
@@ -72,8 +76,9 @@ const browseSrc = (ctx: ViewCtx, p: Params, alias = 'sv') => seriesSrcWith(brows
  */
 const booksSrc = (ctx: ViewCtx, p: Params, alias = 'bv') => `(
   SELECT b.id, b.series_id, b.source, b.file, b.root, b.pages, b.mtime, b.published_at, b.page_dims,
-         b.updated_at, b.fingerprint, b.scanlator, b.source_id, b.pruned_at, b.size, b.missing_pages, b.chapter_name,
+         b.updated_at, b.fingerprint, b.scanlator, b.source_id, b.pruned_at, b.pruned_reason, b.size, b.missing_pages, b.chapter_name,
          COALESCE(ov.number, b.number) AS number,
+         ${rangeEnd('b', 'ov')} AS number_end,
          COALESCE(ov.title,  b.title)  AS title
     FROM lib_books b
     -- The join that was missing. This carried zero references to lib_series, so a book id alone opened a
@@ -81,6 +86,9 @@ const booksSrc = (ctx: ViewCtx, p: Params, alias = 'bv') => `(
     -- soft delete, merge, and now library access -- reaches chapters only through here.
     JOIN lib_series s ON s.id = b.series_id AND ${visible('s', ctx, p)}
     LEFT JOIN book_overrides ov ON ov.book_id = b.id
+    -- A notice chapter the admin hides (lib/noticeChapters.ts) is not a chapter to anyone: not listed, not opened
+    -- by id, not next or previous, not in the offline plan or the Komga-compatible API. By the effective number.
+   WHERE ${noticeShown('s', 'b', 'ov')}
 ) ${alias}`;
 
 /** The overridden title for one series, for the book DTOs that carry seriesTitle. */
@@ -155,6 +163,11 @@ function seriesDto(r: any) {
 
 function bookDto(r: any) {
   const num: number = r.number ?? 0;
+  // The last chapter of a file holding several (v0.55.2, #150: `Batman 01-07` is 1 to 7), null for one chapter
+  // (lib/chapterRanges.ts). `number`/`numberSort` stay the start -- the book's place in every order, and the number
+  // the Komga API hands Mihon -- while `metadata.number`, which is display only, says the whole range: "1–7".
+  // Reintroduce `String(num)` below: "the chapter list says the range" in chapterRanges.int.test.ts reads "1".
+  const end: number | null = r.number_end == null ? null : Number(r.number_end);
   // release date: the source's chapter date when stamped, else when the file landed in the library
   const released = r.published_at
     ? new Date(r.published_at).toISOString()
@@ -167,8 +180,9 @@ function bookDto(r: any) {
     seriesTitle: r.series_title ?? '',
     name: r.title,
     number: num,
+    numberEnd: end,
     media: { pagesCount: r.pages ?? 0, mediaType: 'application/vnd.comicbook+zip', status: 'READY' },
-    metadata: { title: r.title, number: String(num), numberSort: num, summary: '', releaseDate: released },
+    metadata: { title: r.title, number: numberText(num, end), numberSort: num, summary: '', releaseDate: released },
     // The chapter's own name as its source gave it (lib/library.ts chapterName), null when it had none. NOT
     // `name`/`metadata.title`, which are the filename's and keep saying so for every client that prints them.
     chapterName: r.chapter_name ?? null,
@@ -188,6 +202,14 @@ function bookDto(r: any) {
     // it any more. A client that ignores this gets a 404 from the image server, which is the honest failure
     // but a poor thing to find out by tapping.
     pruned: !!r.pruned_at,
+    // WHY the file is gone, while it is (v0.55.4; the column note in lib/migrate.ts): 'deleted' by Delete files or by
+    // Rescan everything (lib/rescan.ts), 'missing' by Verify chapter files, null by the read-chapter cleanup, a
+    // chapter's own delete, or a mark from before v0.37.0. The series page words a tombstone by it: one in a library
+    // you built by hand that Rescan everything found gone reads "File no longer on disk", never "Deleted from the
+    // server" -- nothing deleted it. Read through booksSrc's column list, like every field here.
+    // Reintroduce by dropping it (or `b.pruned_reason` above): "a chapter Rescan everything marked says why" in
+    // rescan.int.test.ts reads undefined.
+    prunedReason: r.pruned_at ? (r.pruned_reason ?? null) : null,
     // The 1-based pages that are placeholders in the file: the chapter was saved with these missing
     // (lib/partial.ts) and the sweep is still trying to fetch them. null when the chapter is complete. The
     // series page draws the badge from this; the reader learns which pages from /api/books/:id/pages.
@@ -286,6 +308,16 @@ function condSql(cond: any, params: any[], hasUser = false): string {
                  OR EXISTS (SELECT 1 FROM series_sources src_f WHERE src_f.series_id = sv.id AND src_f.source_id = $${n}))`;
     return cond.anySource.operator === 'isNot' ? `NOT ${ex}` : ex;
   }
+  // #149: whether a series has a main source at all, in Komga's boolean shape (`isTrue` / `isFalse`, no value).
+  // `isFalse` is the Library's "No source": a folder added by hand, or a series never matched to a site -- an empty
+  // `source_id`, whatever it follows. A key of its own, never `mainSource` with a magic id: a site added by address
+  // takes its id from the name the admin gives it, so any word may be a real source's id, and an older server would
+  // answer that with an empty grid where an unknown key is a 400. `sv` carries source_id (SERIES_SRC, since v0.52.0).
+  if (cond.hasMainSource && typeof cond.hasMainSource === 'object') {
+    const op = cond.hasMainSource.operator;
+    if (op !== 'isTrue' && op !== 'isFalse') throw new UnsupportedFilter(`hasMainSource:${op}`);
+    return op === 'isFalse' ? '(sv.source_id IS NULL)' : '(sv.source_id IS NOT NULL)';
+  }
 
   throw new UnsupportedFilter(Object.keys(cond).filter((k) => k !== 'operator')[0] || 'unknown');
 }
@@ -328,14 +360,19 @@ function sortSql(sort?: string, perUser = false): string {
  * per-user filter or sort is actually asked for, so the ordinary "everything, A to Z" query is unchanged.
  *
  * userId is always $1 when present, because condSql pushes its own parameters as it walks the tree.
+ * Built per query, not once: the notice fragment in it is a constant while nothing hides (lib/noticeChapters.ts).
  */
-const MINE_CTE = `WITH mine AS (
+const mineCte = () => `WITH mine AS (
   SELECT series_id,
          count(*) FILTER (WHERE completed)::int     AS done,
          count(*) FILTER (WHERE NOT completed)::int AS started,
          -- When this viewer last read in the series: the edition of a work the Library shows (searchSeries).
          max(updated_at)                            AS last_at
-    FROM read_progress WHERE user_id = $1 GROUP BY series_id
+    FROM read_progress WHERE user_id = $1
+     -- Against the count that leaves hidden notice chapters out (seriesSrcWith), so a read notice cannot fill in
+     -- for an unread chapter in "read" and "in progress".
+     AND NOT ${noticeBook('read_progress.book_id')}
+   GROUP BY series_id
 ), fav AS (
   SELECT series_id FROM favorites WHERE user_id = $1
 )`;
@@ -525,6 +562,19 @@ export const owned = {
     );
   },
 
+  /**
+   * How many of the viewer's series have no main source (#149): the Library's "No source" chip. Counted over browseSrc
+   * like librarySources, with the search's own predicate (condSql `hasMainSource: isFalse`), so the number beside the
+   * chip is what tapping it returns. Reintroduce a predicate of its own that also asks series_sources: "the No source
+   * count is what its search returns" in sourceFilters.int.test.ts finds the series that follows a source counted out.
+   */
+  seriesWithoutSource: async (ctx: ViewCtx) => {
+    const p = new Params();
+    const src = browseSrc(ctx, p);
+    const where = condSql({ hasMainSource: { operator: 'isFalse' } }, p.values as any[]);
+    return (await one<{ n: number }>(`SELECT count(*)::int AS n FROM ${src} WHERE ${where}`, p.values as any[]))?.n ?? 0;
+  },
+
   genres: async (ctx: ViewCtx) => {
     const p = new Params();
     const src = browseSrc(ctx, p);
@@ -567,7 +617,7 @@ export const owned = {
    * enrichSeries runs after LIMIT/OFFSET, so post-filtering would return short pages, a totalElements that
    * disagrees with them, and an infinite scroll that stops early.
    *
-   * MINE_CTE needs the user id as $1, so it is pushed before anything else and the visibility predicate
+   * mineCte needs the user id as $1, so it is pushed before anything else and the visibility predicate
    * follows. Nothing here counts placeholders by hand.
    */
   searchSeries: async (ctx: ViewCtx, body: any, pg = 0, size = 40, sort?: string) => {
@@ -575,8 +625,8 @@ export const owned = {
     const wantsUser = !!ctx.userId
       && (collapse || JSON.stringify(body?.condition ?? {}).includes('readStatus') || /unread|favou?rite/i.test(sort || ''));
     const p = new Params();
-    const cte = wantsUser ? MINE_CTE : '';
-    if (wantsUser) p.add(ctx.userId); // MINE_CTE reads $1
+    const cte = wantsUser ? mineCte() : '';
+    if (wantsUser) p.add(ctx.userId); // mineCte reads $1
     const src = browseSrc(ctx, p);
     const from = wantsUser
       ? `${src} LEFT JOIN mine m ON m.series_id = sv.id LEFT JOIN fav f ON f.series_id = sv.id`

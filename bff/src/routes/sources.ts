@@ -13,7 +13,7 @@ import { selectChapters, type ChapterFrom } from '../lib/selectChapters';
 import { noteChapterFailure } from '../lib/chapterFailures';
 import { scanOrder } from '../lib/scanOrder';
 import { followGuard, seriesLanguage } from '../lib/seriesLang';
-import { searchAll, groupByTitle, bySource, SEARCH_FIRST_ANSWER_MS } from '../lib/searchAll';
+import { searchAll, groupByTitle, bySource, ratingOf, SEARCH_FIRST_ANSWER_MS, type Rated, type RatingFilter } from '../lib/searchAll';
 import { budgetFor } from '../lib/sources/budget';
 import { SOLVER_CONCURRENCY } from '../lib/sources/flaresolverr';
 
@@ -74,7 +74,7 @@ function fillScanView(st: FillScan) {
 }
 /** Test seam. */
 export function _clearFillScans(): void { fillScans.clear(); }
-import { persistScan, setBookDates, setBookMeta, libraryIdFor, type LibraryRow, LIBRARY_ROOT, DL_ROOT } from '../lib/library';
+import { persistScan, setBookDates, setBookMeta, libraryIdFor, libraryRows, LIBRARY_ROOT, DL_ROOT } from '../lib/library';
 import { notInLibrary, notInLibraryParts } from '../lib/downloadCensus';
 import { english, joined, say, saids, type Part, type Said } from '../lib/said';
 import { diskSpelling } from '../lib/libraryAdmin';
@@ -87,8 +87,11 @@ import { enqueueArchive, archiveBusy, archiveScanPending, archiveSeriesIds, arch
 import { registerArchiveRoutes } from './archive';
 import { chooseReleases, groupsOf, releaseOrder } from '../lib/releases';
 import { effectivePrefsFor, readSeriesPrefs } from '../lib/scanlatorPrefs';
-import { copyToChapter, listingRows, replaceListing, type ListingCopy } from '../lib/seriesListing';
+import { copyToChapter, declaredLang, listingRows, replaceListing, sameRelease, type ListingCopy } from '../lib/seriesListing';
+import { cleanSourceOrder } from '../lib/sourcePrefs';
+import { paceLevel, rateKeyOf, restLeft } from '../lib/pace';
 import { haveNumbers } from '../lib/libraryNumbers';
+import { heldBy, isRange, rangeEnd, rawRangeEnd } from '../lib/chapterRanges';
 import {
   addNumbering, numberingFor, numberedChapters, stampAddNumbering, registerBusyProbe, onRenumbered, POSTING_ORDER_REFUSAL,
   type NumberingChoice,
@@ -97,6 +100,8 @@ import { numKey } from '../lib/postingOrder';
 import { groupStats } from '../lib/groupStats';
 import { fetchAniListArt, fetchTrendingManhwa, TrendingItem } from '../lib/anilist';
 import { learnDirection, directionFromAniListMatch } from '../lib/readingDirection';
+import { learnTypeFromSource, learnTypeFromAniList } from '../lib/seriesType';
+import { noticeListed } from '../lib/noticeChapters';
 import { q, one } from '../lib/db';
 import { healthAll, isDisabled, blockedNow, reportLatest, reportFail, reportSlow, classify, noteStage } from '../lib/sourceHealth';
 import { diagnose, EMPTY_SUSPECT } from '../lib/sourceDiagnosis';
@@ -125,7 +130,10 @@ import { dismissRun, listRuns, requestStop } from '../lib/downloadJobs';
 //
 // Which SOURCES you may reach is the opposite: entirely about who is asking, which is what `viewCtxFor` and
 // `sourceAllowedFor` answer.
-import { visibleToAll, viewCtxFor, sourceAllowedFor, sourceBrowsableFor, browsable, visible, seriesVisible, Params, type ViewCtx, hideAdult } from '../lib/visibility';
+import {
+  visibleToAll, viewCtxFor, sourceAllowedFor, sourceBrowsableFor, browsable, visible, seriesVisible, Params, type ViewCtx, hideAdult, adultFilter,
+  ADULT_RATING,
+} from '../lib/visibility';
 // v0.52.0 (#72): language editions of one work, and the language model they stand on.
 import { editionFolder, linkEdition, workRows, type WorkRow } from '../lib/editions';
 import { effectiveLang, sourceLanguage } from '../lib/seriesLang';
@@ -456,9 +464,18 @@ function cardFor(seen: DownloadsAudience, me: string | null, folder: string, { b
   return { folder, ...j, ...(open ? { seriesId: seriesId ?? row?.id, ...(cover ? { cover } : {}) } : {}), mine: !!by && by === me };
 }
 
+/**
+ * How many chapters of one Fetch may come in at once, each from a different image server (v0.55.4, #158). Only a Fetch
+ * whose chapters are the same release on several followed sources has more than one lane; every other job is one.
+ */
+const JOB_LANES = 3;
+/** How often a job that found its folder taken by another writer looks again (startDownloadJob). */
+const FOLDER_WAIT_MS = 500;
+
 export function startDownloadJob(input: DownloadJobInput): { total: number } {
   const { folder, title, seriesId, chapters, meta } = input;
-  jobs.set(folder, { title, total: chapters.length, done: 0, status: 'downloading', startedAt: Date.now(), origin: input.origin ?? 'fetch', ...(input.by ? { by: input.by } : {}) });
+  const origin = input.origin ?? 'fetch';
+  jobs.set(folder, { title, total: chapters.length, done: 0, status: 'downloading', startedAt: Date.now(), origin, ...(input.by ? { by: input.by } : {}) });
   const settle = async (ch: SourceChapter, landed: boolean) => {
     if (!input.onSettled) return;
     // A hook that throws must not take the job's tail with it: the scan and the stamps still have to run.
@@ -466,7 +483,7 @@ export function startDownloadJob(input: DownloadJobInput): { total: number } {
   };
   const nameOf = (id: string) => getSource(id)?.name ?? id;
 
-  void withOrigin(input.origin ?? 'fetch', input.by ?? null, async () => {
+  void withOrigin(origin, input.by ?? null, async () => {
     let failures = 0;
     // What this job wrote, for the provenance stamp; a skipped copy was already on disk and is not ours.
     const landed: Array<{ number: number; scanlator?: string; source?: string; missing?: number[]; title?: string; chapterId?: string }> = [];
@@ -489,8 +506,10 @@ export function startDownloadJob(input: DownloadJobInput): { total: number } {
     // other copies are only ever taken from followed sources -- the same rule as a manual fetch, where a
     // listing row's source is trusted only while the series follows it). Read once, before any download.
     const sources = new Set(chapters.map((c) => c.source ?? ''));
+    const series = await one<{ source_id: string | null; numbering: string | null; source_prefs: unknown }>(
+      'SELECT source_id, numbering, source_prefs FROM lib_series WHERE id = $1', [seriesId]).catch(() => null);
     const followed = new Set([
-      ...(await one<{ source_id: string | null }>('SELECT source_id FROM lib_series WHERE id = $1', [seriesId]).then((r) => (r?.source_id ? [r.source_id] : []), () => [])),
+      ...(series?.source_id ? [series.source_id] : []),
       ...(await q<{ source_id: string }>('SELECT source_id FROM series_sources WHERE series_id = $1', [seriesId]).catch(() => [])).map((r) => r.source_id),
     ]);
     const exhausted = () => [...sources, ...followed].every((sid) => refusing.has(sid));
@@ -506,10 +525,78 @@ export function startDownloadJob(input: DownloadJobInput): { total: number } {
         'SELECT title, copies FROM series_listing WHERE series_id = $1 AND number = $2::real', [seriesId, n]).catch(() => null);
       return (row?.copies ?? []).filter((c) => followed.has(c.source)).map((c) => copyToChapter(c, { number: n, title: row!.title }));
     };
-    for (const ch of chapters) {
-      if (runtime.stopping) break; // between chapters, never mid-write
-      if (jobs.get(folder)?.cancelRequested) break; // Cancel (#82): the same place, for the same reason
-      const via = ch.source ?? '';
+
+    // Which other copies each chapter may come from (v0.55.4, #158): the same release on the series' other followed
+    // sources (lib/seriesListing.ts sameRelease), so that a Fetch all is spread over the sites that carry it rather than
+    // asked of one -- faster, and less likely to be refused. Only a Fetch of chapters the release rules chose: never a
+    // copy a person picked (`pinned`), nor a number they once picked a version of (lib_books.picked_at), nor a fill's,
+    // a refetch's or an add's, nor on a series numbered by posting order or with a source order of its own.
+    // Reintroduce by leaving `copiesOf` empty: "a Fetch all is spread over two image servers" in
+    // fetchRotation.int.test.ts takes every chapter from the chosen site, one at a time.
+    const copiesOf = new Map<SourceChapter, SourceChapter[]>();
+    const loose = origin === 'fetch' && series?.numbering !== 'posting_order'
+      && !cleanSourceOrder((series?.source_prefs as { priority?: unknown } | null)?.priority).length
+      ? chapters.filter((c) => !c.pinned) : [];
+    if (loose.length) {
+      const nums = loose.map((c) => c.number);
+      const picked = new Set((await q<{ number: number }>(
+        'SELECT number FROM lib_books WHERE series_id = $1 AND number = ANY($2::real[]) AND picked_at IS NOT NULL', [seriesId, nums],
+      ).catch(() => [])).map((r) => Number(r.number)));
+      const rows = new Map((await q<{ number: number; title: string | null; copies: ListingCopy[] }>(
+        'SELECT number, title, copies FROM series_listing WHERE series_id = $1 AND number = ANY($2::real[])', [seriesId, nums],
+      ).catch(() => [])).map((r) => [Number(r.number), r] as const));
+      for (const ch of loose) {
+        const row = rows.get(ch.number);
+        const own = row?.copies?.find((c) => c.source === ch.source && c.sourceId === ch.sourceId);
+        if (!row || !own || picked.has(ch.number)) continue;
+        const same = sameRelease(own, row.copies, { followed, langOf: declaredLang }).slice(1);
+        if (same.length) copiesOf.set(ch, same.map((c) => copyToChapter(c, { number: ch.number, title: row.title })));
+      }
+    }
+
+    // One lane per image server, at most JOB_LANES: the chapters of one Fetch come in side by side only from different
+    // rate keys (lib/pace.ts rateKeyOf) -- two sites on one image server are one site, and a second lane there would only
+    // ask it twice as often. A job nothing can rotate is one lane, chapter after chapter, exactly as before.
+    // Reintroduce `lanes = 1`: "a Fetch all is spread over two image servers" never has the two at once; by keying the
+    // lanes by source (laneOn): "two sources on one image server are one site" downloads two chapters at once on it.
+    const lanes = copiesOf.size ? JOB_LANES : 1;
+    const pending = [...chapters];
+    const running = new Set<{ source: string; done: Promise<void> }>();
+    /** Chapters this job has started per rate key: what a chapter's copies are taken in turn by. */
+    const used = new Map<string, number>();
+    let stop = false;
+    const laneOn = (src: string) => { const key = rateKeyOf(src); return [...running].some((l) => rateKeyOf(l.source) === key); };
+
+    /**
+     * Of a chapter's copies, the one to start now: on a rate key no lane of this job is on, from a source that may be
+     * asked (loaded, allowed, switched on, out of a cooldown, not refusing this job), at full speed and not resting
+     * before one that is slowed (lib/pace.ts), then the key this job has asked least, then the chapter's own copy. Both
+     * by key, so two sites on one image server are one: they are busy together and asked as often as one, and the
+     * chapter's own copy wins their tie. Null: wait for a lane to free. A chapter none of whose sources may be asked goes
+     * as its own copy, as before rotation: the helper skips a refusing source and turns to the alternates.
+     * Reintroduce by counting `used` per source: "two sources on one image server are one site" in
+     * fetchRotation.int.test.ts takes turns between them.
+     */
+    const pickCopy = async (ch: SourceChapter, may: (src: string) => Promise<boolean>): Promise<SourceChapter | null> => {
+      const others = copiesOf.get(ch);
+      if (!others) return laneOn(ch.source ?? '') ? null : ch;
+      let best: { c: SourceChapter; slow: number; n: number } | null = null;
+      let anyMay = false;
+      for (const c of [ch, ...others]) {
+        const src = c.source ?? '';
+        if (!(await may(src))) continue;
+        anyMay = true;
+        if (laneOn(src)) continue;
+        const slow = paceLevel(src) || restLeft(src) ? 1 : 0;
+        const n = used.get(rateKeyOf(src)) ?? 0;
+        if (!best || slow < best.slow || (slow === best.slow && n < best.n)) best = { c, slow, n };
+      }
+      if (best) return best.c;
+      return anyMay || laneOn(ch.source ?? '') ? null : ch;
+    };
+
+    /** One chapter, start to settle: the old loop's body, for whichever copy pickCopy chose. `ch` is what the job was given. */
+    const runOne = async (ch: SourceChapter & { pinned?: boolean }, use: SourceChapter): Promise<void> => {
       settled.add(ch);
       let out;
       try {
@@ -524,7 +611,7 @@ export function startDownloadJob(input: DownloadJobInput): { total: number } {
          * RIGHT, because a right match is often under a different English title.
          */
         out = await downloadWithFallback({
-          seriesId, title, folder, meta, chapter: ch,
+          seriesId, title, folder, meta, chapter: use,
           alternates: () => alternatesOf(ch.number),
           refusing, allowed: input.allowed, hunt: undefined,
         });
@@ -533,7 +620,8 @@ export function startDownloadJob(input: DownloadJobInput): { total: number } {
         if (e?.diskFull) {
           if (j) { j.status = 'error'; tell(j, say('job.noSpace', { error: String(e.message) }), savedSoFar(j)); j.finishedAt = Date.now(); }
           await settle(ch, false);
-          break;
+          stop = true;
+          return;
         }
         throw e;
       }
@@ -583,9 +671,51 @@ export function startDownloadJob(input: DownloadJobInput): { total: number } {
       // Every source this job could draw on has refused: the rest of the queue has nowhere to land.
       if (refusing.size && exhausted()) {
         if (j && j.status !== 'error') { j.status = 'error'; if (j.reason === undefined) tell(j, say('job.saved', { done: j.done, total: j.total })); j.finishedAt = Date.now(); }
-        break;
+        stop = true;
       }
+    };
+
+    // Start what may start, wait for a lane, again. Stopping (a shutdown, Cancel #82, a full disk, every source refusing)
+    // is between chapters, never mid-write: what is in flight finishes, nothing new starts.
+    const halted = () => stop || runtime.stopping || !!jobs.get(folder)?.cancelRequested;
+    // ⚠️ Another writer may have taken the folder between the route's jobBusy check and this start -- every route that
+    // starts a job awaits a listing refresh, the chapters' states or an audit entry in between: a Rescan everything
+    // Apply (lib/rescan.ts holdSeries), the slow archive's chapter, Fetch newest or a repair holds it in busyFolders.
+    // None of them looks again once it has it, and the lanes below would write beside it, into a series being judged or
+    // renumbered. So the job waits for it to let go; from here on the job's own card holds the folder (jobBusy), and
+    // nothing else takes it. Reintroduce by dropping the wait: "a Fetch that starts while a Rescan holds its series
+    // waits for it" in fetchRotation.int.test.ts lands a chapter while the folder is held.
+    while (busyFolders.has(folder) && !halted()) await new Promise((r) => setTimeout(r, FOLDER_WAIT_MS));
+    while (pending.length && !halted()) {
+      // Whether a source may be asked, read once per round rather than once per chapter: a Fetch all is 300 of them.
+      const asked = new Map<string, Promise<boolean>>();
+      const may = (src: string) => {
+        let v = asked.get(src);
+        if (!v) {
+          v = (async () => !!src && !!getSource(src) && !refusing.has(src) && (!input.allowed || input.allowed(src))
+            && !(await isDisabled(src).catch(() => false)) && !(await blockedNow(src).catch(() => null)))();
+          asked.set(src, v);
+        }
+        return v;
+      };
+      while (running.size < lanes && pending.length && !halted()) {
+        let next: { i: number; use: SourceChapter } | null = null;
+        for (let i = 0; i < pending.length && !next; i++) {
+          const use = await pickCopy(pending[i], may);
+          if (use) next = { i, use };
+        }
+        if (!next) break;
+        const ch = pending.splice(next.i, 1)[0];
+        const key = rateKeyOf(next.use.source ?? '');
+        used.set(key, (used.get(key) ?? 0) + 1);
+        const lane = { source: next.use.source ?? '', done: Promise.resolve() };
+        lane.done = runOne(ch, next.use).finally(() => { running.delete(lane); });
+        running.add(lane);
+      }
+      if (!running.size) break; // nothing could start and nothing is running: nothing ever will
+      await Promise.race([...running].map((l) => l.done));
     }
+    await Promise.all([...running].map((l) => l.done));
     noteLeft();
     // Settled BEFORE the scan, so a copy the hook puts back is on disk when the scanner looks.
     for (const ch of chapters) if (!settled.has(ch)) await settle(ch, false);
@@ -636,6 +766,7 @@ function findOrder(): string[] {
 // type keeps its old address for anyone who imported it from here.
 import { pickBest, pickBestScored, type MatchConfidence } from '../lib/titleMatch';
 import { withOrigin, listActivity, dismissFailed, type Origin, type ActivityEntry } from '../lib/downloadActivity';
+import { cleanGenres } from '../lib/genres';
 export type { MatchConfidence };
 
 /**
@@ -1269,7 +1400,9 @@ export async function addSeriesFromSource(opts: {
   const stateLang = edition?.lang ?? majorityLang(chosen) ?? canonLang(src.lang);
   // The description as the page will show it: MangaDex writes Markdown, and this is what goes into every
   // ComicInfo the downloader writes and, through the scanner, into lib_series.summary.
-  const meta = { series: title, summary: cleanDescription(series?.summary), author: series?.author, genres: series?.genres, url: series?.url, status: series?.status };
+  // Its genres without a site's genre menu (lib/genres.ts, v0.55.5), whichever source read them: they go into the row and
+  // every chapter file's ComicInfo, which a scan reads back.
+  const meta = { series: title, summary: cleanDescription(series?.summary), author: series?.author, genres: cleanGenres(series?.genres), url: series?.url, status: series?.status };
 
   /**
    * "Nothing yet": the series is created and followed, and no chapter is fetched.
@@ -1317,7 +1450,7 @@ export async function addSeriesFromSource(opts: {
    */
   if (chapterFrom === 'none') {
     const floor = chosen.length ? Math.max(...chosen.map((c) => c.number)) + 0.001 : null;
-    const libs = await q<LibraryRow>('SELECT id, path FROM libraries ORDER BY length(path) DESC');
+    const libs = await libraryRows();
     const libraryId = existing
       ? (await one<{ library_id: string }>('SELECT library_id FROM lib_series WHERE id = $1', [existing.id]))?.library_id ?? libraryIdFor(folder, libs)
       : libraryIdFor(folder, libs);
@@ -1361,11 +1494,13 @@ export async function addSeriesFromSource(opts: {
         ON CONFLICT (series_id) DO UPDATE SET cover = COALESCE(series_art.cover, EXCLUDED.cover)`, [id, series.coverUrl]).catch(() => {});
     }
     await learnDirection({ id }, series?.readingDirection, 'source').catch(() => {});
+    await learnTypeFromSource({ id }, series);
     fetchAniListArt(title)
       .then(async (a) => {
         await q(`INSERT INTO series_art (series_id, banner, cover) VALUES ($1, $2, $3)
           ON CONFLICT (series_id) DO UPDATE SET banner = COALESCE(series_art.banner, EXCLUDED.banner), cover = COALESCE(series_art.cover, EXCLUDED.cover)`, [id, a.banner, a.cover]).catch(() => {});
         await learnDirection({ id }, directionFromAniListMatch(title, a), 'anilist');
+        await learnTypeFromAniList({ id }, title, a);
       })
       .catch(() => {});
     return { ok: true, status: 200, title, folder, chapters: 0, started: false, nothing: true, seriesId: id, ...(archive ? { archive } : {}), ...(linked ? { edition: linked } : {}) };
@@ -1403,16 +1538,19 @@ export async function addSeriesFromSource(opts: {
    * before this existed. Fetching twice is the old bug; skipping a chapter nobody holds would be a new one.
    */
   // Under posting order (a series removed and added back), override-aware as the sweep's is: a book in a root the
-  // renumber could not rename holds its posting number in book_overrides (lib/numbering.ts).
-  const have = new Set((await q<{ number: number }>(
+  // renumber could not rename holds its posting number in book_overrides (lib/numbering.ts). A file holding a range
+  // (v0.55.2, lib/chapterRanges.ts) holds every number in it, as in the sweep's. Reintroduce the start alone: "an add
+  // of a series a range file already holds downloads nothing it holds" in chapterRanges.int.test.ts queues 2 to 5.
+  const have = heldBy(await q<{ number: number; end: number | null }>(
     numbered.applied === 'posting_order'
-      ? `SELECT DISTINCT COALESCE(ov.number, b.number) AS number FROM lib_books b JOIN lib_series s ON s.id = b.series_id
+      ? `SELECT DISTINCT COALESCE(ov.number, b.number) AS number, ${rangeEnd('b', 'ov')} AS end
+           FROM lib_books b JOIN lib_series s ON s.id = b.series_id
            LEFT JOIN book_overrides ov ON ov.book_id = b.id
           WHERE s.folder = $1 AND b.pruned_at IS NULL AND b.number IS NOT NULL`
-      : `SELECT DISTINCT b.number FROM lib_books b JOIN lib_series s ON s.id = b.series_id
+      : `SELECT DISTINCT b.number, ${rawRangeEnd('b')} AS end FROM lib_books b JOIN lib_series s ON s.id = b.series_id
           WHERE s.folder = $1 AND b.pruned_at IS NULL AND b.number IS NOT NULL`,
     [folder],
-  ).catch(() => [])).map((r) => Number(r.number)));
+  ).catch(() => []));
   const toFetch = selected.filter((c) => !have.has(c.number));
 
   // "Latest 25 of 200" leaves 1..175 on the source that we do not hold, and the updater treats every
@@ -1450,6 +1588,7 @@ export async function addSeriesFromSource(opts: {
     await q('UPDATE lib_series SET auto_update = $1, source_id = $2, source_series_id = $3, chapter_floor = $5, lang = COALESCE(lang, $6) WHERE folder = $4',
       [autoUpdate !== false, source, sourceId, folder, floor, stateLang]).catch(() => {});
     await learnDirection({ folder }, series?.readingDirection, 'source').catch(() => {});
+    await learnTypeFromSource({ folder }, series);
     // The same call the run makes on its full selection, and for the same reason: these dates are the
     // source's own, and the chapters they belong to are here -- they were simply fetched by somebody else.
     await setBookDates(folder, selected).catch(() => {});
@@ -1476,6 +1615,7 @@ export async function addSeriesFromSource(opts: {
         // The same match's country, as the weakest evidence of the reading direction, when the entry is visibly
         // this title (lib/directionSignals.ts directionFromAniListMatch).
         await learnDirection({ folder }, directionFromAniListMatch(title, a), 'anilist');
+        await learnTypeFromAniList({ folder }, title, a);
       })
       .catch(() => {});
     return {
@@ -1579,6 +1719,7 @@ export async function addSeriesFromSource(opts: {
     // Which way it reads, when the source can say (MangaDex: the original language). After persistScan, so
     // the row exists; below a ComicInfo that already said otherwise (lib/readingDirection.ts).
     await learnDirection({ folder }, series?.readingDirection, 'source').catch(() => {});
+    await learnTypeFromSource({ folder }, series);
     // The listing the series page and "Who scanlates this" read is written here from the chapters this add
     // already fetched -- no second call to the source -- so a title opened straight from Discover shows
     // its groups and versions at once instead of only what is on disk until the sweep reaches it. Held is
@@ -1616,6 +1757,7 @@ export async function addSeriesFromSource(opts: {
         // The same match's country, as the weakest evidence of the reading direction, when the entry is visibly
         // this title (lib/directionSignals.ts directionFromAniListMatch).
         await learnDirection({ folder }, directionFromAniListMatch(title, a), 'anilist');
+        await learnTypeFromAniList({ folder }, title, a);
       })
       .catch(() => {});
     void (async () => {
@@ -2552,8 +2694,12 @@ export default async function sourceRoutes(app: FastifyInstance) {
       const wholes = plain.map((n) => Math.floor(n));
       const expanded = (await q<{ number: number }>(
         // `number` as stored (real), not cast to float8: 12.1 read back through float8 is 12.100000381..., which
-        // then matches no listing row keyed by the real's own spelling.
-        'SELECT DISTINCT number FROM series_listing WHERE series_id = $1 AND floor(number) = ANY($2::float8[])',
+        // then matches no listing row keyed by the real's own spelling. Never a notice chapter the admin hides
+        // (lib/noticeChapters.ts): 12 is the chapters a person can see under 12, and the sweep does not fetch that
+        // one either. Reintroduce by dropping the clause: "a whole number leaves a hidden notice behind" in
+        // fetchWhole.int.test.ts downloads 30.5.
+        `SELECT DISTINCT l.number FROM series_listing l
+          WHERE l.series_id = $1 AND floor(l.number) = ANY($2::float8[]) AND NOT ${noticeListed('l')}`,
         [seriesId, wholes],
       )).map((r) => Number(r.number));
       const covered = new Set(expanded.map((n) => Math.floor(n)));
@@ -2583,13 +2729,19 @@ export default async function sourceRoutes(app: FastifyInstance) {
     // would send the person to a row with no pages behind it.
     // Override-aware under posting order, as the sweep's have-set is (lib/updater.ts): a book the renumber could
     // not rename holds its posting number in book_overrides, and its raw number is some other post's now.
-    const here = new Set((await q<{ number: number }>(
+    // A number inside a live range file is here too (lib/chapterRanges.ts): the range rows come along whatever they
+    // start at, and heldBy asks each of them. Reintroduce the exact number: "a fetch of a number a range file holds is
+    // already here" in chapterRanges.int.test.ts starts a download of 3.
+    const here = heldBy(await q<{ number: number; end: number | null }>(
       s.numbering === 'posting_order'
-        ? `SELECT COALESCE(ov.number, b.number) AS number FROM lib_books b LEFT JOIN book_overrides ov ON ov.book_id = b.id
-            WHERE b.series_id = $1 AND COALESCE(ov.number, b.number) = ANY($2::real[]) AND b.pruned_at IS NULL`
-        : 'SELECT number FROM lib_books WHERE series_id = $1 AND number = ANY($2::real[]) AND pruned_at IS NULL',
+        ? `SELECT COALESCE(ov.number, b.number) AS number, ${rangeEnd('b', 'ov')} AS end
+             FROM lib_books b LEFT JOIN book_overrides ov ON ov.book_id = b.id
+            WHERE b.series_id = $1 AND (COALESCE(ov.number, b.number) = ANY($2::real[]) OR ${rangeEnd('b', 'ov')} IS NOT NULL)
+              AND b.pruned_at IS NULL`
+        : `SELECT b.number, ${rawRangeEnd('b')} AS end FROM lib_books b
+            WHERE b.series_id = $1 AND (b.number = ANY($2::real[]) OR ${isRange('b')}) AND b.pruned_at IS NULL`,
       [seriesId, numbers],
-    )).map((r) => Number(r.number)));
+    ));
 
     const chapters: Array<SourceChapter & { pinned?: boolean }> = [];
     // Health is per source, asked once per source rather than once per number.
@@ -2674,9 +2826,19 @@ export default async function sourceRoutes(app: FastifyInstance) {
    * polls the same URL with a short `wait` until it is 0.
    */
   app.get('/api/sources/search-all', async (req) => {
-    const { q: rawQ, groupBy, wait, source } = req.query as { q?: string; groupBy?: string; wait?: string; source?: string };
+    const { q: rawQ, groupBy, wait, source, rating: rawRating } = req.query as { q?: string; groupBy?: string; wait?: string; source?: string; rating?: string };
+    // The 18+ filter (v0.55.4, #158): `rating=all|safe|adult`, anything else read as all. Applied to this viewer's
+    // answer only, after the shared entry (lib/searchAll.ts ratingOf, groupByTitle). An account capped below 18 is never
+    // shown an 18+ result whatever it asks: the add checks only the source, so the cap is held here. And with "Show 18+"
+    // off nobody is: that switch already keeps adult SOURCES out of the fan-out, and an 18+ title from a source that is
+    // not -- MangaDex's erotica, a genre on the admin's list -- went on showing in search until v0.55.4.
+    // Reintroduce by honouring `rating` whatever the cap: "a capped account is held to Hide 18+" in searchAll.int.test.ts
+    // finds the 18+ card.
+    const ctx = vc(req);
+    const ratingAsked: RatingFilter = rawRating === 'safe' || rawRating === 'adult' ? rawRating : 'all';
+    const rating: RatingFilter = (ctx.maxAgeRating !== null && ctx.maxAgeRating < ADULT_RATING) || ctx.hideAdultLibraries ? 'safe' : ratingAsked;
     const term = (rawQ || '').trim();
-    if (!term) return { content: [], sources: [], pending: 0, asked: 0 };
+    if (!term) return { content: [], sources: [], pending: 0, asked: 0, rating };
     // Absent means the full first-answer wait, so a caller written before `wait` existed gets the most
     // complete answer one request can give; anything above the cap is clamped rather than refused.
     const asked = wait === undefined || wait === '' ? SEARCH_FIRST_ANSWER_MS : Number(wait);
@@ -2706,14 +2868,18 @@ export default async function sourceRoutes(app: FastifyInstance) {
     const byId = new Map(ask.map((s) => [s.id, s] as const));
     // Shaped in provider-preference order, as before: the first provider of a card is the default pick.
     const order = findOrder().map((id) => byId.get(id)).filter((s): s is SourceAdapter => !!s);
-    const rest = { sources: ans.sources, pending: ans.pending, asked: ans.asked };
+    // `rating`: the filter this answer applied -- the one asked for, or `safe` when the viewer may not be shown 18+.
+    const rest = { sources: ans.sources, pending: ans.pending, asked: ans.asked, rating };
+    // Every result's rating, by the admin's lists as they are now (cached briefly: lib/visibility.ts adultFilter).
+    const lists = await adultFilter();
+    const rated: Rated = { of: (r, src) => ratingOf(r, src, lists), want: rating };
 
     // Same fan-out either way; only the shaping differs. groupBy=source mirrors Mihon's global-search
     // screen (one rail per provider) for the import-review "search manually" sheet — the title-grouped
     // shape below groups all providers of the SAME title into one card instead, which is what Discover
     // wants but hides which specific source a manual pick would come from.
     if (groupBy === 'source') {
-      const rails = bySource(ans.per, order);
+      const rails = bySource(ans.per, order, rated);
       const have = await inLibrary(rails.flatMap((g) => g.results.map((r) => r.title)));
       return {
         content: rails.map((g) => ({ ...g, results: g.results.map((r) => ({ ...r, ...owned(have.get(norm(r.title)), g.source) })) })),
@@ -2722,7 +2888,7 @@ export default async function sourceRoutes(app: FastifyInstance) {
     }
 
     // group by normalized title → one card that carries every provider offering it (preferred order preserved)
-    const groups = groupByTitle(ans.per, order);
+    const groups = groupByTitle(ans.per, order, 30, rated);
     const have = await inLibrary(groups.map((g) => g.title));
     return { content: groups.map((g) => ownedGroup(g, have.get(norm(g.title)))), ...rest };
   });
@@ -2809,8 +2975,8 @@ export default async function sourceRoutes(app: FastifyInstance) {
     // The server's own runs (lib/downloadJobs.ts, #82): the sweep, the repair, a bulk "Fetch newest". An
     // admin's to see and stop -- and a bulk run its starter's too, since it is their selection. Nobody
     // else's: the series a sweep is on may be in a library this viewer cannot open.
-    // A Find other sources run (v0.49.1) is an admin's alone, whoever started it.
-    const runs = listRuns().filter((r) => admin || (r.kind !== 'find_sources' && r.by !== null && r.by === me));
+    // A Find other sources run (v0.49.1) and a Fix everything run (v0.55.0) are an admin's alone, whoever started them.
+    const runs = listRuns().filter((r) => admin || (r.kind !== 'find_sources' && r.kind !== 'autofix' && r.by !== null && r.by === me));
     const activity = listActivity();
     // The slow archive's rows (#117), every viewer's from one shared read (lib/archive.ts, ten seconds).
     const archived = await archiveSeriesIds().catch(() => [] as string[]);

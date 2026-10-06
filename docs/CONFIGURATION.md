@@ -37,6 +37,12 @@ released and shows the answer under Admin → Health. It is a `GET` of a public 
 IP address, exactly as it would if you opened that page in a browser, and nothing else. Nothing about your
 install is sent. Being a version behind is never treated as a fault — it will not turn anything amber.
 
+When **Fix everything** has to try extensions (since v0.55.1), it ranks them by how often each is downloaded: at most
+once a day it reads the public releases list of the repository your extensions come from on GitHub (Keiyoushi's puts
+each extension's files there), the same kind of `GET` with nothing about your install in it. When GitHub cannot be
+reached it uses the last answer, else each extension's version. Set `GITHUB_API_URL` to send both GitHub reads to a
+mirror instead of `https://api.github.com` (the browser tests point it at a stand-in).
+
 **Count this server in the anonymous install count** — *off by default.* Nobody can see how many people
 self-host this, so nobody — including whoever wrote it — knows whether a release reached twenty people or two
 hundred. If you turn this on, once a day your server sends this, and nothing else, to `uchiyomi.com`:
@@ -147,12 +153,18 @@ one source's budget; `SEARCH_CONCURRENCY` defaults to `SCAN_CONCURRENCY` (which 
 and the oldest is evicted above `SEARCH_CACHE_MAX` (`50`). A source detail lookup is cached for ten minutes.
 These caches share network work, not authorisation: results are filtered to the account on every response.
 
+**Library scans that take minutes.** *Scan library now* answers within `REFRESH_FIRST_ANSWER_MS` (default `15000`)
+since v0.55.6; a scan that takes longer goes on, and the page follows it to its end with how far it has got. Keep the
+value under the timeout of any proxy in front of the server (nginx 60 s, Cloudflare 100 s).
+
 `FAKE_SOURCE_URLS=name=http://host:port,name2=http://host:port` registers deterministic HTTP adapters used
 by the release test harness. It is empty in every shipped deployment and is not a production source
 configuration. `FAKE_SOURCE_NSFW=name` (since v0.42.0) makes the named ones — a comma-separated list of
 ids from that same list — declare themselves adult, which is the only way to drive the 18+ rules without a
 real adult extension; it does nothing at all while `FAKE_SOURCE_URLS` is unset, which is every shipped
-deployment.
+deployment. `FAKE_SOURCE_CLOUDFLARE=name` (since v0.55.3) puts the named ones behind a fake Cloudflare: they ask the
+Cloudflare solvers for every page and send a solver's cookie with their images, which is how the harness drives the
+backup solver end to end; the same, it does nothing while `FAKE_SOURCE_URLS` is unset.
 
 The shared source-work limits are `SOLVER_CONCURRENCY` (default `4`) and `SOLVER_BUDGET_MS` (default
 `90000`) for Cloudflare-backed work; `SCAN_CONCURRENCY` defaults to that solver slot count, while
@@ -167,6 +179,86 @@ rather than as a failure: raise it for extension sources behind a slow Cloudflar
 Test key counts against it, plus a few seconds of margin (*Testing… 0:12 of up to 0:53* at the default).
 `SOURCE_LATEST_TIMEOUT_MS` (default `8000`) is how long a source's newest page may take before it counts as slow.
 
+## The Cloudflare solver
+
+Most manga sites sit behind Cloudflare, so the built-in engines fetch them through a **solver**: a real browser in a
+container of its own that gets past the check and hands back the page, its cookies and its user agent; images are
+then fetched directly with that cookie and user agent. Uchiyomi speaks FlareSolverr's `/v1` API, so any solver that
+speaks it works. (Extension sources are fetched by the extension engine, which has its own solver setting: below.)
+
+- `FLARESOLVERR_URL`: the **main** solver. Every shipped compose file runs [FlareSolverr](https://github.com/FlareSolverr/FlareSolverr)
+  as `uchiyomi-flaresolverr` and points this at it, so there is nothing to do.
+- `FLARESOLVERR_FALLBACK_URL` (since v0.55.3; empty by default, which means none): a **backup** solver. A request the
+  main does not answer with a page — it cannot be reached, it runs out of time, it answers with an error, an empty
+  page or something that is not its JSON, or it stays busy — is sent once, unchanged, to the backup. The solver that
+  answered a site last is asked first for that site for the next six hours, so a site the main cannot get past does
+  not wait for the main to fail every time (a solver that was only busy keeps its sites); after that the main is asked
+  first again and gets its sites back. Cookies
+  and the user agent are kept per solver and site, and a site's images go with the pair of the solver that solved it
+  (a `cf_clearance` cookie only works with the user agent that earned it).
+- A solver that answers **HTTP 429 itself is busy**, not the site refusing: trawl does that when every browser it has
+  is in use. Uchiyomi asks it again twice, 3 and 6 seconds apart, then the backup. It never puts the site in a
+  cooldown or reads as the site asking for a pause; if every solver stays busy, the source's diagnosis says so and
+  names the fix (more browsers, or a lower `SOLVER_CONCURRENCY`).
+- `SOLVER_CONCURRENCY` (default `4`, above) is how many solves Uchiyomi asks for at once, whichever solver answers.
+
+The solvers to choose from, all speaking the same API:
+
+| Solver | What to know |
+|---|---|
+| [FlareSolverr](https://github.com/FlareSolverr/FlareSolverr) | The default. Chrome, a fresh browser for every request; about 850 MB idle. Needs `shm_size: 1gb` (the shipped files set it). |
+| [trawl](https://github.com/germondai/trawl) | Camoufox (a patched Firefox), and it keeps solved sessions, so a repeat visit to a site is quick: on one install's own sites, a median of 2 s against FlareSolverr's 12, and 316 MB idle against 865. Young (created June 2026): pin a version. Its pool holds one browser unless `BROWSER_POOL_SIZE` says more, and Uchiyomi asks for four solves at once: set 2 or more, or lower `SOLVER_CONCURRENCY`. `SESSION_CACHE_DRIVER=memory` runs it without Redis. AGPL-3.0, as its own container. |
+| [Byparr](https://github.com/ThePhaseless/Byparr) | Says it is up at `/health` instead of its root; Uchiyomi reads both. |
+
+**Admin → Health** names the solver by how it greets — FlareSolverr, trawl, or another — and compares FlareSolverr's
+and trawl's version with their own latest release (any other solver's with nothing). With a backup the *Cloudflare
+solver* card lists both, *Main solver* and *Backup solver*, each with its address: amber with *The main solver is not
+answering; the backup is solving* while only the backup answers, amber while the backup does not answer, and the
+usual *Not answering* when neither does. The nightly repair and **Fix everything** count the solver as up while either
+answers, and **Reset the solver** clears what Uchiyomi remembers about both. Fix everything puts the solver under *Needs
+you* only when neither answers: with one of the two down its end says so under what goes on by itself, since every
+request is still solved.
+
+The extension engine uses the **main** solver only: **Connect** points its own helper at `FLARESOLVERR_URL` (see
+`FLARESOLVERR_ENABLED` / `FLARESOLVERR_URL` under [Downloading](#downloading), and [extensions.md](extensions.md)).
+
+**trawl as the main solver, FlareSolverr kept as the backup** — in [`deploy/docker-compose.yml`](../deploy/docker-compose.yml),
+point `FLARESOLVERR_URL` on the `uchiyomi` service at trawl, add `FLARESOLVERR_FALLBACK_URL` beside it, and add the
+service below next to `uchiyomi-flaresolverr` (which stays as it is). The shipped files keep FlareSolverr alone; this is
+a choice, not a default.
+
+```yaml
+services:
+  uchiyomi:
+    environment:
+      # ...everything else as it is
+      FLARESOLVERR_URL: http://uchiyomi-trawl:8191
+      FLARESOLVERR_FALLBACK_URL: http://uchiyomi-flaresolverr:8191
+
+  uchiyomi-trawl:
+    image: ghcr.io/germondai/trawl:1.7.0   # pinned: it is young, and has changed a setting once already
+    container_name: uchiyomi-trawl
+    restart: unless-stopped
+    shm_size: 1gb
+    mem_limit: 2g
+    environment:
+      SESSION_CACHE_DRIVER: memory   # keep solved sessions in memory, no Redis
+      BROWSER_POOL_SIZE: "2"
+    healthcheck:
+      # /health answers 503 until a browser is up (15 to 30 s after a start).
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8191/health >/dev/null || exit 1"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    networks: [uchiyomi_app]
+```
+
+Then `docker compose up -d`. To go back, put `FLARESOLVERR_URL` back to `http://uchiyomi-flaresolverr:8191` and drop
+the other line (and the service, if you like). The extension engine keeps the solver its own container names
+(FlareSolverr, in the shipped files); for extension sources to go through trawl too, set `FLARESOLVERR_URL` on the
+`uchiyomi-suwayomi` service to `http://uchiyomi-trawl:8191` as well. It has no backup of its own.
+
 ## Downloading
 
 All optional; the defaults are what the live install runs. Adding a series and importing hundreds of
@@ -178,7 +270,9 @@ ever hit.
 - `CHAPTER_RETRY_CAP` (default `3`): ordinary failures before a chapter is left as failed until a person
   explicitly retries it.
 
-- `DOWNLOAD_CONCURRENCY` (default `2`): chapters downloaded at once, per source.
+- `DOWNLOAD_CONCURRENCY` (default `2`): chapters downloaded at once, per source -- per rate key: the MangaDex languages
+  share one, and since v0.55.3 so do sources whose pages come from one image server (Natomanga and Mangakakalot). One
+  at a time while a 429 has raised that key's pace (see `DOWNLOAD_RESUME_WAIT_MS`).
 - `DOWNLOAD_MIN_GAP_MS` (default `1200`): minimum gap between the starts of two chapter downloads from the same
   source, doubled for each pace level a 429 has earned it (1200 → 2400 → 4800 ms).
 - `DOWNLOAD_PAGE_GAP_MS` (default `250`): pause between page requests inside one chapter, for an engine or
@@ -236,9 +330,12 @@ ever hit.
   so they are set in every shipped compose file; raise both together for a very long extension list, keeping
   the ceiling well above the `-Xmx` heap for the memory Java uses outside it.
 - `DOWNLOAD_RESUME_WAIT_MS` (default `5000,10000,20000`): waits before the three attempts to resume a
-  chapter after a 429. A source's longer `Retry-After` is always the floor. A 429 also raises that source's
-  in-memory pace level (0–4): slowed levels use one page worker and double gaps up to four seconds; ten
-  quiet minutes lower the level by one. A successful slow chapter does not immediately reset it.
+  chapter after a 429. A source's longer `Retry-After` is always the floor. Every chapter on the source waits the same
+  wait, not only the refused one. A 429 also raises that source's in-memory pace level (0–4): slowed levels download
+  one chapter at a time, use one page worker and double gaps up to four seconds. Since v0.55.3 a level is held at least
+  an hour, and comes off one step at a time only after ten chapters in a row came down whole without a 429 at it (a
+  level nothing downloads through loses a step every three days); it was ten quiet minutes a step, and a site that
+  kept refusing was asked at full speed again within the hour. Nothing persists: a restart starts at full speed.
 - `PARTIAL_CHAPTER_FLOOR` (default `0.8`): if an ordinary, non-refusal failure leaves at least this share of
   pages, save the chapter with indexed placeholders and repair evidence instead of discarding it. `0`
   disables partial chapters. A 403/429 is a refusal and is never saved partial.
@@ -257,7 +354,19 @@ ever hit.
 - `REPAIR_DIRECTIONS_MAX` (default `500`, 1–5000): series one run asks each service — MangaDex, then AniList —
   about their reading direction (step 8 below): at most five and ten requests a night at the default.
 - `REPAIR_PACE_MS` (default `1500`, 0 or more): the pause between two series the repair's *Retry now* step
-  re-checks. `0` is a legitimate value and means no pause at all.
+  re-checks. `0` is a legitimate value and means no pause at all. Fix everything paces every series of its
+  failures, short and gap steps by it too.
+- `AUTOFIX_MAX_MINUTES` (default `90`, 1–1440): how long one run of Health's **Fix everything** (since v0.55.0)
+  may work through the network-heavy part -- Replace, the failures, short and gap steps, extensions -- before it
+  stops at a safe point; what is left waits for the next run.
+- `AUTOFIX_SEARCHES` (default `60`, 0–1000): searches of other sites one Fix everything run may start for short
+  chapters and gaps, shared like the repair's five.
+- `AUTOFIX_INSTALLS` (default: no cap; 0–100000): extensions one Fix everything run may install for series no source
+  carries. Since v0.55.1 there is no cap unless you set one: the run tries extensions one at a time, the ones the
+  series' translation groups name first, then the most downloaded, until the series are found or
+  `AUTOFIX_MAX_MINUTES` is spent, and the next run continues down the list. `0` switches its extensions phase off. A
+  package that carries none of the series it was searched for is removed again at once, and is not tried for those
+  series again for a month.
 - `MIN_FREE_GB` (default `10`): refuse to start a download when the download disk has less than this free.
   `0` disables the floor. Fails open if free space cannot be measured.
 
@@ -328,7 +437,10 @@ provable on their own, and two more only when you switch them on, in this order:
    zero-page chapter. The copies come from the chapter listing the step refreshes before it asks anything,
    so a source that is in a cooldown at that moment offers no copy at all rather than one that stays
    silent; either way it is not part of a proof.
-5. **Gaps.** `REPAIR_GAPS_MAX` series with the largest holes, at most once a day each: a hole a followed
+5. **Gaps.** `REPAIR_GAPS_MAX` series, the least recently checked first (since v0.55.0; before, the largest holes
+   first, which searched the same unfillable ones every night), at most once a day each, and never one whose last
+   search found nobody has its chapters while that answer is under a week old and nothing has landed since. Holes
+   below a series' "Latest N" start are left alone: nothing fetches below it. A hole a followed
    source already lists is left to the chapter sweep, and only a hole nobody lists starts a search. A
    source is followed only under the same 90%-numbering rule as every other automatic follow, and at most
    20 chapters are fetched per series. A series the run has no searches left for is not marked as checked:

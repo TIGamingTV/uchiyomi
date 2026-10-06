@@ -17,6 +17,10 @@
 #   E2E_NO_WALK=1 skips the run.mjs walk at the end (with KEEP=1: just bring an instance up to poke at)
 #   E2E_MIN_FREE_GB=0 on a host with less than 10 GiB free: the downloader's floor refuses every download under it
 #   KEEP=1 E2E_ENGINE=fake E2E_FAKE_EXTRA=v54 E2E_NO_WALK=1 bash web/test/e2e/up.sh   # the stack for walk49's replace
+#   KEEP=1 E2E_ENGINE=fake E2E_FAKE_EXTRA=v55 E2E_MAX_SOURCES=2 E2E_NO_WALK=1 bash web/test/e2e/up.sh   # walk49's autofix
+#   KEEP=1 E2E_SOLVERS=1 E2E_NO_WALK=1 bash web/test/e2e/up.sh   # walk49's solver: a main and a backup solver, fake-b
+#     behind a fake Cloudflare
+#   KEEP=1 E2E_EMPTY_LIBRARY=1 E2E_NO_WALK=1 bash web/test/e2e/up.sh   # walk49's find: a new server, nothing in its library
 #
 # The embedded leg is the proof that the one-container layout behaves like the two-container one, in the
 # only place both are actually driven end to end. CI runs both.
@@ -32,7 +36,11 @@ APP="$NET"
 DB="$NET-db"
 FAKE_A="$NET-fake-a"
 FAKE_B="$NET-fake-b"
+FAKE_C="$NET-fake-c"
+FAKE_D="$NET-fake-d"
 ENGINE_C="$NET-engine"
+SOLVER_MAIN="$NET-solver-main"
+SOLVER_BACKUP="$NET-solver-backup"
 # Docker's default address pools can be exhausted on a busy host, so the subnet is pinned rather than left
 # to chance -- an unexplained "all predefined address pools have been fully subnetted" is a bad first
 # impression of a test suite.
@@ -44,10 +52,24 @@ EMBEDDED=${E2E_EMBEDDED:-0}
 # leg on PORT+1; fixed 18150/18151 made those two otherwise-correct runs fight over a host port.
 FAKE_A_PORT=${E2E_FAKE_A_PORT:-$((20000 + (PORT % 1000) * 2))}
 FAKE_B_PORT=${E2E_FAKE_B_PORT:-$((FAKE_A_PORT + 1))}
+# v0.55.1, the autofix walk's two more (E2E_FAKE_EXTRA=v55 only): fake-c, whose images answer 429, and fake-d, whose page
+# lists fail -- the owner's Mangakakalot and AllManga. From a range of their own, two per app port: 24000-25999.
+FAKE_C_PORT=${E2E_FAKE_C_PORT:-$((24000 + (PORT % 1000) * 2))}
+FAKE_D_PORT=${E2E_FAKE_D_PORT:-$((FAKE_C_PORT + 1))}
+OWNER=0
+case ",${E2E_FAKE_EXTRA:-}," in *,v55,*) OWNER=1 ;; esac
 # The engine's from a range of its own: the fake sources hold 20000-21999 (two per app port) and walk43's webhook
 # listener 22000-22999. It was FAKE_B_PORT + 1 -- the next app port's fake-a port -- so an instance with the engine
 # stopped the one started on PORT+1 from binding its first fake source.
 ENGINE_PORT=${E2E_ENGINE_PORT:-$((23000 + PORT % 1000))}
+# v0.55.3, E2E_SOLVERS=1: two fake Cloudflare solvers (fakeSolver.mjs) -- the main greeting as trawl 1.7.0, the backup
+# as FlareSolverr 3.5.2 -- as the app's FLARESOLVERR_URL and FLARESOLVERR_FALLBACK_URL, and fake-b behind a fake
+# Cloudflare: its stub answers only a request carrying a solver's cf_clearance (fakeSource.mjs --cloudflare yes), and the
+# app asks it through the solvers (FAKE_SOURCE_CLOUDFLARE). For walk49's solver phase (solverWalk.mjs). Their control
+# ports from a range of their own, two per app port: 26000-27999.
+SOLVERS=${E2E_SOLVERS:-0}
+SOLVER_MAIN_PORT=${E2E_SOLVER_MAIN_PORT:-$((26000 + (PORT % 1000) * 2))}
+SOLVER_BACKUP_PORT=$((SOLVER_MAIN_PORT + 1))
 # E2E_ENGINE=fake: the strict fake Suwayomi v2.3.2243 (bff/test/fixtures/fakeSuwayomiEngine.mjs) as the extension
 # engine, in E2E_ENGINE_MODE (up, down, slow, extension_error; /__mode switches it later). Unset: no engine at
 # all, SUWAYOMI_URL empty -- the "No extension engine is set up" state (#72).
@@ -84,19 +106,30 @@ fi
 # downloads to -- in this rig the host's own disk. A test host with less free than that refuses every download, and
 # the walks read it as a broken feature; 0 turns the floor off. Unset: the app's own default.
 if [ -n "${E2E_MIN_FREE_GB:-}" ]; then APP_ENV+=(-e "MIN_FREE_GB=$E2E_MIN_FREE_GB"); fi
+# E2E_MAX_SOURCES: the extension engine's source limit (SUWAYOMI_MAX_SOURCES, 25 when unset). The autofix walk runs
+# under a limit of two: the two packages Fix everything keeps fit, one at a time beside each it tries and removes, and a
+# third used source is then the one over it (Free a slot). Unset: the app's own default.
+if [ -n "${E2E_MAX_SOURCES:-}" ]; then APP_ENV+=(-e "SUWAYOMI_MAX_SOURCES=$E2E_MAX_SOURCES"); fi
+# After ENGINE_ENV on the app's command line, so these win over the engine's stand-in solver address.
+if [ "$SOLVERS" = "1" ]; then
+  APP_ENV+=(-e "FLARESOLVERR_URL=http://$SOLVER_MAIN:8191" -e "FLARESOLVERR_FALLBACK_URL=http://$SOLVER_BACKUP:8191" -e "FAKE_SOURCE_CLOUDFLARE=fake-b")
+  CLOUDFLARE_B="yes"
+else
+  CLOUDFLARE_B="no"
+fi
 
 cleanup() {
-  [ "${KEEP:-0}" = "1" ] && { echo "kept: $NET on :$PORT, fake sources on :$FAKE_A_PORT/:$FAKE_B_PORT${ENGINE:+, fake engine on :$ENGINE_PORT} (library $LIB, data $DATA)"; return; }
+  [ "${KEEP:-0}" = "1" ] && { echo "kept: $NET on :$PORT, fake sources on :$FAKE_A_PORT/:$FAKE_B_PORT${ENGINE:+, fake engine on :$ENGINE_PORT}$([ "$OWNER" = "1" ] && echo ", fake-c/fake-d on :$FAKE_C_PORT/:$FAKE_D_PORT")$([ "$SOLVERS" = "1" ] && echo ", solvers on :$SOLVER_MAIN_PORT/:$SOLVER_BACKUP_PORT") (library $LIB, data $DATA)"; return; }
   # -v: postgres:16-alpine declares its data directory a volume, and every run left that anonymous volume behind
   # (about 49 MB); nothing else here has one to leave.
-  docker rm -f -v "$APP" "$DB" "$FAKE_A" "$FAKE_B" "$ENGINE_C" >/dev/null 2>&1 || true
+  docker rm -f -v "$APP" "$DB" "$FAKE_A" "$FAKE_B" "$FAKE_C" "$FAKE_D" "$ENGINE_C" "$SOLVER_MAIN" "$SOLVER_BACKUP" >/dev/null 2>&1 || true
   docker network rm "$NET" >/dev/null 2>&1 || true
   # /data is written by the container as PUID (our own uid), so a plain rm works.
   rm -rf "$LIB" "$DATA"
 }
 trap cleanup EXIT INT TERM
 
-docker rm -f -v "$APP" "$DB" "$FAKE_A" "$FAKE_B" "$ENGINE_C" >/dev/null 2>&1 || true
+docker rm -f -v "$APP" "$DB" "$FAKE_A" "$FAKE_B" "$FAKE_C" "$FAKE_D" "$ENGINE_C" "$SOLVER_MAIN" "$SOLVER_BACKUP" >/dev/null 2>&1 || true
 docker network rm "$NET" >/dev/null 2>&1 || true
 docker network create --subnet "$SUBNET" "$NET" >/dev/null
 
@@ -106,8 +139,33 @@ docker run -d --name "$FAKE_A" --network "$NET" -p "127.0.0.1:$FAKE_A_PORT:$FAKE
   node web/test/e2e/fakeSource.mjs --name fake-a --port "$FAKE_A_PORT" --extra "$EXTRA_A" >/dev/null
 docker run -d --name "$FAKE_B" --network "$NET" -p "127.0.0.1:$FAKE_B_PORT:$FAKE_B_PORT" \
   -v "$REPO:/repo:ro" -w /repo node:24-alpine \
-  node web/test/e2e/fakeSource.mjs --name fake-b --port "$FAKE_B_PORT" --extra "$EXTRA_B" >/dev/null
-for stub in "http://127.0.0.1:$FAKE_A_PORT/__log" "http://127.0.0.1:$FAKE_B_PORT/__log"; do
+  node web/test/e2e/fakeSource.mjs --name fake-b --port "$FAKE_B_PORT" --extra "$EXTRA_B" --cloudflare "$CLOUDFLARE_B" >/dev/null
+FAKES="fake-a=http://$FAKE_A:$FAKE_A_PORT,fake-b=http://$FAKE_B:$FAKE_B_PORT"
+STUBS="http://127.0.0.1:$FAKE_A_PORT/__log http://127.0.0.1:$FAKE_B_PORT/__log"
+if [ "$OWNER" = "1" ]; then
+  echo "· and the autofix walk's fake-c (images answer 429) and fake-d (page lists fail)"
+  docker run -d --name "$FAKE_C" --network "$NET" -p "127.0.0.1:$FAKE_C_PORT:$FAKE_C_PORT" \
+    -v "$REPO:/repo:ro" -w /repo node:24-alpine \
+    node web/test/e2e/fakeSource.mjs --name fake-c --port "$FAKE_C_PORT" --extra v551 >/dev/null
+  docker run -d --name "$FAKE_D" --network "$NET" -p "127.0.0.1:$FAKE_D_PORT:$FAKE_D_PORT" \
+    -v "$REPO:/repo:ro" -w /repo node:24-alpine \
+    node web/test/e2e/fakeSource.mjs --name fake-d --port "$FAKE_D_PORT" --extra v551 >/dev/null
+  # Registered before fake-b, so a search asks them first (lib/scanOrder.ts keeps the registry's order): Replace must
+  # pass over fake-d, which lists Fix Search but cannot update it, rather than reach fake-b first by luck.
+  FAKES="fake-a=http://$FAKE_A:$FAKE_A_PORT,fake-c=http://$FAKE_C:$FAKE_C_PORT,fake-d=http://$FAKE_D:$FAKE_D_PORT,fake-b=http://$FAKE_B:$FAKE_B_PORT"
+  STUBS="$STUBS http://127.0.0.1:$FAKE_C_PORT/__log http://127.0.0.1:$FAKE_D_PORT/__log"
+fi
+if [ "$SOLVERS" = "1" ]; then
+  echo "· and two Cloudflare solvers: the main (trawl), the backup (FlareSolverr)"
+  docker run -d --name "$SOLVER_MAIN" --network "$NET" -p "127.0.0.1:$SOLVER_MAIN_PORT:8191" \
+    -v "$REPO:/repo:ro" -w /repo node:24-alpine \
+    node web/test/e2e/fakeSolver.mjs --name main --port 8191 --greeting trawl --version 1.7.0 >/dev/null
+  docker run -d --name "$SOLVER_BACKUP" --network "$NET" -p "127.0.0.1:$SOLVER_BACKUP_PORT:8191" \
+    -v "$REPO:/repo:ro" -w /repo node:24-alpine \
+    node web/test/e2e/fakeSolver.mjs --name backup --port 8191 --greeting flaresolverr --version 3.5.2 >/dev/null
+  STUBS="$STUBS http://127.0.0.1:$SOLVER_MAIN_PORT/__mode http://127.0.0.1:$SOLVER_BACKUP_PORT/__mode"
+fi
+for stub in $STUBS; do
   ready=0
   for _ in $(seq 1 50); do
     if curl -sf -o /dev/null "$stub"; then ready=1; break; fi
@@ -121,7 +179,7 @@ if [ "$ENGINE" = "fake" ]; then
   echo "· starting the fake extension engine (${E2E_ENGINE_MODE:-up})"
   docker run -d --name "$ENGINE_C" --network "$NET" -p "127.0.0.1:$ENGINE_PORT:$ENGINE_PORT" \
     -v "$REPO:/repo:ro" -w /repo node:24-alpine \
-    node web/test/e2e/fakeEngine.mjs --port "$ENGINE_PORT" --mode "${E2E_ENGINE_MODE:-up}" >/dev/null
+    node web/test/e2e/fakeEngine.mjs --port "$ENGINE_PORT" --mode "${E2E_ENGINE_MODE:-up}" --extra "${E2E_FAKE_EXTRA:-none}" >/dev/null
   ready=0
   for _ in $(seq 1 50); do
     if curl -sf -o /dev/null "http://127.0.0.1:$ENGINE_PORT/__mode"; then ready=1; break; fi
@@ -130,10 +188,19 @@ if [ "$ENGINE" = "fake" ]; then
   [ "$ready" = "1" ] || { echo "fake engine did not start" >&2; exit 1; }
   # A solver address for the app to share with the engine (Connect); nothing needs it to answer.
   ENGINE_ENV=(-e "SUWAYOMI_URL=http://$ENGINE_C:$ENGINE_PORT" -e "FLARESOLVERR_URL=http://$NET-solver:8191")
+  # v0.55.1: the autofix walk's GitHub, the fake engine's stand-in for the releases list Fix everything ranks extensions
+  # by (bff lib/githubRelease.ts GITHUB_API_URL). Only there: every other stack asks nothing of GitHub it relies on.
+  if [ "$OWNER" = "1" ]; then ENGINE_ENV+=(-e "GITHUB_API_URL=http://$ENGINE_C:$ENGINE_PORT/__github"); fi
 fi
 
-echo "· seeding a library"
-python3 "$REPO/web/test/e2e/seed.py" "$LIB"
+# E2E_EMPTY_LIBRARY=1 (v0.55.4): nothing seeded, so the library a new owner meets is the one the walk sees -- where
+# "Import your library" is offered (walk49's find). run.mjs needs the seeded series: never both.
+if [ "${E2E_EMPTY_LIBRARY:-0}" = "1" ]; then
+  echo "· an empty library: nothing seeded"
+else
+  echo "· seeding a library"
+  python3 "$REPO/web/test/e2e/seed.py" "$LIB"
+fi
 
 echo "· building the all-in-one image"
 docker build -q -f "$REPO/Dockerfile.aio" -t "$IMAGE" "$REPO" >/dev/null
@@ -143,7 +210,7 @@ if [ "$EMBEDDED" = "1" ]; then
   docker run -d --name "$APP" --network "$NET" -p "127.0.0.1:$PORT:3000" \
     -e JWT_SECRET='e2e-secret-at-least-16-chars' \
     -e LIBRARY_BACKEND=owned \
-    -e FAKE_SOURCE_URLS="fake-a=http://$FAKE_A:$FAKE_A_PORT,fake-b=http://$FAKE_B:$FAKE_B_PORT" \
+    -e FAKE_SOURCE_URLS="$FAKES" \
     -e FAKE_SOURCE_NSFW="$ADULT_SOURCE" \
     -e DOWNLOAD_PAGE_GAP_MS=20 -e DOWNLOAD_RESUME_WAIT_MS=200,200,200 \
     -e PUID="$(id -u)" -e PGID="$(id -g)" ${ENGINE_ENV[@]+"${ENGINE_ENV[@]}"} ${APP_ENV[@]+"${APP_ENV[@]}"} \
@@ -160,7 +227,7 @@ else
     -e DATABASE_URL="postgres://postgres:e2e@$DB:5432/yomi" \
     -e JWT_SECRET='e2e-secret-at-least-16-chars' \
     -e LIBRARY_BACKEND=owned \
-    -e FAKE_SOURCE_URLS="fake-a=http://$FAKE_A:$FAKE_A_PORT,fake-b=http://$FAKE_B:$FAKE_B_PORT" \
+    -e FAKE_SOURCE_URLS="$FAKES" \
     -e FAKE_SOURCE_NSFW="$ADULT_SOURCE" \
     -e DOWNLOAD_PAGE_GAP_MS=20 -e DOWNLOAD_RESUME_WAIT_MS=200,200,200 \
     -e PUID="$(id -u)" -e PGID="$(id -g)" ${ENGINE_ENV[@]+"${ENGINE_ENV[@]}"} ${APP_ENV[@]+"${APP_ENV[@]}"} \

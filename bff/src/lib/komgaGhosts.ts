@@ -29,6 +29,8 @@
 // that belongs on a phone credential. This module reads the same table and takes five columns.
 import { q, one } from './db';
 import { seriesVisible, type ViewCtx } from './visibility';
+import { listedShown } from './noticeChapters';
+import { holds } from './chapterRanges';
 
 /**
  * A `covered` listing row (v0.50.0, lib/partAlias.ts R2) is another site's split of a chapter this server holds:
@@ -38,6 +40,13 @@ import { seriesVisible, type ViewCtx } from './visibility';
  * marks them (lib/komgaProgress.ts): reading past chapter 78 is reading 78's parts, whoever split it.
  */
 export const NOT_COVERED = "l.status <> 'covered'";
+
+/**
+ * A notice chapter the admin hides (lib/noticeChapters.ts) is no chapter of the series, so no ghost either: Mihon
+ * would list it, and the highest notice would be the total the trackers read. Reads the series as `s`. Built per
+ * query, not once at load: it is a constant while nothing hides.
+ */
+const notNotice = () => listedShown('s', 'l');
 
 /**
  * Is the opt-in on?
@@ -123,7 +132,10 @@ const iso = (v: Date | string | null): string | null =>
  * a real row at 105 and once as a ghost at 105, and the tracker counts it twice. Tombstones are lib_books
  * rows and so are excluded here by construction; they reach the list from the ordinary query, which is what
  * keeps their read_progress attached. (lib/seriesListing's listingFor matches the same way since v0.43.0,
- * when a ghost row began carrying read state and a duplicate stopped being only cosmetic.)
+ * when a ghost row began carrying read state and a duplicate stopped being only cosmetic.) A number inside a file
+ * holding a range (v0.55.2, lib/chapterRanges.ts `holds`) is that file's, never a ghost: beside `Batman 01-07`, a
+ * listed 2 to 7 is nothing missing. Reintroduce the plain equality: "a range file's numbers are no ghosts (Komga)" in
+ * chapterRanges.int.test.ts finds 2 to 7 in the list.
  *
  * No floor filter. A chapter below lib_series.chapter_floor is one this server chose not to fetch, but it is
  * still a chapter of the series, and the tracker total is wrong without it -- which is the whole reason this
@@ -142,11 +154,11 @@ export async function ghostBooksFor(seriesId: string): Promise<GhostBook[]> {
     `SELECT l.number, l.title, l.published_at, l.scanlator, s.title AS series_title
        FROM series_listing l
        JOIN lib_series s ON s.id = l.series_id
-      WHERE l.series_id = $1 AND ${NOT_COVERED}
+      WHERE l.series_id = $1 AND ${NOT_COVERED} AND ${notNotice()}
         AND NOT EXISTS (
           SELECT 1 FROM lib_books b
             LEFT JOIN book_overrides ov ON ov.book_id = b.id
-           WHERE b.series_id = l.series_id AND COALESCE(ov.number, b.number) = l.number)
+           WHERE b.series_id = l.series_id AND ${holds('b', 'ov', 'l.number')})
       ORDER BY l.number`,
     [seriesId],
   );
@@ -180,11 +192,11 @@ export async function ghostBookById(id: string, ctx: ViewCtx): Promise<GhostBook
     `SELECT l.number, l.title, l.published_at, l.scanlator, s.title AS series_title
        FROM series_listing l
        JOIN lib_series s ON s.id = l.series_id
-      WHERE l.series_id = $1 AND l.number = $2::real AND ${NOT_COVERED}
+      WHERE l.series_id = $1 AND l.number = $2::real AND ${NOT_COVERED} AND ${notNotice()}
         AND NOT EXISTS (
           SELECT 1 FROM lib_books b
             LEFT JOIN book_overrides ov ON ov.book_id = b.id
-           WHERE b.series_id = l.series_id AND COALESCE(ov.number, b.number) = l.number)`,
+           WHERE b.series_id = l.series_id AND ${holds('b', 'ov', 'l.number')})`,
     [parsed.seriesId, parsed.number],
   );
   if (!row) return null;
@@ -211,11 +223,12 @@ export async function ghostNumbers(seriesId: string): Promise<number[]> {
   const rows = await q<{ number: string | number }>(
     `SELECT l.number
        FROM series_listing l
-      WHERE l.series_id = $1 AND ${NOT_COVERED}
+       JOIN lib_series s ON s.id = l.series_id
+      WHERE l.series_id = $1 AND ${NOT_COVERED} AND ${notNotice()}
         AND NOT EXISTS (
           SELECT 1 FROM lib_books b
             LEFT JOIN book_overrides ov ON ov.book_id = b.id
-           WHERE b.series_id = l.series_id AND COALESCE(ov.number, b.number) = l.number)
+           WHERE b.series_id = l.series_id AND ${holds('b', 'ov', 'l.number')})
       ORDER BY l.number`,
     [seriesId],
   );

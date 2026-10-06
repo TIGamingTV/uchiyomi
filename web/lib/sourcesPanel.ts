@@ -13,6 +13,7 @@
 import { keys, t as tr } from './i18n';
 import { activeLocale, languageName, numberText } from './format';
 import { dayText } from './said';
+import { joinSentences } from './jobs';
 import { stateReason, stateWord } from './sourceHealth';
 import { extSourceIdOf } from './sourcePrefs';
 import type { Tone } from './status';
@@ -56,6 +57,11 @@ export interface OverviewSource {
   icon?: boolean;
   /** A site added by address: where it lives. */
   address?: string | null;
+  /**
+   * v0.55.1: not loaded because the engine's source limit is full, with the limit it is over -- not broken, and Replace is
+   * not its fix (the sheet says so instead: limitLine). Absent from every other source, and from an older server.
+   */
+  overLimit?: { limit: number } | null;
 }
 
 export interface SourcesAttention {
@@ -129,6 +135,24 @@ export function initialView(params: { get(name: string): string | null }): Sourc
 export function settingsTarget(params: { get(name: string): string | null }): string | null {
   const id = params.get('settings');
   return id && /^-?\d{1,20}$/.test(id) ? `sw:${id}` : null;
+}
+
+/**
+ * `source=<overview id>` (v0.55.0): the source whose sheet opens on arrival -- any kind, by the id the overview gives it
+ * (`sw:<id>`, `mangadex-es`, a site's slug). Health's Free a slot sends it. Null for anything else.
+ */
+export function sourceTarget(params: { get(name: string): string | null }): string | null {
+  const id = params.get('source');
+  return id && id.length <= 200 && !/[\s<>"]/.test(id) ? id : null;
+}
+
+/**
+ * Where Health's Free a slot goes (v0.55.0): Admin → Sources, on the frozen series' source when the row names one --
+ * its sheet, where a source nothing uses can be switched off to make room under the source limit. A whole page load:
+ * the console reads its tab from the address once (lib/useTabParam.ts).
+ */
+export function freeSlotHref(item: Pick<HealthItem, 'sourceId'>): string {
+  return item.sourceId ? `/admin/?tab=Sources&source=${encodeURIComponent(item.sourceId)}` : '/admin/?tab=Sources';
 }
 
 // ---- one source in words ---------------------------------------------------------------------------------------
@@ -287,7 +311,9 @@ export type SheetKey = 'replace' | 'test' | 'unblock' | 'turn-off' | 'turn-on' |
 
 /**
  * What a source's sheet offers, in the order its keys sit:
- * - Replace, the one filled key, while it cannot serve the series it is main to: failing, switched off or not loaded;
+ * - Replace, the one filled key, while it cannot serve the series it is main to: failing, switched off or not loaded --
+ *   but not loaded because the engine's source limit is full (v0.55.1, `overLimit`): that source works, Health's Free a
+ *   slot lands on its sheet, and room under the limit is the fix, which its line says (limitLine);
  * - Test, for a source Uchiyomi has loaded (a source its extension switched off is not, and its Test would only say so);
  * - Clear block, while a cooldown holds it;
  * - Turn off, or Turn on for one switched off;
@@ -297,7 +323,7 @@ export type SheetKey = 'replace' | 'test' | 'unblock' | 'turn-off' | 'turn-on' |
 export function sheetKeys(s: OverviewSource, a?: Pick<SourcesAttention, 'replace'> | null): SheetKey[] {
   const out: SheetKey[] = [];
   const dead = s.standing === 'failing' || s.standing === 'off' || s.standing === 'not_loaded' || !!a?.replace.includes(s.id);
-  if (dead && s.main > 0) out.push('replace');
+  if (dead && s.main > 0 && !s.overLimit) out.push('replace');
   const loaded = s.standing !== 'not_loaded' && !(s.standing === 'off' && (s.offBy === 'extension' || s.offBy === 'language'));
   if (loaded) out.push('test');
   if (s.standing === 'cooling' || s.state === 'blocked') out.push('unblock');
@@ -305,6 +331,20 @@ export function sheetKeys(s: OverviewSource, a?: Pick<SourcesAttention, 'replace
   else if (s.standing !== 'not_loaded') out.push('turn-off');
   if (s.kind === 'site') out.push('remove');
   return out;
+}
+
+/**
+ * Why a source the engine's limit left out is not loaded, and the way to room, in one line under its state on the sheet
+ * (v0.55.1): "The engine’s limit of 25 sources is full. Turn off a source you don’t use, or raise SUWAYOMI_MAX_SOURCES."
+ * The variable is the Docker install's, copied in untranslated; the desktop app has none to raise. Null for any other
+ * source.
+ */
+export function limitLine(s: Pick<OverviewSource, 'overLimit'>, desktop: boolean): string | null {
+  const n = s.overLimit?.limit;
+  if (!n) return null;
+  const full = n === 1 ? tr('The engine’s limit of 1 source is full.') : tr('The engine’s limit of {n} sources is full.', { n: numberText(n) });
+  return joinSentences(full, desktop ? tr('Turn off a source you don’t use.')
+    : tr('Turn off a source you don’t use, or raise {name}.', { name: 'SUWAYOMI_MAX_SOURCES' }));
 }
 
 /** The request behind Turn on: undo what switched it off -- an admin's switch, or its extension's. */

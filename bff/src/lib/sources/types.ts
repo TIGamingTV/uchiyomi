@@ -26,6 +26,17 @@ export interface SourceSeries {
    * added (lib/readingDirection.ts), below ComicInfo's own word and above AniList's.
    */
   readingDirection?: ReadingDirection;
+  /**
+   * The title's ORIGINAL language, when the source can say: MangaDex's `originalLanguage`. Learned onto the series
+   * as its type (lib/seriesType.ts: ja manga, ko manhwa, zh manhua), which the notice-chapter switches go by.
+   */
+  originalLanguage?: string;
+  /**
+   * How the source itself rates the title, when it does (v0.55.4, #158): MangaDex's `contentRating`. Discover's search
+   * reads it for its 18+ filter (lib/searchAll.ts ratingOf): erotica and pornographic are 18+, safe and suggestive are
+   * not. Absent for every scraped site and extension, which say nothing per title.
+   */
+  contentRating?: 'safe' | 'suggestive' | 'erotica' | 'pornographic';
 }
 
 export interface SourceChapter {
@@ -160,6 +171,13 @@ export interface SourceAdapter {
    * Cooldowns (source_health) stay per id on purpose.
    */
   rateGroup?: string;
+  /**
+   * Page URLs are a proxy's, shared by many sources, not the site's own image server (v0.55.3): the extension engine
+   * serves every extension's pages. The downloader joins sources whose pages come from one image server under one rate
+   * key (lib/pace.ts notePageHosts), and a proxy's address would join every source behind it. Absent: the pages come
+   * from the site's own servers, or a CDN of its own.
+   */
+  pagesProxied?: boolean;
   /**
    * BCP-47-ish language this source publishes in, when it only publishes in one. Suwayomi reports it per
    * source; a built-in declares it only when its own requests pin a language (each MangaDex adapter asks for

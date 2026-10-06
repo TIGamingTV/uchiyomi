@@ -202,8 +202,9 @@ test('a series with no working source is listed, one with a working source is no
     const detail = (title: string) => up.items.find((i) => i.title === title)!.detail;
     assert.match(detail('Frozen Fixture'), /sw:999999999 is no longer installed/);
     // Reintroduce by dropping the EXISTS subquery from frozenSeries(): "a switched-off source is said to be
-    // switched off" fails, the detail reads "no longer installed" for a source that is right there.
-    assert.match(detail('Off Fixture'), /sw:health-off is switched off/, 'a switched-off source is said to be switched off');
+    // switched off" fails, the detail reads "no longer installed" for a source that is right there. Named as the engine
+    // named it since v0.55.1 (sourceLabel), where it read sw:health-off.
+    assert.match(detail('Off Fixture'), /its source Off is switched off/, 'a switched-off source is said to be switched off');
   } finally {
     for (const id of [S_FROZEN, S_ROUTED, S_OFF]) await q('DELETE FROM lib_series WHERE id = $1', [id]);
     await q(`DELETE FROM suwayomi_sources WHERE source_id = 'health-off'`);
@@ -257,7 +258,7 @@ test('a dead primary with a live follower is reference, not a warning; with a de
   }
 });
 
-const S_ENGINE = 's_health_engine', S_GONE = 's_health_gone';
+const S_ENGINE = 's_health_engine', S_GONE = 's_health_gone', S_ROOM = 's_health_room';
 
 /**
  * #72: with no extension engine answering, EVERY extension series is unrouted, and an enabled source then read
@@ -272,15 +273,22 @@ test('the engine being off is the reason, not the source limit', { skip: DSN ? f
   const { q } = await import('../src/lib/db');
   const { frozenSeries } = await import('../src/lib/health');
   const { noIgnores } = await import('../src/lib/healthIgnore');
+  const { env } = await import('../src/env');
+  const reg = await import('../src/lib/sources/suwayomi/register');
+  const { unregisterAdapter } = await import('../src/lib/sources');
   await migrate();
-  for (const id of [S_ENGINE, S_GONE]) await q('DELETE FROM lib_series WHERE id = $1', [id]);
-  await q(`DELETE FROM suwayomi_sources WHERE source_id = 'health-engine'`);
+  for (const id of [S_ENGINE, S_GONE, S_ROOM]) await q('DELETE FROM lib_series WHERE id = $1', [id]);
+  await q(`DELETE FROM suwayomi_sources WHERE source_id IN ('health-engine', 'health-room')`);
   // Enabled and remembered, but not registered: exactly what every extension source is while the engine is away.
-  await q(`INSERT INTO suwayomi_sources (source_id, name, lang, enabled) VALUES ('health-engine', 'Engine Source', 'en', true)`);
+  await q(`INSERT INTO suwayomi_sources (source_id, name, lang, enabled) VALUES ('health-engine', 'Engine Source', 'en', true),
+             ('health-room', 'Room Source', 'en', true)`);
   await q(`INSERT INTO lib_series (id, source, title, folder, books_count, source_id, source_series_id)
            VALUES ($1, 'test', 'Engine Fixture', $1, 12, 'sw:health-engine', '1')`, [S_ENGINE]);
   await q(`INSERT INTO lib_series (id, source, title, folder, books_count, source_id, source_series_id)
            VALUES ($1, 'test', 'Gone Fixture', $1, 3, 'gone-pack-source', '1')`, [S_GONE]);
+  // A series on the source that takes the one slot below.
+  await q(`INSERT INTO lib_series (id, source, title, folder, books_count, source_id, source_series_id)
+           VALUES ($1, 'test', 'Room Fixture', $1, 2, 'sw:health-room', '1')`, [S_ROOM]);
   try {
     const detail = async (engine: 'off' | 'switched_off' | 'unreachable' | 'up', title: string) => {
       const c = await frozenSeries(noIgnores(), engine);
@@ -289,21 +297,53 @@ test('the engine being off is the reason, not the source limit', { skip: DSN ? f
     };
     for (const engine of ['off', 'switched_off'] as const) {
       const r = await detail(engine, 'Engine Fixture');
-      assert.match(r.detail, /^12 chapters; its source sw:health-engine can’t be reached because the extension engine is off$/, `the engine is the reason (${engine})`);
+      assert.match(r.detail, /^12 chapters; its source Engine Source can’t be reached because the extension engine is off$/, `the engine is the reason (${engine})`);
       assert.doesNotMatch(r.detail, /source limit/);
       assert.match(r.note, /^Series that came from extensions wait for the extension engine; Admin → Sources shows how to bring it back\. /);
     }
     assert.match((await detail('unreachable', 'Engine Fixture')).detail, /because the extension engine isn’t answering$/);
+    const actions = async (engine: 'off' | 'up', title: string) => (await frozenSeries(noIgnores(), engine)).items.find((i) => i.title === title)!;
+    // v0.55.1: switched on and not loaded is over the limit only when the last load says it left the source out
+    // (register.ts leftOutByLimit, which the sources overview reads too). Before any such load, an extension the engine
+    // no longer offers is not over any limit: it is gone, and Replace is its fix. Reintroduce `r.still_enabled` alone in
+    // frozenSeries: "switched on but not left out by the limit is not over it" fails, and its Free a slot would land on
+    // a sheet offering Replace.
+    assert.match((await detail('up', 'Engine Fixture')).detail, /its source Engine Source is no longer installed$/,
+      'switched on but not left out by the limit is not over it');
+    assert.deepEqual((await actions('up', 'Engine Fixture')).actions, ['replace_source', 'find_sources', 'ignore']);
+    // Left out by the limit as a load leaves it: an engine that answered, a limit of one, and a source some series reads
+    // through ahead of it in the engine's order.
+    const was = { url: env.SUWAYOMI_URL, cap: env.SUWAYOMI_MAX_SOURCES };
+    Object.assign(env, { SUWAYOMI_URL: 'http://engine.test:4567', SUWAYOMI_MAX_SOURCES: 1 });
+    try {
+      await reg.loadSuwayomiSources(async () => [{ id: 'health-room', name: 'Room Source', lang: 'en' }, { id: 'health-engine', name: 'Engine Source', lang: 'en' }] as any);
+    } finally {
+      Object.assign(env, was);
+    }
+    assert.ok(reg.leftOutByLimit('sw:health-engine') && !reg.leftOutByLimit('sw:health-room'), 'PREMISE: the load left the engine fixture out');
     const up = await detail('up', 'Engine Fixture');
-    assert.match(up.detail, /sw:health-engine is over the source limit \(SUWAYOMI_MAX_SOURCES\)/, 'with the engine up, the limit is the reason');
+    assert.match(up.detail, /is over the source limit \(SUWAYOMI_MAX_SOURCES\)$/, 'with the engine up, the limit is the reason');
+    // v0.55.1: by the name the engine gave it, as the rest of Health names a source (sourceLabel), never `sw:…`.
+    // Reintroduce `source: r.source_id` in frozenSeries: the engine's own reason above already reads sw:health-engine.
+    assert.match(up.detail, /^12 chapters; its source Engine Source is over/, 'the over-limit row names its source as the engine named it');
     assert.doesNotMatch(up.note, /wait for the extension engine/);
+    // v0.55.0: the limit is a slot to free, not a source to replace -- the source works. Reintroduce by offering Replace
+    // there (keysFor -> sourceKeys): the over-limit row reads replace_source.
+    const slot = await actions('up', 'Engine Fixture');
+    assert.deepEqual(slot.actions, ['free_slot', 'ignore'], 'the over-limit row offers a slot to free, never Replace');
+    assert.equal(slot.sourceId, 'sw:health-engine', 'naming the source Admin → Sources opens on');
+    assert.deepEqual((await actions('off', 'Engine Fixture')).actions, ['ignore'], 'with the engine away there is no slot to free either: the engine is the fix');
+    assert.deepEqual((await actions('up', 'Gone Fixture')).actions, ['replace_source', 'find_sources', 'ignore'], 'a source that is gone still offers Replace');
     // A source that is not an extension's is not the engine's to explain.
     for (const engine of ['off', 'switched_off', 'unreachable', 'up'] as const) {
       assert.match((await detail(engine, 'Gone Fixture')).detail, /gone-pack-source is no longer installed$/, `a non-extension source (${engine})`);
     }
   } finally {
-    for (const id of [S_ENGINE, S_GONE]) await q('DELETE FROM lib_series WHERE id = $1', [id]);
-    await q(`DELETE FROM suwayomi_sources WHERE source_id = 'health-engine'`);
+    for (const id of [S_ENGINE, S_GONE, S_ROOM]) await q('DELETE FROM lib_series WHERE id = $1', [id]);
+    await q(`DELETE FROM suwayomi_sources WHERE source_id IN ('health-engine', 'health-room')`);
+    unregisterAdapter('sw:health-room');
+    // With no engine configured again, a load registers nothing and forgets what the last one left out.
+    await reg.loadSuwayomiSources(async () => []);
   }
 });
 
@@ -756,6 +796,16 @@ test('an impossible chapter number is offered for deletion, unless it was renumb
     assert.deepEqual(item.bookIds, [`b_${S_OUT}_10000`], 'the chip is told exactly which chapter to delete');
     assert.deepEqual(item.numbers, [10000]);
     assert.deepEqual(item.actions, ['delete', 'ignore'], 'deleting is the action, and it is never automatic');
+    // v0.55.0 integration: the 10000 is this card's, never 9,994 missing chapters on the gaps card -- a hole nothing can
+    // fetch, which Fix everything's gap step leaves alone, so a bookmarked one kept "the next run continues" on its end
+    // for good. A real hole below it is still a gap. Reintroduce by counting every number in chapterGaps (drop
+    // plausibleNumbers): "an impossible number is the outliers card's, not a gap of thousands" fails.
+    const gapRow = async () => (await runHealthChecks()).checks.find((x: any) => x.id === 'chapter-gaps').items.find((i: any) => i.title === 'Outlier Fixture');
+    assert.equal(await gapRow(), undefined, 'an impossible number is the outliers card\'s, not a gap of thousands');
+    await q('DELETE FROM lib_books WHERE id = $1', [`b_${S_OUT}_4`]);
+    assert.deepEqual((await gapRow())?.numbers, [4], 'a real hole below an impossible number is still a gap');
+    await q(`INSERT INTO lib_books (id, series_id, source, file, title, number, pages) VALUES ($1,$2,'test',$3,'Chapter 4',4,20)`,
+      [`b_${S_OUT}_4`, S_OUT, `/test/${S_OUT}/4.cbz`]);
 
     await q(`INSERT INTO book_overrides (book_id, number) VALUES ($1, 6)`, [`b_${S_OUT}_10000`]);
     assert.equal(await outlier(), undefined, 'correcting the number clears the finding');
@@ -1000,6 +1050,44 @@ test('a gap the repair has already looked into is greyed until its answer goes s
   }
 });
 
+test('holes below a series\' "Latest N" start are listed for reference; the holes above it are still the finding', { skip: DSN ? false : 'set TEST_DATABASE_URL to run' }, async () => {
+  // v0.55.0. Reintroduce by counting every hole in chapterGaps (drop splitAtFloor): the first row counts six missing
+  // with 4-6 and 9 among them, and the second is a finding with Fill now on it.
+  const { migrate } = await import('../src/lib/migrate');
+  const { q } = await import('../src/lib/db');
+  const { runHealthChecks } = await import('../src/lib/health');
+  await migrate();
+  const S = 's_health_floor';
+  await q('DELETE FROM lib_series WHERE id = $1', [S]);
+  await q(`INSERT INTO lib_series (id, source, title, folder, chapter_floor) VALUES ($1,'test','Floor Fixture',$1,10)`, [S]);
+  for (const n of [1, 2, 3, 7, 8, 12, 13]) {
+    await q(`INSERT INTO lib_books (id, series_id, source, file, title, number, pages) VALUES ($1,$2,'test',$3,$4,$5,20)`,
+      [`b_${S}_${n}`, S, `/test/${S}/${n}.cbz`, `Chapter ${n}`, n]);
+  }
+  const check = async () => {
+    const c = (await runHealthChecks()).checks.find((x: any) => x.id === 'chapter-gaps');
+    await assertSaid([c]);
+    return { c, row: c.items.find((i: any) => i.seriesId === S) };
+  };
+  try {
+    // Holes 4-6 and 9-11 with the series started at chapter 10: 4-6 and 9 are before the start, 10-11 is the finding.
+    const mixed = (await check()).row;
+    assert.notEqual(mixed.info, true, 'a hole at or above the start is still a finding');
+    assert.deepEqual(mixed.numbers, [10, 11], 'and only it is what Fill now is about');
+    assert.equal(mixed.detail, '2 missing — 10-11; 4 more before where you started (chapter 10)');
+    assert.ok(mixed.actions.includes('fill'));
+
+    await q('UPDATE lib_series SET chapter_floor = 13 WHERE id = $1', [S]);
+    const { c, row } = await check();
+    assert.equal(row.info, true, 'every hole before the start: listed for reference');
+    assert.equal(row.detail, '6 missing before where you started (chapter 13) — 4-6, 9-11');
+    assert.equal(row.actions, undefined, 'with nothing to press');
+    assert.ok(c.summarySaid.some((p: any) => p.code === 'gaps.beforeStart'), 'and the summary counts it apart from "already looked into"');
+  } finally {
+    await q('DELETE FROM lib_series WHERE id = $1', [S]);
+  }
+});
+
 const D1 = 's_health_dup_a', D2 = 's_health_dup_b';
 
 /**
@@ -1062,6 +1150,52 @@ test('a duplicate pair suggests the copy with the most to lose as the one to kee
 });
 
 const S_FAIL = 's_health_fail';
+
+/**
+ * v0.55.1: a source whose every failing chapter was refused for room (HTTP 429, status `rate_limited`) is waiting, not
+ * failing. The owner's Health read "70 chapters across 4 sources keep failing" in amber while Fix everything said the
+ * rate-limited ones clear by themselves. One chapter failing any other way keeps the source a finding.
+ *
+ * Reintroduce by dropping the `info` line in health.ts chapterFailures: the card is amber with only waiting chapters.
+ */
+test('chapters refused only for room are waiting, not failing', { skip: DSN ? false : 'set TEST_DATABASE_URL to run' }, async () => {
+  const { migrate } = await import('../src/lib/migrate');
+  const { q } = await import('../src/lib/db');
+  const { runHealthChecks } = await import('../src/lib/health');
+  await migrate();
+  const S = 's_health_wait';
+  const SRC = 'health-wait-src';
+  await q('DELETE FROM lib_series WHERE id = $1', [S]);
+  await q('DELETE FROM chapter_failures WHERE series_id = $1', [S]);
+  await q(`INSERT INTO lib_series (id, source, title, folder) VALUES ($1,'test','Wait Fixture',$1)`, [S]);
+  await q(`INSERT INTO chapter_failures (series_id, number, source_id, status, reason, attempts, at, first_at)
+           VALUES ($1, 1, $2, 'rate_limited', 'no images downloaded (blocked?) (page 1: 429)', 1, now(), now()),
+                  ($1, 2, $2, 'rate_limited', 'no images downloaded (blocked?) (page 1: 429)', 1, now(), now())`, [S, SRC]);
+  const card = async () => {
+    const c = (await runHealthChecks()).checks.find((x: any) => x.id === 'chapter-failures');
+    await assertSaid([c]);
+    return c;
+  };
+  try {
+    const c = await card();
+    const row = c.items.find((i: any) => i.sourceId === SRC);
+    assert.equal(row?.info, true, 'a source refusing only for room is a statement, not a finding');
+    assert.ok(!c.items.some((i: any) => !i.info), 'nothing else fails in this fixture');
+    assert.equal(c.status, 'ok', 'chapters waiting for a pause to end do not turn the card amber');
+    assert.match(c.summary, /2 chapters wait for a site that asked for a pause, and are tried again by themselves/);
+
+    // One chapter failing another way: the source is a finding again, and the waiting count is not said beside it.
+    await q(`INSERT INTO chapter_failures (series_id, number, source_id, status, reason, attempts, at, first_at)
+             VALUES ($1, 3, $2, 'error', 'HTTP 500', 1, now(), now())`, [S, SRC]);
+    const mixed = await card();
+    assert.notEqual(mixed.items.find((i: any) => i.sourceId === SRC)?.info, true, 'one real failure keeps it a finding');
+    assert.equal(mixed.status, 'warn');
+    assert.match(mixed.summary, /3 chapters across 1 source keep failing/);
+  } finally {
+    await q('DELETE FROM chapter_failures WHERE series_id = $1', [S]);
+    await q('DELETE FROM lib_series WHERE id = $1', [S]);
+  }
+});
 
 /**
  * v0.49.0: "failing since" is the FIRST failure (first_at), not the latest attempt, and a source that cannot
@@ -1340,7 +1474,8 @@ test("the solver's newer release is named with one v", { skip: DSN ? false : 'se
   forgetSolverPing();
   try {
     const row = await solverHealth();
-    assert.equal(row.summary, 'Ready (v3.4.6) — v3.5.2 is available', 'the solver\'s newer release is named with one v');
+    // v0.55.3: FlareSolverr is named by its kind ("trawl answering at its root is trawl", below).
+    assert.equal(row.summary, 'Ready (FlareSolverr v3.4.6) — v3.5.2 is available', 'the solver\'s newer release is named with one v');
     assert.deepEqual(row.items.map((i) => i.title), ['v3.4.6 → v3.5.2']);
     assert.equal(englishOf(row.summarySaid), row.summary, 'the codes say the same');
   } finally {
@@ -1390,6 +1525,126 @@ test("Byparr answering at /health is a working solver, and never behind FlareSol
     assert.equal(row.items.length, 0);
   } finally {
     globalThis.fetch = realFetch;
+    resetSolverVersionCache();
+    forgetSolverPing();
+  }
+});
+
+/**
+ * v0.55.3: trawl (#144) greets "TRAWL is ready!" at its root, and `solverPing` read every greeting with "ready" in it as
+ * FlareSolverr's: Health held trawl's 1.7.0 against FlareSolverr's 3.x releases and said an update was out. It is named
+ * by its greeting now, and held against its own releases. Reintroduce `flaresolverr` for every greeting (kindOf in
+ * flaresolverr.ts): "a TRAWL greeting is trawl" fails; compare it with FlareSolverr's releases (latestSolverVersion
+ * without the kind, in solverHealth): the summary names v3.6.0 as available.
+ */
+test('trawl answering at its root is trawl, named and held against its own releases', { skip: DSN ? false : 'set TEST_DATABASE_URL to run' }, async () => {
+  const { migrate } = await import('../src/lib/migrate');
+  const { solverHealth } = await import('../src/lib/health');
+  const { resetSolverVersionCache } = await import('../src/lib/solverVersion');
+  const { forgetSolverPing, solverPing } = await import('../src/lib/sources/flaresolverr');
+  const { englishOf } = await import('../src/lib/said');
+  await migrate();
+  const realFetch = globalThis.fetch;
+  const json = (body: unknown) => new Response(JSON.stringify(body), { status: 200, headers: { 'content-type': 'application/json' } });
+  globalThis.fetch = (async (u: any) => {
+    const url = String(u);
+    // Each repository's own latest: trawl is current, FlareSolverr's is a number trawl's must never be held against.
+    if (url.includes('/repos/germondai/trawl/')) return json({ tag_name: 'v1.7.0' });
+    if (url.startsWith('https://api.github.com/')) return json({ tag_name: 'v3.6.0' });
+    // trawl 1.7.0's own greeting, as the live one answered it (2026-10-04).
+    return json({ msg: 'TRAWL is ready!', version: '1.7.0', uptime: 7 });
+  }) as typeof fetch;
+  resetSolverVersionCache();
+  forgetSolverPing();
+  try {
+    const ping = await solverPing();
+    assert.equal(ping.ok, true);
+    assert.equal(ping.kind, 'trawl', 'a TRAWL greeting is trawl');
+    forgetSolverPing();
+    const row = await solverHealth();
+    assert.equal(row.status, 'ok');
+    assert.equal(row.summary, 'Ready (trawl v1.7.0)', "trawl is named, and is not behind FlareSolverr's releases");
+    assert.equal(englishOf(row.summarySaid), row.summary, 'the codes say the same');
+    assert.equal(row.items.length, 0, 'no "newer solver" row');
+  } finally {
+    globalThis.fetch = realFetch;
+    resetSolverVersionCache();
+    forgetSolverPing();
+  }
+});
+
+/**
+ * v0.55.3, a backup solver (FLARESOLVERR_FALLBACK_URL): the card lists both solvers, the main first, each with its state,
+ * and is amber whenever one does not answer -- the main ("the backup is solving"), the backup (it would not answer when
+ * needed), or both (the solver-down card it always was, which Fix everything's Needs you reads by its first code).
+ * Reintroduce the card without rows (`rows = []` in solverHealth): "the card lists both solvers" fails; its status from
+ * the sources blaming the solver alone: "status and items disagree" (a finding on an ok card); the main's ping as the
+ * whole of the solver's (solverPing's top level): "the main down, the backup solving" reads the solver-down card.
+ */
+test('with a backup, the card lists both solvers and says which one is not answering', { skip: DSN ? false : 'set TEST_DATABASE_URL to run' }, async () => {
+  const { migrate } = await import('../src/lib/migrate');
+  const { solverHealth } = await import('../src/lib/health');
+  const { resetSolverVersionCache } = await import('../src/lib/solverVersion');
+  const { forgetSolverPing } = await import('../src/lib/sources/flaresolverr');
+  await migrate();
+  const MAIN = 'http://main-solver.test:8191', BACKUP = 'http://backup-solver.test:8191';
+  const saved = { main: process.env.FLARESOLVERR_URL, backup: process.env.FLARESOLVERR_FALLBACK_URL };
+  process.env.FLARESOLVERR_URL = MAIN;
+  process.env.FLARESOLVERR_FALLBACK_URL = BACKUP;
+  const up = { main: true, backup: true };
+  const realFetch = globalThis.fetch;
+  const json = (body: unknown) => new Response(JSON.stringify(body), { status: 200, headers: { 'content-type': 'application/json' } });
+  const refused = () => Promise.reject(Object.assign(new TypeError('fetch failed'), { cause: { code: 'ECONNREFUSED' } }));
+  globalThis.fetch = (async (u: any) => {
+    const url = String(u);
+    if (url.includes('/repos/germondai/trawl/')) return json({ tag_name: 'v1.7.0' });
+    if (url.startsWith('https://api.github.com/')) return json({ tag_name: 'v3.6.0' });
+    // The owner's plan: trawl as the main, FlareSolverr kept as the backup.
+    if (url.startsWith(MAIN)) return up.main ? json({ msg: 'TRAWL is ready!', version: '1.7.0' }) : refused();
+    if (url.startsWith(BACKUP)) return up.backup ? json({ msg: 'FlareSolverr is ready!', version: '3.4.6' }) : refused();
+    return realFetch(u);
+  }) as typeof fetch;
+  const card = async (main: boolean, backup: boolean) => {
+    up.main = main; up.backup = backup;
+    forgetSolverPing();
+    const c = await solverHealth();
+    await assertSaid([c]);
+    assert.equal(c.items.filter((i: any) => !i.info).length === 0, c.status === 'ok', 'status and items disagree');
+    return c;
+  };
+  resetSolverVersionCache();
+  try {
+    let c = await card(true, true);
+    assert.equal(c.status, 'ok');
+    assert.equal(c.summary, 'Ready (trawl v1.7.0)');
+    assert.deepEqual(c.items.map((i: any) => [i.title, i.detail, !!i.info]), [
+      ['Main solver', `Ready (trawl v1.7.0) · ${MAIN}`, true],
+      ['Backup solver', `Ready (FlareSolverr v3.4.6) — v3.6.0 is available · ${BACKUP}`, true],
+    ], 'the card lists both solvers, each with its kind, its version and its own newer release');
+
+    c = await card(false, true);
+    assert.equal(c.status, 'warn', 'the main down, the backup solving: amber');
+    assert.equal(c.summary, 'The main solver is not answering; the backup is solving', 'the main down, the backup solving');
+    assert.match(c.note ?? '', /goes to the backup/);
+    assert.deepEqual(c.items.map((i: any) => [i.title, i.detail, !!i.info]), [
+      ['Main solver', `not answering (ECONNREFUSED) · ${MAIN}`, false],
+      ['Backup solver', `Ready (FlareSolverr v3.4.6) — v3.6.0 is available · ${BACKUP}`, true],
+    ]);
+
+    c = await card(true, false);
+    assert.equal(c.status, 'warn', 'a backup that would not answer turns the card amber');
+    assert.equal(c.summary, 'Ready (trawl v1.7.0); the backup is not answering');
+    assert.deepEqual(c.items.map((i: any) => [i.title, !!i.info]), [['Main solver', true], ['Backup solver', false]]);
+
+    c = await card(false, false);
+    assert.equal(c.status, 'warn');
+    assert.equal(c.summarySaid![0].code, 'solver.down', 'both down: the solver-down card, by its first code');
+    assert.equal(c.summary, `Not answering at ${MAIN} (ECONNREFUSED); the backup is not answering`);
+    assert.deepEqual(c.items.map((i: any) => [i.title, !!i.info]), [['Main solver', false], ['Backup solver', false]]);
+  } finally {
+    globalThis.fetch = realFetch;
+    if (saved.main === undefined) delete process.env.FLARESOLVERR_URL; else process.env.FLARESOLVERR_URL = saved.main;
+    if (saved.backup === undefined) delete process.env.FLARESOLVERR_FALLBACK_URL; else process.env.FLARESOLVERR_FALLBACK_URL = saved.backup;
     resetSolverVersionCache();
     forgetSolverPing();
   }
@@ -1450,6 +1705,183 @@ test("a source that is off or failing and is some series' main offers Replace; a
   }
 });
 
+test('images failing with 429 are a cooldown: no Replace, and its series still update; images failing with a 500 are failing (v0.55.1)', { skip: DSN ? false : 'set TEST_DATABASE_URL to run' }, async () => {
+  // The owner's first Fix everything run (2026-10-03): Mangakakalot's image server answered 429 -- "0/32 pages
+  // downloaded (HTTP 429)", five in a row, recorded as an error before v0.55.1 -- so Source health read it failing,
+  // offered Replace, and Fix everything moved 14 series off a source whose searches and chapter lists answer fine. A rate
+  // limit is a cooldown: its row is the cooldown's, `rate_limited`, also once the cooldown ran out or a passing Test
+  // cleared it. Reintroduce by counting rate limits among the failing (lib/health.ts sourceTrouble's `failing`, or
+  // currentFailures in lib/sourceEvidence.ts): hl-limit reads failing with Replace offered, and its series is frozen.
+  const { migrate } = await import('../src/lib/migrate');
+  const { q } = await import('../src/lib/db');
+  const { runHealthChecks, frozenSeries } = await import('../src/lib/health');
+  const { noIgnores } = await import('../src/lib/healthIgnore');
+  const { registerAdapter } = await import('../src/lib/sources');
+  const { standingsOf } = await import('../src/lib/sourceStanding');
+  const { noteStage } = await import('../src/lib/sourceHealth');
+  await migrate();
+  const IDS = ['hl-limit', 'hl-limitnew', 'hl-err', 'hl-note'];
+  for (const id of IDS) registerAdapter(stubSource(id) as any);
+  const SERIES = ['s_hl_limit', 's_hl_limitnew', 's_hl_err'];
+  const clean = async () => {
+    await q('DELETE FROM lib_series WHERE id = ANY($1::text[])', [SERIES]);
+    await q('DELETE FROM source_health WHERE source_id = ANY($1::text[])', [IDS]);
+  };
+  await clean();
+  for (const id of SERIES) {
+    await q(`INSERT INTO lib_series (id, source, title, folder, books_count, source_id, source_series_id, auto_update)
+             VALUES ($1, 'test', $1, $1, 4, $2, 'x', true)`, [id, id.replace('s_hl_', 'hl-')]);
+  }
+  const images = (error: string, kind = 'error') =>
+    JSON.stringify({ images: { failAt: new Date(Date.now() - 60_000).toISOString(), failBy: 'traffic', streak: 5, kind, error } });
+  // As the owner's row was: rate limited, its cooldown over. And one recorded since v0.55.1, its cooldown cleared by a
+  // Test that passed (a Test fetches no image). And a source whose images fail with a server error.
+  await q(`INSERT INTO source_health (source_id, status, disabled, blocked_until, last_error, stages) VALUES
+             ('hl-limit', 'rate_limited', false, now() - interval '5 minutes', '0/32 pages downloaded (HTTP 429)', $1::jsonb),
+             ('hl-limitnew', 'ok', false, NULL, NULL, $2::jsonb),
+             ('hl-err', 'blocked', false, NULL, '0/32 pages downloaded (HTTP 500)', $3::jsonb)`,
+    [images('0/32 pages downloaded (HTTP 429)'), images('0/32 pages downloaded (HTTP 429)', 'rate_limited'), images('0/32 pages downloaded (HTTP 500)')]);
+  try {
+    const c = (await runHealthChecks()).checks.find((x: any) => x.id === 'sources');
+    await assertSaid([c]);
+    const row = (id: string) => c.items.find((i: any) => i.sourceId === id);
+    assert.equal(row('hl-limit').state, 'blocked', 'images failing with 429 are a cooldown, never a failure');
+    assert.equal(row('hl-limit').cooldown?.status, 'rate_limited');
+    assert.ok(!row('hl-limit').actions.includes('replace_source'), 'and a cooldown is never Replaced: it ends by itself');
+    assert.deepEqual([row('hl-limitnew').state, row('hl-limitnew').cooldown], ['blocked', { status: 'rate_limited', until: null }],
+      'a rate limit whose cooldown a Test cleared is still one');
+    assert.ok(!row('hl-limitnew').actions.includes('replace_source'));
+    assert.equal(row('hl-err').state, 'failing', 'images failing with a 500 are failing');
+    assert.ok(row('hl-err').actions.includes('replace_source'), 'and offer Replace');
+
+    const standing = await standingsOf(['hl-limit', 'hl-limitnew', 'hl-err']);
+    assert.deepEqual([standing.get('hl-limit'), standing.get('hl-limitnew'), standing.get('hl-err')], ['cooling', 'cooling', 'failing']);
+    const frozen = await frozenSeries(noIgnores(), 'up');
+    const listed = new Set(frozen.items.map((i: any) => i.seriesId));
+    assert.ok(!listed.has('s_hl_limit') && !listed.has('s_hl_limitnew'), 'a series on a rate-limited main can still update');
+    assert.ok(listed.has('s_hl_err'), 'one on a main whose images fail cannot');
+
+    // What ordinary use records from here on: a failure in the words of a rate limit is recorded as one. Reintroduce by
+    // dropping the rate-limit kind from noteStage (lib/sourceHealth.ts): it is recorded as an error.
+    await noteStage('hl-note', 'pages', 'fail', { error: 'suwayomi: HTTP error 429' });
+    await noteStage('hl-note', 'chapters', 'fail', { error: 'suwayomi: HTTP error 500' });
+    const noted = (await q(`SELECT stages FROM source_health WHERE source_id = 'hl-note'`))[0]?.stages;
+    assert.equal(noted?.pages?.kind, 'rate_limited', 'a 429 in ordinary use is recorded as a rate limit');
+    assert.equal(noted?.chapters?.kind, 'error');
+  } finally {
+    await clean();
+  }
+});
+
+test('a source downloading at a raised pace says so: a quiet row of its own, and a sentence on any other (v0.55.3)', { skip: DSN ? false : 'set TEST_DATABASE_URL to run' }, async () => {
+  // The owner's Natomanga: after its image server's 429s its chapters come one at a time, at longer gaps, for hours
+  // (lib/pace.ts), and nothing on Health said why. Reintroduce by dropping `paced` from sourceTrouble (lib/health.ts):
+  // hp-slow has no row, and the rate-limited row says nothing of its pace.
+  const { migrate } = await import('../src/lib/migrate');
+  const { q } = await import('../src/lib/db');
+  const { runHealthChecks } = await import('../src/lib/health');
+  const { registerAdapter } = await import('../src/lib/sources');
+  const pace = await import('../src/lib/pace');
+  await migrate();
+  const IDS = ['hp-slow', 'hp-limit', 'hp-fast'];
+  for (const id of IDS) registerAdapter(stubSource(id) as any);
+  const clean = async () => {
+    await q(`DELETE FROM lib_series WHERE id = 's_hp_slow'`);
+    await q('DELETE FROM source_health WHERE source_id = ANY($1::text[])', [IDS]);
+  };
+  await clean();
+  await q(`INSERT INTO lib_series (id, source, title, folder, books_count, source_id, source_series_id, auto_update)
+           VALUES ('s_hp_slow', 'test', 'Paced Tale', 's_hp_slow', 4, 'hp-slow', 'x', true)`);
+  // hp-slow's last chapter landed (status ok) at the raised pace; hp-limit is in its cooldown; hp-fast is fine.
+  await q(`INSERT INTO source_health (source_id, status, blocked_until, last_error) VALUES
+             ('hp-slow', 'ok', NULL, NULL),
+             ('hp-limit', 'rate_limited', now() + interval '20 minutes', '0/113 pages downloaded (HTTP 429)'),
+             ('hp-fast', 'ok', NULL, NULL)`);
+  pace.clearPace();
+  pace.noteRateLimited('hp-slow');
+  pace.noteRateLimited('hp-limit');
+  try {
+    const c = (await runHealthChecks()).checks.find((x: any) => x.id === 'sources');
+    await assertSaid([c]);
+    const row = (id: string) => c.items.find((i: any) => i.sourceId === id);
+    const slow = row('hp-slow');
+    assert.ok(slow, 'a source at a raised pace is listed with nothing else wrong');
+    assert.equal(slow.state, 'slowed');
+    assert.equal(slow.slowed, true);
+    assert.equal(slow.info, true, 'for reference: nothing to fix, it comes back up by itself');
+    assert.equal(slow.group, 'quiet');
+    assert.equal(slow.detailSaid[0].code, 'sources.paced');
+    assert.match(slow.detail, /^Downloading slowly: the site asked for fewer requests; 1 series use it$/);
+    assert.ok(!slow.actions.includes('replace_source') && !slow.actions.includes('find_sources'), 'and nothing to replace');
+    const limit = row('hp-limit');
+    assert.equal(limit.state, 'blocked', 'a cooldown is still the row\'s state');
+    assert.equal(limit.slowed, true, 'and its pace is said beside it');
+    assert.ok(limit.detailSaid.some((d: any) => d.code === 'sources.paced'), limit.detail);
+    assert.equal(row('hp-fast'), undefined, 'a source at its own pace has nothing to say');
+  } finally {
+    pace.clearPace();
+    await clean();
+  }
+});
+
+test('a failed chapter moved onto a main that rests or downloads slowly waits; onto one at full speed it is a finding (v0.55.3, lanes F and G)', { skip: DSN ? false : 'set TEST_DATABASE_URL to run' }, async () => {
+  // The owner's case: Replace moved two series off AllManga onto Natomanga, and their failed chapters followed them
+  // (status `moved`, lib/chapterFailures.ts refileFailures). Natomanga answered 429: its own row reads rate_limited, its
+  // cooldown long run out, and the moved chapters wait for its pause. Natomanga and Mangakakalot share one image server
+  // (2xstorage.com), so a 429 at Mangakakalot slows Natomanga too (lib/pace.ts, one key per image server) while
+  // Natomanga's own row reads ok: chapters moved onto it wait as well, one at a time in its queue. Onto a source at full
+  // speed they are a finding, as any failed chapter is. Reintroduce by dropping `f.source_id = ANY($1)` from Health's
+  // waiting count (lib/health.ts chapterFailures): "a moved chapter on a slowed main waits" fails; by dropping
+  // `h.status = 'rate_limited'`: "on the rate-limited one" fails.
+  const { migrate } = await import('../src/lib/migrate');
+  const { q } = await import('../src/lib/db');
+  const { runHealthChecks } = await import('../src/lib/health');
+  const { registerAdapter, unregisterAdapter } = await import('../src/lib/sources');
+  const pace = await import('../src/lib/pace');
+  await migrate();
+  const NATO = 'fg-natomanga', NATO2 = 'fg-natomanga2', KAKA = 'fg-mangakakalot', FAST = 'fg-fast';
+  const IDS = [NATO, NATO2, KAKA, FAST];
+  const SERIES = ['s_fg_limited', 's_fg_slowed', 's_fg_fast'];
+  for (const id of IDS) registerAdapter(stubSource(id) as any);
+  const clean = async () => {
+    await q('DELETE FROM chapter_failures WHERE series_id = ANY($1::text[])', [SERIES]);
+    await q('DELETE FROM lib_series WHERE id = ANY($1::text[])', [SERIES]);
+    await q('DELETE FROM source_health WHERE source_id = ANY($1::text[])', [IDS]);
+  };
+  await clean();
+  for (const [id, main] of [[SERIES[0], NATO], [SERIES[1], NATO2], [SERIES[2], FAST]]) {
+    await q(`INSERT INTO lib_series (id, source, title, folder, source_id, source_series_id, auto_update)
+             VALUES ($1, 'test', $1, $1, $2, 'x', true)`, [id, main]);
+    // Two chapters each, failed at AllManga's pages and moved onto the new main: not tried there yet.
+    await q(`INSERT INTO chapter_failures (series_id, number, source_id, status, reason, attempts, at, first_at)
+             VALUES ($1, 6, $2, 'moved', 'no page urls', 0, now(), now() - interval '3 days'),
+                    ($1, 7, $2, 'moved', 'no page urls', 0, now(), now() - interval '3 days')`, [id, main]);
+  }
+  await q(`INSERT INTO source_health (source_id, status, consecutive, blocked_until, last_error) VALUES
+             ($1, 'rate_limited', 5, now() - interval '10 minutes', '0/113 pages downloaded (HTTP 429)'),
+             ($2, 'ok', 0, NULL, NULL), ($3, 'rate_limited', 1, now() + interval '15 minutes', '0/32 pages downloaded (HTTP 429)'),
+             ($4, 'ok', 0, NULL, NULL)`, [NATO, NATO2, KAKA, FAST]);
+  pace.clearPace();
+  // Both have shown their pages on one image server; then Mangakakalot's were refused.
+  pace.notePageHosts({ id: NATO2 }, ['https://imgs-2.2xstorage.com/a/1.jpg']);
+  pace.notePageHosts({ id: KAKA }, ['https://img-r1.2xstorage.com/b/1.jpg']);
+  pace.noteRateLimited(KAKA);
+  try {
+    assert.ok(pace.paceLevel(NATO2) > 0, 'PREMISE: a 429 at Mangakakalot slows Natomanga through their one image server');
+    assert.equal(pace.paceLevel(FAST), 0, 'PREMISE: the other new main downloads at full speed');
+    const c = (await runHealthChecks()).checks.find((x: any) => x.id === 'chapter-failures');
+    await assertSaid([c]);
+    const row = (id: string) => c.items.find((i: any) => i.sourceId === id);
+    assert.equal(row(NATO)?.info, true, `on the rate-limited one, its cooldown run out, they wait: ${JSON.stringify(row(NATO))}`);
+    assert.equal(row(NATO2)?.info, true, `a moved chapter on a slowed main waits: ${JSON.stringify(row(NATO2))}`);
+    assert.ok(row(FAST) && row(FAST).info !== true, 'onto a main at full speed they are a finding: nothing holds them back');
+  } finally {
+    pace.clearPace();
+    await clean();
+    for (const id of IDS) unregisterAdapter(id);
+  }
+});
+
 test('a series whose loaded main is off or failing, with no working follower, can no longer update; one with a working follower is reference; a cooling main is not listed', { skip: DSN ? false : 'set TEST_DATABASE_URL to run' }, async () => {
   // Reintroduce by dropping the `OR ls.source_id = ANY($1)` clause from frozenSeries: the series on the switched-off main
   // is absent. Reintroduce "any loaded follower counts" (drop the standing test on followers): the series whose follower
@@ -1488,18 +1920,19 @@ test('a series whose loaded main is off or failing, with no working follower, ca
     const item = (id: string) => c.items.find((i: any) => i.seriesId === id);
     assert.ok(item('s_fz_off'), 'the series on the switched-off main is listed');
     assert.equal(item('s_fz_off').info, undefined, 'and it is a finding');
-    assert.equal(item('s_fz_off').detail, '4 chapters; its source fz-off is switched off');
+    // Named as the rest of Health names them (sourceLabel, v0.55.1): the main source by its name, as its followers were.
+    assert.equal(item('s_fz_off').detail, '4 chapters; its source Name fz-off is switched off');
     assert.deepEqual([item('s_fz_off').sourceId, item('s_fz_off').actions, item('s_fz_off').findSeries],
       ['fz-off', ['replace_source', 'find_sources', 'ignore'], 2], 'Replace first, over every series whose main source it is');
     assert.ok(item('s_fz_failoff'), 'a series whose only follower is switched off');
     assert.equal(item('s_fz_failoff').info, undefined, 'a switched-off follower carries nothing: still a finding');
-    assert.equal(item('s_fz_failoff').detail, '4 chapters; its source fz-fail is failing');
-    assert.equal(item('s_fz_offline').detail, '4 chapters; its source fz-offline says it is offline', "the site's own offline notice, said so");
+    assert.equal(item('s_fz_failoff').detail, '4 chapters; its source Name fz-fail is failing');
+    assert.equal(item('s_fz_offline').detail, '4 chapters; its source Name fz-offline says it is offline', "the site's own offline notice, said so");
     assert.equal(item('s_fz_failok').info, true, 'a working follower carries it: reference');
-    assert.equal(item('s_fz_failok').detail, 'primary fz-fail failing; still following Name fz-ok');
+    assert.equal(item('s_fz_failok').detail, 'primary Name fz-fail failing; still following Name fz-ok');
     assert.deepEqual([item('s_fz_failok').sourceId, item('s_fz_failok').actions], ['fz-fail', ['replace_source']], 'its follower can be made the main source');
     assert.equal(item('s_fz_offcool').info, true, 'a follower in a cooldown still carries a series');
-    assert.equal(item('s_fz_offcool').detail, 'primary fz-off switched off; still following Name fz-cool');
+    assert.equal(item('s_fz_offcool').detail, 'primary Name fz-off switched off; still following Name fz-cool');
     assert.equal(item('s_fz_cool'), undefined, 'a main that is only cooling down is not listed');
     assert.equal(c.status, 'warn');
   } finally {
