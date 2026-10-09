@@ -21,12 +21,13 @@ import { visibleToAll } from './visibility';
 import { isDisabled } from './sourceHealth';
 import { mangadexOriginalLanguages } from './sources/mangadex';
 import { fetchAniListCountries } from './anilist';
+import { withAniListMutation, type ScopedQuery } from './anilistPolicy';
 import {
   DIRECTION_FROM, isReadingDirection, directionFromLanguage, directionFromCountry, directionFromAniListMatch,
   type DirectionFrom, type ReadingDirection,
 } from './directionSignals';
 
-import { learnSeriesType, typeFromLanguage, typeFromCountry, typeFromAniListMatch } from './seriesType';
+import { learnSeriesTypeWith, typeFromLanguage, typeFromCountry, typeFromAniListMatch } from './seriesType';
 
 export * from './directionSignals';
 
@@ -40,14 +41,15 @@ export * from './directionSignals';
  * AniList entry), and only a weaker one is refused. Reintroduce `<`: readingDirection.int.test.ts "a signal
  * may correct its own earlier answer" keeps the stale value.
  */
-export async function learnDirection(
+export async function learnDirectionWith(
+  qq: ScopedQuery,
   where: { id: string } | { folder: string },
   dir: ReadingDirection | null | undefined,
   from: DirectionFrom,
 ): Promise<boolean> {
   if (!isReadingDirection(dir)) return false;
   const byId = 'id' in where;
-  const rows = await q<{ id: string }>(
+  const rows = await qq<{ id: string }>(
     `UPDATE lib_series SET reading_direction = $2, reading_direction_from = $3
       WHERE ${byId ? 'id' : 'folder'} = $1
         AND COALESCE(array_position($4::text[], reading_direction_from), 0) <= array_position($4::text[], $3::text)
@@ -56,6 +58,15 @@ export async function learnDirection(
     [byId ? where.id : where.folder, dir, from, DIRECTION_FROM],
   );
   return rows.length > 0;
+}
+
+/** Unconditional/manual wrapper. Automatic AniList work uses the scoped form under `withAniListMutation`. */
+export async function learnDirection(
+  where: { id: string } | { folder: string },
+  dir: ReadingDirection | null | undefined,
+  from: DirectionFrom,
+): Promise<boolean> {
+  return learnDirectionWith(q, where, dir, from);
 }
 
 // ---- the nightly backfill (lib/repair.ts, step `directions`) -------------------------------------------------
@@ -114,7 +125,8 @@ export async function detectDirections(opts: { max: number; log?: Log }): Promis
                        (SELECT ss.source_series_id FROM series_sources ss
                          WHERE ss.series_id = s.id AND (ss.source_id = 'mangadex' OR ss.source_id LIKE 'mangadex-%') LIMIT 1)) AS md
          FROM lib_series s
-        WHERE ${visibleToAll('s')}
+         JOIN libraries l ON l.id = s.library_id
+        WHERE ${visibleToAll('s')} AND s.auto_update AND l.anilist_lookup
           AND (s.reading_direction_from IS NULL OR s.reading_direction_from = 'anilist')
           AND (s.source_id = 'mangadex' OR s.source_id LIKE 'mangadex-%'
                OR EXISTS (SELECT 1 FROM series_sources ss
@@ -130,14 +142,31 @@ export async function detectDirections(opts: { max: number; log?: Log }): Promis
     }
     if (byMd.size) {
       try {
-        const langs = await lookups.mangadex([...byMd.keys()]);
-        for (const [md, lang] of langs) {
-          for (const id of byMd.get(md.toLowerCase()) ?? []) {
-            out.asked++;
-            if (await learnDirection({ id }, directionFromLanguage(lang), 'source')) out.learned++;
-            // The same answer says what kind of comic it is (lib/seriesType.ts). Only for the series asked about the
-            // direction: the type is a passenger here, and changes nothing about who is asked.
-            await learnSeriesType({ id }, typeFromLanguage(lang), 'source').catch(() => false);
+        // A library may be unmonitored while this repair is queued. Re-read immediately before the
+        // outbound batch and drop every series whose background work is now disabled.
+        const live = new Set((await q<{ id: string }>(
+          `SELECT s.id FROM lib_series s JOIN libraries l ON l.id = s.library_id
+            WHERE s.id = ANY($1::text[]) AND s.auto_update AND l.anilist_lookup`,
+          [[...new Set([...byMd.values()].flat())]],
+        )).map((r) => r.id));
+        for (const [md, ids] of byMd) {
+          const keep = ids.filter((id) => live.has(id));
+          if (keep.length) byMd.set(md, keep); else byMd.delete(md);
+        }
+        if (byMd.size) {
+          const langs = await lookups.mangadex([...byMd.keys()]);
+          for (const [md, lang] of langs) {
+            for (const id of byMd.get(md.toLowerCase()) ?? []) {
+              out.asked++;
+              const applied = await withAniListMutation({ id }, 'automatic', async (qq, seriesId) => {
+                const learned = await learnDirectionWith(qq, { id: seriesId }, directionFromLanguage(lang), 'source');
+                // The same answer says what kind of comic it is (lib/seriesType.ts). Only for the series asked about
+                // the direction: the type is a passenger here, and changes nothing about who is asked.
+                await learnSeriesTypeWith(qq, { id: seriesId }, typeFromLanguage(lang), 'source');
+                return learned;
+              });
+              if (applied.applied && applied.value) out.learned++;
+            }
           }
         }
       } catch (e) {
@@ -157,7 +186,9 @@ export async function detectDirections(opts: { max: number; log?: Log }): Promis
             t.linked_by IS NOT NULL AS human
        FROM lib_series s
        JOIN series_trackers t ON t.series_id = s.id AND t.provider = 'anilist'
-      WHERE ${visibleToAll('s')} AND s.reading_direction_from IS NULL AND t.external_id ~ '^[0-9]{1,10}$'
+       JOIN libraries l ON l.id = s.library_id
+      WHERE ${visibleToAll('s')} AND s.auto_update AND l.anilist_lookup AND s.reading_direction_from IS NULL
+        AND t.external_id ~ '^[0-9]{1,10}$'
       ORDER BY random()
       LIMIT $1`,
     [max],
@@ -166,14 +197,31 @@ export async function detectDirections(opts: { max: number; log?: Log }): Promis
   for (const r of linked) byMedia.set(Number(r.media), [...(byMedia.get(Number(r.media)) ?? []), r]);
   if (byMedia.size) {
     try {
-      const answers = await lookups.anilist([...byMedia.keys()]);
-      for (const [media, a] of answers) {
-        for (const r of byMedia.get(media) ?? []) {
-          out.asked++;
-          const dir = r.human ? directionFromCountry(a.country) : directionFromAniListMatch([r.title, r.otitle], a);
-          if (await learnDirection({ id: r.id }, dir, 'anilist')) out.learned++;
-          const type = r.human ? typeFromCountry(a.country) : typeFromAniListMatch([r.title, r.otitle], a);
-          await learnSeriesType({ id: r.id }, type, 'anilist').catch(() => false);
+      // Re-read both switches at the privacy boundary. Moving a series therefore applies the destination
+      // library's policy even when this run selected it before the move.
+      const live = new Set((await q<{ id: string }>(
+        `SELECT s.id FROM lib_series s JOIN libraries l ON l.id = s.library_id
+          WHERE s.id = ANY($1::text[]) AND s.auto_update AND l.anilist_lookup`,
+        [[...new Set([...byMedia.values()].flat().map((r) => r.id))]],
+      )).map((r) => r.id));
+      for (const [media, rows] of byMedia) {
+        const keep = rows.filter((r) => live.has(r.id));
+        if (keep.length) byMedia.set(media, keep); else byMedia.delete(media);
+      }
+      if (byMedia.size) {
+        const answers = await lookups.anilist([...byMedia.keys()]);
+        for (const [media, a] of answers) {
+          for (const r of byMedia.get(media) ?? []) {
+            out.asked++;
+            const dir = r.human ? directionFromCountry(a.country) : directionFromAniListMatch([r.title, r.otitle], a);
+            const type = r.human ? typeFromCountry(a.country) : typeFromAniListMatch([r.title, r.otitle], a);
+            const applied = await withAniListMutation({ id: r.id }, 'automatic', async (qq, seriesId) => {
+              const learned = await learnDirectionWith(qq, { id: seriesId }, dir, 'anilist');
+              await learnSeriesTypeWith(qq, { id: seriesId }, type, 'anilist');
+              return learned;
+            });
+            if (applied.applied && applied.value) out.learned++;
+          }
         }
       }
     } catch (e) {

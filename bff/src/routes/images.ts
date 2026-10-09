@@ -5,10 +5,11 @@ import { komga, komgaImage } from '../lib/komga';
 import { serveImage, getOrFetch } from '../lib/imageCache';
 import { dominantHex } from '../lib/color';
 import { fetchAniListArt } from '../lib/anilist';
-import { learnDirection, directionFromAniListMatch } from '../lib/readingDirection';
-import { learnTypeFromAniList } from '../lib/seriesType';
+import { learnDirectionWith, directionFromAniListMatch } from '../lib/readingDirection';
+import { learnTypeFromAniListWith } from '../lib/seriesType';
+import { automaticAniListAllowed, withAniListMutation } from '../lib/anilistPolicy';
 import { noticeBook, noticeShown } from '../lib/noticeChapters';
-import { linkSeries } from '../lib/trackers';
+import { linkSeriesWith } from '../lib/trackers';
 import { LIBRARY_ROOT, cbzPageAt } from '../lib/library';
 import { cfSession } from '../lib/sources/flaresolverr';
 import { solverMayVisit } from '../lib/sources/imageHosts';
@@ -23,7 +24,8 @@ import { join } from 'path';
 import { readFile } from 'fs/promises';
 import { q, one } from '../lib/db';
 import { viewCtxFor, visibleBookFile, seriesVisible, SYSTEM_CTX, type ViewCtx } from '../lib/visibility';
-import { artFile } from '../lib/seriesArt';
+import { artFile, FIRST_PAGE } from '../lib/seriesArt';
+import { namesOf } from '../lib/altTitles';
 import { HERO_FRAMES, backdropLook, heroFit, type HeroAr } from '../lib/heroFrame';
 import { heroServable, heroFrame, heroVariant, queueHero, type AutoHeroAr } from '../lib/autoHero';
 
@@ -341,7 +343,7 @@ const bannerSharp = (input: Buffer) =>
 async function backdropRecipe(id: string, style: 'hero' | 'banner' | null, ar: HeroAr, ctx: ViewCtx): Promise<{ variant: string; producer: () => Promise<{ buffer: Buffer; contentType: string }> }> {
   const hero = style === 'hero';
   // admin override wins (uploaded banner/cover or pasted URL)
-  const ovr = await one<{ banner: string | null; v: string }>('SELECT banner, EXTRACT(EPOCH FROM updated_at) * 1000 AS v FROM series_overrides WHERE series_id = $1', [id]);
+  const ovr = await one<{ banner: string | null; cover: string | null; v: string }>('SELECT banner, cover, EXTRACT(EPOCH FROM updated_at) * 1000 AS v FROM series_overrides WHERE series_id = $1', [id]);
   if (ovr?.banner) {
     return {
       variant: `artw7${hero ? `h${ar}` : style === 'banner' ? 'b' : ''}:${id}:ov:${Math.floor(Number(ovr.v))}`,
@@ -356,31 +358,72 @@ async function backdropRecipe(id: string, style: 'hero' | 'banner' | null, ar: H
       },
     };
   }
-  let art = await one<{ banner: string | null; cover: string | null }>('SELECT banner, cover FROM series_art WHERE series_id = $1', [id]);
-  if (!art) {
-    try {
-      let title = '';
+  // Use the first page (v0.55.7, lib/seriesArt.ts FIRST_PAGE): the series' art is its own pages -- the first page's wash
+  // here, and the banner made from its pages -- and nothing online is looked up or shown for it. Reintroduce by reading
+  // series_art for it: "the first page, chosen, keeps online art away" in onlineMatch.int.test.ts finds the stored
+  // banner's variant.
+  let art: { banner: string | null; cover: string | null; checked_at: Date | null } | null = ovr?.cover === FIRST_PAGE
+    ? { banner: null, cover: null, checked_at: new Date() }
+    : await one<{ banner: string | null; cover: string | null; checked_at: Date | null }>('SELECT banner, cover, checked_at FROM series_art WHERE series_id = $1', [id]);
+  // An opted-out add may still have its source cover.  That row is deliberately unchecked: once its current library
+  // allows automatic enrichment, look up the missing online banner without replacing the source's own cover.
+  if (!art || (!art.banner && !art.checked_at)) {
+    // A disabled library makes no implicit title request and, importantly, stores no miss.  If the admin
+    // enables lookups later this same absent row is eligible immediately; existing art remains visible.
+    if (!(await automaticAniListAllowed({ id }))) art ??= { banner: null, cover: null, checked_at: null };
+    else {
       try {
-        const lib = await one<{ title: string }>('SELECT title FROM lib_series WHERE id = $1', [id]);
-        if (lib?.title) title = lib.title;
-        else { const s = await komga.series(id); title = s?.metadata?.title || s?.name || ''; }
-      } catch {}
-      const fetched = title ? await fetchAniListArt(title) : { banner: null, cover: null };
-      await q(
-        `INSERT INTO series_art (series_id, banner, cover) VALUES ($1, $2, $3)
-         ON CONFLICT (series_id) DO UPDATE SET banner = EXCLUDED.banner, cover = EXCLUDED.cover, fetched_at = now()`,
-        [id, fetched.banner, fetched.cover],
-      );
-      // the same match also anchors tracker sync — record it while we have it
-      if (fetched.mediaId) {
-        await linkSeries(id, fetched.mediaId, fetched.mediaTitle ?? null);
-        // and, when the entry is visibly this series, where it comes from: the weakest evidence of its direction
-        await learnDirection({ id }, directionFromAniListMatch(title, fetched as { country?: string | null; titles?: string[] }), 'anilist').catch(() => {});
-        await learnTypeFromAniList({ id }, title, fetched as { country?: string | null; titles?: string[] });
+        // Every name the series goes by (lib/altTitles.ts namesOf): the search asks by its title, and the answer is kept
+        // only when it is one of them (lib/onlineMatch.ts). Another work's answer comes back as nulls and is stored as
+        // the miss a 404 is, so it is not asked again on every view (#168).
+        let names: string[] = [];
+        try {
+          names = await namesOf({ id });
+          if (!names.length) { const s = await komga.series(id); const t = s?.metadata?.title || s?.name; if (t) names = [t]; }
+        } catch {}
+        const title = names[0] ?? '';
+        // Names are a database read and the library can change while it is in flight.  Re-read at the actual title
+        // boundary; if the series moved into an opted-out destination, preserve its existing/source art and cache no
+        // miss.  Re-read once more after the network answer before any art/link/type/direction mutation.
+        if (title && !(await automaticAniListAllowed({ id }))) {
+          throw new Error('automatic AniList lookup disabled');
+        }
+        const fetched = title ? await fetchAniListArt(title, names) : { banner: null, cover: null };
+        if (title && !(await automaticAniListAllowed({ id }))) {
+          throw new Error('automatic AniList lookup disabled');
+        }
+        // The last policy read above is still not write authority: a move or toggle can commit in the few instructions
+        // before the INSERT. Lock the series and its current library, then apply the art, link, direction and type as
+        // one decision. A refused transaction stores no negative result, so enabling later can take the lookup up.
+        const applied = await withAniListMutation({ id }, 'automatic', async (qq, seriesId) => {
+          // checked_at: held to the title check as it was stored (lib/matchCheck.ts rechecks a row only while it is NULL).
+          const stored = await qq<{ banner: string | null; cover: string | null; checked_at: Date | null }>(
+            `INSERT INTO series_art (series_id, banner, cover, checked_at) VALUES ($1, $2, $3, now())
+             ON CONFLICT (series_id) DO UPDATE SET
+               banner = COALESCE(series_art.banner, EXCLUDED.banner),
+               cover = COALESCE(series_art.cover, EXCLUDED.cover),
+               fetched_at = now(), checked_at = now()
+             RETURNING banner, cover, checked_at`,
+            [seriesId, fetched.banner, fetched.cover],
+          );
+          // The same match also anchors tracker sync and carries the weakest direction/type evidence.
+          if (fetched.mediaId) {
+            await linkSeriesWith(qq, seriesId, fetched.mediaId, fetched.mediaTitle ?? null);
+            await learnDirectionWith(qq, { id: seriesId }, directionFromAniListMatch(names, fetched), 'anilist');
+            await learnTypeFromAniListWith(qq, { id: seriesId }, names, fetched);
+          }
+          return stored[0] ?? null;
+        });
+        if (applied.applied) {
+          art = applied.value ?? { banner: art?.banner ?? fetched.banner, cover: art?.cover ?? fetched.cover, checked_at: new Date() };
+        } else {
+          art = await one<{ banner: string | null; cover: string | null; checked_at: Date | null }>(
+            'SELECT banner, cover, checked_at FROM series_art WHERE series_id = $1', [id],
+          ) ?? art ?? { banner: null, cover: null, checked_at: null };
+        }
+      } catch {
+        art ??= { banner: null, cover: null, checked_at: null }; // transient AniList error: don't cache; fall back this view
       }
-      art = fetched;
-    } catch {
-      art = { banner: null, cover: null }; // transient AniList error: don't cache; fall back this view
     }
   }
   // v0.51.0: a series someone looks at with no banner of its own -- one just added, or one the daily warm-up has not
@@ -548,8 +591,9 @@ const thumbWidth = (req: FastifyRequest): number => {
   const w = Number((req.query as any)?.w);
   return w === 800 || w === 1600 ? w : 400;
 };
-// Series cover: prefer the real cover art (AniList, cached in series_art.cover); fall back to the first
-// page of chapter 1. Distinct cache variants so it upgrades to the real cover once one is known.
+// Series cover: an admin's (an upload, a link, or the first page by choice), else the real cover art (the source's, or
+// AniList's when its entry is named as the series is, cached in series_art.cover); fall back to the first page of
+// chapter 1. Distinct cache variants so it upgrades to the real cover once one is known.
 export const serveLibSeriesThumb = async (req: FastifyRequest, reply: FastifyReply, id: string) => {
   // The series-level art routes read lib_series and series_art by id, so they need the check that
   // bookFileAbs now carries for chapters. Without it a hidden series' cover still renders, which is
@@ -563,6 +607,8 @@ export const serveLibSeriesThumb = async (req: FastifyRequest, reply: FastifyRep
     return serveImage(req, reply, `lib-sthumb:${id}:ov:${Math.floor(Number(ovr.v))}${wk}`, async () => {
       let input: Buffer;
       if (ovr.cover === 'upload') input = await readFile(artFile(id, 'cover'));
+      // Use the first page (v0.55.7): nothing to fetch, and series_art is not read -- whatever it holds.
+      else if (ovr.cover === FIRST_PAGE) input = await firstPageInput(id, vc(req));
       else { try { input = await fetchCoverImage(ovr.cover!); } catch { input = await firstPageInput(id, vc(req)); } }
       storeColor(id, input);
       const buffer = await sharp(input).resize({ width: w, withoutEnlargement: true }).webp({ quality: 80 }).toBuffer();

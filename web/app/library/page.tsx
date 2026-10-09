@@ -1,11 +1,11 @@
 'use client';
-import { Suspense, useEffect, useMemo, useRef } from 'react';
+import { Suspense, useCallback, useEffect, useMemo, useRef } from 'react';
 import { motion, useReducedMotion } from 'framer-motion';
 import { useSearchParams, useRouter } from 'next/navigation';
 import { useState } from 'react';
 import Link from 'next/link';
 import { useInfiniteQuery, useQuery, useQueryClient } from '@tanstack/react-query';
-import { api } from '@/lib/api';
+import { api, ApiError } from '@/lib/api';
 import { Page, Series } from '@/lib/types';
 import { SeriesTile } from '@/components/cards';
 import { IcSearch, IcSparkle, IcPlus, IcImport } from '@/components/icons';
@@ -34,6 +34,16 @@ import { ServerDownloadsView } from '@/components/ServerDownloadsView';
 import { EmptyState } from '@/components/EmptyState';
 import { LibraryStart } from '@/components/LibraryStart';
 import { ART } from '@/lib/art';
+import { BulkChapterDeleteRunDialog } from '@/components/BulkChapterDeleteRun';
+import {
+  BULK_CHAPTER_DELETE_POLL_MS,
+  bulkChapterDeleteFinished,
+  forgetBulkChapterDeleteRun,
+  rememberBulkChapterDeleteRun,
+  rememberedBulkChapterDeleteRun,
+  startedBulkChapterDeleteRun,
+  type BulkChapterDeleteRun,
+} from '@/lib/bulkChapterDelete';
 
 /** Build the condition tree from the URL. Empty means no condition at all, which needs no user context. */
 function conditionFrom(read: string, status: string, genres: string[], lib: string, src = '', anysrc = '') {
@@ -54,7 +64,12 @@ function conditionFrom(read: string, status: string, genres: string[], lib: stri
 function LibraryInner() {
   const params = useSearchParams();
   const router = useRouter();
-  const sortKey = params.get('sort') || 'updated';
+  const { isAdmin, user, status: authStatus, setSettings } = useAuth();
+  const validSort = (v: unknown): v is string => typeof v === 'string' && SORTS.some((s) => s.key === v);
+  const urlSort = params.get('sort');
+  // A sort in a shared URL controls this visit only.  With none (or old/junk input), the account's explicit
+  // default wins; clicking a sort below is the only thing that changes that default.
+  const sortKey = validSort(urlSort) ? urlSort : validSort(user?.settings?.librarySort) ? user!.settings.librarySort : 'updated';
   const active = useMemo(() => SORTS.find((s) => s.key === sortKey) || SORTS[0], [sortKey]);
 
   // Filters live in the URL so they survive the back button and can be shared, and they are part of the
@@ -87,6 +102,15 @@ function LibraryInner() {
   const [acting, setActing] = useState(false);
   const [moving, setMoving] = useState(false);
   const [removing, setRemoving] = useState(false);
+  // Delete chapters (the admin's, a row of More): its confirm, and whether the selection is also unmonitored.
+  const [deletingChapters, setDeletingChapters] = useState(false);
+  const [alsoPause, setAlsoPause] = useState(true);
+  // The server owns this destructive run once POST answers 202. Keep following it independently of the
+  // confirmation/select state: closing the progress window or reloading must never make an active deletion
+  // look safe to submit again.
+  const [deleteRun, setDeleteRun] = useState<BulkChapterDeleteRun | null>(null);
+  const [deleteRunOpen, setDeleteRunOpen] = useState(false);
+  const [deleteCancelling, setDeleteCancelling] = useState(false);
   // The phone's overflow for the two admin actions (see the bar below).
   const [more, setMore] = useState(false);
   // v0.51.0: Find other sources asks first whether to follow automatically or review first.
@@ -99,7 +123,6 @@ function LibraryInner() {
   // phone, and a notice has to rise above whichever height it has.
   const toolbarRef = useRef<HTMLDivElement>(null);
   useLayer('toolbar', selecting && picked.size > 0, { ref: toolbarRef });
-  const { isAdmin, user, status: authStatus } = useAuth();
   // Series | Downloads (v0.49.0): which of the page's two views, from the URL on every render -- a link to
   // `?view=downloads` while already on /library (the desktop's header button, the palette) does not remount
   // the page, so a value read once would not follow it. Downloads only for a viewer who may download.
@@ -120,6 +143,14 @@ function LibraryInner() {
     // first chapter). Any change made on the page has moved on from it.
     next.delete('folder');
     router.replace(`/library?${next.toString()}`);
+    if (k === 'sort' && validSort(v)) {
+      const previous = user?.settings?.librarySort;
+      setSettings({ librarySort: v });
+      void api('/api/settings', { method: 'PUT', json: { librarySort: v } }).catch(() => {
+        setSettings({ librarySort: previous });
+        toast(tr('Could not save'), 'error');
+      });
+    }
   };
 
   // Everything `activeCount` counts, cleared. Sort survives because it is not a filter -- clearing it would
@@ -148,6 +179,60 @@ function LibraryInner() {
   const qc = useQueryClient();
   const toast = useToast();
 
+  const attachDeleteRun = useCallback((run: BulkChapterDeleteRun, open = true) => {
+    rememberBulkChapterDeleteRun(run.id);
+    setDeleteRun(run);
+    if (open) setDeleteRunOpen(true);
+  }, []);
+
+  // Rejoin the exact run this browser started. If the POST response itself was lost before its id could be
+  // stored, the no-id GET is also useful: only an ACTIVE latest run is adopted here, never yesterday's result.
+  useEffect(() => {
+    if (!isAdmin || authStatus !== 'authed') return;
+    let alive = true;
+    const remembered = rememberedBulkChapterDeleteRun();
+    const path = remembered
+      ? `/api/admin/series/bulk/chapters/delete?runId=${encodeURIComponent(remembered)}`
+      : '/api/admin/series/bulk/chapters/delete';
+    void api<{ run: BulkChapterDeleteRun | null }>(path).then(({ run }) => {
+      if (!alive || !run || (!remembered && run.status !== 'running')) return;
+      attachDeleteRun(run);
+    }).catch((e) => {
+      if (remembered && e instanceof ApiError && (e.status === 400 || e.status === 404)) {
+        forgetBulkChapterDeleteRun(remembered);
+      }
+    });
+    return () => { alive = false; };
+  }, [attachDeleteRun, authStatus, isAdmin]);
+
+  // A missed status read is not a failed deletion. The persisted server run stays authoritative and this
+  // poll keeps retrying, including while its dialog is closed. Completion refreshes both Library and Home.
+  useEffect(() => {
+    if (!deleteRun || deleteRun.status !== 'running') return;
+    let alive = true;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const poll = async () => {
+      let again = true;
+      try {
+        const response = await api<{ run: BulkChapterDeleteRun | null }>(
+          `/api/admin/series/bulk/chapters/delete?runId=${encodeURIComponent(deleteRun.id)}`,
+        );
+        if (!alive || !response.run) return;
+        setDeleteRun(response.run);
+        again = response.run.status === 'running';
+        if (!again) {
+          qc.invalidateQueries({ queryKey: ['library'] });
+          qc.invalidateQueries({ queryKey: ['home'] });
+        }
+      } catch {
+        // Network/proxy failures leave the durable job running; retry instead of offering a duplicate POST.
+      }
+      if (alive && again) timer = setTimeout(poll, BULK_CHAPTER_DELETE_POLL_MS);
+    };
+    timer = setTimeout(poll, 50);
+    return () => { alive = false; if (timer) clearTimeout(timer); };
+  }, [deleteRun?.id, deleteRun?.status, qc]);
+
   /**
    * One series, at random.
    *
@@ -159,8 +244,8 @@ function LibraryInner() {
     try {
       const r = await api<{ seriesId: string | null }>('/api/random');
       if (r.seriesId) router.push(`/series/?id=${r.seriesId}`);
-      else toast('Nothing to pick from yet', 'error');
-    } catch { toast('Could not pick a series', 'error'); }
+      else toast(tr('Nothing to pick from yet'), 'error');
+    } catch { toast(tr('Could not pick a series'), 'error'); }
   };
 
   const onRefresh = async () => {
@@ -183,10 +268,15 @@ function LibraryInner() {
       const r = await api<{ applied: number; skipped: { id: string }[] }>(path, {
         json: { seriesIds: [...picked], ...extra },
       });
-      // Say what was skipped rather than silently applying to fewer than were selected.
-      toast(r.skipped.length ? `${r.applied} updated, ${r.skipped.length} no longer exist` : `${r.applied} updated`, 'success');
+      // Say what was skipped rather than silently applying to fewer than were selected. Each count its own pair of
+      // keys, and its own words: "1 series is no longer…" names what disappeared in every language, and the
+      // Tasks line's "{n} updated" counts extensions.
+      const updated = r.applied === 1 ? tr('1 series updated') : tr('{n} series updated', { n: r.applied });
+      const gone = r.skipped.length === 1 ? tr('1 series is no longer in the library')
+        : tr('{n} series are no longer in the library', { n: r.skipped.length });
+      toast(r.skipped.length ? `${updated} · ${gone}` : updated, 'success');
       settle();
-    } catch { toast('Could not apply that', 'error'); }
+    } catch { toast(tr('Could not apply that'), 'error'); }
     setActing(false);
   };
 
@@ -265,6 +355,86 @@ function LibraryInner() {
       }
     } catch (e) { toast(msgOf(e, tr('Could not remove those')), 'error'); }
     setActing(false);
+  };
+
+  /**
+   * Monitor / Unmonitor the selection: each series' "Auto-update new chapters" (bff POST
+   * /api/admin/series/bulk/auto-update). Unmonitored, nothing unattended searches for or downloads its new chapters --
+   * the sweep, the nightly repair, Fix everything, the slow archive -- while Check now and Fetch on its page still work.
+   */
+  const monitorSelected = async (on: boolean) => {
+    setActing(true);
+    try {
+      const r = await api<{ ok: true; applied: number; skipped: { id: string; reason: string }[] }>('/api/admin/series/bulk/auto-update', {
+        json: { seriesIds: [...picked], autoUpdate: on },
+      });
+      const parts = [on
+        ? (r.applied === 1 ? tr('Monitored 1 series') : tr('Monitored {n} series', { n: r.applied }))
+        : (r.applied === 1 ? tr('Unmonitored 1 series') : tr('Unmonitored {n} series', { n: r.applied }))];
+      if (r.skipped.length) parts.push(r.skipped.length === 1 ? tr('1 skipped') : tr('{n} skipped', { n: r.skipped.length }));
+      toast(parts.join(' · '), r.applied ? 'success' : 'error');
+      if (r.applied) settle();
+    } catch (e) { toast(msgOf(e, tr('Could not change monitoring')), 'error'); }
+    setActing(false);
+  };
+
+  /**
+   * Start the durable chapter cleanup. POST only CLAIMS a persisted server run; GET follows it. That split matters for
+   * a large selection: a reverse proxy can time out, the browser can reload, or this progress window can be closed
+   * without turning an unknown destructive request into a tempting second attempt. If even the 202 response is lost,
+   * the latest run is adopted only when its time and total match this submission.
+   */
+  const deleteChaptersSelected = async () => {
+    setActing(true);
+    const began = Date.now();
+    const total = new Set(picked).size;
+    try {
+      const r = await api<{ ok: true; runId: string; total: number }>(
+        '/api/admin/series/bulk/chapters/delete', {
+          method: 'POST',
+          json: { seriesIds: [...picked], pause: alsoPause },
+        });
+      attachDeleteRun(startedBulkChapterDeleteRun(r.runId, r.total, alsoPause));
+      setDeletingChapters(false);
+      settle();
+    } catch (e) {
+      // A 502/504 can hide a successful 202. Read the just-created row before saying the start failed; matching both
+      // its total and its start window keeps an older cleanup from being mistaken for this one.
+      const recovered = await api<{ run: BulkChapterDeleteRun | null }>(
+        '/api/admin/series/bulk/chapters/delete',
+      ).then((r) => r.run, () => null);
+      const startedAt = recovered ? Date.parse(recovered.startedAt) : 0;
+      if (recovered && recovered.total === total && startedAt >= began - 15_000) {
+        attachDeleteRun(recovered);
+        setDeletingChapters(false);
+        settle();
+      } else {
+        toast(msgOf(e, tr('Could not start the cleanup')), 'error');
+      }
+    }
+    setActing(false);
+  };
+
+  const cancelDeleteRun = async () => {
+    if (!deleteRun || deleteRun.status !== 'running' || deleteRun.cancelRequested) return;
+    setDeleteCancelling(true);
+    try {
+      await api('/api/admin/series/bulk/chapters/delete/cancel', {
+        method: 'POST', json: { runId: deleteRun.id },
+      });
+      setDeleteRun((run) => run?.id === deleteRun.id ? { ...run, cancelRequested: true } : run);
+    } catch (e) {
+      toast(msgOf(e, tr('Could not stop the cleanup')), 'error');
+    }
+    setDeleteCancelling(false);
+  };
+
+  const closeDeleteRun = () => {
+    setDeleteRunOpen(false);
+    if (deleteRun && bulkChapterDeleteFinished(deleteRun)) {
+      forgetBulkChapterDeleteRun(deleteRun.id);
+      setDeleteRun(null);
+    }
   };
 
   /**
@@ -451,6 +621,29 @@ function LibraryInner() {
         </>}
       </header>
 
+      {/* Closing the detail window never loses the server-owned job. This small, persistent row is its way back; the
+          id also survives a full reload in localStorage and is checked against the persisted admin run. */}
+      {deleteRun && !deleteRunOpen && (
+        <div className="px-4 pt-3 lg:px-0">
+          <button type="button" onClick={() => setDeleteRunOpen(true)} data-open-bulk-delete-run
+            className="flex w-full items-center gap-3 rounded-xl border border-ink-700 bg-ink-900/45 px-3 py-2 text-start hover:border-ink-600">
+            <ProgressRing progress={deleteRun.total ? deleteRun.done / deleteRun.total : 0} size="row"
+              label={tr('Delete chapters')} valueText={tr('{done} of {total}', { done: deleteRun.done, total: deleteRun.total })} />
+            <span className="min-w-0 flex-1 text-sm text-fog-200">
+              {tr('Delete chapters')} <span className="text-fog-500">·</span>{' '}
+              {deleteRun.status === 'running'
+                ? (deleteRun.cancelRequested ? tr('Stopping…') : tr('Running'))
+                : deleteRun.status === 'done' ? tr('Done')
+                  : deleteRun.status === 'cancelled' ? tr('Cancelled')
+                    : deleteRun.status === 'interrupted' ? tr('Interrupted') : tr('Failed')}
+            </span>
+            <span className="shrink-0 text-xs tabular-nums text-fog-400" dir="ltr">
+              {tr('{done} of {total}', { done: deleteRun.done, total: deleteRun.total })}
+            </span>
+          </button>
+        </div>
+      )}
+
       {!series && <ServerDownloadsView focusFolder={params.get('folder')} />}
 
       {/* `data-library-grid` is a test hook, not a style. layout.mjs measures fill as the span between the
@@ -547,6 +740,19 @@ function LibraryInner() {
                   className="block w-full rounded-lg px-2.5 py-2.5 text-start text-sm text-fog-100 hover:bg-ink-800/60">
                   {tr('Find other sources')}
                 </button>
+                {/* Monitoring is "Auto-update new chapters" (Edit details → New chapters) for the whole selection. */}
+                <button onClick={() => { setMore(false); void monitorSelected(true); }} data-monitor-selected
+                  className="block w-full rounded-lg px-2.5 py-2.5 text-start text-sm text-fog-100 hover:bg-ink-800/60">
+                  {tr('Monitor')}
+                </button>
+                <button onClick={() => { setMore(false); void monitorSelected(false); }} data-unmonitor-selected
+                  className="block w-full rounded-lg px-2.5 py-2.5 text-start text-sm text-fog-100 hover:bg-ink-800/60">
+                  {tr('Unmonitor')}
+                </button>
+                <button onClick={() => { setMore(false); setAlsoPause(true); setDeletingChapters(true); }} data-delete-chapters-selected
+                  className="block w-full rounded-lg px-2.5 py-2.5 text-start text-sm text-rose-300 hover:bg-ink-800/60">
+                  {tr('Delete chapters')}
+                </button>
                 <button onClick={() => { setMore(false); setRemoving(true); }}
                   className="block w-full rounded-lg px-2.5 py-2.5 text-start text-sm text-rose-300 hover:bg-ink-800/60">
                   {tr('Remove from library')}
@@ -571,6 +777,38 @@ function LibraryInner() {
           }
           onConfirm={removeSelected}
           onClose={() => setRemoving(false)}
+        />
+      )}
+      {deletingChapters && (
+        <ConfirmDialog
+          title={picked.size === 1 ? tr('Delete the downloaded chapters of 1 series?') : tr('Delete the downloaded chapters of {n} series?', { n: picked.size })}
+          danger
+          busy={acting}
+          confirmLabel={tr('Delete chapters')}
+          body={
+            <>
+              <p>{tr('Every chapter Uchiyomi downloaded is deleted from the server, except each series’ cover chapter, so the covers stay. Files in a library you built by hand, and bookmarked chapters, are left alone.')}</p>
+              <p className="mt-2">{tr('The chapters stay listed and everyone keeps their reading history. Fetch again on the series page brings a chapter back.')}</p>
+              <p className="mt-2 font-medium text-amber-300">{tr('Deleting a chapter being read can lose its reading position.')}</p>
+              <label className="mt-3 flex items-start gap-2 text-sm text-fog-200">
+                <input type="checkbox" className="mt-0.5" checked={alsoPause} onChange={(e) => setAlsoPause(e.target.checked)} data-also-pause />
+                <span>
+                  {tr('Also stop updates for these series')}
+                  <span className="block text-xs text-fog-500">{tr('Otherwise the next check downloads their newest chapters again.')}</span>
+                </span>
+              </label>
+            </>
+          }
+          onConfirm={deleteChaptersSelected}
+          onClose={() => setDeletingChapters(false)}
+        />
+      )}
+      {deleteRun && deleteRunOpen && (
+        <BulkChapterDeleteRunDialog
+          run={deleteRun}
+          cancelling={deleteCancelling}
+          onCancel={() => { void cancelDeleteRun(); }}
+          onClose={closeDeleteRun}
         />
       )}
       {moving && (

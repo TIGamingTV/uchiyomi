@@ -15,7 +15,7 @@ import type { FastifyRequest } from 'fastify';
 import { rm, rename, realpath, stat, readdir } from 'fs/promises';
 import { q, one, tx } from './db';
 import { artFile } from './seriesArt';
-import { allWritable, containedPath } from './fsGuard';
+import { allWritable, containedPath, realContainedPath } from './fsGuard';
 import { tombstoneBooks } from './chapterCleanup';
 import { LIBRARY_ROOT, DL_ROOT, listChapters } from './library';
 import { reconcileListingProgress } from './listingProgress';
@@ -109,6 +109,17 @@ export interface MergeResult {
 }
 
 /**
+ * The optimistic route/autofix check is only an explanation for the caller. The merge repeats it after taking both
+ * series-row locks; this error means another process changed one end before those locks were acquired.
+ */
+export class MergeConflictError extends Error {
+  constructor(readonly refusal: MergeRefusal) {
+    super(`merge no longer allowed: ${refusal.refused}`);
+    this.name = 'MergeConflictError';
+  }
+}
+
+/**
  * The absorbed copy's main source, when the survivor can follow it (v0.55.0): it still carries a series -- usable, or
  * only cooling down (lib/sourceStanding.ts) -- it is not the survivor's own main source, it is in the survivor's
  * language (the follow guard every automatic follow passes), and the survivor is not numbered by posting order, whose
@@ -136,8 +147,32 @@ async function carryable(fromId: string, intoId: string): Promise<{ sourceId: st
  * everyone a phantom NEW badge, or hide one.
  */
 export async function mergeSeries(fromId: string, intoId: string): Promise<MergeResult> {
-  const carry = await carryable(fromId, intoId).catch(() => null);
+  // The standing/language checks use several ordinary pool reads. Do them before opening the transaction so a burst
+  // of unrelated merges cannot occupy every pool client and then deadlock waiting for another one. Core source facts
+  // are compared again under the row locks below before this candidate may be carried.
+  const carryCandidate = await carryable(fromId, intoId).catch(() => null);
   return tx(async (qq) => {
+    if (fromId === intoId) throw new MergeConflictError({ refused: 'same_series' });
+    // Stable lock order prevents two opposite/crossing merges from deadlocking. More importantly, the visibility and
+    // edition checks happen again *under* the locks: two BFF processes can both pass mergeRefusal(), but only the first
+    // may move rows. The second observes the first one's merged_into (or a concurrent hide) and refuses.
+    const locked = await qq<SeriesRow & { work_id: string | null; source_id: string | null; source_series_id: string | null; numbering: string | null }>(
+      `SELECT id, title, folder, deleted_at, merged_into, work_id, source_id, source_series_id, numbering
+         FROM lib_series WHERE id = ANY($1::text[]) ORDER BY id FOR UPDATE`, [[fromId, intoId]],
+    );
+    const from = locked.find((r) => r.id === fromId);
+    const into = locked.find((r) => r.id === intoId);
+    if (!from || !into) throw new MergeConflictError({ refused: 'not_found' });
+    if (from.deleted_at) throw new MergeConflictError({ refused: 'deleted', which: 'source' });
+    if (into.deleted_at) throw new MergeConflictError({ refused: 'deleted', which: 'target' });
+    if (from.merged_into) throw new MergeConflictError({ refused: 'merged', which: 'source' });
+    if (into.merged_into) throw new MergeConflictError({ refused: 'merged', which: 'target' });
+    if (from.work_id && from.work_id === into.work_id) throw new MergeConflictError({ refused: 'same_work' });
+
+    const carry = carryCandidate
+      && from.source_id === carryCandidate.sourceId && from.source_series_id === carryCandidate.ref
+      && into.source_id !== carryCandidate.sourceId && into.numbering !== 'posting_order'
+      ? { ...carryCandidate, title: from.title } : null;
     const moved = await qq<{ id: string }>(
       `UPDATE lib_books SET series_id = $2 WHERE series_id = $1 RETURNING id`,
       [fromId, intoId],
@@ -304,6 +339,23 @@ export type DeletedChapters =
   | { applied: number; bytes: number; skipped: Array<{ id: string; reason: string }> }
   | { refused: { reason: string; fix?: string } };
 
+/** Durable progress hooks used by the detached bulk job. Direct/admin-autofix deletes do not need a journal. */
+export type ChapterDeleteJournalItem = {
+  id: string;
+  root: string;
+  file: string;
+  position: number;
+  bytes: number;
+};
+export type ChapterDeleteJournal = {
+  /** Must commit before the first unlink. */
+  beforeUnlink: (item: ChapterDeleteJournalItem) => Promise<void>;
+  /** Test scheduling and observability point: the file is gone but its row is not a tombstone yet. */
+  afterUnlink?: (item: ChapterDeleteJournalItem) => Promise<void>;
+  /** Commits the terminal disposition of every requested chapter. */
+  settled: (item: ChapterDeleteJournalItem & { outcome: 'applied' | 'skipped'; reason?: string }) => Promise<void>;
+};
+
 /**
  * Delete the files of chosen chapters of one series and keep their rows as tombstones, so reading history survives and
  * the updater's have-set still contains the number (the same reasoning as the cleanup's, on the column's note in
@@ -313,7 +365,13 @@ export type DeletedChapters =
  * touched, whoever asks. Audited as `series.chapters_delete`.
  */
 export async function deleteChapterFiles(
-  id: string, bookIds: readonly string[], o: { userId: string | null; req?: FastifyRequest; via?: 'autofix'; runId?: string },
+  id: string, bookIds: readonly string[], o: {
+    userId: string | null;
+    req?: FastifyRequest;
+    via?: 'autofix';
+    runId?: string;
+    journal?: ChapterDeleteJournal;
+  },
 ): Promise<DeletedChapters> {
   const row = await getSeriesRow(id);
   const ids = [...new Set(bookIds)];
@@ -328,24 +386,34 @@ export async function deleteChapterFiles(
     'SELECT DISTINCT book_id FROM bookmarks WHERE book_id = ANY($1)', [ids])).map((r) => r.book_id));
 
   const skipped: Array<{ id: string; reason: string }> = [];
-  const todo: Array<{ id: string; abs: string }> = [];
+  const todo: Array<{ id: string; abs: string; rel: string; position: number }> = [];
   const root = resolve(DL_ROOT);
-  for (const bid of ids) {
+  const recordSkip = async (
+    bid: string, reason: string, position: number,
+    book?: { root: string | null; file: string }, bytes = 0,
+  ) => {
+    skipped.push({ id: bid, reason });
+    await o.journal?.settled({
+      id: bid, root: book?.root ?? '', file: book?.file ?? '', position, bytes, outcome: 'skipped', reason,
+    });
+  };
+  for (let position = 0; position < ids.length; position++) {
+    const bid = ids[position];
     const r = rows.get(bid);
-    if (!r) { skipped.push({ id: bid, reason: 'not_found' }); continue; }
+    if (!r) { await recordSkip(bid, 'not_found', position); continue; }
     // Reintroduce by dropping this check: "delete removes the file, keeps the row and the progress, skips
     // the read library" in chapterActions.int.test.ts fails -- the read library's file is gone.
-    if (r.root !== DL_ROOT) { skipped.push({ id: bid, reason: 'not_owned' }); continue; }
-    if (r.pruned_at) { skipped.push({ id: bid, reason: 'already_pruned' }); continue; }
-    if (bookmarked.has(bid)) { skipped.push({ id: bid, reason: 'bookmarked' }); continue; }
+    if (r.root !== DL_ROOT) { await recordSkip(bid, 'not_owned', position, r); continue; }
+    if (r.pruned_at) { await recordSkip(bid, 'already_pruned', position, r); continue; }
+    if (bookmarked.has(bid)) { await recordSkip(bid, 'bookmarked', position, r); continue; }
     const abs = containedPath(DL_ROOT, r.file);
     // A path that escapes its root is refused, never "cleaned up" -- the health page can argue about it.
     // So is the root ITSELF: containedPath accepts it, the rm below is recursive, and a row whose file
     // resolves to `.` (a hand-edited row is the only way today) would take the whole download directory.
     // Reintroduce by dropping the `abs === root` half: "the download root itself is never a chapter" in
     // chapterActions.int.test.ts finds the directory gone.
-    if (!abs || abs === root) { skipped.push({ id: bid, reason: 'outside_root' }); continue; }
-    todo.push({ id: bid, abs });
+    if (!abs || abs === root) { await recordSkip(bid, 'outside_root', position, r); continue; }
+    todo.push({ id: bid, abs, rel: r.file, position });
   }
   if (todo.length) {
     const w = await allWritable([DL_ROOT]);
@@ -354,11 +422,26 @@ export async function deleteChapterFiles(
   let applied = 0;
   let bytes = 0;
   for (const t of todo) {
+    // Re-resolve at the destructive boundary. A lexically contained row can still walk through an
+    // intermediate (or final) symlink to an unrelated file; an absent final file is safe only when its
+    // nearest existing parent resolves under the real download root.
+    if (await realContainedPath(DL_ROOT, t.rel) !== t.abs) {
+      await recordSkip(t.id, 'outside_root', t.position, { root: DL_ROOT, file: t.rel });
+      continue;
+    }
     const st = await stat(t.abs).catch(() => null);
+    const item: ChapterDeleteJournalItem = {
+      id: t.id, root: DL_ROOT, file: t.rel, position: t.position, bytes: st?.size ?? 0,
+    };
     if (st) {
+      // This commit is the recovery boundary: after it, a new process knows this exact owned row/path may have been
+      // unlinked. If the process dies before tombstoneBooks, startup reconciles the intent against disk and the row.
+      await o.journal?.beforeUnlink(item);
       try { await rm(t.abs, { recursive: true, force: true }); }
-      catch { skipped.push({ id: t.id, reason: 'unlink_failed' }); continue; }
-      bytes += st.size;
+      catch {
+        await recordSkip(t.id, 'unlink_failed', t.position, { root: DL_ROOT, file: t.rel }, st.size);
+        continue;
+      }
       // A set-aside copy from a refetch the process died in (`<file>.refetch-bak` beside the landed file,
       // which reapStaleTemp deliberately leaves alone) must not outlive a deliberate delete of the file:
       // at the next boot the reaper would see a bak with no original, put it back, and the chapter the
@@ -366,6 +449,7 @@ export async function deleteChapterFiles(
       // Reintroduce by dropping this rm: "a stray set-aside copy goes with the file" in
       // chapterActions.int.test.ts finds the bak still there.
       await rm(`${t.abs}${REFETCH_BAK}`, { force: true }).catch(() => {});
+      await o.journal?.afterUnlink?.(item);
     } else if (!(await stat(dirname(t.abs)).catch(() => null))) {
       // ⚠️ The file is missing AND so is its folder: that is the volume not being there (an unmounted
       // share whose empty mount point passed the preflight), not a chapter somebody removed by hand.
@@ -373,13 +457,19 @@ export async function deleteChapterFiles(
       // throw away everything measured about it; the row is left as it is and the answer says why.
       // Reintroduce by dropping this branch: "a missing download folder is not a deleted chapter" in
       // chapterActions.int.test.ts finds pruned_at set.
-      skipped.push({ id: t.id, reason: 'unlink_failed' });
+      await recordSkip(t.id, 'unlink_failed', t.position, { root: DL_ROOT, file: t.rel });
       continue;
+    } else {
+      // The folder is mounted and the file is already absent. The intent still precedes the destructive database
+      // mark, so a crash during tombstoning has the same deterministic recovery path as a completed unlink.
+      await o.journal?.beforeUnlink(item);
     }
     // A file already gone -- its folder still there -- is still marked: the row was claiming bytes that
     // do not exist.
-    await tombstoneBooks([t.id]);
+    await tombstoneBooks([t.id], 'deleted');
+    bytes += item.bytes;
     applied++;
+    await o.journal?.settled({ ...item, outcome: 'applied' });
   }
   // The cover follows the lowest LIVE chapter, the way persistScan and mergeSeries pick it: every
   // thumbnail falls back to the cover chapter's first page, and a tombstone has none.
@@ -391,7 +481,11 @@ export async function deleteChapterFiles(
   }
   await logAudit('series.chapters_delete', {
     userId: o.userId,
-    detail: { id, title: row?.title ?? null, bookIds: ids, applied, bytes, ...(o.via ? { via: o.via, runId: o.runId } : {}) },
+    detail: {
+      id, title: row?.title ?? null, bookIds: ids, applied, bytes,
+      ...(o.via ? { via: o.via } : {}),
+      ...(o.runId ? { runId: o.runId } : {}),
+    },
     req: o.req,
   });
   return { applied, bytes, skipped };
@@ -433,6 +527,9 @@ const SERIES_KEYED_TABLES = [
   'series_alt_titles',
   // v0.51.0: its automatic banner's seed and state (lib/autoHero.ts). Cascades too; named for the same count.
   'series_hero',
+  // v0.55.8: the durable bulk-delete intent journal deliberately has no series FK. Hard Forget removes its
+  // per-series items explicitly while the terminal parent run remains as operation-level history.
+  'admin_bulk_delete_items',
 ] as const;
 
 export interface ForgetRefusal {
@@ -775,7 +872,13 @@ export interface FileOpRefusal { ok: false; reason: string; fix?: string }
  * P2). Reintroduce by rm'ing `row.folder` only: "delete files removes the folder of a row merged into the
  * series" in fileOps.int.test.ts finds the absorbed directory still there.
  */
-export async function deleteSeriesFiles(id: string): Promise<{ ok: true; files: number; bytes: number } | FileOpRefusal> {
+export async function deleteSeriesFiles(id: string): Promise<{
+  ok: true;
+  files: number;
+  bytes: number;
+  /** Exact rows this invocation deliberately made (or reclassified as) tombstones; for the audit, not the API. */
+  deletedBookIds: string[];
+} | FileOpRefusal> {
   const row = await one<{ folder: string; deleted_at: string | null }>(
     'SELECT folder, deleted_at FROM lib_series WHERE id = $1', [id],
   );
@@ -820,6 +923,7 @@ export async function deleteSeriesFiles(id: string): Promise<{ ok: true; files: 
   let bytes = 0;
   const removed: string[] = [];
   const reconciled: string[] = [];
+  const reclassified: string[] = [];
   for (const root of roots) {
     const rows = await q<{ id: string; file: string; pruned_at: string | null; pruned_reason: string | null }>(
       'SELECT id, file, pruned_at, pruned_reason FROM lib_books WHERE series_id = $1 AND root = $2', [id, root],
@@ -853,10 +957,13 @@ export async function deleteSeriesFiles(id: string): Promise<{ ok: true; files: 
     if (!(await rootProven(root, id, present, absent))) continue;
     reconciled.push(...absentLive);
     if (stale) {
-      await q(
-        `UPDATE lib_books SET pruned_reason = 'deleted' WHERE series_id = $1 AND root = $2 AND pruned_reason = 'missing'`,
+      const changed = await q<{ id: string }>(
+        `UPDATE lib_books SET pruned_reason = 'deleted'
+          WHERE series_id = $1 AND root = $2 AND pruned_reason = 'missing'
+          RETURNING id`,
         [id, root],
       );
+      reclassified.push(...changed.map((b) => b.id));
     }
   }
   await tombstoneBooks([...removed, ...reconciled], 'deleted');
@@ -869,7 +976,7 @@ export async function deleteSeriesFiles(id: string): Promise<{ ok: true; files: 
          SELECT id FROM lib_books WHERE series_id = $1 ORDER BY (pruned_at IS NOT NULL), number ASC, file ASC LIMIT 1
        ) WHERE id = $1`, [id]);
   }
-  return { ok: true, files, bytes };
+  return { ok: true, files, bytes, deletedBookIds: [...new Set([...removed, ...reconciled, ...reclassified])] };
 }
 
 /** How many live rows of OTHER series are stat'ed for the mount proof when none of this series' own is present. */

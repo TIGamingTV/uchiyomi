@@ -53,19 +53,19 @@ import { haveNumbers } from './libraryNumbers';
 import { archiveHoles, type ArchiveHoles } from './archiveBoundaries';
 import { DL_ROOT, persistScan, setBookDates, setBookMeta } from './library';
 import { restampBook } from './partial';
-import { chapterFileRel, downloadChapter, type DownloadInput } from './downloader';
+import { chapterFileRel, downloadChapter, DownloadPreflightError, type DownloadInput, type DownloadPreflight } from './downloader';
 import { getSource, withTimeout, type SourceChapter } from './sources';
 import { budgetFor } from './sources/budget';
 import { resetSolverSessions, solverPing } from './sources/flaresolverr';
 import { blockedNow, clearBlock, isDisabled } from './sourceHealth';
-import { copyToChapter, type ListingCopy } from './seriesListing';
+import { automaticChapterAllowedFor, automaticCopiesFor, copyToChapter, seriesFollowsSource, type ListingCopy } from './seriesListing';
 import { groupsOf, normGroup, type ReleasePrefs } from './releases';
 import { effectivePrefsFor, readSeriesPrefs } from './scanlatorPrefs';
 import { borrowNamesFor, NAMES_RETRY_MS } from './borrowNames';
 import { busyFolders } from './bulkNewest';
 import { beginRun, dismissRun, endRun, stopRequested, type RunCard } from './downloadJobs';
 import { say } from './said';
-import { updateSeries, CHAPTER_RETRY_CAP, LIST_TIMEOUT, type Landed } from './updater';
+import { updateSeries, CHAPTER_RETRY_CAP, LIST_TIMEOUT, seriesIsMonitored, type Landed } from './updater';
 import { huntCandidates, huntSource, followHunted, seriesIsAdult, sweepAllowedFor, HUNT_WALL_MS, HUNT_MAX_SOURCES } from './sourceHunt';
 import { SOLVER_BUDGET_MS } from './sources/budget';
 import { canDownload, finishRunRecord, isFullRun, kindOf, startRunRecord, targetOf, type RunOrigin, type RunStatus, type RunTarget } from './repairRuns';
@@ -79,6 +79,7 @@ import { visibleToAll } from './visibility';
 import { detectDirections } from './readingDirection';
 import { withOrigin } from './downloadActivity';
 import { standingsOf } from './sourceStanding';
+import { folderBusy } from './numbering';
 
 /**
  * Which of the eight steps to run. `only` on the options picks a subset; the nightly runs them all. `groups`
@@ -745,7 +746,8 @@ async function stepFailures(r: RepairResult, opts: RepairOpts, budget: { left: n
     if (!wide || await canAsk(row.source_id)) wanted.push(row.series_id);
   }
   const rows = await q<{ id: string; folder: string; title: string }>(
-    `SELECT s.id, s.folder, s.title FROM lib_series s WHERE s.id = ANY($1) AND ${visibleToAll('s')}`, [wanted],
+    // Not an unmonitored series (auto_update off): its rows are reset like any other, but nothing is fetched for it.
+    `SELECT s.id, s.folder, s.title FROM lib_series s WHERE s.id = ANY($1) AND s.auto_update AND ${visibleToAll('s')}`, [wanted],
   ).catch(() => []);
   const folders = new Map(rows.map((s) => [s.id, s.folder]));
   const titles = new Map(rows.map((s) => [s.id, s.title]));
@@ -756,7 +758,7 @@ async function stepFailures(r: RepairResult, opts: RepairOpts, budget: { left: n
     { const h = halted(); if (h) { stopped = h; break; } }
     const folder = folders.get(id);
     if (!folder) continue;
-    if (busyFolders.has(folder)) {
+    if (folderBusy(folder)) {
       skip(r, { step: 'failures', target: { seriesId: id, title: titles.get(id) }, why: 'folder_busy' });
       continue;
     }
@@ -765,7 +767,7 @@ async function stepFailures(r: RepairResult, opts: RepairOpts, budget: { left: n
     busyFolders.add(folder);
     try {
       // Never hunting for "Fix all": its search budget belongs to the gaps step, which runs after this one.
-      const up = await updateSeries(id, 10, { hunt: wide ? false : budget, cancelled });
+      const up = await updateSeries(id, 10, { hunt: wide ? false : budget, cancelled, unattended: true, folderHeld: true });
       added += up.added;
       failed += up.failed;
       if (up.added && up.folder && up.chapters?.length) pending.push({ folder: up.folder, chapters: up.chapters, landed: up.landed });
@@ -806,19 +808,19 @@ async function failuresDriven(r: RepairResult, pending: Dated[], log?: Log): Pro
   r.failures.reset = reset.length;
   const ids = [...new Set(reset.map((x) => x.series_id))];
   const rows = await q<{ id: string; folder: string; title: string }>(
-    `SELECT s.id, s.folder, s.title FROM lib_series s WHERE s.id = ANY($1) AND ${visibleToAll('s')} ORDER BY s.title`, [ids],
+    `SELECT s.id, s.folder, s.title FROM lib_series s WHERE s.id = ANY($1) AND s.auto_update AND ${visibleToAll('s')} ORDER BY s.title`, [ids],
   ).catch(() => []);
   planned('failures', rows.length);
   let series = 0, added = 0, failed = 0;
   let stopped: RepairResult['stopped'];
   for (const [i, s] of rows.entries()) {
     { const h = halted(); if (h) { stopped = h; break; } }
-    if (busyFolders.has(s.folder)) continue;
+    if (folderBusy(s.folder)) continue;
     here({ kind: 'series', seriesId: s.id, title: s.title, phase: 'rechecking', done: i, of: rows.length });
     series++;
     busyFolders.add(s.folder);
     try {
-      const up = await updateSeries(s.id, AUTOFIX_RECHECK_CHAPTERS, { hunt: false, cancelled, ...restingOpt() });
+      const up = await updateSeries(s.id, AUTOFIX_RECHECK_CHAPTERS, { hunt: false, cancelled, unattended: true, folderHeld: true, ...restingOpt() });
       added += up.added;
       failed += up.failed;
       if (up.added && up.folder && up.chapters?.length) pending.push({ folder: up.folder, chapters: up.chapters, landed: up.landed });
@@ -903,6 +905,8 @@ async function whyNotShort(bookId: string): Promise<string> {
  * silently re-opening chapters people had closed.
  */
 async function stepShort(r: RepairResult, opts: RepairOpts, budget: { left: number }, notes: Notes, log?: Log): Promise<RepairResult['stopped']> {
+  // An unmonitored series (auto_update off) is left out of the unattended pass; a Fix pressed on one of its chapters
+  // (`opts.bookId`) is a person asking, and still runs.
   // ⚠️ `b.file = <folder>/Chapter <n>.cbz` is chapterFileRel (lib/downloader.ts) written in SQL, which is
   // safe only because `b.number = floor(b.number)` is in the same WHERE: the cast to int is exact for a
   // whole number and nothing else. A file under any other name is somebody's own copy, not ours.
@@ -913,7 +917,7 @@ async function stepShort(r: RepairResult, opts: RepairOpts, budget: { left: numb
       WHERE b.pages BETWEEN 1 AND 2 AND b.number = floor(b.number)
         AND b.pruned_at IS NULL AND b.short_confirmed_at IS NULL AND b.missing_pages IS NULL
         AND b.root = $1 AND b.file = s.folder || '/Chapter ' || (b.number::int)::text || '.cbz'
-        ${opts.bookId ? 'AND b.id = $3' : ''}
+        ${opts.bookId ? 'AND b.id = $3' : 'AND s.auto_update'}
       ORDER BY b.mtime DESC LIMIT $2`,
     opts.bookId ? [DL_ROOT, REPAIR_SHORT_MAX, opts.bookId] : [DL_ROOT, opts.autofix ? UNCAPPED : REPAIR_SHORT_MAX],
   );
@@ -940,11 +944,13 @@ async function stepShort(r: RepairResult, opts: RepairOpts, budget: { left: numb
   let stopped: RepairResult['stopped'];
   series: for (const [seriesId, rows] of bySeries) {
     { const h = halted(); if (h) { stopped = h; break; } }
+    const unattended = !opts.bookId;
+    if (unattended && !(await seriesIsMonitored(seriesId))) continue;
     const folder = rows[0].folder;
     // Somebody else is already downloading into this folder (a series-page fetch, a Fetch newest run).
     // Two writers on one path is a lost file and a rate-limit strike each; this one simply waits a night.
     // Reintroduce the silent `continue`: "a Fix on a chapter whose folder is busy says so" finds no skip.
-    if (busyFolders.has(folder)) {
+    if (folderBusy(folder)) {
       skip(r, {
         step: 'short', why: 'folder_busy',
         target: { seriesId, title: rows[0].title, ...(opts.bookId ? { bookId: opts.bookId, number: Number(rows[0].number) } : {}) },
@@ -964,15 +970,25 @@ async function stepShort(r: RepairResult, opts: RepairOpts, budget: { left: numb
     );
     if (primary?.source_id) followed.add(primary.source_id);
 
+    // The source/permission reads above awaited. Recheck at the claim boundary so a user job that reserved the
+    // folder meanwhile wins; folderHeld below is permission to cross only our own mark.
+    if (folderBusy(folder)) {
+      skip(r, {
+        step: 'short', why: 'folder_busy',
+        target: { seriesId, title: rows[0].title, ...(opts.bookId ? { bookId: opts.bookId, number: Number(rows[0].number) } : {}) },
+      });
+      continue;
+    }
     busyFolders.add(folder);
     try {
       // The listing the copies come from is as old as the last sweep, and a source that has since fixed a
       // broken chapter would not be noticed. `maxNew: 0` downloads nothing: it is a listing refresh, the
       // same one the refetch route does, under the same kind of wall so a dead source costs ten seconds.
-      await withTimeout(updateSeries(seriesId, 0, restingOpt()), LISTING_REFRESH_MS).catch(() => {});
+      await withTimeout(updateSeries(seriesId, 0, { ...restingOpt(), unattended, folderHeld: true }), LISTING_REFRESH_MS).catch(() => {});
 
       for (const book of rows) {
         { const h = halted(); if (h) { stopped = h; break series; } }
+        if (unattended && !(await seriesIsMonitored(seriesId))) continue series;
         r.short.looked++;
         const at = (phase: RepairPhase, sourceId?: string) => here({
           kind: 'chapter', seriesId, bookId: book.id, title: book.title, number: Number(book.number), phase,
@@ -982,7 +998,7 @@ async function stepShort(r: RepairResult, opts: RepairOpts, budget: { left: numb
         const listing = await one<{ title: string | null; copies: ListingCopy[] }>(
           'SELECT title, copies FROM series_listing WHERE series_id = $1 AND number = $2::real', [seriesId, book.number],
         ).catch(() => null);
-        const ranked = (listing?.copies ?? [])
+        const ranked = (await automaticCopiesFor(seriesId, listing?.copies ?? []))
           .filter((c) => followed.has(c.source))
           // The copy this file came from first: it is the one that can be compared against what is on disk
           // without any numbering question at all, and it is the one most likely to have been fixed.
@@ -1009,16 +1025,23 @@ async function stepShort(r: RepairResult, opts: RepairOpts, budget: { left: numb
          */
         let asked = 0;
         /** A page count, or null when the source was not asked or did not answer -- which ends any proof. */
-        const ask = async (sourceId: string, chapterSourceId: string): Promise<number | null> => {
+        const ask = async (chapter: SourceChapter): Promise<number | null> => {
+          const sourceId = chapter.source ?? '';
           const src = getSource(sourceId);
           if (!src || !allowed(sourceId)) return null;
           if (await isDisabled(sourceId).catch(() => false)) return null;
           if (await blockedNow(sourceId).catch(() => null)) return null;
+          if (unattended && !(await seriesIsMonitored(seriesId))) return null;
+          if (!(await automaticChapterAllowedFor(seriesId, chapter))) return null;
+          // Everything above is a cheap filter. Re-read follow, blocklist, unattended state and health in one
+          // last check immediately beside the outbound page-list call; a preference/unfollow race must not
+          // become an "asked but silent" source either.
+          if (await repairCopyPreflight(seriesId, chapter, unattended)()) return null;
           asked++;
           try {
             // Nothing is reported to source_health from here. A page list asked on our own initiative must
             // never be what puts a source into a cooldown: the sweep's own failures are that signal.
-            const urls = await withTimeout(src.getPageUrls(chapterSourceId), budgetFor(src, SHORT_PAGES_MS));
+            const urls = await withTimeout(src.getPageUrls(chapter.sourceId), budgetFor(src, SHORT_PAGES_MS));
             // ⚠️ An EMPTY list is silence, not an answer of "zero pages". No site serves a zero-page
             // chapter, but every HTML engine returns [] rather than throwing when what it parsed was not
             // the reader page at all -- a Cloudflare interstitial, a moved domain's 404, a theme change
@@ -1036,7 +1059,7 @@ async function stepShort(r: RepairResult, opts: RepairOpts, budget: { left: numb
         for (const c of copies) {
           const chapter = copyToChapter(c, { number: book.number, title: listing?.title ?? null });
           at('asking', c.source);
-          const n = await ask(c.source, c.sourceId);
+          const n = await ask(chapter);
           if (n === null) { silent = true; continue; }
           answered++;
           if (n > best) { best = n; bestChapter = chapter; }
@@ -1050,24 +1073,29 @@ async function stepShort(r: RepairResult, opts: RepairOpts, budget: { left: numb
         // "searched too recently").
         const couldSearch = budget.left > 0;
         if (!bestChapter) {
+          if (unattended && !(await seriesIsMonitored(seriesId))) continue series;
           at('searching');
           const h = await huntSource(seriesId, book.number, {
             allowed, budget, reason: 'short_chapter', force: !!opts.bookId,
+            ...(unattended ? { admit: () => seriesIsMonitored(seriesId) } : {}),
           });
           huntWhy = h.why;
           if (h.followed) notes.followed.push(`${book.title} -> ${h.followed.source}`);
           if (h.chapter?.source) {
             at('asking', h.chapter.source);
-            const n = await ask(h.chapter.source, h.chapter.sourceId);
+            const n = await ask(h.chapter);
             if (n === null) silent = true;
             else { answered++; if (n > best) { best = n; bestChapter = h.chapter; } }
           }
         }
+        if (unattended && !(await seriesIsMonitored(seriesId))) continue series;
         const result = (why: ShortWhy) => noteShort(book.id, { why, asked, answered, best, hunt: huntWhy });
 
         if (bestChapter) {
+          if (unattended && !(await seriesIsMonitored(seriesId))) continue series;
           at('downloading', bestChapter.source);
-          const done = await replaceShort(book, bestChapter, abs, opts, notes, log);
+          const done = await replaceShort(book, bestChapter, abs, opts, notes, log, unattended);
+          if (done === 'paused') continue series;
           await result(done === true ? 'replaced' : 'download_failed');
           if (done === 'disk') { stopped = 'disk'; break series; }
           if (done) { r.short.replaced++; continue; }
@@ -1112,18 +1140,26 @@ async function stepShort(r: RepairResult, opts: RepairOpts, budget: { left: numb
  * is taken only when it still beats what is on disk and the source did not refuse us.
  */
 async function replaceShort(
-  book: ShortBook, chapter: SourceChapter, abs: string, opts: RepairOpts, notes: Notes, log?: Log,
-): Promise<boolean | 'disk'> {
+  book: ShortBook, chapter: SourceChapter, abs: string, opts: RepairOpts, notes: Notes, log: Log | undefined,
+  unattended: boolean,
+): Promise<boolean | 'disk' | 'paused'> {
   const via = chapter.source!;
   const meta: DownloadInput['meta'] = {
     series: book.title, summary: book.summary ?? undefined, author: book.author ?? undefined,
     genres: book.genres ?? undefined, url: book.web ?? undefined, status: book.status ?? undefined,
   };
+  const preflight = repairCopyPreflight(book.series_id, chapter, unattended);
   let missing: number[] = [];
   try {
-    const landed = await downloadChapter({ sourceId: via, seriesFolder: book.folder, chapter, meta }, { replace: true });
+    if (unattended && !(await seriesIsMonitored(book.series_id))) return 'paused';
+    if (!(await automaticChapterAllowedFor(book.series_id, chapter))) return false;
+    const landed = await downloadChapter(
+      { sourceId: via, seriesFolder: book.folder, chapter, meta },
+      { replace: true, preflight },
+    );
     if (!landed) return false;
   } catch (e: any) {
+    if (e instanceof DownloadPreflightError) return e.reason === 'paused' ? 'paused' : false;
     if (e?.diskFull) return 'disk';
     const hold = e?.partial;
     // A refusal (403/429) is the site saying no, and a chapter saved from a refusal would be a shorter
@@ -1135,7 +1171,17 @@ async function replaceShort(
       hold?.drop?.();
       return false;
     }
-    await hold.write();
+    if (!(await automaticChapterAllowedFor(book.series_id, chapter))) { hold.drop?.(); return false; }
+    try {
+      // A shortfall may itself put the source into cooldown. That must stop the next request, but it must
+      // not discard the already-downloaded, useful partial; re-check every write-time authority except the
+      // health consequence of this same request.
+      await hold.write(repairCopyPreflight(book.series_id, chapter, unattended, true));
+    } catch (writeError) {
+      hold.drop?.();
+      if (writeError instanceof DownloadPreflightError) return writeError.reason === 'paused' ? 'paused' : false;
+      throw writeError;
+    }
     missing = hold.missing;
   }
   // restampBook is the only writer of `pages` on the REPLACE path: the count that decided to download
@@ -1242,7 +1288,8 @@ async function stepGroups(r: RepairResult, opts: RepairOpts, notes: Notes, log?:
   for (const b of rows0) {
     if (candidates.length >= REPAIR_GROUPS_MAX) break;
     if (b.file !== chapterFileRel(b.folder, Number(b.number))) continue;
-    if (betterCopy(b, b.copies, await prefsFor(b), null)) candidates.push(b);
+    const open = await automaticCopiesFor(b.series_id, b.copies ?? []);
+    if (betterCopy(b, open, await prefsFor(b), null)) candidates.push(b);
   }
   if (!candidates.length) return undefined;
 
@@ -1255,8 +1302,9 @@ async function stepGroups(r: RepairResult, opts: RepairOpts, notes: Notes, log?:
   let stopped: RepairResult['stopped'];
   series: for (const [seriesId, rows] of bySeries) {
     { const h = halted(); if (h) { stopped = h; break; } }
+    if (!(await seriesIsMonitored(seriesId))) continue;
     const folder = rows[0].folder;
-    if (busyFolders.has(folder)) continue;
+    if (folderBusy(folder)) continue;
     const allowed = await sweepAllowedFor(await seriesIsAdult(seriesId).catch(() => false));
     const primary = await one<{ source_id: string | null }>('SELECT source_id FROM lib_series WHERE id = $1', [seriesId]).catch(() => null);
     const followed = new Set<string>(
@@ -1264,24 +1312,31 @@ async function stepGroups(r: RepairResult, opts: RepairOpts, notes: Notes, log?:
     );
     if (primary?.source_id) followed.add(primary.source_id);
 
+    if (folderBusy(folder)) continue;
     busyFolders.add(folder);
     try {
       // The listing is as old as the last sweep: refreshed first, so the copy judged is one the sources list
       // now. A series whose refresh did not come back is left for tomorrow -- a stale listing is how a copy
       // a site has since taken down would be "the preferred group's version".
-      const refreshed = await withTimeout(updateSeries(seriesId, 0), LISTING_REFRESH_MS).catch(() => null);
-      if (!refreshed || refreshed.outcome !== 'ok') { r.groups.left += rows.length; continue; }
+      const refreshed = await withTimeout(updateSeries(seriesId, 0, { unattended: true, folderHeld: true }), LISTING_REFRESH_MS).catch(() => null);
+      if (!refreshed || refreshed.outcome !== 'ok') {
+        if (refreshed?.outcome !== 'paused') r.groups.left += rows.length;
+        continue;
+      }
       for (const book of rows) {
         { const h = halted(); if (h) { stopped = h; break series; } }
+        if (!(await seriesIsMonitored(seriesId))) continue series;
         r.groups.looked++;
         await q('UPDATE lib_books SET upgrade_tried_at = now() WHERE id = $1', [book.id]).catch(() => {});
         const listing = await one<{ title: string | null; copies: ListingCopy[] }>(
           'SELECT title, copies FROM series_listing WHERE series_id = $1 AND number = $2::real', [seriesId, book.number],
         ).catch(() => null);
-        const copy = listing && betterCopy(book, listing.copies, await prefsFor(book), followed);
+        prefsOf.delete(seriesId);
+        const open = listing ? await automaticCopiesFor(seriesId, listing.copies) : [];
+        const copy = listing && betterCopy(book, open, await prefsFor(book), followed);
         if (!copy || !allowed(copy.source)) { r.groups.left++; continue; }
         const chapter = copyToChapter(copy, { number: book.number, title: listing!.title });
-        const count = await pageCount(copy.source, copy.sourceId, allowed);
+        const count = await pageCount(chapter, allowed, seriesId);
         // ⚠️ Decided BEFORE the download: never a shorter copy, and silence is not a yes.
         // Reintroduce by dropping the page test: "a shorter copy never replaces a longer one" in
         // groupUpgrade.int.test.ts finds the notice written over the chapter.
@@ -1291,6 +1346,7 @@ async function stepGroups(r: RepairResult, opts: RepairOpts, notes: Notes, log?:
           continue;
         }
         const done = await replaceWithGroup(book, chapter, copy, opts, notes, log);
+        if (done === 'paused') continue series;
         if (done === 'disk') { stopped = 'disk'; break series; }
         if (done) r.groups.replaced++;
         else r.groups.left++;
@@ -1307,13 +1363,24 @@ async function stepGroups(r: RepairResult, opts: RepairOpts, notes: Notes, log?:
  * the group step. Never reported to source_health: a page list asked on our own initiative must not be what
  * puts a source into a cooldown. An EMPTY list is silence, not zero pages (see stepShort).
  */
-async function pageCount(sourceId: string, chapterSourceId: string, allowed: (s: string) => boolean): Promise<number | null> {
+async function pageCount(
+  chapter: SourceChapter, allowed: (s: string) => boolean, seriesId?: string,
+): Promise<number | null> {
+  const sourceId = chapter.source ?? '';
   const src = getSource(sourceId);
   if (!src || !allowed(sourceId)) return null;
   if (await isDisabled(sourceId).catch(() => false)) return null;
   if (await blockedNow(sourceId).catch(() => null)) return null;
+  if (seriesId && !(await seriesIsMonitored(seriesId))) return null;
+  if (seriesId && !(await automaticChapterAllowedFor(seriesId, chapter))) return null;
   try {
-    const urls = await withTimeout(src.getPageUrls(chapterSourceId), budgetFor(src, SHORT_PAGES_MS));
+    if (seriesId) {
+      // The checks above are early filters. This one sits beside getPageUrls so an unfollow, block or
+      // auto-update toggle during the earlier awaits wins before the source sees the request.
+      const reason = await repairCopyPreflight(seriesId, chapter, true)();
+      if (reason) return null;
+    }
+    const urls = await withTimeout(src.getPageUrls(chapter.sourceId), budgetFor(src, SHORT_PAGES_MS));
     return urls.length || null;
   } catch {
     return null;
@@ -1323,22 +1390,29 @@ async function pageCount(sourceId: string, chapterSourceId: string, allowed: (s:
 /** Write the preferred group's copy over the file, whole or not at all, and stamp and audit it. */
 async function replaceWithGroup(
   book: GroupBook, chapter: SourceChapter, copy: ListingCopy, opts: RepairOpts, notes: Notes, log?: Log,
-): Promise<boolean | 'disk'> {
+): Promise<boolean | 'disk' | 'paused'> {
   const via = copy.source;
   const meta: DownloadInput['meta'] = {
     series: book.title, summary: book.summary ?? undefined, author: book.author ?? undefined,
     genres: book.genres ?? undefined, url: book.web ?? undefined, status: book.status ?? undefined,
   };
+  const preflight = repairCopyPreflight(book.series_id, chapter, true);
   try {
+    if (!(await seriesIsMonitored(book.series_id))) return 'paused';
+    if (!(await automaticChapterAllowedFor(book.series_id, chapter))) return false;
     // writeAtomic underneath: the file on disk is untouched until the new one is entirely there. A copy
     // that arrives short is offered as a hold (e.partial) and REFUSED here -- a partial is a downgrade.
-    const landed = await downloadChapter({ sourceId: via, seriesFolder: book.folder, chapter, meta }, { replace: true });
+    const landed = await downloadChapter(
+      { sourceId: via, seriesFolder: book.folder, chapter, meta },
+      { replace: true, preflight },
+    );
     if (!landed) return false;
   } catch (e: any) {
     // Refused, so its entry in the downloads ends now, as not kept: left open it waited out downloadActivity's
     // HOLD_MS as a download still running (the v0.49.0 fix in downloadWithFallback, missed here). Reintroduce by
     // dropping it: "a short copy the upgrade refuses" in groupUpgrade.int.test.ts finds it active.
     e?.partial?.drop?.();
+    if (e instanceof DownloadPreflightError) return e.reason === 'paused' ? 'paused' : false;
     if (e?.diskFull) return 'disk';
     return false;
   }
@@ -1366,6 +1440,26 @@ async function replaceWithGroup(
   return true;
 }
 
+/** Current unattended authority for one repair copy, evaluated inside the downloader's source gate. */
+function repairCopyPreflight(
+  seriesId: string,
+  chapter: SourceChapter,
+  requireMonitored: boolean,
+  writing = false,
+): DownloadPreflight {
+  return async () => {
+    if (requireMonitored && !(await seriesIsMonitored(seriesId))) return 'paused';
+    const sourceId = chapter.source ?? '';
+    if (!sourceId || !getSource(sourceId) || !(await seriesFollowsSource(seriesId, sourceId))) return 'source';
+    const allowed = await sweepAllowedFor(await seriesIsAdult(seriesId).catch(() => false));
+    if (!allowed(sourceId)) return 'source';
+    if (!(await automaticChapterAllowedFor(seriesId, chapter))) return 'policy';
+    if (await isDisabled(sourceId).catch(() => true)) return 'disabled';
+    if (!writing && await blockedNow(sourceId).then(Boolean, () => true)) return 'cooldown';
+    return null;
+  };
+}
+
 /**
  * (g) Chapter names from another source (lib/borrowNames.ts, #85): for up to REPAIR_NAMES_MAX series with a
  * chapter that has no name, one whose own source names nothing, find a source whose numbering matches and take
@@ -1376,6 +1470,7 @@ async function stepNames(r: RepairResult, log?: Log): Promise<RepairResult['stop
   const rows = await q<{ id: string; title: string }>(
     `SELECT s.id, s.title FROM lib_series s
       WHERE ${visibleToAll('s')}
+        AND s.auto_update
         AND COALESCE(s.borrow_names, (SELECT borrow_names FROM server_settings WHERE id = 1)) IS TRUE
         AND EXISTS (SELECT 1 FROM lib_books b WHERE b.series_id = s.id AND b.pruned_at IS NULL AND b.chapter_name IS NULL)
         AND COALESCE((s.name_donor->>'none')::bigint, 0) <= $1
@@ -1392,6 +1487,7 @@ async function stepNames(r: RepairResult, log?: Log): Promise<RepairResult['stop
   }
   for (const s of rows) {
     { const h = halted(); if (h) return h; }
+    if (!(await seriesIsMonitored(s.id))) continue;
     const res = await borrowNamesFor(s.id).catch(() => null);
     r.names.series++;
     r.names.named += res?.named ?? 0;
@@ -1542,7 +1638,7 @@ async function stepGaps(r: RepairResult, opts: RepairOpts, budget: { left: numbe
   let stopped: RepairResult['stopped'];
   for (const [i, s] of take.entries()) {
     { const h = halted(); if (h) { stopped = h; break; } }
-    if (busyFolders.has(s.folder)) {
+    if (folderBusy(s.folder)) {
       skip(r, { step: 'gaps', target: { seriesId: s.id, title: s.title }, why: 'folder_busy' });
       continue;
     }
@@ -1585,8 +1681,8 @@ async function stepGaps(r: RepairResult, opts: RepairOpts, budget: { left: numbe
       log?.info(`repair: no searches left this run -- "${s.title}" and any series behind it keep their place in the queue`);
       break;
     }
+    if (!opts.seriesId && !(await seriesIsMonitored(s.id))) continue;
     r.gaps.series++;
-    await q('UPDATE lib_series SET gaps_checked_at = now() WHERE id = $1', [s.id]).catch(() => {});
 
     // Until a candidate is found, every unlisted gap number is one nobody has. The follow narrows it.
     let unfillable = [...unlisted];
@@ -1597,25 +1693,34 @@ async function stepGaps(r: RepairResult, opts: RepairOpts, budget: { left: numbe
     };
 
     if (unlisted.size) {
+      if (!opts.seriesId && !(await seriesIsMonitored(s.id))) continue;
       at('searching');
       const adultRule = await sweepAllowedFor(await seriesIsAdult(s.id).catch(() => false));
       const allowed = (id: string) => adultRule(id) && !resting(id);
       const found = await huntCandidates(s.id, {
         allowed, budget, reason: 'gap', force: !!opts.seriesId,
+        ...(!opts.seriesId ? { admit: () => seriesIsMonitored(s.id) } : {}),
         // The candidate must be able to fill a hole nobody else lists. `assess` over the RAW list it
         // already fetched: this asks what the source HAS, and the release preferences decide later which
         // copy of it the sweep takes.
         wants: (j) => assess(s.have, (j.chapters ?? []).map((c) => c.number)).fillable.some((n) => unlisted.has(n)),
       });
+      // A hunt can span several sources. If Unmonitor landed while it was in flight, keep neither its
+      // result nor a freshness stamp that would postpone the next run after monitoring is restored.
+      if (!opts.seriesId && !(await seriesIsMonitored(s.id))) continue;
       // huntCandidates never answers no_copy -- that verdict belongs to huntSource, which reaches it only
       // AFTER following a source that turned out to lack the number. Narrowed here so the stored why says
       // what was actually asked.
       out.why = found.why === 'no_copy' ? 'no_candidate' : found.why;
       if (found.chosen) {
+        if (!opts.seriesId && !(await seriesIsMonitored(s.id))) continue;
         at('following');
         const fillable = assess(s.have, (found.chosen.chapters ?? []).map((c) => c.number)).fillable.filter((n) => unlisted.has(n));
         try {
-          const f = await followHunted(s.id, found.title, found.chosen, 'gap', { numbers: fillable });
+          const f = await followHunted(
+            s.id, found.title, found.chosen, 'gap', { numbers: fillable },
+            !opts.seriesId ? () => seriesIsMonitored(s.id) : undefined,
+          );
           out.followed = f.source;
           out.coverage = found.chosen.coverage;
           unfillable = [...unlisted].filter((n) => !fillable.includes(n));
@@ -1654,7 +1759,7 @@ async function stepGaps(r: RepairResult, opts: RepairOpts, budget: { left: numbe
     // do something about (an alternative title, a manual add), and a count of series would hide whether
     // that is one stubborn hole or a series nothing else carries at all.
     r.gaps.unfillable += unfillable.length;
-    await q('UPDATE lib_series SET gaps_result = $2::jsonb WHERE id = $1', [s.id, JSON.stringify(out)]).catch(() => {});
+    await q('UPDATE lib_series SET gaps_checked_at = now(), gaps_result = $2::jsonb WHERE id = $1', [s.id, JSON.stringify(out)]).catch(() => {});
     if (stopped) break;
     if (opts.autofix && REPAIR_PACE_MS) await sleep(REPAIR_PACE_MS);
   }
@@ -1667,6 +1772,10 @@ async function stepGaps(r: RepairResult, opts: RepairOpts, budget: { left: numbe
   async function fetchGaps(
     s: { id: string; title: string; folder: string }, gapSet: Set<number>, out: GapsResult | null, log?: Log,
   ): Promise<{ fetched: number; numbers: Set<number>; pending: Dated | null; disk: boolean }> {
+    if (folderBusy(s.folder)) {
+      skip(r, { step: 'gaps', target: { seriesId: s.id, title: s.title }, why: 'folder_busy' });
+      return { fetched: 0, numbers: new Set(), pending: null, disk: false };
+    }
     busyFolders.add(s.folder);
     try {
       // Fill now fetches below an active slow archive's boundary too (#117): the person asked for these
@@ -1675,7 +1784,8 @@ async function stepGaps(r: RepairResult, opts: RepairOpts, budget: { left: numbe
       // boundary: what lies below it is the archive's. Reintroduce by dropping the option: "Fill now fetches
       // below an active archive's boundary" in repair.int.test.ts fetches nothing.
       const up = await updateSeries(s.id, opts.autofix ? AUTOFIX_GAP_CHAPTERS : REPAIR_GAP_CHAPTERS, {
-        hunt: false, cancelled, ignoreArchiveBoundary: !!opts.seriesId, ...restingOpt(),
+        // Fill now (`opts.seriesId`) is a person asking for this series; the nightly and Fix everything are not.
+        hunt: false, cancelled, ignoreArchiveBoundary: !!opts.seriesId, unattended: !opts.seriesId, folderHeld: true, ...restingOpt(),
       });
       const fetched = up.landed.filter((l) => gapSet.has(Math.floor(l.number)));
       // ⚠️ Two different numbers, and both are reported. The fetch is the ordinary sweep of the

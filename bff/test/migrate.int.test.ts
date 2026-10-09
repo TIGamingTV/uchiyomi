@@ -786,3 +786,176 @@ test('migrate: v0.55.2 reads every chapter already in a library by rule 1, and v
     }
   });
 });
+
+test('migrate: v0.55.7 marks no match as checked that was stored before it, and v0.55.6 keeps writing its rows', { skip }, async () => {
+  // #168: checked_at NULL is what the background recheck takes up (lib/matchCheck.ts), so every link and art row that is
+  // there when the column arrives must read NULL -- a DEFAULT is written into every existing row by ADD COLUMN, and each
+  // would read as checked, never to be looked at. v0.55.6 boots on this schema and INSERTs without naming it: its rows
+  // are unchecked too. Reintroduce `DEFAULT now()` on either column: the declared default reads now(), and "a v0.55.6
+  // row reads as checked" fails.
+  // The same block's #150 piece (the integration folded both lanes' into one): lib_series.info_read, the file a scan last
+  // read a series' ComicInfo from, nullable with no default -- NULL is "read it at the next scan", which is what a series
+  // v0.55.6 adds after a rollback must be. Reintroduce a default: "a v0.55.6 series reads as read" fails.
+  const cols = await q<{ table_name: string; column_name: string; data_type: string; column_default: string | null; is_nullable: string }>(
+    `SELECT table_name, column_name, data_type, column_default, is_nullable FROM information_schema.columns
+      WHERE table_schema = 'public' AND table_name IN ('series_trackers', 'series_art', 'server_settings', 'lib_series')
+        AND column_name IN ('checked_at', 'match_check_last_run', 'match_check_last_result', 'info_read')
+      ORDER BY table_name, column_name`);
+  assert.deepEqual(cols.map((c) => [c.table_name, c.column_name, c.data_type, c.column_default, c.is_nullable]), [
+    ['lib_series', 'info_read', 'text', null, 'YES'],
+    ['series_art', 'checked_at', 'timestamp with time zone', null, 'YES'],
+    ['series_trackers', 'checked_at', 'timestamp with time zone', null, 'YES'],
+    ['server_settings', 'match_check_last_result', 'jsonb', null, 'YES'],
+    ['server_settings', 'match_check_last_run', 'timestamp with time zone', null, 'YES'],
+  ], 'a v0.55.7 column is missing, required, or has a default');
+  await withClient(async (c) => {
+    await c.query('BEGIN');
+    try {
+      await c.query(`INSERT INTO lib_series (id, source, title, folder) VALUES ('t-match', 'test', 'T', 'T!match-m/T')`);
+      // Exactly the INSERTs v0.55.6 makes: the backdrop's art row (routes/images.ts) and its link (lib/trackers.ts).
+      await c.query(`INSERT INTO series_art (series_id, banner, cover) VALUES ('t-match', NULL, 'https://example.org/c.jpg')`);
+      await c.query(`INSERT INTO series_trackers (series_id, provider, external_id, title, linked_by) VALUES ('t-match', 'anilist', '1', 'T', NULL)`);
+      const { rows } = await c.query(`SELECT (SELECT checked_at FROM series_art WHERE series_id = 't-match') AS art,
+                                             (SELECT checked_at FROM series_trackers WHERE series_id = 't-match') AS link,
+                                             (SELECT info_read FROM lib_series WHERE id = 't-match') AS info`);
+      assert.deepEqual([rows[0].art, rows[0].link], [null, null], 'a v0.55.6 row reads as checked');
+      assert.equal(rows[0].info, null, 'a v0.55.6 series reads as read');
+    } finally {
+      await c.query('ROLLBACK');
+    }
+  });
+});
+
+test('migrate: v0.55.8 enables automatic AniList enrichment for existing and rollback-created libraries', { skip }, async () => {
+  const cols = await q<{ data_type: string; column_default: string | null; is_nullable: string }>(
+    `SELECT data_type, column_default, is_nullable FROM information_schema.columns
+      WHERE table_schema = 'public' AND table_name = 'libraries' AND column_name = 'anilist_lookup'`);
+  assert.deepEqual(cols.map((c) => [c.data_type, c.column_default, c.is_nullable]),
+    [['boolean', 'true', 'NO']], 'the per-library AniList policy is not an additive compatible boolean');
+  await withClient(async (c) => {
+    await c.query('BEGIN');
+    try {
+      // The INSERT an older binary makes after rollback omits the new column and must keep historical behaviour.
+      await c.query(`INSERT INTO libraries (id, name, path) VALUES ('t-anilist-default','Old writer','T AniList Default')`);
+      const { rows } = await c.query(`SELECT anilist_lookup FROM libraries WHERE id = 't-anilist-default'`);
+      assert.equal(rows[0]?.anilist_lookup, true);
+    } finally {
+      await c.query('ROLLBACK');
+    }
+  });
+});
+
+test('migrate: v0.55.8 preserves the natural state underneath a blocked listing', { skip }, async () => {
+  const id = 't-listing-natural';
+  await q('DELETE FROM lib_series WHERE id = $1', [id]).catch(() => {});
+  try {
+    await q(`INSERT INTO lib_series (id, source, title, folder) VALUES ($1,'test',$1,'T!listing-natural')`, [id]);
+    // Model the schema immediately before v0.55.8: the additive column is nullable and has no useful values yet.
+    await q(`ALTER TABLE series_listing DROP CONSTRAINT IF EXISTS series_listing_unblocked_status_check`);
+    await q(`ALTER TABLE series_listing ALTER COLUMN unblocked_status DROP NOT NULL`);
+    await q(`ALTER TABLE series_listing ALTER COLUMN unblocked_status DROP DEFAULT`);
+    for (const [number, status] of [[1, 'blocked'], [2, 'available'], [3, 'held'], [4, 'covered']] as const) {
+      await q(`INSERT INTO series_listing
+                 (series_id, number, source_id, chosen, status, copies, unblocked_status)
+               VALUES ($1,$2,'test',$3::jsonb,$4,'[]'::jsonb,NULL)`,
+        [id, number, JSON.stringify({ sourceId: `c-${number}`, source: 'test', number }), status]);
+    }
+
+    await migrate();
+    const rows = await q<{ number: number; unblocked_status: string }>(
+      `SELECT number, unblocked_status FROM series_listing WHERE series_id = $1 ORDER BY number`, [id]);
+    assert.deepEqual(rows.map((r) => [Number(r.number), r.unblocked_status]),
+      [[1, 'held'], [2, 'available'], [3, 'held'], [4, 'covered']],
+      'legacy blocked rows must fail closed, while visible rows already state their natural status');
+    const col = (await q<{ column_default: string | null; is_nullable: string }>(
+      `SELECT column_default, is_nullable FROM information_schema.columns
+        WHERE table_schema = 'public' AND table_name = 'series_listing' AND column_name = 'unblocked_status'`))[0];
+    assert.deepEqual([col?.column_default, col?.is_nullable], ["'available'::text", 'NO']);
+    const check = (await q<{ def: string }>(
+      `SELECT pg_get_constraintdef(oid) AS def FROM pg_constraint
+        WHERE conrelid = 'series_listing'::regclass AND conname = 'series_listing_unblocked_status_check'`))[0]?.def;
+    assert.match(check ?? '', /available.*held.*covered/, 'the natural state accepts anything outside its three values');
+
+    // A rollback writer omits the new column. It must get the compatible available state, never fail its insert.
+    await q(`INSERT INTO series_listing (series_id, number, source_id, chosen, status, copies)
+             VALUES ($1,5,'test',$2::jsonb,'available','[]'::jsonb)`,
+      [id, JSON.stringify({ sourceId: 'c-5', source: 'test', number: 5 })]);
+    assert.equal((await q<{ unblocked_status: string }>(
+      'SELECT unblocked_status FROM series_listing WHERE series_id = $1 AND number = 5', [id]))[0]?.unblocked_status, 'available');
+    await assert.rejects(
+      q(`INSERT INTO series_listing (series_id, number, source_id, chosen, status, copies, unblocked_status)
+         VALUES ($1,6,'test',$2::jsonb,'blocked','[]'::jsonb,'blocked')`,
+      [id, JSON.stringify({ sourceId: 'c-6', source: 'test', number: 6 })]),
+      /series_listing_unblocked_status_check/,
+    );
+  } finally {
+    await q('DELETE FROM lib_series WHERE id = $1', [id]).catch(() => {});
+    // If an assertion above interrupted the schema exercise, leave the shared test database usable.
+    await migrate().catch(() => {});
+  }
+});
+
+test('migrate: v0.55.8 distinguishes Rescan-missing legacy tombstones from proven deliberate deletion', { skip }, async () => {
+  const ids = [
+    't-prov-none', 't-prov-owned', 't-prov-chapter', 't-prov-chapter-stale', 't-prov-partial', 't-prov-series',
+    't-prov-series-mismatch', 't-prov-series-stale', 't-prov-series-exact', 't-prov-rollback',
+  ];
+  const dl = process.env.DL_ROOT || '/library-dl';
+  await q('DELETE FROM audit_log WHERE detail->>\'id\' = ANY($1)', [ids]).catch(() => {});
+  await q('DELETE FROM lib_books WHERE series_id = ANY($1)', [ids]).catch(() => {});
+  await q('DELETE FROM lib_series WHERE id = ANY($1)', [ids]).catch(() => {});
+  try {
+    for (const id of ids) {
+      await q(`INSERT INTO lib_series (id, source, title, folder) VALUES ($1,'test',$1,$2)`, [id, `T!prov/${id}`]);
+      await q(`INSERT INTO lib_books (id, series_id, source, file, root, pruned_at, pruned_reason)
+               VALUES ($1,$2,'test',$3,$4,now(),'deleted')`, [`b-${id}`, id, `T!prov/${id}/1.cbz`, id === 't-prov-owned' ? dl : '/library']);
+    }
+    await q(`INSERT INTO audit_log (event, detail) VALUES
+      ('series.chapters_delete', $1::jsonb),
+      ('series.chapters_delete', $2::jsonb),
+      ('series.delete_files', $3::jsonb),
+      ('series.delete_files', $4::jsonb),
+      ('series.delete_files', $5::jsonb)`, [
+      JSON.stringify({ id: 't-prov-chapter', bookIds: ['b-t-prov-chapter'], applied: 1 }),
+      JSON.stringify({ id: 't-prov-partial', bookIds: ['b-t-prov-partial', 'skipped-book'], applied: 1 }),
+      JSON.stringify({ id: 't-prov-series', files: 1, bytes: 12 }),
+      JSON.stringify({ id: 't-prov-series-mismatch', files: 2, bytes: 12 }),
+      JSON.stringify({ id: 't-prov-series-exact', files: 0, bytes: 0, bookIds: ['b-t-prov-series-exact'], applied: 1 }),
+    ]);
+    await q(`INSERT INTO audit_log (at, event, detail)
+             VALUES
+               (now() - interval '10 minutes', 'series.delete_files', $1::jsonb),
+               (now() - interval '10 minutes', 'series.chapters_delete', $2::jsonb)`, [
+      JSON.stringify({ id: 't-prov-series-stale', files: 1, bytes: 12 }),
+      JSON.stringify({ id: 't-prov-chapter-stale', bookIds: ['b-t-prov-chapter-stale'], applied: 1 }),
+    ]);
+
+    await migrate();
+    const reason = async (id: string) => (await q<{ pruned_reason: string }>(
+      'SELECT pruned_reason FROM lib_books WHERE id = $1', [`b-${id}`]))[0]?.pruned_reason;
+    assert.equal(await reason('t-prov-none'), 'rescan_missing', 'an unowned ambiguous row stayed deliberately deleted');
+    assert.equal(await reason('t-prov-owned'), 'deleted', 'an owned download tombstone was reclassified');
+    assert.equal(await reason('t-prov-chapter'), 'deleted', 'an exact successful chapter-delete audit was ignored');
+    assert.equal(await reason('t-prov-chapter-stale'), 'rescan_missing',
+      'an old exact chapter-delete audit was allowed to bless a later ambiguous tombstone for the same stable id');
+    assert.equal(await reason('t-prov-partial'), 'rescan_missing', 'a request audit was mistaken for proof its skipped book was deleted');
+    assert.equal(await reason('t-prov-series'), 'deleted',
+      'a contemporaneous legacy whole-series audit with the exact removed-file count was ignored');
+    assert.equal(await reason('t-prov-series-mismatch'), 'rescan_missing',
+      'a whole-series audit whose file count does not prove every contemporaneous tombstone was trusted');
+    assert.equal(await reason('t-prov-series-stale'), 'rescan_missing',
+      'an old whole-series audit was allowed to bless a later ambiguous tombstone');
+    assert.equal(await reason('t-prov-series-exact'), 'deleted',
+      'the exact affected-book proof written by the current Delete files route was ignored');
+
+    // A rollback can create another legacy value after the first v0.55.8 boot. The next boot must repair it too,
+    // rather than treating this as a once-only data migration whose stamp survived the rollback.
+    await q(`UPDATE lib_books SET pruned_reason = 'deleted' WHERE id = 'b-t-prov-rollback'`);
+    await migrate();
+    assert.equal(await reason('t-prov-rollback'), 'rescan_missing');
+  } finally {
+    await q('DELETE FROM audit_log WHERE detail->>\'id\' = ANY($1)', [ids]).catch(() => {});
+    await q('DELETE FROM lib_books WHERE series_id = ANY($1)', [ids]).catch(() => {});
+    await q('DELETE FROM lib_series WHERE id = ANY($1)', [ids]).catch(() => {});
+  }
+});

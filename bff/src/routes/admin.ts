@@ -13,24 +13,25 @@ import { cacheBytes } from '../lib/imageCache';
 import { runtime } from '../lib/runtime';
 import { persistScan, libraryIdFor, libraryRows, LIBRARY_ROOT, DL_ROOT, setBookDates, setBookMeta } from '../lib/library';
 import { applyMoves, heldElsewhere, lockLibrarySaves, previewMoves, setFolders, storedFolders, underSql, LIBRARY_MAX_FOLDERS } from '../lib/libraryFolders';
-import { containedPath, allWritable } from '../lib/fsGuard';
-import { deleteSeries, restoreSeries, mergeSeries, mergeRefusal, getSeriesRow, deleteSeriesFiles, renameSeriesFolder, forgetSeries, diskSpelling, deleteChapterFiles } from '../lib/libraryAdmin';
+import { containedPath, allWritable, realContainedPath } from '../lib/fsGuard';
+import { deleteSeries, restoreSeries, mergeSeries, mergeRefusal, MergeConflictError, getSeriesRow, deleteSeriesFiles, renameSeriesFolder, forgetSeries, diskSpelling, deleteChapterFiles } from '../lib/libraryAdmin';
 import { editionFollowing, linkEdition, linkPair, unlinkEdition, workRows } from '../lib/editions';
 import { toStoredRel, trimTrailingSlashes } from '../lib/relPath';
 import { runFingerprintBackfill, fingerprintRemaining, fpState } from '../lib/fingerprintJob';
 import { runPageHashBackfill, pageHashRemaining, phState } from '../lib/pageHashJob';
 import { runBackup } from '../lib/backup';
-import { runUpdateAll, updateSeries, runSweep } from '../lib/updater';
+import { runUpdateAll, updateSeries, runSweep, runsInside } from '../lib/updater';
 import { ARCHIVE_SETTINGS_COLS, ARCHIVE_SETTINGS_SHAPE, archiveWindowPair, applyArchiveSettings, archiveFreeGb } from '../lib/archive';
 import { runChapterCleanup, cleanupSettings, dueCountCached, tombstoneBooks } from '../lib/chapterCleanup';
 import { runVerify, verifyState } from '../lib/verifyFiles';
+import { matchCheckState, runMatchCheck } from '../lib/matchCheck';
 import { startRescan, rescanState } from '../lib/rescan';
 import { runRepair, repairState, repairLiveSnapshot, REPAIR_HOURS, REPAIR_LIMITS, REPAIR_STEPS, REPAIR_SHORT_MAX, REPAIR_GAPS_MAX, type RepairSkip, type RepairStep } from '../lib/repair';
 import { listRunRecords, runDigest, type RunTarget } from '../lib/repairRuns';
 import { worstCase } from '../lib/repairEstimate';
 import { authenticate, requireAdmin, userIdOf, roleOf, revokeAllSessions, revokeRefreshTokenById, passwordError } from '../lib/auth';
 import { logAudit, recentAudit } from '../lib/audit';
-import { recordAltTitles } from '../lib/altTitles';
+import { namesOf, recordAltTitles } from '../lib/altTitles';
 import { healthAllWithEvidence, setDisabled, clearBlock, pruneOrphanedHealth, isDisabled, blockedNow } from '../lib/sourceHealth';
 import { smokeTest } from '../lib/sourceProbe';
 import { startSourceCheck, checkRunning, checkProgress } from '../lib/sourceWatchdog';
@@ -48,9 +49,9 @@ import { lastSuwayomiLoad, rememberMissing } from '../lib/sources/suwayomi/regis
 import { engineStatusReport, connectEngineSolver } from '../lib/extensionEngine';
 import { env } from '../env';
 import { readFile, writeFile, mkdir, rm, rename, stat } from 'fs/promises';
-import { dirname, resolve } from 'path';
+import { dirname, resolve, sep } from 'path';
 import sharp from 'sharp';
-import { ART_BODY_LIMIT, ART_DIR, artFile, artOverview } from '../lib/seriesArt';
+import { ART_BODY_LIMIT, ART_DIR, FIRST_PAGE, artFile, artOverview } from '../lib/seriesArt';
 import { writePreflight } from '../lib/fsGuard';
 // Admin stats report on the whole library by definition; this route is already behind requireAdmin.
 import { NO_LIBRARIES, SYSTEM_CTX, visibleToAll, sanitiseAdultList, sanitiseSourceIds, invalidateAdultFilter, browsableIds, nameableIds, viewCtxFor, hideAdult } from '../lib/visibility';
@@ -59,7 +60,10 @@ import { borrowNamesFor, clearBorrowedNames } from '../lib/borrowNames';
 import { sanitiseNoticeTypes } from '../lib/noticeChapters';
 import { seriesHidesNotices, hiddenCount, refreshNoticesActive } from '../lib/noticeSettings';
 import { SERIES_TYPES, isKnownSeriesType, learnTypeFromAniList } from '../lib/seriesType';
-import { addSeriesFromSource, findBestMatch, resolveCandidate, norm, jobBusy, startDownloadJob, clearLatestCache, FILL_MAX_CHAPTERS, REFRESH_BUDGET_MS } from './sources';
+import {
+  addSeriesFromSource, findBestMatch, resolveCandidate, norm, jobBusy, claimDownloadJob, releaseDownloadJobClaim,
+  startDownloadJob, clearLatestCache, FILL_MAX_CHAPTERS, REFRESH_BUDGET_MS,
+} from './sources';
 import { confirmsTitle } from '../lib/confirmTitle';
 import { chapterFileRel } from '../lib/downloader';
 import { REFETCH_BAK } from '../lib/fsAtomic';
@@ -70,7 +74,8 @@ import { say, saidOf } from '../lib/said';
 import { prefsSchema, readGlobalPrefs, readSeriesPrefs, effectivePrefsFor } from '../lib/scanlatorPrefs';
 import { groupsOf, normGroup } from '../lib/releases';
 import { groupStats, emptyGroupStat, type StatCopy } from '../lib/groupStats';
-import { copyToChapter, type ListingCopy } from '../lib/seriesListing';
+import { copyToChapter, reapplyBlocklistInTransaction, type ListingCopy } from '../lib/seriesListing';
+import { claimWriterFolders } from '../lib/bulkNewest';
 import { seriesSourcesFor } from '../lib/seriesSources';
 import { switchMainSource } from '../lib/mainSource';
 import { refileFailures } from '../lib/chapterFailures';
@@ -87,7 +92,8 @@ import { readHealthSummary, scheduleHealthSummaryRefresh, storeHealthSummary } f
 import { titlesFromMangadexList, entriesFromMangadexList } from '../lib/mangadexList';
 import { MANGADEX_LANGS, canonLang, mdLang, setUnstatedLang } from '../lib/lang';
 import { cleanMangadexLangs, mangadexLangs, setMangadexLangs, syncMangadexSources } from '../lib/sources/mangadexLangs';
-import { fetchAniListArt, fetchAniListCandidates, fetchAnimeBanner } from '../lib/anilist';
+import { fetchAniListArt, fetchAniListCandidates, fetchAnimeBanner, type AniListArt } from '../lib/anilist';
+import { namesMatch } from '../lib/onlineMatch';
 import { READING_DIRECTIONS } from '../lib/komgaDto';
 import { learnDirection, directionFromAniListMatch } from '../lib/readingDirection';
 import { fetchKitsuBanner } from '../lib/kitsu';
@@ -95,6 +101,9 @@ import { randomBytes } from 'crypto';
 import { appVersion } from '../lib/appVersion';
 import { PING_URL, buildPayload, installFacts, monthlyId, newSecret, sendForget } from '../lib/installPing';
 import { withOrigin } from '../lib/downloadActivity';
+import {
+  readBulkChapterDeleteRun, requestBulkChapterDeleteCancel, startBulkChapterDelete,
+} from '../lib/bulkChapterDelete';
 
 type ImportJob = { running: boolean; total: number; done: number; added: number; already: number; notFound: number; failed: number; startedAt: number; details: Array<{ title: string; status: string; source?: string }> };
 let importJob: ImportJob | null = null;
@@ -389,6 +398,74 @@ async function closeBatchIfSettled(batchId: string): Promise<ImportBatchRow | nu
 }
 
 /**
+ * The series the art backfill hunts for: every visible one with no banner, neither found nor an admin's -- and not one
+ * an admin set to Use the first page (v0.55.7, lib/seriesArt.ts FIRST_PAGE), for which nothing is looked up. Reintroduce
+ * by dropping that condition: "the first page, chosen, keeps online art away" in onlineMatch.int.test.ts finds it here.
+ */
+export const artBackfillTargets = () => q<{ id: string; title: string }>(
+  `SELECT s.id, s.title FROM lib_series s
+     LEFT JOIN series_art a ON a.series_id = s.id
+     LEFT JOIN series_overrides o ON o.series_id = s.id
+    WHERE ${visibleToAll('s')} AND (a.banner IS NULL OR a.banner = '') AND o.banner IS NULL AND o.cover IS DISTINCT FROM $1
+    ORDER BY s.title`, [FIRST_PAGE]);
+
+/**
+ * The art backfill's hunt for one series (Admin → Art → Backfill missing banners): a banner, widest net first-hit-wins
+ * -- AniList manga (its banner, or its anime adaptation's, same query) → a harsher-cleaned retry → a direct AniList ANIME
+ * search → Kitsu's wide cover -- and a cover from MangaDex when AniList had none. What it found is stored under what
+ * the series has (an empty field is filled, never one an admin set: the route asks only for series without a banner
+ * override), and an AniList entry found is linked. Answers what it stored: 'banner', 'cover', or null for nothing.
+ *
+ * Every answer is kept only when it is named as the series is (v0.55.7, #168, lib/onlineMatch.ts namesMatch): each
+ * search answers with its best guess, and the harsher title -- cut at the first dash or colon -- asks for exactly the
+ * parent a spin-off is named after, so its answer must still be called what the series is called. MangaDex's FIRST
+ * hit was taken as it came. Reintroduce by keeping the first hit: "the backfill stores only what is named as the
+ * series" in onlineMatch.int.test.ts finds the other work's cover.
+ */
+export async function huntArt(t: { id: string; title: string }): Promise<'banner' | 'cover' | null> {
+  const names = await namesOf({ id: t.id });
+  if (!names.length) names.push(t.title);
+  const none: AniListArt = { banner: null, cover: null };
+  let art: AniListArt = await fetchAniListArt(t.title, names).catch(() => none);
+  const harsh = t.title.replace(/\([^)]*\)/g, '').replace(/\s*[-–—:].*$/, '').trim();
+  if (!art.banner && harsh && harsh !== t.title) {
+    const retry = await fetchAniListArt(harsh, names).catch(() => none);
+    // The entry linked below is whichever answer was this series (both were held to its names): the retry's art used to
+    // replace the first answer whole, and the link and the direction went with it.
+    art = { ...(art.mediaId ? art : retry), banner: retry.banner ?? art.banner, cover: art.cover ?? retry.cover };
+  }
+  if (!art.banner) art.banner = await fetchAnimeBanner(t.title, names).catch(() => null);
+  if (!art.banner) art.banner = await fetchKitsuBanner(t.title, names);
+  if (!art.banner && harsh && harsh !== t.title) art.banner = await fetchKitsuBanner(harsh, names);
+  if (!art.cover) {
+    try {
+      // The first hit NAMED as the series is, never simply the first hit: a search's first result for a title it does
+      // not carry is another work (lib/titleMatch.ts).
+      const mdSrc = getSource('mangadex');
+      const res = mdSrc ? await mdSrc.search(t.title) : [];
+      art.cover = (res ?? []).find((r) => r.coverUrl && namesMatch(names, [r.title]))?.coverUrl || null;
+    } catch { /* mangadex miss is fine */ }
+  }
+  if (!art.banner && !art.cover) return null;
+  // checked_at (lib/matchCheck.ts): a row this writes whole is checked; one it only fills keeps the mark of what it
+  // already held.
+  await q(
+    `INSERT INTO series_art (series_id, banner, cover, checked_at) VALUES ($1, $2, $3, now())
+     ON CONFLICT (series_id) DO UPDATE SET
+       banner = COALESCE(EXCLUDED.banner, series_art.banner),
+       cover  = COALESCE(EXCLUDED.cover,  series_art.cover), fetched_at = now(),
+       checked_at = CASE WHEN EXCLUDED.banner IS NOT NULL AND EXCLUDED.cover IS NOT NULL THEN now() ELSE series_art.checked_at END`,
+    [t.id, art.banner, art.cover],
+  );
+  if (art.mediaId) {
+    await linkSeries(t.id, art.mediaId, art.mediaTitle ?? null);
+    await learnDirection({ id: t.id }, directionFromAniListMatch(names, art), 'anilist').catch(() => {});
+    await learnTypeFromAniList({ id: t.id }, names, art);
+  }
+  return art.banner ? 'banner' : 'cover';
+}
+
+/**
  * Drop import batches nobody will come back to. Called daily from server.ts. Finished and discarded batches
  * go after `SWEEP_DONE_DAYS`: the series they added are their own lib_series rows, and each batch carries up
  * to 500 candidate rows. Batches still `resolving`/`review`/`importing` get `SWEEP_OPEN_DAYS` -- long enough
@@ -482,6 +559,10 @@ export default async function adminRoutes(app: FastifyInstance) {
   // v0.55.4: Rescan everything's preview and plan, the same way (routes/rescan.ts).
   await app.register(rescanRoutes);
 
+  /** Synchronous two-sided hand-off between updateSeries and destructive route writers. */
+  const claimSeriesWriter = (seriesIds: readonly string[], folders: readonly string[]) =>
+    claimWriterFolders(folders, jobBusy, () => seriesIds.some((id) => runsInside(id) > 0));
+
   // Owned-library scan (Phase 1): walk the CBZ folder and upsert lib_series/lib_books. Stamps lastScan like
   // POST /api/refresh does (the Tasks row's "last run", and that route's one-a-minute rule), and asks the
   // header summary to catch up with what the scan found (v0.49.0).
@@ -493,7 +574,15 @@ export default async function adminRoutes(app: FastifyInstance) {
   });
 
   // Owned downloader/updater (Phase 2): pull new chapters from the source for one series or the whole library.
-  app.post('/api/admin/update/:id', async (req) => withOrigin('check', userIdOf(req), () => updateSeries((req.params as { id: string }).id, Number((req.body as any)?.maxNew) || 10)));
+  app.post('/api/admin/update/:id', async (req, reply) => {
+    const { id } = req.params as { id: string };
+    const row = await getSeriesRow(id);
+    if (!row) return reply.code(404).send({ error: 'not_found' });
+    if (jobBusy(row.folder)) return reply.code(409).send({ error: 'busy', message: 'Another task is changing that series.' });
+    const result = await withOrigin('check', userIdOf(req), () => updateSeries(id, Number((req.body as any)?.maxNew) || 10));
+    if (result.outcome === 'busy') return reply.code(409).send({ error: 'busy', message: 'Another task is changing that series.' });
+    return result;
+  });
   // Through runSweep, as the schedule and Run now are (#117): `runtime.updating` is the flag every other job --
   // the repair, the slow archive -- stands aside for, and a bare runUpdateAll here ran without it. 409 while a
   // sweep or a repair runs; the sweep's result, as before, when it ends.
@@ -526,7 +615,7 @@ export default async function adminRoutes(app: FastifyInstance) {
   const SETTINGS_COLS = 'server_name, allow_registration, updater_hours, extension_hours, extension_auto_update, '
     + 'update_check, install_ping, install_ping_last, scanlator_prefs, cleanup_read, cleanup_read_days, backup_hour, auto_follow_on_failure, '
     + 'repair_enabled, komga_ghost_chapters, adult_genres, adult_sources, source_prefs, group_upgrade, borrow_names, '
-    + 'mangadex_langs, unstated_lang, hide_notice_types, '
+    + 'mangadex_langs, unstated_lang, hide_notice_types, deleted_as_ghosts, '
     + ARCHIVE_SETTINGS_COLS;
   // `extensions_configured` is not a column: extension_hours has a NOT NULL default, so its presence says
   // nothing about whether there is an engine to check. The settings page needs to know, or it offers two
@@ -636,6 +725,11 @@ export default async function adminRoutes(app: FastifyInstance) {
       // nothing the web app shows: it widens one API's chapter list so the trackers behind it can count.
       komgaGhostChapters: z.boolean().optional(),
       /**
+       * Deleted chapters shown as ghosts (lib/deletedGhosts.ts): a chapter whose file was deleted on purpose is drawn as
+       * a ghost row on the series page and listed "not downloaded" to Mihon. Display only; off by default.
+       */
+      deletedAsGhosts: z.boolean().optional(),
+      /**
        * What the 18+ switch hides besides 18+ libraries: genres to treat as adult, and sources to treat
        * as adult whatever their extension says. Both are surfacing preferences -- nothing here changes
        * who may open a series, and an individual title can be exempted from the genre rule on its own
@@ -709,7 +803,32 @@ export default async function adminRoutes(app: FastifyInstance) {
     if (b.updateCheck !== undefined) await q('UPDATE server_settings SET update_check = $1, updated_at = now() WHERE id = 1', [b.updateCheck]);
     if (b.autoFollowOnFailure !== undefined) await q('UPDATE server_settings SET auto_follow_on_failure = $1, updated_at = now() WHERE id = 1', [b.autoFollowOnFailure]);
     if (b.installPing !== undefined) await setInstallPing(b.installPing);
-    if (b.scanlatorPrefs !== undefined) await q('UPDATE server_settings SET scanlator_prefs = $1::jsonb, updated_at = now() WHERE id = 1', [JSON.stringify(b.scanlatorPrefs)]);
+    const nextGlobalSources = b.sourcePrefs === undefined
+      ? undefined
+      : { priority: cleanSourceOrder(b.sourcePrefs.priority) };
+    if (b.scanlatorPrefs !== undefined || nextGlobalSources !== undefined) {
+      try {
+        await tx(async (qq) => {
+          // Global saves take the settings row first, then every affected series in stable id order inside
+          // reapplyBlocklistInTransaction. A listing refresh takes each series row then its advisory lock, so the
+          // two paths cannot publish a choice calculated from the preferences the save just replaced.
+          await qq('SELECT id FROM server_settings WHERE id = 1 FOR UPDATE');
+          if (b.scanlatorPrefs !== undefined) {
+            await qq('UPDATE server_settings SET scanlator_prefs = $1::jsonb, updated_at = now() WHERE id = 1',
+              [JSON.stringify(b.scanlatorPrefs)]);
+          }
+          if (nextGlobalSources !== undefined) {
+            await qq('UPDATE server_settings SET source_prefs = $1::jsonb, updated_at = now() WHERE id = 1',
+              [JSON.stringify(nextGlobalSources)]);
+          }
+          await reapplyBlocklistInTransaction(qq);
+        });
+      } catch (e) {
+        console.warn(`[prefs] applying the global blocklist failed: ${(e as Error)?.message || e}`);
+        return reply.code(503).send({ error: 'blocklist_apply_failed' });
+      }
+      if (nextGlobalSources !== undefined) invalidateSourcePrefs();
+    }
     if (b.cleanupRead !== undefined) await q('UPDATE server_settings SET cleanup_read = $1, updated_at = now() WHERE id = 1', [b.cleanupRead]);
     if (b.cleanupReadDays !== undefined) await q('UPDATE server_settings SET cleanup_read_days = $1, updated_at = now() WHERE id = 1', [b.cleanupReadDays]);
     if (b.repairEnabled !== undefined) await q('UPDATE server_settings SET repair_enabled = $1, updated_at = now() WHERE id = 1', [b.repairEnabled]);
@@ -718,6 +837,7 @@ export default async function adminRoutes(app: FastifyInstance) {
     // timer used to re-read the hour only when it fired (server.ts, the backup block says why).
     if (b.backupHour !== undefined) { await q('UPDATE server_settings SET backup_hour = $1, updated_at = now() WHERE id = 1', [b.backupHour]); runtime.rearmBackup?.(); }
     if (b.komgaGhostChapters !== undefined) await q('UPDATE server_settings SET komga_ghost_chapters = $1, updated_at = now() WHERE id = 1', [b.komgaGhostChapters]);
+    if (b.deletedAsGhosts !== undefined) await q('UPDATE server_settings SET deleted_as_ghosts = $1, updated_at = now() WHERE id = 1', [b.deletedAsGhosts]);
     // Sanitised here as well as in visibility.ts: what is stored should be what is enforced, so a
     // name that could never match is rejected at the door rather than sitting in the settings page
     // looking as though it does something.
@@ -737,11 +857,6 @@ export default async function adminRoutes(app: FastifyInstance) {
       await q('UPDATE server_settings SET borrow_names = $1, updated_at = now() WHERE id = 1', [b.borrowNames]);
       // "Stop doing that" means the names it wrote go too; a series switched on for itself keeps its own.
       if (!b.borrowNames) await clearBorrowedNames('following-server').catch(() => 0);
-    }
-    if (b.sourcePrefs !== undefined) {
-      await q('UPDATE server_settings SET source_prefs = $1::jsonb, updated_at = now() WHERE id = 1',
-        [JSON.stringify({ priority: cleanSourceOrder(b.sourcePrefs.priority) })]);
-      invalidateSourcePrefs();
     }
     if (b.mangadexLangs !== undefined) {
       const before = mangadexLangs();
@@ -793,13 +908,14 @@ export default async function adminRoutes(app: FastifyInstance) {
     scheduleVars: vars,
   });
   app.get('/api/admin/tasks', async (req) => {
-    const s = await one<{ updater_hours: number; backup_hour: number; backup_last_run: string | null; backup_last_result: any; extension_hours: number; extension_auto_update: boolean; extension_last_run: string | null; extension_last_result: any; cleanup_read: boolean; cleanup_read_days: number; cleanup_read_last_run: string | null; cleanup_read_last_result: any; verify_last_run: string | null; verify_last_result: any; repair_enabled: boolean; repair_last_run: string | null; repair_last_result: any; rescan_last_run: string | null; rescan_last_result: any }>(
+    const s = await one<{ updater_hours: number; backup_hour: number; backup_last_run: string | null; backup_last_result: any; extension_hours: number; extension_auto_update: boolean; extension_last_run: string | null; extension_last_result: any; cleanup_read: boolean; cleanup_read_days: number; cleanup_read_last_run: string | null; cleanup_read_last_result: any; verify_last_run: string | null; verify_last_result: any; repair_enabled: boolean; repair_last_run: string | null; repair_last_result: any; rescan_last_run: string | null; rescan_last_result: any; match_check_last_run: string | null; match_check_last_result: any }>(
       `SELECT updater_hours, backup_hour, backup_last_run, backup_last_result,
               extension_hours, extension_auto_update, extension_last_run, extension_last_result,
               cleanup_read, cleanup_read_days, cleanup_read_last_run, cleanup_read_last_result,
               verify_last_run, verify_last_result,
               repair_enabled, repair_last_run, repair_last_result,
-              rescan_last_run, rescan_last_result
+              rescan_last_run, rescan_last_result,
+              match_check_last_run, match_check_last_result
          FROM server_settings WHERE id = 1`,
     );
     // the backup's last run is persisted, so prefer the DB value over the in-memory one (which resets on restart)
@@ -830,7 +946,9 @@ export default async function adminRoutes(app: FastifyInstance) {
         name: 'Fingerprint library files',
         ...sched('in the background, rechecked every 6h'),
         lastRun: fpState.finishedAt,
-        lastResult: fpState.finishedAt ? { done: fpState.done, failed: fpState.failed, ms: fpState.ms } : null,
+        // `young` (v0.55.7): files a pass the server started left for a later one, still being written -- said on the
+        // line (web lib/tasks.ts), or the waiting count beside it reads as a job that stalled.
+        lastResult: fpState.finishedAt ? { done: fpState.done, failed: fpState.failed, young: fpState.young, ms: fpState.ms } : null,
         running: fpState.running,
         remaining: await fingerprintRemaining().catch(() => null),
       },
@@ -844,6 +962,18 @@ export default async function adminRoutes(app: FastifyInstance) {
           : null,
         running: phState.running,
         remaining: await pageHashRemaining().catch(() => null),
+      },
+      // v0.55.7 (#168): the online matches stored by title before they were checked -- AniList links, covers and banners
+      // -- held to the title check (lib/matchCheck.ts): in the background after a boot, then every 6h for whatever is
+      // still unchecked; Run now checks every automatic one again. Its line is the last run that checked something,
+      // persisted like Verify's.
+      {
+        id: 'matches',
+        name: 'Check online matches',
+        ...sched('in the background, rechecked every 6h'),
+        lastRun: matchCheckState.finishedAt || (s?.match_check_last_run ? new Date(s.match_check_last_run).getTime() : null),
+        lastResult: matchCheckState.finishedAt ? matchCheckState.lastResult : (s?.match_check_last_result ?? null),
+        running: matchCheckState.running,
       },
       // On demand only, and never at boot (the header of lib/verifyFiles.ts says why): the repair for a
       // database restored without its chapter files. Listed always, because the moment it is needed is the
@@ -1091,6 +1221,15 @@ export default async function adminRoutes(app: FastifyInstance) {
       );
       return { ok: true, started: true };
     }
+    if (id === 'matches') {
+      // Every automatic match again, not only the unchecked ones the background pass takes (lib/matchCheck.ts): a
+      // Run now that found nothing to do would read as a button that does nothing (#34). Never awaited: it asks
+      // AniList and MangaDex, paced. The Tasks line shows what it did.
+      const run = runMatchCheck(app.log, { all: true });
+      if (!run) return { ok: false, error: 'busy' };
+      run.catch((e) => app.log.warn(`matches: the check failed: ${(e as Error)?.message || e}`));
+      return { ok: true, started: true };
+    }
     if (id === 'rescan') {
       // Never awaited, for Verify's reason (lib/rescan.ts): a scan and one stat per chapter over a share is minutes, and
       // a request that long dies at the proxy while the walk goes on. The Tasks panel polls
@@ -1333,17 +1472,35 @@ export default async function adminRoutes(app: FastifyInstance) {
       await q('UPDATE lib_series SET auto_update = $2 WHERE id = $1', [id, b.data.autoUpdate]);
       detail.autoUpdate = b.data.autoUpdate;
     }
-    if (b.data.scanlatorPrefs !== undefined) {
-      await q('UPDATE lib_series SET scanlator_prefs = $2::jsonb WHERE id = $1',
-        [id, b.data.scanlatorPrefs === null ? null : JSON.stringify(b.data.scanlatorPrefs)]);
-      detail.scanlatorPrefs = b.data.scanlatorPrefs;
-    }
-    if (b.data.sourcePrefs !== undefined) {
-      // An empty order is stored as NULL, not as an empty list: both mean "the server's order applies", and one
-      // spelling of that is what the series page reads back to show "Server default".
-      const order = b.data.sourcePrefs === null ? [] : cleanSourceOrder(b.data.sourcePrefs.priority);
-      await q('UPDATE lib_series SET source_prefs = $2::jsonb WHERE id = $1', [id, order.length ? JSON.stringify({ priority: order }) : null]);
-      detail.sourcePrefs = order.length ? { priority: order } : null;
+    const nextSeriesSources = b.data.sourcePrefs === undefined
+      ? undefined
+      : b.data.sourcePrefs === null ? null : cleanSourceOrder(b.data.sourcePrefs.priority);
+    if (b.data.scanlatorPrefs !== undefined || nextSeriesSources !== undefined) {
+      try {
+        await tx(async (qq) => {
+          // The UPDATE takes the series row first; the helper then takes its transaction advisory lock and re-reads
+          // the effective settings before replacing every denormalised chosen field. Preference and listing commit
+          // together, or neither does.
+          if (b.data.scanlatorPrefs !== undefined) {
+            await qq('UPDATE lib_series SET scanlator_prefs = $2::jsonb WHERE id = $1',
+              [id, b.data.scanlatorPrefs === null ? null : JSON.stringify(b.data.scanlatorPrefs)]);
+          }
+          if (nextSeriesSources !== undefined) {
+            // An empty order is stored as NULL: both mean "the server's order applies", and one spelling is
+            // what the series page reads back as "Server default".
+            await qq('UPDATE lib_series SET source_prefs = $2::jsonb WHERE id = $1',
+              [id, nextSeriesSources?.length ? JSON.stringify({ priority: nextSeriesSources }) : null]);
+          }
+          await reapplyBlocklistInTransaction(qq, [id]);
+        });
+      } catch (e) {
+        console.warn(`[prefs] applying the blocklist to ${id} failed: ${(e as Error)?.message || e}`);
+        return reply.code(503).send({ error: 'blocklist_apply_failed' });
+      }
+      if (b.data.scanlatorPrefs !== undefined) detail.scanlatorPrefs = b.data.scanlatorPrefs;
+      if (nextSeriesSources !== undefined) {
+        detail.sourcePrefs = nextSeriesSources?.length ? { priority: nextSeriesSources } : null;
+      }
     }
     if (b.data.borrowNames !== undefined) {
       await q('UPDATE lib_series SET borrow_names = $2 WHERE id = $1', [id, b.data.borrowNames]);
@@ -1658,6 +1815,7 @@ export default async function adminRoutes(app: FastifyInstance) {
     if (seriesChecks.get(id)?.running) return reply.code(409).send({ error: 'busy', message: 'Already checking that series.' });
     const row = await getSeriesRow(id);
     if (!row) return reply.code(404).send({ error: 'not_found' });
+    if (jobBusy(row.folder)) return reply.code(409).send({ error: 'busy', message: 'Another task is changing that series.' });
     seriesChecks.set(id, { running: true, startedAt: Date.now() });
     // A followed source's chapters arrive through this check, so its downloads are the check's (#82 follow-up).
     void withOrigin('check', userIdOf(req), () => updateSeries(id, Number((req.body as any)?.maxNew) || 10))
@@ -1698,9 +1856,13 @@ export default async function adminRoutes(app: FastifyInstance) {
     if (!row) return reply.code(404).send({ error: 'not_found' });
     if (row.deleted_at) return reply.code(400).send({ error: 'already_deleted', message: 'That series is already hidden.' });
     if (row.merged_into) return reply.code(400).send({ error: 'merged', message: 'That series was merged into another one.' });
-    const r = await deleteSeries(id);
-    await logAudit('series.delete', { userId: userIdOf(req), detail: { id, title: row.title, books: r.books }, req });
-    return r;
+    const claim = claimSeriesWriter([id], [row.folder]);
+    if (!claim) return reply.code(409).send({ error: 'busy', message: 'Another task is changing that series.' });
+    try {
+      const r = await deleteSeries(id);
+      await logAudit('series.delete', { userId: userIdOf(req), detail: { id, title: row.title, books: r.books }, req });
+      return r;
+    } finally { claim.release(); }
   });
 
   // The library page's "Remove from library" over a selection: the single DELETE above, once per id, and
@@ -1716,18 +1878,103 @@ export default async function adminRoutes(app: FastifyInstance) {
     const b = z.object({ ids: z.array(z.string().min(1).max(64)).min(1).max(500) }).safeParse(req.body);
     if (!b.success) return reply.code(400).send({ error: 'bad_request', message: 'Which series should be removed?' });
     let hidden = 0;
-    const skipped: Array<{ id: string; reason: 'merged' | 'already_hidden' | 'not_found' }> = [];
+    const skipped: Array<{ id: string; reason: 'merged' | 'already_hidden' | 'not_found' | 'busy' }> = [];
     // One id listed twice is one series: the second pass would read `already_hidden` and mislabel it.
     for (const id of new Set(b.data.ids)) {
       const row = await getSeriesRow(id);
       if (!row) { skipped.push({ id, reason: 'not_found' }); continue; }
       if (row.deleted_at) { skipped.push({ id, reason: 'already_hidden' }); continue; }
       if (row.merged_into) { skipped.push({ id, reason: 'merged' }); continue; }
-      const r = await deleteSeries(id);
-      hidden++;
-      await logAudit('series.delete', { userId: userIdOf(req), detail: { id, title: row.title, books: r.books }, req });
+      const claim = claimSeriesWriter([id], [row.folder]);
+      if (!claim) { skipped.push({ id, reason: 'busy' }); continue; }
+      try {
+        const r = await deleteSeries(id);
+        hidden++;
+        await logAudit('series.delete', { userId: userIdOf(req), detail: { id, title: row.title, books: r.books }, req });
+      } finally { claim.release(); }
     }
     return { ok: true, hidden, skipped };
+  });
+
+  /**
+   * Monitor / Unmonitor over a selection: `lib_series.auto_update`, the series' "Auto-update new chapters" (PATCH
+   * /api/admin/series/:id `autoUpdate`), for many at once. Unmonitored, a series gets no new chapter searched for or
+   * downloaded by anything unattended -- the sweep, the nightly repair, Fix everything, the slow archive
+   * (UpdateOpts.unattended in lib/updater.ts) -- while Check now, Fetch and Fill now on the series still work. Nothing
+   * else changes: its chapters, its sources and its listing stay. A series that is gone, hidden or merged away is
+   * skipped with why; one already in the asked state is counted as applied. One `series.settings` audit row per series,
+   * as the single route writes it.
+   */
+  app.post('/api/admin/series/bulk/auto-update', async (req, reply) => {
+    const b = z.object({
+      seriesIds: z.array(z.string().min(1).max(64)).min(1).max(500),
+      autoUpdate: z.boolean(),
+    }).safeParse(req.body);
+    if (!b.success) return reply.code(400).send({ error: 'bad_request', message: 'Which series, and monitored or not?' });
+    const ids = [...new Set(b.data.seriesIds)];
+    const rows = await q<{ id: string; title: string; deleted_at: string | null; merged_into: string | null }>(
+      'SELECT id, title, deleted_at, merged_into FROM lib_series WHERE id = ANY($1)', [ids]);
+    const byId = new Map(rows.map((r) => [r.id, r]));
+    const skipped: Array<{ id: string; reason: 'not_found' | 'hidden' | 'merged' }> = [];
+    const todo: Array<{ id: string; title: string }> = [];
+    for (const id of ids) {
+      const r = byId.get(id);
+      if (!r) skipped.push({ id, reason: 'not_found' });
+      else if (r.merged_into) skipped.push({ id, reason: 'merged' });
+      else if (r.deleted_at) skipped.push({ id, reason: 'hidden' });
+      else todo.push({ id, title: r.title });
+    }
+    if (todo.length) {
+      await q('UPDATE lib_series SET auto_update = $2 WHERE id = ANY($1)', [todo.map((t) => t.id), b.data.autoUpdate]);
+      for (const t of todo) {
+        await logAudit('series.settings', { userId: userIdOf(req), detail: { id: t.id, title: t.title, autoUpdate: b.data.autoUpdate, via: 'bulk' }, req });
+      }
+    }
+    return { ok: true, applied: todo.length, autoUpdate: b.data.autoUpdate, skipped };
+  });
+
+  /**
+   * Delete the downloaded chapters of every series in a selection: the series page's Remove chapters
+   * (lib/libraryAdmin.ts deleteChapterFiles), once per series, over all of its chapters but one. Its rules, whoever asks:
+   * only files in the download folder (a library you built by hand is never touched), a bookmarked chapter is skipped,
+   * the rows stay as tombstones so reading history survives and Fetch again brings a chapter back.
+   *
+   * ⚠️ NOT Delete files (POST /api/admin/series/:id/delete-files), which takes the whole folder from every root, the read
+   * library's included, and stays behind its per-title typed confirm -- a bulk of THAT is what PR #53 was refused for.
+   *
+   * The cover chapter stays (the series' `cover_book_id`, else its lowest live chapter): every thumbnail and a tile with
+   * no art of its own fall back to its first page, and a tombstone has none. A series a download, a repair or a check is
+   * inside right now is skipped as `busy`: a file deleted under a writer comes back, or half does. `pause` (default true)
+   * also unmonitors each series it acted on, so the sweep does not fetch the newest chapters straight back.
+   */
+  app.post('/api/admin/series/bulk/chapters/delete', async (req, reply) => {
+    const b = z.object({
+      seriesIds: z.array(z.string().min(1).max(64)).min(1).max(500),
+      pause: z.boolean().optional(),
+    }).safeParse(req.body);
+    if (!b.success) return reply.code(400).send({ error: 'bad_request', message: 'Which series?' });
+    const ids = [...new Set(b.data.seriesIds)];
+    const run = await startBulkChapterDelete({
+      ids, pause: b.data.pause !== false, userId: userIdOf(req), req, busy: jobBusy,
+    });
+    if (!run) return reply.code(409).send({ error: 'bulk_delete_busy', message: 'Another chapter cleanup is already running.' });
+    return reply.code(202).send({ ok: true, runId: run.id, total: run.total });
+  });
+
+  app.get('/api/admin/series/bulk/chapters/delete', async (req, reply) => {
+    const parsed = z.object({ runId: z.string().uuid().optional() }).safeParse(req.query);
+    if (!parsed.success) return reply.code(400).send({ error: 'bad_request', message: 'That run id is not valid.' });
+    const run = await readBulkChapterDeleteRun(parsed.data.runId);
+    if (parsed.data.runId && !run) return reply.code(404).send({ error: 'not_found' });
+    return { run };
+  });
+
+  app.post('/api/admin/series/bulk/chapters/delete/cancel', async (req, reply) => {
+    const parsed = z.object({ runId: z.string().uuid().optional() }).optional().safeParse(req.body);
+    if (!parsed.success) return reply.code(400).send({ error: 'bad_request', message: 'That run id is not valid.' });
+    const id = await requestBulkChapterDeleteCancel(parsed.data?.runId);
+    if (!id) return reply.code(404).send({ error: 'not_running', message: 'That chapter cleanup is no longer running.' });
+    return { ok: true, runId: id, cancelRequested: true };
   });
 
   app.post('/api/admin/series/:id/restore', async (req, reply) => {
@@ -1735,9 +1982,13 @@ export default async function adminRoutes(app: FastifyInstance) {
     const row = await getSeriesRow(id);
     if (!row) return reply.code(404).send({ error: 'not_found' });
     if (!row.deleted_at) return reply.code(400).send({ error: 'not_deleted', message: 'That series is not hidden.' });
-    await restoreSeries(id);
-    await logAudit('series.restore', { userId: userIdOf(req), detail: { id, title: row.title }, req });
-    return { ok: true };
+    const claim = claimSeriesWriter([id], [row.folder]);
+    if (!claim) return reply.code(409).send({ error: 'busy', message: 'Another task is changing that series.' });
+    try {
+      await restoreSeries(id);
+      await logAudit('series.restore', { userId: userIdOf(req), detail: { id, title: row.title }, req });
+      return { ok: true };
+    } finally { claim.release(); }
   });
 
   /**
@@ -1778,15 +2029,33 @@ export default async function adminRoutes(app: FastifyInstance) {
         case 'same_work': return reply.code(409).send({ error: 'same_work', message: 'These are two language editions of one work. Unlink one first if they really are the same edition.' });
       }
     }
-    const from = (await getSeriesRow(id))!;
-    const into = (await getSeriesRow(b.data.into))!;
-    const r = await mergeSeries(id, into.id);
-    await logAudit('series.merge', {
-      userId: userIdOf(req),
-      detail: { from: id, fromTitle: from.title, into: into.id, intoTitle: into.title, ...r },
-      req,
-    });
-    return r;
+    // One read, followed immediately by the synchronous multi-folder claim. Two separate awaits let a rename of the
+    // first series finish between them, leaving us holding its old folder while merging the row now writing elsewhere.
+    const current = await q<{ id: string; title: string; folder: string }>(
+      'SELECT id, title, folder FROM lib_series WHERE id = ANY($1::text[])', [[id, b.data.into]],
+    );
+    const from = current.find((r) => r.id === id);
+    const into = current.find((r) => r.id === b.data.into);
+    if (!from || !into) return reply.code(404).send({ error: 'not_found' });
+    const claim = claimSeriesWriter([id, into.id], [from.folder, into.folder]);
+    if (!claim) return reply.code(409).send({ error: 'busy', message: 'Another task is changing one of those series.' });
+    try {
+      const r = await mergeSeries(id, into.id);
+      await logAudit('series.merge', {
+        userId: userIdOf(req),
+        detail: { from: id, fromTitle: from.title, into: into.id, intoTitle: into.title, ...r },
+        req,
+      });
+      return r;
+    } catch (e) {
+      if (e instanceof MergeConflictError) {
+        return reply.code(409).send({
+          error: 'merge_changed',
+          message: 'One of those series changed while the merge was starting. Refresh and try again.',
+        });
+      }
+      throw e;
+    } finally { claim.release(); }
   });
 
   /**
@@ -2055,10 +2324,22 @@ export default async function adminRoutes(app: FastifyInstance) {
     if (!sameTitle(b.data.confirm, row.title)) {
       return reply.code(400).send({ error: 'confirm_mismatch', message: 'Type the series title to confirm — typography does not have to match.' });
     }
-    const r = await deleteSeriesFiles(id);
-    if (!r.ok) return reply.code(409).send({ error: 'refused', message: r.reason, fix: r.fix });
-    await logAudit('series.delete_files', { userId: userIdOf(req), detail: { id, files: r.files, bytes: r.bytes }, req });
-    return r;
+    const folders = (await q<{ folder: string }>('SELECT folder FROM lib_series WHERE id = $1 OR merged_into = $1 ORDER BY folder', [id])).map((x) => x.folder);
+    const claim = claimSeriesWriter([id], folders);
+    if (!claim) return reply.code(409).send({ error: 'busy', message: 'Another task is changing that series.' });
+    try {
+      const r = await deleteSeriesFiles(id);
+      if (!r.ok) return reply.code(409).send({ error: 'refused', message: r.reason, fix: r.fix });
+      const { deletedBookIds, ...answer } = r;
+      // Exact identities make the recurring v0.55.8 provenance repair safe on later boots. `files` alone is
+      // not enough: Delete files may also reconcile already-absent rows on a demonstrably mounted library.
+      await logAudit('series.delete_files', {
+        userId: userIdOf(req),
+        detail: { id, files: r.files, bytes: r.bytes, bookIds: deletedBookIds, applied: deletedBookIds.length },
+        req,
+      });
+      return answer;
+    } finally { claim.release(); }
   });
 
   /**
@@ -2079,17 +2360,24 @@ export default async function adminRoutes(app: FastifyInstance) {
     if (!sameTitle(b.data.confirm, row.title)) {
       return reply.code(400).send({ error: 'confirm_mismatch', message: 'Type the series title to confirm — typography does not have to match.' });
     }
-    const r = await forgetSeries(id);
-    if (!r.ok) {
-      if (r.refused === 'not_found') return reply.code(404).send({ error: 'not_found' });
-      return reply.code(409).send({ error: 'refused', message: r.message, fix: r.fix });
-    }
-    await logAudit('series.forget', {
-      userId: userIdOf(req),
-      detail: { id, title: r.title, folder: r.folder, books: r.books, absorbed: r.absorbed, absorbedIds: r.absorbedIds, users: r.users, rowsByTable: r.rowsByTable },
-      req,
-    });
-    return { ok: true, books: r.books, absorbed: r.absorbed, users: r.users };
+    const owned = await q<{ id: string; folder: string }>(
+      'SELECT id, folder FROM lib_series WHERE id = $1 OR merged_into = $1 ORDER BY id', [id],
+    );
+    const claim = claimSeriesWriter(owned.map((s) => s.id), owned.map((s) => s.folder));
+    if (!claim) return reply.code(409).send({ error: 'busy', message: 'Another task is changing that series.' });
+    try {
+      const r = await forgetSeries(id);
+      if (!r.ok) {
+        if (r.refused === 'not_found') return reply.code(404).send({ error: 'not_found' });
+        return reply.code(409).send({ error: 'refused', message: r.message, fix: r.fix });
+      }
+      await logAudit('series.forget', {
+        userId: userIdOf(req),
+        detail: { id, title: r.title, folder: r.folder, books: r.books, absorbed: r.absorbed, absorbedIds: r.absorbedIds, users: r.users, rowsByTable: r.rowsByTable },
+        req,
+      });
+      return { ok: true, books: r.books, absorbed: r.absorbed, users: r.users };
+    } finally { claim.release(); }
   });
 
   // ---- chapter-level file operations ----
@@ -2117,9 +2405,13 @@ export default async function adminRoutes(app: FastifyInstance) {
     if (!row) return reply.code(404).send({ error: 'not_found' });
     // lib/libraryAdmin.ts deleteChapterFiles (v0.55.0): the route's own rules, in one place, which Fix everything's files
     // phase runs too -- the bookmark veto, the download folder only, the root itself never.
-    const r = await deleteChapterFiles(id, b.data.bookIds, { userId: userIdOf(req), req });
-    if ('refused' in r) return reply.code(409).send({ error: 'refused', message: r.refused.reason, fix: r.refused.fix });
-    return { ok: true, applied: r.applied, bytes: r.bytes, skipped: r.skipped };
+    const claim = claimSeriesWriter([id], [row.folder]);
+    if (!claim) return reply.code(409).send({ error: 'busy', message: 'Another task is changing that series.' });
+    try {
+      const r = await deleteChapterFiles(id, b.data.bookIds, { userId: userIdOf(req), req });
+      if ('refused' in r) return reply.code(409).send({ error: 'refused', message: r.refused.reason, fix: r.refused.fix });
+      return { ok: true, applied: r.applied, bytes: r.bytes, skipped: r.skipped };
+    } finally { claim.release(); }
   });
 
   /**
@@ -2181,10 +2473,11 @@ export default async function adminRoutes(app: FastifyInstance) {
       if (r.root !== DL_ROOT) { skipped.push({ id: bid, reason: 'not_owned' }); continue; }
       const number = Number(r.number);
       const abs = containedPath(DL_ROOT, r.file);
+      const realSafe = abs ? await realContainedPath(DL_ROOT, r.file) : null;
       // The root itself can never be the chapter file (the path check below already forbids it: a chapter
       // file ends in `Chapter <n>.cbz`), but the rename below is a destructive move and the comparison is
       // free -- the same guard the delete route and the cleanup carry.
-      if (!abs || abs === root || r.file !== chapterFileRel(s.folder, number)) { skipped.push({ id: bid, reason: 'not_ours' }); continue; }
+      if (!abs || realSafe !== abs || abs === root || r.file !== chapterFileRel(s.folder, number)) { skipped.push({ id: bid, reason: 'not_ours' }); continue; }
       eligible.push({ id: bid, number, file: r.file, abs, pruned: !!r.pruned_at });
     }
     // The listing is refreshed FIRST, so the copy fetched is the one the release rules choose NOW -- which
@@ -2229,7 +2522,7 @@ export default async function adminRoutes(app: FastifyInstance) {
       sourceState.set(sid, st);
       return st;
     };
-    const todo: Array<{ row: typeof eligible[number]; chapter: SourceChapter }> = [];
+    const todo: Array<{ row: typeof eligible[number]; chapter: SourceChapter & { pinned?: boolean } }> = [];
     for (const e of eligible) {
       const l = listed.get(e.number);
       const pick = pickOf.get(e.id);
@@ -2240,7 +2533,10 @@ export default async function adminRoutes(app: FastifyInstance) {
         if (!l || !copy) { skipped.push({ id: e.id, reason: 'not_listed' }); continue; }
         const st = await stateOf(copy.source);
         if (st !== 'ok') { skipped.push({ id: e.id, reason: st }); continue; }
-        todo.push({ row: e, chapter: copyToChapter(copy, { number: e.number, title: l.title }) });
+        // Carry the explicit-pick marker into startDownloadJob. It is the downloader's authorization to
+        // use this blocked copy, and also prevents downloadWithFallback from silently choosing another
+        // version if the named copy fails.
+        todo.push({ row: e, chapter: { ...copyToChapter(copy, { number: e.number, title: l.title }), pinned: true } });
         continue;
       }
       if (!l) { skipped.push({ id: e.id, reason: 'not_listed' }); continue; }
@@ -2255,54 +2551,73 @@ export default async function adminRoutes(app: FastifyInstance) {
     if (jobBusy(s.folder)) return reply.code(409).send({ error: 'busy', message: 'A download for that series is already running.' });
     const w = await allWritable([DL_ROOT]);
     if (!w.ok) return reply.code(409).send({ error: 'refused', message: w.reason, fix: w.fix });
+    // Reserve synchronously before the first set-aside rename. A bulk cleanup may have claimed the shared
+    // folder while allWritable was awaited; in that case this refuses instead of renaming under its unlink.
+    const claim = claimDownloadJob(s.folder, id);
+    if (!claim) return reply.code(409).send({ error: 'busy', message: 'Another task is changing that series.' });
 
-    // Set aside, mark, forget the failures -- per row, before the job starts, so the downloader's own
-    // "already on disk" check does not skip the very file we are replacing.
-    const byNumber = new Map(todo.map((t) => [t.row.number, t.row]));
-    for (const t of todo) {
-      await rename(t.row.abs, `${t.row.abs}${REFETCH_BAK}`).catch((e: any) => {
-        // No file behind a tombstone is expected; anything else is worth a line, and the settle hook
-        // below still handles it (the file is where it was, so the downloader skips and the mark clears).
-        if (e?.code !== 'ENOENT') console.warn(`[refetch] could not set aside ${t.row.file}: ${e?.message || e}`);
-      });
-      await tombstoneBooks([t.row.id]);
-    }
-    await q('DELETE FROM chapter_failures WHERE series_id = $1 AND number = ANY($2::real[])',
-      [id, todo.map((t) => t.row.number)]).catch(() => {});
-    const picks = todo.filter((t) => pickOf.has(t.row.id)).map((t) => ({ bookId: t.row.id, number: t.row.number, source: t.chapter.source, sourceId: t.chapter.sourceId }));
-    await logAudit('series.chapters_refetch', {
-      userId: userIdOf(req),
-      detail: { id, title: s.title, bookIds: todo.map((t) => t.row.id), numbers: todo.map((t) => t.row.number), ...(picks.length ? { picks } : {}), skipped },
-      req,
-    });
-    const { total } = startDownloadJob({
-      origin: 'refetch',
-      folder: s.folder, title: s.title, seriesId: id,
-      chapters: todo.map((t) => t.chapter).sort((a, b) => a.number - b.number),
-      meta: { series: s.title, summary: s.summary, author: s.author, genres: s.genres, url: s.web, status: s.status },
-      by: userIdOf(req),
-      // A Cancel (#82) settles every chapter the job did not reach as not landed, so each set-aside copy
-      // below is put back exactly as for a chapter that failed.
-      onSettled: async (ch, landed) => {
-        const r = byNumber.get(ch.number);
-        if (!r) return;
-        const bak = `${r.abs}${REFETCH_BAK}`;
-        if (landed) {
-          await rm(bak, { force: true });
-          // A copy picked by name is the admin's choice, and the nightly group upgrade (lib/repair.ts
-          // stepGroups) leaves it alone; a plain Fetch again hands the choice back to the preferences.
-          await q('UPDATE lib_books SET picked_at = $2 WHERE id = $1', [r.id, pickOf.has(r.id) ? new Date() : null]).catch(() => {});
-          return;
+    try {
+      // `allWritable`, the listing refresh and the claim all awaited after the first validation. Check every path
+      // again before the first set-aside rename so an intermediate symlink swapped in meanwhile cannot move a file
+      // outside DL_ROOT. Nothing has been mutated yet, so one unsafe row refuses the whole replacement cleanly.
+      for (const t of todo) {
+        if (await realContainedPath(DL_ROOT, t.row.file) !== t.row.abs) {
+          return reply.code(409).send({ error: 'nothing_to_fetch', message: 'None of those chapters can be fetched again safely.',
+            skipped: [...skipped, { id: t.row.id, reason: 'not_ours' }] });
         }
-        // Not landed: put the old copy back if it was set aside, and un-mark the row whenever a file is
-        // there to read -- the restored one, or the original a failed rename left in place. A row that had
-        // no file to begin with (a tombstone being fetched again) keeps its mark: the bytes are still gone.
-        const exists = (p: string) => stat(p).then(() => true, () => false);
-        if (await exists(bak) && !(await exists(r.abs))) await rename(bak, r.abs).catch(() => {});
-        if (await exists(r.abs)) await q('UPDATE lib_books SET pruned_at = NULL WHERE id = $1', [r.id]).catch(() => {});
-      },
-    });
-    return { ok: true, started: true, folder: s.folder, total, skipped };
+      }
+      // Set aside, mark, forget the failures -- per row, before the job starts, so the downloader's own
+      // "already on disk" check does not skip the very file we are replacing.
+      const byNumber = new Map(todo.map((t) => [t.row.number, t.row]));
+      for (const t of todo) {
+        await rename(t.row.abs, `${t.row.abs}${REFETCH_BAK}`).catch((e: any) => {
+          // No file behind a tombstone is expected; anything else is worth a line, and the settle hook
+          // below still handles it (the file is where it was, so the downloader skips and the mark clears).
+          if (e?.code !== 'ENOENT') console.warn(`[refetch] could not set aside ${t.row.file}: ${e?.message || e}`);
+        });
+        // A live row is marked only while its old file is aside. A deliberate tombstone is already marked,
+        // and overwriting its reason with NULL would make a failed restore lose deletion provenance.
+        if (!t.row.pruned) await tombstoneBooks([t.row.id]);
+      }
+      await q('DELETE FROM chapter_failures WHERE series_id = $1 AND number = ANY($2::real[])',
+        [id, todo.map((t) => t.row.number)]).catch(() => {});
+      const picks = todo.filter((t) => pickOf.has(t.row.id)).map((t) => ({ bookId: t.row.id, number: t.row.number, source: t.chapter.source, sourceId: t.chapter.sourceId }));
+      await logAudit('series.chapters_refetch', {
+        userId: userIdOf(req),
+        detail: { id, title: s.title, bookIds: todo.map((t) => t.row.id), numbers: todo.map((t) => t.row.number), ...(picks.length ? { picks } : {}), skipped },
+        req,
+      });
+      const { total } = startDownloadJob({
+        origin: 'refetch',
+        folder: s.folder, title: s.title, seriesId: id,
+        chapters: todo.map((t) => t.chapter).sort((a, b) => a.number - b.number),
+        meta: { series: s.title, summary: s.summary, author: s.author, genres: s.genres, url: s.web, status: s.status },
+        by: userIdOf(req),
+        // A Cancel (#82) settles every chapter the job did not reach as not landed, so each set-aside copy
+        // below is put back exactly as for a chapter that failed.
+        onSettled: async (ch, landed) => {
+          const r = byNumber.get(ch.number);
+          if (!r) return;
+          const bak = `${r.abs}${REFETCH_BAK}`;
+          if (landed) {
+            await rm(bak, { force: true });
+            // A copy picked by name is the admin's choice, and the nightly group upgrade (lib/repair.ts
+            // stepGroups) leaves it alone; a plain Fetch again hands the choice back to the preferences.
+            await q('UPDATE lib_books SET picked_at = $2 WHERE id = $1', [r.id, pickOf.has(r.id) ? new Date() : null]).catch(() => {});
+            return;
+          }
+          // Not landed: put the old copy back if it was set aside, and un-mark the row whenever a file is
+          // there to read -- the restored one, or the original a failed rename left in place. A row that had
+          // no file to begin with (a tombstone being fetched again) keeps its mark: the bytes are still gone.
+          const exists = (p: string) => stat(p).then(() => true, () => false);
+          if (await exists(bak) && !(await exists(r.abs))) await rename(bak, r.abs).catch(() => {});
+          if (await exists(r.abs)) await q('UPDATE lib_books SET pruned_at = NULL WHERE id = $1', [r.id]).catch(() => {});
+        },
+      }, claim);
+      return { ok: true, started: true, folder: s.folder, total, skipped };
+    } finally {
+      releaseDownloadJobClaim(claim);
+    }
   });
 
   /**
@@ -2377,10 +2692,16 @@ export default async function adminRoutes(app: FastifyInstance) {
     const { id } = req.params as { id: string };
     const b = z.object({ folder: z.string().min(1).max(400) }).safeParse(req.body);
     if (!b.success) return reply.code(400).send({ error: 'bad_request' });
-    const r = await renameSeriesFolder(id, b.data.folder);
-    if (!r.ok) return reply.code(409).send({ error: 'refused', message: r.reason, fix: r.fix });
-    await logAudit('series.rename_folder', { userId: userIdOf(req), detail: { id, folder: b.data.folder }, req });
-    return r;
+    const row = await getSeriesRow(id);
+    if (!row) return reply.code(404).send({ error: 'not_found' });
+    const claim = claimSeriesWriter([id], [row.folder, b.data.folder]);
+    if (!claim) return reply.code(409).send({ error: 'busy', message: 'Another task is changing that folder.' });
+    try {
+      const r = await renameSeriesFolder(id, b.data.folder);
+      if (!r.ok) return reply.code(409).send({ error: 'refused', message: r.reason, fix: r.fix });
+      await logAudit('series.rename_folder', { userId: userIdOf(req), detail: { id, folder: b.data.folder }, req });
+      return r;
+    } finally { claim.release(); }
   });
 
   /** The 409 for a folder another library holds: which folder, and whose, named in the message too. */
@@ -2395,9 +2716,9 @@ export default async function adminRoutes(app: FastifyInstance) {
   // library into several named after scrapers. Library zero covers the whole root and always exists.
 
   app.get('/api/admin/libraries', async () => {
-    const rows = await q<{ id: string; name: string; path: string; paths: string[]; age_rating: number | null; n: number; pinned: number; members: string[] }>(
+    const rows = await q<{ id: string; name: string; path: string; paths: string[]; age_rating: number | null; anilist_lookup: boolean; n: number; pinned: number; members: string[] }>(
       // `paths`: every folder it holds (v0.55.1, #148), the first -- `path`, all a v0.55.0 reads -- first, then by name.
-      `SELECT l.id, l.name, l.path, l.age_rating,
+      `SELECT l.id, l.name, l.path, l.age_rating, l.anilist_lookup,
               (SELECT coalesce(array_agg(lp.path ORDER BY lp.path <> l.path, lp.path), '{}') FROM library_paths lp
                 WHERE lp.library_id = l.id) AS paths,
               (SELECT count(*)::int FROM lib_series s WHERE s.library_id = l.id AND ${visibleToAll('s')}) AS n,
@@ -2538,6 +2859,8 @@ export default async function adminRoutes(app: FastifyInstance) {
       // PATCH the rating, which meant a failed second call left a library that silently showed everything
       // to everyone under a "Created" toast.
       ageRating: z.number().int().min(0).max(18).nullable().optional(),
+      // Automatic title/id enrichment only. Manual Admin Art, relink and tracker actions remain available.
+      anilistLookup: z.boolean().optional(),
     }).safeParse(req.body);
     if (!b.success) return reply.code(400).send({ error: 'bad_request' });
     const raw = b.data.paths ?? (b.data.path !== undefined ? [b.data.path] : null);
@@ -2553,8 +2876,8 @@ export default async function adminRoutes(app: FastifyInstance) {
       // Checked under the lock, so two saves cannot both take one folder.
       const held = await heldElsewhere(qq, id, paths);
       if (held) return { held };
-      await qq(`INSERT INTO libraries (id, name, path, age_rating) VALUES ($1,$2,$3,$4)`,
-        [id, b.data.name.trim(), paths[0], b.data.ageRating ?? null]);
+      await qq(`INSERT INTO libraries (id, name, path, age_rating, anilist_lookup) VALUES ($1,$2,$3,$4,$5)`,
+        [id, b.data.name.trim(), paths[0], b.data.ageRating ?? null, b.data.anilistLookup ?? true]);
       // Reassignment is deliberate and happens here, not in a scan: the scanner keeps an existing folder in
       // the library it is already in, precisely so it can never re-mint an id by recomputing. The longest folder
       // wins, so a new `Manga/Seinen` takes from `Manga` and never the other way, and a pinned series stays put:
@@ -2580,6 +2903,8 @@ export default async function adminRoutes(app: FastifyInstance) {
       paths: z.array(z.string().max(300)).min(1).max(LIBRARY_MAX_FOLDERS).optional(),
       // A default its series inherit. null clears it.
       ageRating: z.number().int().min(0).max(18).nullable().optional(),
+      // false stops future implicit AniList calls for series currently in this library; it does not erase metadata.
+      anilistLookup: z.boolean().optional(),
       // Who may see it. See the note below: this is not simply "insert a row".
       members: z.array(z.string()).optional(),
     }).safeParse(req.body);
@@ -2613,6 +2938,9 @@ export default async function adminRoutes(app: FastifyInstance) {
     }
     if (b.data.ageRating !== undefined) {
       await q('UPDATE libraries SET age_rating = $2 WHERE id = $1', [id, b.data.ageRating]);
+    }
+    if (b.data.anilistLookup !== undefined) {
+      await q('UPDATE libraries SET anilist_lookup = $2 WHERE id = $1', [id, b.data.anilistLookup]);
     }
 
     /**
@@ -2689,21 +3017,38 @@ export default async function adminRoutes(app: FastifyInstance) {
 
   // Set/replace a cover or background: paste a URL, upload an image (base64 data URL), or reset to automatic. The body
   // limit fits the largest picture Edit details takes once it is base64 (lib/seriesArt.ts ART_BODY_LIMIT).
+  // `first_page` (v0.55.7, #168, the cover only): the series' own first page is its cover for good, and its art is its
+  // own pages -- nothing found online is shown or looked up for it (lib/seriesArt.ts FIRST_PAGE). Reset to automatic
+  // takes it back.
   app.put('/api/admin/series/:id/art', { bodyLimit: ART_BODY_LIMIT }, async (req, reply) => {
-    const { id } = req.params as { id: string };
+    const requestedId = (req.params as { id: string }).id;
     const b = z.object({
       kind: z.enum(['cover', 'banner']),
-      mode: z.enum(['url', 'upload', 'reset']),
+      mode: z.enum(['url', 'upload', 'reset', 'first_page']),
       url: z.string().url().optional(),
       dataUrl: z.string().optional(),
     }).safeParse(req.body);
     if (!b.success) return reply.code(400).send({ error: 'bad_request' });
+    // Use the exact canonical id read from the database, not a route segment, in persistent file paths. Besides
+    // removing user input from the path expression, this prevents two malformed ids that safeId() normalises to
+    // the same filename from deleting or replacing one another before the foreign key rejects the write.
+    const series = await one<{ id: string }>('SELECT id FROM lib_series WHERE id = $1', [requestedId]);
+    if (!series) return reply.code(404).send({ error: 'not_found' });
+    const id = series.id;
     const { kind, mode } = b.data;
+    if (mode === 'first_page' && kind !== 'cover') return reply.code(400).send({ error: 'bad_request', message: 'The first page is a cover, not a banner.' });
+    const artPath = artFile(id, kind);
+    // artFile has the same containment guard for every caller. Keep an explicit sink-adjacent check here too:
+    // this endpoint begins at an HTTP parameter and writes or removes a persistent file.
+    if (!artPath.startsWith(resolve(ART_DIR) + sep)) return reply.code(400).send({ error: 'bad_path' });
     let value: string | null = null;
-    if (mode === 'url') {
+    if (mode === 'first_page') {
+      await rm(artPath, { force: true }).catch(() => {});
+      value = FIRST_PAGE;
+    } else if (mode === 'url') {
       if (!b.data.url) return reply.code(400).send({ error: 'no_url', message: 'Paste an image URL.' });
       value = b.data.url;
-      await rm(artFile(id, kind), { force: true }).catch(() => {});
+      await rm(artPath, { force: true }).catch(() => {});
     } else if (mode === 'upload') {
       const m = /^data:image\/[a-z0-9.+-]+;base64,(.+)$/i.exec(b.data.dataUrl || '');
       if (!m) return reply.code(400).send({ error: 'bad_image', message: 'Upload a valid image.' });
@@ -2713,10 +3058,10 @@ export default async function adminRoutes(app: FastifyInstance) {
         buf = await sharp(Buffer.from(m[1], 'base64')).rotate().resize({ width: maxW, withoutEnlargement: true }).webp({ quality: 86 }).toBuffer();
       } catch { return reply.code(400).send({ error: 'bad_image', message: "That file isn't a readable image." }); }
       await mkdir(ART_DIR, { recursive: true }).catch(() => {});
-      await writeFile(artFile(id, kind), buf);
+      await writeFile(artPath, buf);
       value = 'upload';
     } else {
-      await rm(artFile(id, kind), { force: true }).catch(() => {});
+      await rm(artPath, { force: true }).catch(() => {});
       value = null;
     }
     const col = kind === 'cover' ? 'cover' : 'banner';
@@ -2741,10 +3086,13 @@ export default async function adminRoutes(app: FastifyInstance) {
     const s = await one<{ title: string }>('SELECT title FROM lib_series WHERE id = $1', [id]);
     if (!s) return reply.code(404).send({ error: 'not_found' });
     const cleaned = s.title.replace(/\([^)]*\)/g, '').replace(/\s*[-–—:].*$/, '').trim() || s.title;
+    // A person picks from these, so AniList's several answers are offered as they come; Kitsu's one banner is offered
+    // from an entry named as the series is, the rule it is stored by (lib/kitsu.ts).
+    const names = await namesOf({ id });
     const [anilist, anilistLoose, kitsu, md] = await Promise.all([
       fetchAniListCandidates(s.title).catch(() => []),
       cleaned !== s.title ? fetchAniListCandidates(cleaned).catch(() => []) : Promise.resolve([]),
-      fetchKitsuBanner(s.title).then((b) => (b ? [{ title: s.title, banner: b, cover: null as string | null }] : [])).catch(() => []),
+      fetchKitsuBanner(s.title, names.length ? names : [s.title]).then((b) => (b ? [{ title: s.title, banner: b, cover: null as string | null }] : [])).catch(() => []),
       (async () => {
         try {
           const mdSrc = getSource('mangadex');
@@ -2768,58 +3116,20 @@ export default async function adminRoutes(app: FastifyInstance) {
     return { title: s.title, content: out };
   });
 
-  // Bulk backfill: re-hunt art for series missing a banner (or any art). AniList first (cleaned-title retry),
-  // MangaDex cover as a second source. Runs in the background; poll /api/admin/art/backfill/status.
+  // Bulk backfill: re-hunt art for series missing a banner (or any art), one at a time (huntArt above, every answer held
+  // to the series' names since v0.55.7). Runs in the background; poll /api/admin/art/backfill/status.
   app.post('/api/admin/art/backfill', async (req, reply) => {
     if (artJob?.running) return reply.code(409).send({ error: 'busy', message: 'A backfill is already running.' });
-    const targets = await q<{ id: string; title: string }>(
-      `SELECT s.id, s.title FROM lib_series s
-       LEFT JOIN series_art a ON a.series_id = s.id
-       LEFT JOIN series_overrides o ON o.series_id = s.id
-       WHERE ${visibleToAll('s')} AND (a.banner IS NULL OR a.banner = '') AND o.banner IS NULL
-       ORDER BY s.title`,
-    );
+    const targets = await artBackfillTargets();
     const job: ArtJob = { running: true, total: targets.length, done: 0, banners: 0, covers: 0, misses: 0, startedAt: Date.now() };
     artJob = job;
     await logAudit('art.backfill_start', { userId: userIdOf(req), detail: { count: targets.length }, req });
     void (async () => {
       for (const t of targets) {
-        try {
-          // banner hunt, widest net first-hit-wins: AniList manga (banner or its anime adaptation's, same
-          // query) → harsher-cleaned retry → direct AniList ANIME search → Kitsu wide cover.
-          let art = await fetchAniListArt(t.title).catch(() => ({ banner: null as string | null, cover: null as string | null }));
-          const harsh = t.title.replace(/\([^)]*\)/g, '').replace(/\s*[-–—:].*$/, '').trim();
-          if (!art.banner && harsh && harsh !== t.title) {
-            const retry = await fetchAniListArt(harsh).catch(() => ({ banner: null, cover: null }));
-            art = { banner: retry.banner ?? art.banner, cover: art.cover ?? retry.cover };
-          }
-          if (!art.banner) art.banner = await fetchAnimeBanner(t.title).catch(() => null);
-          if (!art.banner) art.banner = await fetchKitsuBanner(t.title);
-          if (!art.banner && harsh && harsh !== t.title) art.banner = await fetchKitsuBanner(harsh);
-          if (!art.cover) {
-            try {
-              const mdSrc = getSource('mangadex');
-              const res = mdSrc ? await mdSrc.search(t.title) : [];
-              art.cover = res?.[0]?.coverUrl || null;
-            } catch { /* mangadex miss is fine */ }
-          }
-          if (art.banner || art.cover) {
-            await q(
-              `INSERT INTO series_art (series_id, banner, cover) VALUES ($1, $2, $3)
-               ON CONFLICT (series_id) DO UPDATE SET
-                 banner = COALESCE(EXCLUDED.banner, series_art.banner),
-                 cover  = COALESCE(EXCLUDED.cover,  series_art.cover), fetched_at = now()`,
-              [t.id, art.banner, art.cover],
-            );
-            if ((art as any).mediaId) {
-              await linkSeries(t.id, (art as any).mediaId, (art as any).mediaTitle ?? null);
-              await learnDirection({ id: t.id }, directionFromAniListMatch(t.title, art as any), 'anilist').catch(() => {});
-              await learnTypeFromAniList({ id: t.id }, t.title, art as any);
-            }
-            if (art.banner) job.banners++;
-            else job.covers++;
-          } else job.misses++;
-        } catch { job.misses++; }
+        const found = await huntArt(t).catch(() => null);
+        if (found === 'banner') job.banners++;
+        else if (found === 'cover') job.covers++;
+        else job.misses++;
         job.done++;
         await new Promise((r) => setTimeout(r, 2200)); // stay under AniList's ~30 req/min
       }
@@ -3372,11 +3682,14 @@ export default async function adminRoutes(app: FastifyInstance) {
     void (async () => {
       for (const t of targets) {
         try {
-          const m = await fetchAniListArt(t.title);
+          // Only an entry named as the series is (v0.55.7, lib/onlineMatch.ts): the link is where progress is pushed.
+          const names = await namesOf({ id: t.id });
+          if (!names.length) names.push(t.title);
+          const m = await fetchAniListArt(t.title, names);
           if (m.mediaId) {
             await linkSeries(t.id, m.mediaId, m.mediaTitle ?? null);
-            await learnDirection({ id: t.id }, directionFromAniListMatch(t.title, m), 'anilist').catch(() => {});
-            await learnTypeFromAniList({ id: t.id }, t.title, m);
+            await learnDirection({ id: t.id }, directionFromAniListMatch(names, m), 'anilist').catch(() => {});
+            await learnTypeFromAniList({ id: t.id }, names, m);
             job.linked++;
           }
           else job.misses++;

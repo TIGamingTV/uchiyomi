@@ -30,6 +30,7 @@ import { serveLibSeriesThumb, serveLibBookThumb, serveLibBookPage } from './imag
 import { springPage, komgaSeries, komgaBook, komgaGhostBook, komgaPage, parseSeriesQuery, parseBooksQuery } from '../lib/komgaDto';
 import { readProgressV2, readProgressDetail, markReadUpTo } from '../lib/komgaProgress';
 import { ghostsEnabled, ghostBooksFor, ghostBookById, isGhostId } from '../lib/komgaGhosts';
+import { deletedAsGhostsOn, deliberatelyDeleted } from '../lib/deletedGhosts';
 import { editionLabels } from '../lib/editions';
 
 const SAFE_METHODS = new Set(['GET', 'HEAD', 'OPTIONS']);
@@ -63,6 +64,19 @@ function unauthorized(reply: FastifyReply, message: string) {
 export default async function komgaCompatRoutes(app: FastifyInstance) {
   const vc = (req: FastifyRequest): ViewCtx => (req as any).viewCtx as ViewCtx;
   const uid = (req: FastifyRequest): string => (req as any).user.sub as string;
+
+  /**
+   * One definition of a book that must behave like an absent chapter throughout the Komga surface. The
+   * broad ghost switch exposes every tombstone; the narrower switch exposes only deliberate deletions.
+   * Read both settings once per request so a list cannot classify the same row differently halfway through.
+   */
+  type AbsencePolicy = { allTombstones: boolean; deliberateTombstones: boolean };
+  const absencePolicy = async (): Promise<AbsencePolicy> => {
+    const [allTombstones, deliberateTombstones] = await Promise.all([ghostsEnabled(), deletedAsGhostsOn()]);
+    return { allTombstones, deliberateTombstones };
+  };
+  const absentBook = (book: { pruned?: boolean; prunedReason?: string | null; owned?: boolean }, policy: AbsencePolicy): boolean =>
+    book.pruned === true && (policy.allTombstones || (policy.deliberateTombstones && deliberatelyDeleted(book)));
 
   /**
    * Failed credentials per client IP, on the budget /auth/login has (10 per 5 minutes; server.ts registers
@@ -294,12 +308,16 @@ export default async function komgaCompatRoutes(app: FastifyInstance) {
     const { id } = req.params as { id: string };
     if (!(await seriesVisible(id, vc(req)))) return reply.code(404).send({ error: 'not_found' });
     const parsed = parseBooksQuery(req.query as Record<string, unknown>);
-    const ghosts = await ghostsEnabled();
+    const policy = await absencePolicy();
+    const ghosts = policy.allTombstones;
+    // "Show deleted chapters as ghosts" (lib/deletedGhosts.ts): a chapter deleted on purpose is listed "not downloaded"
+    // like a ghost even with the broad ghost opt-in off; a file Verify found missing keeps today's treatment.
+    const absentRow = (b: any) => absentBook(b, policy);
     // One query for the whole series rather than a count and a page: the READY filter has to run over the
     // rows, and a series holds hundreds of chapters, not millions.
     const all = await owned.seriesBooks(vc(req), id, 0, 100_000, parsed.sort);
-    const real = parsed.readyOnly && !ghosts ? all.content.filter((b: any) => !b.pruned) : all.content;
-    let rows: unknown[] = real.map((b: any) => komgaBook(b, { absent: ghosts }));
+    const real = parsed.readyOnly ? all.content.filter((b: any) => !b.pruned || absentRow(b)) : all.content;
+    let rows: unknown[] = real.map((b: any) => komgaBook(b, { absent: absentRow(b) }));
     if (ghosts) {
       // Merged by number into the order seriesBooks already returned, rather than appended: the extension
       // renders the list as given, and a chapter list that runs 1..40 and then jumps back to 3 is unreadable.
@@ -351,7 +369,7 @@ export default async function komgaCompatRoutes(app: FastifyInstance) {
     // `absent` changes nothing unless the row is a tombstone (lib/komgaDto komgaBook ANDs the two), so only a
     // tombstone pays for the settings read. Every ordinary chapter open -- which is every open at all on an
     // install that does not run the read cleanup -- costs exactly what it did before the opt-in existed.
-    return komgaBook(dto, { absent: dto.pruned ? await ghostsEnabled() : false });
+    return komgaBook(dto, { absent: absentBook(dto, await absencePolicy()) });
   });
 
   // 1-based page numbers, as Komga's are and as the extension uses them verbatim in the image URL. A pruned
@@ -367,26 +385,34 @@ export default async function komgaCompatRoutes(app: FastifyInstance) {
       const ghost = (await ghostsEnabled()) ? await ghostBookById(id, vc(req)) : null;
       return ghost ? [] : reply.code(404).send({ error: 'not_found' });
     }
-    if (!(await bookOr404(req, reply, id))) return;
+    const dto = await bookOr404(req, reply, id);
+    if (!dto) return;
+    if (absentBook(dto, await absencePolicy())) return [];
     const pages = await owned.bookPages(vc(req), id);
     return pages.map((p, i) => komgaPage(p, i));
   });
 
   // `?convert=png` is accepted and ignored: the extension appends it for media types it cannot decode, and
   // every page this server holds is jpeg/png/webp/gif/avif, all of which it can.
-  app.get('/api/v1/books/:id/pages/:n', (req, reply) => {
+  app.get('/api/v1/books/:id/pages/:n', async (req, reply) => {
     const { id, n } = req.params as { id: string; n: string };
     const pageNo = Number(n);
     if (!Number.isInteger(pageNo) || pageNo < 1) return reply.code(400).send({ error: 'bad_page', message: 'Page numbers start at 1.' });
     // A ghost has no page 1 to serve. 404 rather than a placeholder, for the reason on /pages above.
     if (isGhostId(id)) return reply.code(404).send({ error: 'not_found' });
+    const dto = await bookOr404(req, reply, id);
+    if (!dto) return;
+    if (absentBook(dto, await absencePolicy())) return reply.code(404).send({ error: 'not_found' });
     return serveLibBookPage(req, reply, id, pageNo, 0);
   });
 
   // No cover for a chapter with no pages; the extension falls back to the series thumbnail.
-  app.get('/api/v1/books/:id/thumbnail', (req, reply) => {
+  app.get('/api/v1/books/:id/thumbnail', async (req, reply) => {
     const { id } = req.params as { id: string };
     if (isGhostId(id)) return reply.code(404).send({ error: 'not_found' });
+    const dto = await bookOr404(req, reply, id);
+    if (!dto) return;
+    if (absentBook(dto, await absencePolicy())) return reply.code(404).send({ error: 'not_found' });
     return serveLibBookThumb(req, reply, id);
   });
 

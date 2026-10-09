@@ -6,7 +6,7 @@
 openapi: 3.1.0
 info:
   title: Uchiyomi API
-  version: 0.55.6
+  version: 0.55.8
   description: "Everything the web app does, it does over this API. Session JWTs are for the browser; scripts
     use a personal API token (Profile -> Connections -> API tokens), sent as `Authorization: Bearer uy_...`.
     Scopes: read (every token; GET plus the library search POST, which is a query), write (anything that changes data), admin (the /api/admin surface, which also
@@ -190,6 +190,128 @@ components:
                   said: { $ref: '#/components/schemas/AutofixSaid' }
                   action: { type: object, additionalProperties: true }
         log: { type: array, items: { $ref: '#/components/schemas/AutofixSaid' } }
+    AccountSettings:
+      type: object
+      additionalProperties: true
+      description: >-
+        The caller's forwards-compatible settings object. Unknown top-level keys are accepted and retained;
+        the named keys below are validated because they affect navigation or refer to owned database rows.
+      properties:
+        librarySort:
+          type: string
+          enum: [updated, new, az, unread]
+          description: >-
+            The Library's saved default sort. A valid `sort` in the Library URL wins for that visit; opening a
+            shared URL does not change this setting.
+        homeCollections:
+          type: array
+          maxItems: 3
+          uniqueItems: true
+          items: { type: string, minLength: 1, maxLength: 64 }
+          description: >-
+            Ordered ids of up to three Lists owned by this account. Missing preserves the legacy first-three-
+            nonempty Home rails; an explicit empty array means no List rails. Empty selected Lists retain their
+            slot. Already-stored stale or unowned ids are ignored by Home and omitted on the next edit;
+            a request that tries to add one is refused.
+        showAllChapters:
+          type: boolean
+          description: Show one unpaged chapter list, including all grey rows and unfolded older runs.
+        reader:
+          type: object
+          additionalProperties: true
+          description: Reader defaults, including `coverEdges` since v0.55.7.
+        listSorts:
+          type: object
+          additionalProperties:
+            type: string
+            enum: [az, za, read, unread, latest]
+          description: Per-List display sorts; absence for a List means its own order.
+    AdminBulkDeleteResult:
+      type: object
+      required: [id, outcome, chapters, bytes, kept, paused, chapterSkips]
+      properties:
+        id: { type: string, description: Series id. }
+        title: { type: string }
+        outcome: { type: string, enum: [applied, skipped, failed] }
+        reason:
+          type: string
+          enum: [not_found, hidden, merged, busy, nothing_to_delete, refused, cancelled, failed]
+        message: { type: string }
+        chapters: { type: integer, minimum: 0, description: Chapter files removed for this series. }
+        bytes: { type: integer, minimum: 0 }
+        kept: { type: integer, minimum: 0, description: Cover, bookmarked, manual and otherwise skipped files kept. }
+        paused: { type: boolean, description: Whether this result also turned auto-update off. }
+        chapterSkips:
+          type: object
+          additionalProperties: { type: integer, minimum: 0 }
+          description: Chapter-level skips grouped by the deletion guard's stable reason.
+    AdminBulkDeleteSummary:
+      type: object
+      required: [applied, chapters, bytes, kept, paused, skipped, failed, chapterSkips]
+      properties:
+        applied: { type: integer, minimum: 0 }
+        chapters: { type: integer, minimum: 0 }
+        bytes: { type: integer, minimum: 0 }
+        kept: { type: integer, minimum: 0 }
+        paused: { type: integer, minimum: 0 }
+        skipped: { type: integer, minimum: 0 }
+        failed: { type: integer, minimum: 0 }
+        chapterSkips:
+          type: object
+          additionalProperties: { type: integer, minimum: 0 }
+    AdminBulkDeleteRun:
+      type: object
+      required: [id, status, startedAt, finishedAt, cancelRequested, pause, total, done, summary, results, current, error]
+      properties:
+        id: { type: string, format: uuid }
+        status: { type: string, enum: [running, done, cancelled, failed, interrupted] }
+        startedAt: { type: string, format: date-time }
+        finishedAt: { type: [string, "null"], format: date-time }
+        cancelRequested: { type: boolean }
+        pause: { type: boolean }
+        total: { type: integer, minimum: 0 }
+        done: { type: integer, minimum: 0 }
+        summary: { $ref: '#/components/schemas/AdminBulkDeleteSummary' }
+        results:
+          type: array
+          items: { $ref: '#/components/schemas/AdminBulkDeleteResult' }
+        current:
+          type: [object, "null"]
+          description: >-
+            Chapter-granular progress for the series currently being processed. It remains persisted with the
+            deletion journal so a stopped worker can reconcile an unlink before reporting a terminal result.
+          required: [id, title, total, processed, chapters, bytes, kept, paused, chapterSkips]
+          properties:
+            id: { type: string }
+            title: { type: string }
+            total: { type: integer, minimum: 0 }
+            processed: { type: integer, minimum: 0 }
+            chapters: { type: integer, minimum: 0 }
+            bytes: { type: integer, minimum: 0 }
+            kept: { type: integer, minimum: 0 }
+            paused: { type: boolean }
+            chapterSkips:
+              type: object
+              additionalProperties: { type: integer, minimum: 0 }
+        error: { type: [string, "null"] }
+    AdminLibrary:
+      type: object
+      required: [id, name, path, paths, age_rating, anilist_lookup, n, pinned, members]
+      properties:
+        id: { type: string }
+        name: { type: string }
+        path: { type: string }
+        paths: { type: array, items: { type: string } }
+        age_rating: { type: [integer, "null"] }
+        anilist_lookup:
+          type: boolean
+          description: >-
+            Whether automatic art, title/id matching, type/direction repair, startup match checks and scheduled
+            AniList enrichment may contact AniList for series currently in this library. Manual actions remain
+            available and existing metadata is preserved when false.
+        n: { type: integer, minimum: 0, description: Visible series in the library. }
+        pinned: { type: integer, minimum: 0, description: Series filed into this library by hand. }
+        members: { type: array, items: { type: string } }
     KomgaPage:
       type: object
       description: >-
@@ -1917,6 +2039,12 @@ paths:
                       sourceName, extSourceId?}` as described above. While `pending` is set the series downloads
                       nothing until an admin confirms or declines the change (POST
                       /api/admin/series/{id}/numbering).
+                  deletedAsGhosts:
+                    type: boolean
+                    description: >-
+                      The admin's "Show deleted chapters as ghosts" (PATCH /api/admin/settings `deletedAsGhosts`), to
+                      every viewer: the series page draws a chapter whose file was deleted on purpose as a ghost row.
+                      The chapter itself is still in /api/series/{id}/books, `pruned`, with its `prunedReason`.
         "401":
           description: Not authenticated
         "404":
@@ -2138,6 +2266,15 @@ paths:
                 type: object
                 additionalProperties: true
                 properties:
+                  id:
+                    type: string
+                    description: >-
+                      Stable book identity. A tombstone keeps the same id, including when another tombstone has
+                      the same chapter number, so progress and a deliberate restore address the intended row.
+                  seriesId: { type: string }
+                  number:
+                    type: number
+                    description: The start of the original chapter number or range.
                   scanlator:
                     type: [string, "null"]
                     description: >-
@@ -2156,13 +2293,13 @@ paths:
                       410.
                   prunedReason:
                     type: [string, "null"]
-                    enum: [deleted, missing, null]
+                    enum: [deleted, missing, rescan_missing, null]
                     description: >-
-                      Since v0.55.4: why a pruned chapter's file is gone, null while it has one. `deleted`: Delete
-                      files removed it, or Rescan everything found it gone from a library built by hand (with
-                      `owned` false; the web says "File no longer on disk"); `missing`: Verify chapter files found
-                      no file behind a downloaded chapter, which the next sweep fetches again; null: the read-chapter
-                      cleanup, a chapter's own delete, or a mark from before v0.37.0.
+                      Why a pruned chapter's file is gone, null while it has one. `deleted` is a deliberate Delete
+                      files or chapter cleanup action; `missing` means Verify found a downloaded file absent;
+                      `rescan_missing` means Rescan found a read-library entry absent. A null reason on a tombstone
+                      is a deliberate cleanup or a legacy mark. Only deliberate tombstones may use the book-id
+                      restore operation; missing/rescan_missing rows remain recovery evidence.
                   owned:
                     type: boolean
                     description: >-
@@ -2184,10 +2321,64 @@ paths:
                       "Batman 01-07 (1987).cbz"; null for one chapter, and for a file an admin gave one number.
                       `number` and `metadata.numberSort` stay the start (1), and `metadata.number` reads the
                       range ("1–7"). Every number from the start to the end counts as held.
+                  readProgress:
+                    type: [object, "null"]
+                    description: >-
+                      The caller's progress, retained on a tombstone and on the same stable book id after a
+                      successful restore.
+                    properties:
+                      page: { type: integer, minimum: 0 }
+                      completed: { type: boolean }
         "401":
           description: Not authenticated
         "404":
           description: Not found, or not visible to this account
+  /api/books/{id}/refetch:
+    post:
+      tags:
+        - downloads
+      summary: Restore one visible chapter that Uchiyomi deliberately deleted, by its stable book id.
+      operationId: postApiBooksIdRefetch
+      description: >-
+        Available to a member who may download. The server derives the only permitted copy from the tombstone:
+        its canonical download-root path, stored source and stored source chapter id. It accepts no client-supplied
+        source, chapter number or path. The exact historical source need not still be followed: the tombstone's
+        book id, series, stored source, stored source chapter id and canonical download-root path are its authority.
+        That source must still have an installed adapter, be enabled, be outside cooldown and be allowed by the
+        caller's age boundary. The copy is pinned, so this explicit choice may override a scanlator block, but it
+        never falls back to another copy. Ranges, manual/read-library files, missing evidence and a copy whose stored
+        identity or canonical path changed are not refetchable. Progress stays attached to the same book id.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, minLength: 1, maxLength: 64 }
+      security:
+        - bearer: []
+      responses:
+        "200":
+          description: The standard one-series download-job start response.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok, started, folder, total]
+                properties:
+                  ok: { type: boolean }
+                  started: { type: boolean }
+                  folder: { type: string }
+                  total: { type: integer, minimum: 1 }
+        "401":
+          description: Not authenticated
+        "403":
+          description: Download permission is disabled for this account.
+        "404":
+          description: No such visible tombstone, or it is outside the caller's library or age boundary.
+        "409":
+          description: >-
+            `not_refetchable`: the row is not a deliberate canonical owned tombstone, its exact stored copy is
+            unsafe or unavailable, a renumber is pending, or the download root is not writable; `busy`: another
+            writer owns this series folder.
   /api/books/{id}/pages:
     get:
       tags:
@@ -4397,6 +4588,11 @@ paths:
       tags:
         - personal
       summary: One collection and its series.
+      description: >-
+        `{id, name, accent, sort_order, items}`: the series in the list's own order, enriched like every listing
+        (`yomi.unread` is the unread badge), a series hidden by the 18+ switch or an age cap left out. Since v0.55.7 (#164)
+        each item also carries `lastReadAt` (when the caller last read in it, their own progress only; null if never)
+        and `latestChapterAt` (when its newest chapter arrived; null without one), for the list's sorts.
       operationId: getApiCollectionsId
       parameters:
         - name: id
@@ -4423,6 +4619,7 @@ paths:
       tags:
         - personal
       summary: Add a series to a collection.
+      description: At the end of the list's own order (since v0.55.7; before, at position 0), as the bulk add puts them.
       operationId: postApiCollectionsIdItems
       parameters:
         - name: id
@@ -5182,28 +5379,37 @@ paths:
         - bearer: []
       responses:
         "200":
-          description: OK
+          description: The caller's complete settings object.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AccountSettings' }
         "401":
           description: Not authenticated
     put:
       tags:
         - personal
       summary: Save the caller's reader and app settings.
+      description: >-
+        Merged into the stored settings by top-level key, so an object value is replaced whole. Among the keys:
+        `reader` (the reader's defaults; since v0.55.7 with `coverEdges`, default true, the cover's colour at the
+        reader's edges) and, since v0.55.7, `listSorts` (list id to `az`, `za`, `read`, `unread` or `latest`: the order
+        each list is shown in; a list's own order is not stored). Since v0.55.8 the validated keys are `librarySort`,
+        `homeCollections` and `showAllChapters`. Unknown keys remain accepted and retained for compatibility.
       operationId: putApiSettings
       requestBody:
         required: false
         content:
           application/json:
             schema:
-              type: object
-              properties:
-                settings:
-                  type: object
+              $ref: '#/components/schemas/AccountSettings'
       security:
         - bearer: []
       responses:
         "200":
-          description: OK
+          description: The complete merged settings object.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AccountSettings' }
         "400":
           description: Malformed body or parameter
         "401":
@@ -6073,6 +6279,12 @@ paths:
                       How many chapters the cleanup would delete if it ran now, at the current day setting,
                       whether or not it is switched on -- so the number can be seen before consenting. Memoised
                       for half a minute; null when it could not be counted.
+                  deleted_as_ghosts:
+                    type: boolean
+                    description: >-
+                      Whether deliberate tombstones are rendered as fetchable ghosts in the series and
+                      Komga-compatible chapter lists. Off by default. Missing and rescan_missing evidence never
+                      becomes a deliberate ghost. PATCH writes it as `deletedAsGhosts`.
                   backup_hour:
                     type: integer
                     minimum: 0
@@ -6178,7 +6390,13 @@ paths:
                 scanlatorPrefs:
                   description: >-
                     The server-wide release preferences, replaced whole. Blocks made here apply to every
-                    series; the priority applies to a series that has no ranking of its own.
+                    series; the priority applies to a series that has no ranking of its own. A group blocked or
+                    unblocked here is applied to the stored listing of every series that lists it before the
+                    answer: a chapter only blocked groups released is `blocked` -- no ghost on
+                    /api/series/{id}/listing or the Komga list, never downloaded -- and one an unblocked group
+                    also released takes that group's copy. The preference write and listing replacement are one
+                    transaction; series are locked in sorted order and effective preferences are re-read under the
+                    lock. If any reapplication fails, the preference is rolled back and the route answers 503.
                   $ref: "#/components/schemas/ScanlatorPrefs"
                 cleanupRead:
                   description: >-
@@ -6231,6 +6449,16 @@ paths:
                     what the setting is for -- maxNumberSort only: they are not counted in booksCount or
                     booksUnreadCount, so a fully read series still reports COMPLETED -- and they never
                     affect lastReadContinuousNumberSort. Nothing outside /api/v1 and /api/v2 changes.
+                  type: boolean
+                deletedAsGhosts:
+                  description: >-
+                    Show deleted chapters as ghosts. Off by default. A chapter whose file was deleted on purpose (a
+                    tombstone whose pruned_reason is not `missing`, and not a hand-built library's file Rescan
+                    everything found gone) is drawn on the series page as a ghost row -- its read tick, Fetch --
+                    rather than as a deleted chapter, and listed "not downloaded" on the Komga-compatible chapter list
+                    even with komgaGhostChapters off. Display only: the updater, counts and progress read it as
+                    before. Every viewer learns it from GET /api/series/{id}/listing `deletedAsGhosts`; GET answers it
+                    as `deleted_as_ghosts`.
                   type: boolean
                 adultGenres:
                   description: >-
@@ -6384,6 +6612,8 @@ paths:
           description: Not authenticated
         "403":
           description: "Forbidden: token scope, account permission or age limit"
+        "503":
+          description: blocklist_apply_failed -- no scanlator preference changed because listing reapplication failed.
   /api/admin/tasks:
     get:
       tags:
@@ -6419,6 +6649,8 @@ paths:
         Since v0.55.4 the list always carries `rescan` ("Rescan everything", schedule "on demand"): `running`
         while its preview or Apply runs, and `lastRun`/`lastResult` the last APPLY's (see POST
         /api/admin/tasks/rescan/apply), persisted in server_settings.rescan_last_run / rescan_last_result.
+        The `fingerprint` entry's `lastResult` is this process's last pass, {done, failed, young, ms} -- `young`
+        (since v0.55.7) the files a pass the server started left for a later one, written in the last minute.
       security:
         - bearer: []
       responses:
@@ -6532,7 +6764,7 @@ paths:
         the library, then looks for every live chapter row's own file under the library folder and the download
         folder -- never a hidden or merged series', nor one in the middle of a renumber -- and keeps a plan in
         memory. Answers {running: 'preview' | 'apply' | null, phase: 'scan' | 'look' | 'pair' | 'numbers' (a
-        preview) | 'mark' | 'renumber' (an Apply) | null, done, of (rows or files of the phase, null while scanning
+        preview) | 'mark' | 'merge' | 'follow' (both v0.55.7) | 'renumber' (an Apply) | null, done, of (rows or files of the phase, null while scanning
         or reading names), startedAt, error: 'failed' |
         'stopped' | null (how the last preview or Apply ended when it did not end well), plan, last (the last
         Apply's result, below, this process's or the one server_settings kept), lastRun (epoch ms or null)}.
@@ -6542,10 +6774,19 @@ paths:
         never "not there" -- left alone), unmounted [{root, missing?, of?}] (a folder with no file present
         behind any of its rows, or more than 90 % of them gone: looks unmounted, and nothing under it is
         planned), gone (rows in your own library folder whose file is gone), moved (gone rows whose file is
-        another live row's now, by fingerprint: renamed or moved, kept), downloads (rows in the download
+        another live row's now, by fingerprint: renamed or moved, kept -- and since v0.55.7 a row never
+        fingerprinted, by the ONE live row anywhere with its file name in another folder, exactly its stored
+        mtime and, when both know it, its size, first seen by a scan after the one that last saw the gone row;
+        zero or two such rows, or one another gone row or a fingerprint twin claims too, is no pair, and such a
+        pair never marks a row), follow (v0.55.7: of those, the pairs
+        inside one series, whose chapters Apply points at the new file), downloads (rows in the download
         folder whose file is gone: Verify chapter files' to mark, counted only), emptied (series with every
-        live chapter's file gone), goneSeries, emptiedList [{seriesId, chapters, title}], movedList [{seriesId,
-        title, file, to: {seriesId, title, file}}], numbers, numbersTotal}. The lists hold at most 200 entries
+        live chapter's file gone), goneSeries, emptiedList [{seriesId, chapters, title, into?: {seriesId, title}}]
+        (into, v0.55.7: the one series every live chapter of it moved into, named when this viewer may list it),
+        movedList [{seriesId, title, file, to: {seriesId, title, file}}], numbers, numbersTotal, merges, mergesTotal}.
+        `merges` (v0.55.7, at most 1000, by title) is the merge opt-in: [{seriesId, title, into: {seriesId, title},
+        chapters}], each a series with nothing left whose every live chapter moved into `into`, which the merge route
+        would merge there and neither mid-renumber; offered only when both may be listed. The lists hold at most 200 entries
         each and name only series this viewer may list (the 18+ hide, as on the repair status); the counts are
         always whole. `numbers` is the opt-in, every series (by title, at most 1000) whose chapter numbers the
         file-name rules of v0.55.2 would change -- each row still read by an older rule, read again with rule 2
@@ -6555,8 +6796,9 @@ paths:
         how many a tracker would be told higher, or lower -- which the tracker floor refuses), examples [{file,
         from, to}] (at most 3, numbers as text: "2" -> "5", "1" -> "1–7")}]. A series numbered by posting order,
         or in the middle of a renumber, is never listed; a row Verify marked 'missing' is never read again.
-        `last` is null or {ok, plan (the preview it applied), marked, back, changed, moved, busy, downloads,
-        emptied, unmounted [{root}], renumbered {series, chapters}, ms, stopped?: 'shutdown'}.
+        `last` is null or {ok, plan (the preview it applied), marked, back, changed, moved, followed, twins, merged,
+        notMerged, busy, downloads, emptied, unmounted [{root}], renumbered {series, chapters}, ms, stopped?:
+        'shutdown'} (followed, twins, merged and notMerged since v0.55.7).
       security:
         - bearer: []
       responses:
@@ -6577,18 +6819,38 @@ paths:
         v0.55.4 (discussion #150). Detached like the preview, because it stats every planned file again: answers
         {ok: true, started: true}, or {ok: false, error} when it may not start -- `busy` (a preview or an Apply is
         running), `no_plan`, `stale` (a newer preview replaced it, or it is older than 30 minutes), `applied`
-        (each plan is applied once), `not_in_plan` (a series in `renumber` the preview did not list), or the job
+        (each plan is applied once), `not_in_plan` (a series in `renumber` the preview did not list, or in `merge`
+        one it did not offer), or the job
         it would run beside: `sweep_running`, `autofix_running`,
         `repair_running`, `verify_running`, `cleanup_running`, `scan_running`. One writer per series, as a renumber
         has it: a series a download is writing into or a check is reading as Apply reaches it (a Fetch and its lanes,
         the slow archive's chapter, Fetch newest, a repair) is left alone -- neither marked nor renumbered, counted in
         the result's `busy` for the next Rescan -- and every other series it changes is held busy until it is done, so
-        no Fetch (409 `busy`), archive chapter or Fetch newest starts in it meanwhile. With every library scan held off,
+        no Fetch (409 `busy`), archive chapter or Fetch newest starts in it meanwhile, and the chapter sweep (since
+        v0.55.7) puts it to the back of its queue once, then skips it. With every library scan held off,
         each planned row is asked again -- the same id at the same file, still live, its series neither hidden,
         merged nor being renumbered, its file still not there, and no live row with its fingerprint -- and the
         library folder must still hold a file the preview saw; then it is marked pruned with `pruned_reason =
         'deleted'` (held: the sweep never fetches it back), and the cover and books_count of every series it
-        touched are recomputed. It never erases a row, touches a file on disk, marks a row in the download folder
+        touched are recomputed. Since v0.55.7 each pair of the plan inside ONE series (a file moved or renamed
+        within its series) is asked again too -- both rows unchanged, one fingerprint (or, for a row never
+        fingerprinted, still the one live row with its name and time), the old file still gone and the new one
+        there -- and, when the new row holds nothing of anyone's (no reading progress, reading event,
+        bookmark, note, offline copy, number or title set by hand, or page marked by hand; asked with both rows
+        locked), the old row takes the new file (root, file, mtime, size, fingerprint; its number and title read
+        from the new name by its own name_rule), the new row is deleted and a cover on it moves to the old row:
+        the chapter shows once, with its id and everyone's history (`followed`). A new row that holds something is
+        kept beside the old one (`twins`); a pair whose old file came back is `back`, one changed since the preview
+        `changed`. Each series in `merge` (v0.55.7) is asked again with both series held -- the merge route's
+        checks (mergeRefusal) still pass, neither is mid-renumber, every live row of it is still gone and has a live
+        twin in the other series whose file is there -- else it is left alone (`notMerged`); then its tracker link is
+        copied to the other series for each provider that has none (a person's link as it is; an automatic one
+        keeps checked_at only when every name the absorbed series goes by is one the other will go by and the
+        online-match check is not running, else it goes unchecked for that check), it is merged exactly as POST
+        /api/admin/series/{id}/merge merges (every row and everyone's history, favourites, ratings, collections,
+        read marks and tracker floor; audited `series.merge` with via 'rescan' and the plan id), and its pairs
+        follow as above (`merged`).
+        It never erases a row with anything on it, touches a file on disk, marks a row in the download folder
         (Verify chapter files' to mark), relabels a row already pruned, hides or forgets a series, or changes a
         tracker floor, read mark, favourite or rating. A file that comes back is picked up on the same row by the
         next scan. Then, in the same hold and in ONE transaction, the series in `renumber` (the opt-in) are read
@@ -6598,7 +6860,8 @@ paths:
         preview is left alone. Nothing is pushed to any tracker: the next chapter a reader finishes sends its
         number as usual. The result lands on the status route's `last` and on GET /api/admin/tasks as the
         `rescan` entry's lastResult, persisted in server_settings.rescan_last_run / rescan_last_result. Audit:
-        `library.rescan` {plan, marked, back, changed, moved, busy, downloads, emptied, unmounted, ms}, and
+        `library.rescan` {plan, marked, back, changed, moved, followed, twins, merged, notMerged, busy, downloads, emptied,
+        unmounted, ms}, and
         `library.rescan_numbers` {plan, series, chapters, ids} when the opt-in renumbered something.
       requestBody:
         required: true
@@ -6620,13 +6883,21 @@ paths:
                     in plan.numbers. Omitted or empty renumbers nothing.
                   items:
                     type: string
+                merge:
+                  type: array
+                  maxItems: 10000
+                  description: >-
+                    Since v0.55.7, the merge opt-in: the series to merge into the series their files went to, each one
+                    the preview offered in plan.merges. Omitted or empty merges nothing.
+                  items:
+                    type: string
       security:
         - bearer: []
       responses:
         "200":
           description: OK
         "400":
-          description: The body is not {plan} with a uuid, and `renumber` series ids if any.
+          description: The body is not {plan} with a uuid, and `renumber` and `merge` series ids if any.
         "401":
           description: Not authenticated
         "403":
@@ -6635,7 +6906,7 @@ paths:
     post:
       tags:
         - admin
-      summary: Start a scheduled task now (scan, update, backup, fingerprint, pagehash, cleanup, extensions, verify, repair, rescan).
+      summary: Start a scheduled task now (scan, update, backup, fingerprint, pagehash, cleanup, extensions, verify, repair, rescan, matches).
         {ok:false,error:busy} while it runs, {ok:false,error:not_enabled} for a task that is switched off,
         {ok:false,error:sweep_running} for `repair` while a chapter sweep is going, and
         {ok:false,error:repair_running} for `update` while a library repair is going.
@@ -6693,10 +6964,13 @@ paths:
             the repair for a database restored without its chapter files. `repair` is the nightly library
             repair and is the only one that takes a body. `rescan` (since v0.55.4, "Rescan everything") starts
             a preview -- a scan, then a look for every live chapter's own file -- and changes nothing; its
-            progress and plan are on GET /api/admin/tasks/rescan/status.
+            progress and plan are on GET /api/admin/tasks/rescan/status. `matches` (since v0.55.7, "Check online
+            matches") holds every automatic AniList link and every cover and banner found by a title search to the
+            title check again, detached; its last run is the `matches` entry of GET /api/admin/tasks
+            ({matches, removed, links, art, unanswered, stopped?, ms}), audited as `library.match_check`.
           schema:
             type: string
-            enum: [scan, update, backup, fingerprint, pagehash, cleanup, extensions, verify, repair, rescan]
+            enum: [scan, update, backup, fingerprint, pagehash, cleanup, extensions, verify, repair, rescan, matches]
       requestBody:
         required: false
         description: Only `repair` reads a body; every other task ignores it.
@@ -6930,7 +7204,11 @@ paths:
                   description: >-
                     The series' own release preferences, replaced whole; null clears them so the server-wide
                     ones apply again. The priority given here replaces the global list for this series, the
-                    blocked list is added to it, and a null patienceDays inherits.
+                    blocked list is added to it, and a null patienceDays inherits. Applied to the series' stored
+                    listing before the answer, as the server-wide save is: a chapter only blocked groups released
+                    leaves /api/series/{id}/listing and the Komga list at once, and comes back on an unblock in its
+                    calculated natural `available`, `held` or `covered` state. The preference and listing update are
+                    atomic; a failed reapplication rolls both back and answers 503.
                   oneOf:
                     - $ref: "#/components/schemas/ScanlatorPrefs"
                     - type: "null"
@@ -6994,6 +7272,8 @@ paths:
           description: Not found, or not visible to this account
         "409":
           description: "`edition_lang`, `edition_exists` (see `lang`) or `nothing_listed` (see `chapterFloor`)"
+        "503":
+          description: blocklist_apply_failed -- the scanlator preference and listing update were rolled back.
     delete:
       tags:
         - admin
@@ -7076,6 +7356,199 @@ paths:
           description: Not authenticated
         "403":
           description: "Forbidden: token scope, account permission or age limit"
+  /api/admin/series/bulk/auto-update:
+    post:
+      tags:
+        - admin
+      summary: "Monitor or Unmonitor over a selection: each series' auto_update, as PATCH /api/admin/series/{id} sets it."
+      operationId: postApiAdminSeriesBulkAutoUpdate
+      description: >-
+        Requires an admin account and a token carrying the admin scope. Sets lib_series.auto_update ("Auto-update new
+        chapters") for every series named. An unmonitored series gets no new chapter searched for or downloaded by
+        anything unattended -- the sweep and its partial-chapter pass, the nightly repair's failures, short-chapter and
+        gap steps, Fix everything, the slow archive -- while Check now, Fetch, Fetch again and Fill now on the series
+        still work. A series that is gone, hidden or merged away is skipped with its reason. One `series.settings` audit
+        row per series.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [seriesIds, autoUpdate]
+              properties:
+                seriesIds:
+                  type: array
+                  minItems: 1
+                  maxItems: 500
+                  description: Series ids, 1-64 characters each; duplicates count once.
+                  items:
+                    type: string
+                autoUpdate:
+                  type: boolean
+                  description: true monitors, false unmonitors.
+      security:
+        - bearer: []
+      responses:
+        "200":
+          description: "{ ok: true, applied, autoUpdate, skipped: [{ id, reason }] }"
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  applied:
+                    type: integer
+                  autoUpdate:
+                    type: boolean
+                  skipped:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id:
+                          type: string
+                        reason:
+                          type: string
+                          enum: [not_found, hidden, merged]
+        "400":
+          description: "bad_request: the body is not { seriesIds, autoUpdate }."
+        "401":
+          description: Not authenticated
+        "403":
+          description: "Forbidden: token scope, account permission or age limit"
+  /api/admin/series/bulk/chapters/delete:
+    post:
+      tags:
+        - admin
+      summary: "Delete the downloaded chapters of a selection, the cover chapter kept: Remove chapters once per series."
+      operationId: postApiAdminSeriesBulkChaptersDelete
+      description: >-
+        Requires an admin account and admin scope. Claims one persisted, detached cleanup run and answers before
+        unlinking begins. The worker applies POST /api/admin/series/{id}/chapters/delete to every live download-root
+        chapter except the selected cover (or lowest owned chapter). It retains the shared folder lock through file
+        deletion, optional unmonitoring and audit creation; rechecks missing, hidden, merged and busy state at execution
+        time; preserves manual files, bookmarks, covers, rows and reading progress. Deleting a chapter somebody is
+        reading can still lose their position in that file, which is why the UI warns before starting. `pause` defaults
+        true. Closing/reloading the browser or a proxy timeout does not stop the job. A second active run is 409.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [seriesIds]
+              properties:
+                seriesIds:
+                  type: array
+                  minItems: 1
+                  maxItems: 500
+                  description: Series ids, 1-64 characters each; duplicates count once.
+                  items:
+                    type: string
+                pause:
+                  type: boolean
+                  description: Also unmonitor each series deleted from (auto_update off). Defaults to true.
+      security:
+        - bearer: []
+      responses:
+        "202":
+          description: The run was durably claimed; follow it with GET on this path.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok, runId, total]
+                properties:
+                  ok: { type: boolean }
+                  runId: { type: string, format: uuid }
+                  total: { type: integer, minimum: 1 }
+        "400":
+          description: "bad_request: the body is not { seriesIds, pause? }."
+        "401":
+          description: Not authenticated
+        "403":
+          description: "Forbidden: token scope, account permission or age limit"
+        "409":
+          description: "bulk_delete_busy -- one cleanup run is already active."
+    get:
+      tags:
+        - admin
+      summary: Read a persisted bulk chapter-delete run.
+      operationId: getApiAdminSeriesBulkChaptersDelete
+      description: >-
+        With `runId`, returns that run or 404. Without it, returns the newest run or null. Progress and every
+        per-series result are persisted, so a browser can rejoin after reload or a proxy failure. A run left active
+        by an unexpected server restart becomes terminal `interrupted`; it is never replayed automatically.
+      parameters:
+        - name: runId
+          in: query
+          required: false
+          schema: { type: string, format: uuid }
+      security:
+        - bearer: []
+      responses:
+        "200":
+          description: The requested/newest run, or null when no run exists.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [run]
+                properties:
+                  run:
+                    oneOf:
+                      - { $ref: '#/components/schemas/AdminBulkDeleteRun' }
+                      - { type: "null" }
+        "400":
+          description: bad_request -- runId is not a UUID.
+        "401":
+          description: Not authenticated
+        "403":
+          description: "Forbidden: token scope, account permission or age limit"
+        "404":
+          description: not_found -- no run has that id.
+  /api/admin/series/bulk/chapters/delete/cancel:
+    post:
+      tags:
+        - admin
+      summary: Ask an active bulk chapter-delete run to stop between series.
+      operationId: postApiAdminSeriesBulkChaptersDeleteCancel
+      description: >-
+        Sets a persisted cancellation request. Cancellation is observed between series, never while a chapter is
+        being unlinked or before that series' optional pause and audit have settled. Omit runId to target the active run.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                runId: { type: string, format: uuid }
+      security:
+        - bearer: []
+      responses:
+        "200":
+          description: Cancellation was recorded.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok, runId, cancelRequested]
+                properties:
+                  ok: { type: boolean }
+                  runId: { type: string, format: uuid }
+                  cancelRequested: { type: boolean }
+        "400":
+          description: bad_request -- runId is not a UUID.
+        "401":
+          description: Not authenticated
+        "403":
+          description: "Forbidden: token scope, account permission or age limit"
+        "404":
+          description: not_running -- no matching active run.
   /api/admin/scanlators:
     get:
       tags:
@@ -8416,13 +8889,32 @@ paths:
       description: >-
         Requires an admin account and a token carrying the admin scope. Scopes only ever restrict. Each library in
         `content` carries `paths` (since v0.55.1): every folder it holds, its first folder first (the one `path`
-        names), then the rest by name; the default library's is empty. `candidates`, the folders an admin could split
-        out, leave out every folder a library holds.
+        names), then the rest by name; the default library's is empty. Since v0.55.8 every row also carries
+        `anilist_lookup`. `candidates`, the folders an admin could split out, leave out every folder a library holds.
       security:
         - bearer: []
       responses:
         "200":
           description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [content, candidates]
+                properties:
+                  content:
+                    type: array
+                    items: { $ref: '#/components/schemas/AdminLibrary' }
+                  candidates:
+                    type: array
+                    items:
+                      type: object
+                      required: [path, series, looksLikeSource, depth]
+                      properties:
+                        path: { type: string }
+                        series: { type: integer, minimum: 0 }
+                        looksLikeSource: { type: boolean }
+                        depth: { type: integer, minimum: 1 }
         "401":
           description: Not authenticated
         "403":
@@ -8439,8 +8931,11 @@ paths:
         longest folder its own folder is in, across every library's folders (a series under a deeper library's folder
         stays there). `moved` counts the series that changed library, removed ones included. Each folder is checked
         as `path` always was (relative to the library root, no `..`); the same folder twice is held once.
+        `anilistLookup` defaults true. False prevents future automatic AniList art/title/id matching, direction/type
+        repair and scheduled enrichment for series currently in this library, without clearing existing metadata;
+        explicit Admin Art, Relink, Check online matches, tracker and Discover actions remain available.
       requestBody:
-        required: false
+        required: true
         content:
           application/json:
             schema:
@@ -8461,7 +8956,13 @@ paths:
                     Every folder the library holds (since v0.55.1), the first being the one a rollback to v0.55.0
                     reads. Wins over `path`.
                 ageRating:
-                  type: integer
+                  type: [integer, "null"]
+                  minimum: 0
+                  maximum: 18
+                anilistLookup:
+                  type: boolean
+                  default: true
+                  description: Permit automatic AniList enrichment for series currently in this library.
       security:
         - bearer: []
       responses:
@@ -8564,14 +9065,16 @@ paths:
     patch:
       tags:
         - admin
-      summary: Rename a library, re-path it, change its age rating or who may open it.
+      summary: Rename or re-path a library, change its age rating, AniList policy, or who may open it.
       operationId: patchApiAdminLibrariesId
       description: >-
         Requires an admin account and a token carrying the admin scope. Scopes only ever restrict. `paths` (since
         v0.55.1) replaces every folder the library holds; `path` alone makes it that one folder. New folders move
         series as a create does, and what the old folders held that the new ones do not goes to whichever library
         holds it now, in one transaction; the default library `lib` keeps its empty path and ignores either. Folders
-        are checked before anything is written, so a refused save (400, 409) changes nothing.
+        are checked before anything is written, so a refused save (400, 409) changes nothing. `anilistLookup: false`
+        prevents future automatic AniList enrichment for series in this library and preserves existing art, links,
+        type and direction; moving a series makes the destination library's policy effective.
       parameters:
         - name: id
           in: path
@@ -8596,7 +9099,12 @@ paths:
                   maxItems: 200
                   description: Every folder the library holds, the first first (since v0.55.1). Wins over `path`.
                 ageRating:
-                  type: integer
+                  type: [integer, "null"]
+                  minimum: 0
+                  maximum: 18
+                anilistLookup:
+                  type: boolean
+                  description: Permit automatic AniList enrichment for series currently in this library.
                 members:
                   type: array
                   items: { type: string }
@@ -8701,7 +9209,10 @@ paths:
         Requires an admin account and a token carrying the admin scope. Scopes only ever restrict. `upload` takes an
         image of up to 11 MB as a base64 data URL; the body may be up to about 14.7 MB to carry one (v0.53.0; 12 MB
         before, which refused pictures between 9 and 11 MB). `url` stores the address the art is fetched from, and
-        `reset` hands the art back to the automatic source.
+        `reset` hands the art back to the automatic source. `first_page` (v0.55.7, the cover only; a banner is a 400)
+        makes the series' own first page its cover for good: `overrides.cover` on the series reads `first_page`, and
+        nothing found online is shown or looked up for it -- its banner is made from its pages unless an admin set one.
+        Automatic art is kept from an online entry only when it is named as the series is (v0.55.7).
       parameters:
         - name: id
           in: path
@@ -8721,7 +9232,7 @@ paths:
                   enum: [cover, banner]
                 mode:
                   type: string
-                  enum: [url, upload, reset]
+                  enum: [url, upload, reset, first_page]
                 url:
                   type: string
                   format: uri
@@ -8750,7 +9261,8 @@ paths:
         - admin
       summary: Which series have real art and which fall back to a page.
       operationId: getApiAdminArtOverview
-      description: Requires an admin account and a token carrying the admin scope. Scopes only ever restrict.
+      description: Requires an admin account and a token carrying the admin scope. Scopes only ever restrict. Each row
+        says `first_page` when an admin made the series' first page its cover (v0.55.7).
       security:
         - bearer: []
       responses:

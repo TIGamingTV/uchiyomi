@@ -275,6 +275,34 @@ CREATE TABLE IF NOT EXISTS series_listing (
 -- of the row. Rows written before v0.33.0 carry the empty default until the series' next check.
 ALTER TABLE series_listing ADD COLUMN IF NOT EXISTS copies jsonb NOT NULL DEFAULT '[]';
 
+-- The visible status can be blocked while a preference hides every stored copy. Keep the state underneath that
+-- temporary block so lifting it restores held/covered faithfully instead of making every chapter available. A row
+-- written before v0.55.8 cannot prove which natural state a blocked chapter had, so it fails closed as held until the
+-- next source refresh rebuilds it. Non-blocked rows already carry their natural state in status.
+ALTER TABLE series_listing ADD COLUMN IF NOT EXISTS unblocked_status text;
+UPDATE series_listing
+   SET unblocked_status = CASE
+     WHEN status IN ('available', 'held', 'covered') THEN status
+     ELSE 'held'
+   END
+ WHERE unblocked_status IS NULL
+    OR unblocked_status NOT IN ('available', 'held', 'covered');
+ALTER TABLE series_listing ALTER COLUMN unblocked_status SET DEFAULT 'available';
+ALTER TABLE series_listing ALTER COLUMN unblocked_status SET NOT NULL;
+DO $migration$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint
+     WHERE conrelid = 'series_listing'::regclass
+       AND conname = 'series_listing_unblocked_status_check'
+  ) THEN
+    ALTER TABLE series_listing
+      ADD CONSTRAINT series_listing_unblocked_status_check
+      CHECK (unblocked_status IN ('available', 'held', 'covered'));
+  END IF;
+END
+$migration$;
+
 -- Content identity, so a chapter can be recognised after it moves. Derived from the archive's central
 -- directory (entry names + CRC-32 + uncompressed sizes), which is cheap to read and survives recompression.
 -- Nothing reads these yet; a background job fills them in, and fp_at is set even on failure so an unreadable
@@ -302,6 +330,7 @@ CREATE INDEX IF NOT EXISTS lib_books_pruned_idx ON lib_books (pruned_at) WHERE p
 --   'deleted'  the admin's Delete files removed it (lib/libraryAdmin.ts deleteSeriesFiles)
 --   'missing'  the admin's "Verify chapter files" task found no file behind the row (lib/verifyFiles.ts):
 --              a database-only restore, since chapter files are never in a backup
+--   'rescan_missing' Rescan found a read-library entry absent; unlike deliberate deletion it may be fetched again
 -- ⚠️ The updater's have-set reads this. A cleanup or Delete-files tombstone still counts as HELD -- "we let
 -- the bytes go on purpose, do not fetch it again" is the whole point of those marks -- while a 'missing'
 -- one does not, so the next sweep fetches it again. That is what makes a restore recover its chapters
@@ -370,6 +399,57 @@ CREATE TABLE IF NOT EXISTS audit_log (
   user_agent text
 );
 CREATE INDEX IF NOT EXISTS idx_audit_at ON audit_log(at DESC);
+
+-- v0.55.8: Rescan used to label a vanished read-library file as if Delete files had removed it. That made it a held
+-- tombstone forever, so restoring only the database could never fetch it again. A row outside the owned download root
+-- is changed to rescan_missing, except where an audit proves deliberate removal. A chapter-delete audit's bookIds
+-- alone do not prove that a particular request succeeded, because the audit includes skipped requests too, so it
+-- proves one book only when every requested id was applied and the audit follows this tombstone's stamp (an older
+-- successful deletion of the same stable id cannot prove what happened after it was restored). Whole-series Delete
+-- files now records the exact affected
+-- ids under the same rule. Older versions recorded only a file count; retain those only when the numeric count exactly
+-- matches every tombstone stamped in the five minutes immediately before the audit. That bounded compatibility case
+-- proves the normal on-disk deletion without allowing an old or mismatched series audit to bless ambiguous rows.
+-- This intentionally runs on every boot: an older image
+-- used after rollback can write the ambiguous value again, and the update is idempotent.
+UPDATE lib_books b
+   SET pruned_reason = 'rescan_missing'
+ WHERE b.pruned_reason = 'deleted'
+   AND b.root IS DISTINCT FROM '${(process.env.DL_ROOT || '/library-dl').replaceAll("'", "''")}'
+   AND NOT EXISTS (
+     SELECT 1 FROM audit_log a
+      WHERE a.detail->>'id' = b.series_id
+        AND (
+          (a.event = 'series.chapters_delete'
+           AND a.at >= b.pruned_at
+           AND jsonb_typeof(a.detail->'bookIds') = 'array'
+           AND a.detail->'bookIds' ? b.id
+           AND CASE WHEN COALESCE(a.detail->>'applied', '') ~ '^[0-9]+$'
+                    THEN (a.detail->>'applied')::int = jsonb_array_length(a.detail->'bookIds')
+                    ELSE false END)
+          OR
+          (a.event = 'series.delete_files'
+           AND a.at >= b.pruned_at
+           AND (
+             (jsonb_typeof(a.detail->'bookIds') = 'array'
+              AND a.detail->'bookIds' ? b.id
+              AND CASE WHEN COALESCE(a.detail->>'applied', '') ~ '^[0-9]+$'
+                       THEN (a.detail->>'applied')::int = jsonb_array_length(a.detail->'bookIds')
+                       ELSE false END)
+             OR
+             (COALESCE(a.detail->>'files', '') ~ '^[1-9][0-9]*$'
+              AND b.pruned_at >= a.at - interval '5 minutes'
+              AND (a.detail->>'files')::int = (
+                SELECT count(*)::int
+                  FROM lib_books proved
+                 WHERE proved.series_id = b.series_id
+                   AND proved.pruned_reason = 'deleted'
+                   AND proved.pruned_at >= a.at - interval '5 minutes'
+                   AND proved.pruned_at <= a.at
+              ))
+           ))
+        )
+   );
 
 -- per-source health: block / rate-limit detection (status: ok | rate_limited | blocked | down)
 CREATE TABLE IF NOT EXISTS source_health (
@@ -723,6 +803,9 @@ CREATE TABLE IF NOT EXISTS opds_tokens (
 -- A library can carry an age rating that its series inherit. Rating 210 series one at a time is not a thing
 -- anyone does, so without this the age limits shipped alongside are impractical on a real library.
 ALTER TABLE libraries ADD COLUMN IF NOT EXISTS age_rating int;
+-- Per-library privacy boundary for implicit AniList enrichment (#168). Existing and rollback-created libraries keep
+-- the historical behaviour; switching it off never clears art, tracker links, direction or type already learned.
+ALTER TABLE libraries ADD COLUMN IF NOT EXISTS anilist_lookup boolean NOT NULL DEFAULT true;
 
 -- Why a series is in the library it is in. The scanner already keeps an existing series where it is, so a
 -- hand-move survives a rescan by accident; this records that it was DELIBERATE, so creating or re-pathing a
@@ -1459,7 +1542,8 @@ ALTER TABLE lib_books ADD COLUMN IF NOT EXISTS number_end real;
 -- looked in chapter rows and, while a notice switch is on, leaves out the hidden notices among the rows that came
 -- (lib/enrich.ts newSinceSeen) -- which it can only tell apart by when they came. Taken by number, a file collected
 -- late below the series' top (a 01-07 omnibus beside a hidden 44.5) was the notice, and swallowed. The scan's
--- INSERT takes the default and its ON CONFLICT never names the column, so a row keeps the time it first came. Rows
+-- ON CONFLICT never names the column, so a row keeps the time it first came; since v0.55.7 its INSERT names it, with
+-- the time the scan began (lib/library.ts firstSeen: Rescan everything tells two scans apart by it). Rows
 -- from before this release all carry the time of the upgrade and tie, ordered by number as before. v0.55.1 boots on
 -- this schema: it never names the column, and its INSERTs take the default.
 ALTER TABLE lib_books ADD COLUMN IF NOT EXISTS created_at timestamptz NOT NULL DEFAULT now();
@@ -1476,6 +1560,81 @@ ALTER TABLE server_settings ADD COLUMN IF NOT EXISTS hide_notice_short_only bool
 -- boots on this schema and never names them.
 ALTER TABLE server_settings ADD COLUMN IF NOT EXISTS rescan_last_run    timestamptz;
 ALTER TABLE server_settings ADD COLUMN IF NOT EXISTS rescan_last_result jsonb;
+
+-- v0.55.7: ONE block, the release's pieces in order. All additive and nullable: v0.55.6 boots on this schema and
+-- never names them.
+--
+-- (#168) An online match is stored only when it is named as the series is (lib/onlineMatch.ts). checked_at is
+-- when an automatic AniList link (linked_by NULL) or a stored cover or banner was held to that check; NULL is never,
+-- which the background recheck takes up (lib/matchCheck.ts): every row from before this release, a link an edition
+-- copies from another, and whatever an older version writes after a rollback. Deliberately NO DEFAULT: ADD COLUMN would
+-- write it into every existing row, and each would read as checked. The recheck's last run is persisted like Verify's,
+-- for the Tasks line.
+ALTER TABLE series_trackers ADD COLUMN IF NOT EXISTS checked_at timestamptz;
+ALTER TABLE series_art      ADD COLUMN IF NOT EXISTS checked_at timestamptz;
+ALTER TABLE server_settings ADD COLUMN IF NOT EXISTS match_check_last_run    timestamptz;
+ALTER TABLE server_settings ADD COLUMN IF NOT EXISTS match_check_last_result jsonb;
+--
+-- (#150) The file a scan last read a series' ComicInfo from -- its first chapter archive -- as JSON [how it was
+-- read, path, mtime ms, size] (lib/library.ts infoReadOf). A scan opens that archive again only when the file is no
+-- longer the one it read: on @Kedryn's Unraid every scan opened the first archive of every folder. NULL = read it at the
+-- next scan. v0.55.6 never names it: its scans read every folder, as they always did.
+ALTER TABLE lib_series ADD COLUMN IF NOT EXISTS info_read text;
+
+-- Deleted chapters shown as ghosts (lib/deletedGhosts.ts): with it on, a chapter whose file was deleted on purpose -- a
+-- tombstone whose pruned_reason is not 'missing' -- is drawn on the series page as a ghost row and listed to Mihon as
+-- "not downloaded", instead of as a deleted chapter. Display only: the updater, the counts and progress read the
+-- tombstone as before. Off by default; an older build boots on this schema and never names it.
+ALTER TABLE server_settings ADD COLUMN IF NOT EXISTS deleted_as_ghosts boolean NOT NULL DEFAULT false;
+
+-- v0.55.8: Delete downloaded chapters for a selection is a detached admin job. Keeping the selection, progress and
+-- result in Postgres means closing the browser or crossing a proxy timeout cannot turn a destructive operation into an
+-- unknown retry. worker_id distinguishes this process from a row a previous process left running; the admin plugin
+-- closes those rows as interrupted at boot. There may be only one active run, matching the one shared folder-writer
+-- lock used by downloads, repairs, rescans and renumbering.
+CREATE TABLE IF NOT EXISTS admin_bulk_delete_runs (
+  id               uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  worker_id        uuid NOT NULL,
+  started_by       uuid REFERENCES users(id) ON DELETE SET NULL,
+  started_at       timestamptz NOT NULL DEFAULT now(),
+  finished_at      timestamptz,
+  heartbeat_at     timestamptz NOT NULL DEFAULT now(),
+  status           text NOT NULL DEFAULT 'running'
+                   CHECK (status IN ('running', 'done', 'cancelled', 'failed', 'interrupted')),
+  cancel_requested boolean NOT NULL DEFAULT false,
+  pause            boolean NOT NULL DEFAULT true,
+  series_ids       text[] NOT NULL,
+  total            int NOT NULL,
+  done             int NOT NULL DEFAULT 0,
+  summary          jsonb NOT NULL DEFAULT '{"applied":0,"chapters":0,"bytes":0,"kept":0,"paused":0,"skipped":0,"failed":0,"chapterSkips":{}}'::jsonb,
+  results          jsonb NOT NULL DEFAULT '[]'::jsonb,
+  current          jsonb,
+  error            text
+);
+-- A v0.55.8 prerelease may already have created the run table without chapter-level crash state.
+ALTER TABLE admin_bulk_delete_runs ADD COLUMN IF NOT EXISTS current jsonb;
+-- Intent is committed before unlink. A new process can therefore distinguish "never reached this chapter" from
+-- "may have unlinked it", inspect the exact owned path, and finish the tombstone before closing the run. Applied and
+-- skipped rows remain with the run as its destructive-operation journal and disappear with the bounded run history.
+CREATE TABLE IF NOT EXISTS admin_bulk_delete_items (
+  run_id       uuid NOT NULL REFERENCES admin_bulk_delete_runs(id) ON DELETE CASCADE,
+  series_id    text NOT NULL,
+  book_id      text NOT NULL,
+  root         text NOT NULL,
+  file         text NOT NULL,
+  position     int NOT NULL,
+  state        text NOT NULL CHECK (state IN ('intent', 'applied', 'skipped', 'unresolved')),
+  bytes        bigint NOT NULL DEFAULT 0,
+  reason       text,
+  created_at   timestamptz NOT NULL DEFAULT now(),
+  updated_at   timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (run_id, book_id)
+);
+CREATE INDEX IF NOT EXISTS idx_admin_bulk_delete_items_state
+  ON admin_bulk_delete_items (run_id, state, position);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_admin_bulk_delete_one_running
+  ON admin_bulk_delete_runs ((true)) WHERE status = 'running';
+CREATE INDEX IF NOT EXISTS idx_admin_bulk_delete_started ON admin_bulk_delete_runs (started_at DESC);
 `;
 
 // Serialises migrate() across processes. CREATE TABLE IF NOT EXISTS is not safe to run concurrently:

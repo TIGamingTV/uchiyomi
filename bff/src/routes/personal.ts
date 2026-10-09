@@ -38,6 +38,32 @@ function computeStreaks(days: string[]): { current: number; longest: number } {
   return { current, longest };
 }
 
+/**
+ * What a list's sort orders need that a series DTO does not carry (#164), for the series of one list: when this reader
+ * last read in each, and when each one's newest chapter arrived. One query each for the whole list, over ids the route
+ * has already let through.
+ *
+ * `read` is the reader's OWN latest progress in the series -- another member's reading is not theirs -- with hidden
+ * notice chapters left out, as enrich's counts leave them out; a series they never opened has none. `latest` is the
+ * newest chapter file's time (lib_series.latest_mtime), what the Library's Updated sort orders by: the source's own
+ * chapter date is missing for most chapters. None for a series without a chapter, and none on a Komga backend, which
+ * keeps no lib_series rows.
+ */
+async function listDates(userId: string, ids: string[]): Promise<{ read: Map<string, string>; latest: Map<string, string> }> {
+  if (!ids.length) return { read: new Map(), latest: new Map() };
+  const read = await q<{ series_id: string; at: Date }>(
+    `SELECT series_id, max(updated_at) AS at FROM read_progress
+      WHERE user_id = $1 AND series_id = ANY($2) AND NOT ${noticeBook('read_progress.book_id')}
+      GROUP BY series_id`,
+    [userId, ids],
+  );
+  const latest = await q<{ id: string; mt: string }>('SELECT id, latest_mtime AS mt FROM lib_series WHERE id = ANY($1) AND latest_mtime > 0', [ids]);
+  return {
+    read: new Map(read.map((r) => [r.series_id, new Date(r.at).toISOString()])),
+    latest: new Map(latest.map((r) => [r.id, new Date(Number(r.mt)).toISOString()])),
+  };
+}
+
 export default async function personalRoutes(app: FastifyInstance) {
   app.addHook('preHandler', authenticate);
   app.addHook('preHandler', async (req) => {
@@ -218,7 +244,14 @@ export default async function personalRoutes(app: FastifyInstance) {
     // Nothing is removed from the collection itself -- reordering and membership are untouched.
     const shown = await browsableIds(ids, vc(req));
     const series = (await Promise.all(ids.filter((sid) => shown.has(sid)).map((sid) => komga.series(vc(req), sid).catch(() => null)))).filter(Boolean);
-    return { ...col, items: await enrichSeries(req, series) };
+    const items = await enrichSeries(req, series);
+    // The list's sorts (#164) order by two dates no series payload carries; they ride on these items alone. The items
+    // stay in the list's own order: the web sorts them, a list being one request and never paged.
+    const dates = await listDates(uid, items.map((s: any) => s.id));
+    return {
+      ...col,
+      items: items.map((s: any) => ({ ...s, lastReadAt: dates.read.get(s.id) ?? null, latestChapterAt: dates.latest.get(s.id) ?? null })),
+    };
   });
 
   app.post('/api/collections/:id/items', async (req) => {
@@ -227,7 +260,14 @@ export default async function personalRoutes(app: FastifyInstance) {
     const { seriesId } = z.object({ seriesId: z.string().min(1) }).parse(req.body);
     const owns = await one('SELECT id FROM collections WHERE id = $1 AND user_id = $2', [id, uid]);
     if (!owns) return { ok: false };
-    await q('INSERT INTO collection_items (collection_id, series_id) VALUES ($1, $2) ON CONFLICT DO NOTHING', [id, seriesId]);
+    // At the end of the list's own order, where the bulk add puts them. The column's default, 0, tied a series added
+    // to a list someone had ordered by hand with its first entry -- and the list's own order is its default sort.
+    await q(
+      `INSERT INTO collection_items (collection_id, series_id, position)
+       VALUES ($1, $2, COALESCE((SELECT max(position) + 1 FROM collection_items WHERE collection_id = $1), 0))
+       ON CONFLICT DO NOTHING`,
+      [id, seriesId],
+    );
     return { ok: true };
   });
 
@@ -818,10 +858,37 @@ export default async function personalRoutes(app: FastifyInstance) {
     return row?.data ?? {};
   });
 
-  app.put('/api/settings', async (req) => {
+  app.put('/api/settings', async (req, reply) => {
     const uid = userIdOf(req);
     // zod 4 requires a key schema as well as a value schema; z.record(valueOnly) was a v3 signature.
-    const data = z.record(z.string(), z.any()).parse(req.body ?? {});
+    const body = z.record(z.string(), z.any()).safeParse(req.body ?? {});
+    if (!body.success) return reply.code(400).send({ error: 'bad_settings', message: 'Settings must be an object.' });
+    const data = body.data;
+    // Most of this object intentionally remains forwards-compatible: old servers must retain settings written
+    // by a newer web client.  The settings that alter navigation or name database rows are stricter, though.
+    // Without this boundary an arbitrary sort leaks into the catalogue query, and a forged collection id can
+    // make Home disclose whether another account owns it.
+    if ('librarySort' in data) {
+      const sort = z.enum(['updated', 'new', 'az', 'unread']).safeParse(data.librarySort);
+      if (!sort.success) return reply.code(400).send({ error: 'bad_settings', message: 'Choose a valid Library sort.' });
+      data.librarySort = sort.data;
+    }
+    if ('showAllChapters' in data && typeof data.showAllChapters !== 'boolean') {
+      return reply.code(400).send({ error: 'bad_settings', message: 'Show all chapters must be on or off.' });
+    }
+    if ('homeCollections' in data) {
+      const parsed = z.array(z.string().min(1).max(64)).max(30).safeParse(data.homeCollections);
+      if (!parsed.success) return reply.code(400).send({ error: 'bad_settings', message: 'Choose up to three lists for Home.' });
+      const ids = [...new Set(parsed.data)];
+      if (ids.length > 3) return reply.code(400).send({ error: 'bad_settings', message: 'Choose up to three lists for Home.' });
+      if (ids.length) {
+        const owned = await q<{ id: string }>('SELECT id FROM collections WHERE user_id = $1 AND id = ANY($2)', [uid, ids]);
+        if (owned.length !== ids.length) {
+          return reply.code(400).send({ error: 'bad_settings', message: 'One of those lists is no longer available.' });
+        }
+      }
+      data.homeCollections = ids;
+    }
     await q(
       `INSERT INTO app_settings (user_id, data) VALUES ($1, $2::jsonb)
        ON CONFLICT (user_id) DO UPDATE SET data = app_settings.data || EXCLUDED.data`,

@@ -1,5 +1,187 @@
 # Changelog
 
+## v0.55.8 — 2026-10-08
+
+**Your Library sort is now a default, up to three Lists can live on Home, and each library can opt out of automatic
+AniList lookups. Chapter cleanup is durable and recoverable, scanlator blocks apply safely everywhere, and Reduce
+effects no longer leaves a page hidden after navigation.**
+
+This release incorporates and credits **@TIGamingTV**'s chapter-management and scanlator work in
+[#171](https://github.com/AngeloSha/uchiyomi/pull/171), with the transaction, concurrency, recovery and authorization
+guards needed for release.
+
+### Library and Home
+
+- **A Library sort becomes your default** when you click **Updated**, **Newest**, **A–Z** or **Most unread**, and follows
+  your account to every device. A sort in a shared URL wins for that visit without changing the default. This completes
+  the Library part of [#150](https://github.com/AngeloSha/uchiyomi/discussions/150).
+- **Choose zero to three Lists for Home**, put them in positions 1–3, and move them earlier or later. Home follows that
+  order and shows up to twelve series per rail. An empty selected List keeps its slot; choosing none means no List rails.
+  Until the first edit, the old first-three-nonempty behaviour remains. This completes
+  [#164](https://github.com/AngeloSha/uchiyomi/discussions/164).
+- **Show all chapters at once** is an account setting: one page, every grey row, and older runs unfolded.
+
+### Chapter cleanup and recovery
+
+- **Delete downloaded chapters over a Library selection** is now a persisted background run:
+  - the server answers before it starts unlinking, and the progress window can be closed or rejoined after a reload or
+    proxy timeout;
+  - only one run is active, cancellation happens between series, and an unexpected restart records *interrupted*
+    instead of silently replaying deletion;
+  - each series is rechecked at execution time, and the shared folder lock stays held through deletion, optional
+    unmonitoring and its audit;
+  - manual files, bookmarks, covers, chapter rows and reading progress remain. The confirmation warns that deleting a
+    chapter somebody is reading can lose their position in that file.
+- **Deleted chapters keep their identity.** Duplicate numbers and chapter ranges remain separate tombstones carrying
+  their book id, range, deletion reason and every reader's progress.
+- **Members who may download can restore a deliberate tombstone** from its grey row. Uchiyomi uses only that row's
+  canonical stored source copy; it accepts no client-supplied path or source, and never falls back to another copy.
+- **Why a file is absent is no longer blurred together:** `deleted` is deliberate, `missing` is Verify's evidence,
+  and `rescan_missing` is a read-library file Rescan found absent. Ambiguous legacy rows are backfilled conservatively.
+- **Show deleted chapters as ghosts** is consistent in the web app and the Komga-compatible list, detail and page
+  routes. The reveal control counts both source ghosts and deliberate tombstones, so it cannot hide itself.
+- **Unmonitor really means unattended work stops:** the sweep, partial completion, short and gap repair, Fix everything
+  and the slow archive re-read the switch before each new source/network operation. Manual Check, Fetch and Fill remain.
+
+### AniList privacy per library
+
+Asked for in [#168](https://github.com/AngeloSha/uchiyomi/discussions/168):
+
+- Every library, including the default one, has **Look up art and metadata on AniList automatically**.
+- Off means no automatic art, title/id match, reading-direction/type repair, startup match check or scheduled enrichment
+  for series currently in that library, and no negative lookup cache entry is made.
+- Existing art, links, type and direction stay. Moving a series adopts the destination library's policy.
+- Explicit Admin Art, Relink, Check online matches, tracker import/sync and Discover actions remain available and say
+  that the action may contact AniList.
+
+### Scanlator and source safety
+
+- Blocking or unblocking a scanlator now rebuilds every affected stored choice in the same transaction as the
+  preference. Concurrent checks are serialized, effective preferences are re-read under the lock, and a failed rebuild
+  rolls the preference back instead of leaving settings and listings disagreeing.
+- A blocked row retains its natural *available*, *held* or *covered* state, so unblocking restores the right one.
+- Ordinary Fetch, the slow archive, partial repair and same-release rotation all apply the same blocklist. Only a copy
+  explicitly pinned by a person may override a block, and a pinned copy never falls back. A 403/429 refusal never
+  triggers fallback or a source hunt.
+
+### Reader, navigation and dependencies
+
+- **Reduce effects navigation is visible again:** in-app links switch synchronously in that mode, so an outgoing page
+  cannot leave the main body hidden. Fixes [#174](https://github.com/AngeloSha/uchiyomi/issues/174), reported by
+  **@AlexisJAnderson**.
+- The reader's **Cover colour at the edges** setting from v0.55.7 remains available under both reader and profile
+  settings, as requested in [#170](https://github.com/AngeloSha/uchiyomi/discussions/170).
+- **Security dependency:** sharp 0.35.5, from Dependabot
+  [#173](https://github.com/AngeloSha/uchiyomi/pull/173).
+
+### Upgrading
+
+- **Database:** additive changes only:
+  - `libraries.anilist_lookup`;
+  - `series_listing.unblocked_status`;
+  - the persisted `admin_bulk_delete_runs` table and its chapter-level `current` progress snapshot;
+  - the `admin_bulk_delete_items` intent journal used to reconcile an interrupted unlink without repeating it;
+  - the new `rescan_missing` value in the existing `lib_books.pruned_reason` provenance field, with an audited legacy
+    backfill.
+
+  v0.55.7 can run on the same database, so rolling back the application is still one image-pin change. A database
+  restore cannot recover files deliberately deleted by a cleanup.
+- **For scripts** ([api.md](docs/api.md)):
+  - `/api/settings` validates `librarySort`, `homeCollections` and `showAllChapters`, while retaining unknown keys;
+  - library create/update accepts `anilistLookup`, and library rows carry `anilist_lookup`;
+  - Book responses carry stable tombstone identity, range, progress and `rescan_missing`; new
+    `POST /api/books/:id/refetch` restores one canonical deliberate tombstone;
+  - bulk chapter delete is `POST` → **202** `{runId}`, `GET` for persisted progress, and `POST .../cancel`;
+  - admin settings document `deleted_as_ghosts`.
+
+## v0.55.7 — 2026-10-07
+
+**Online matches must carry the series' name, Rescan everything merges moved folders, and the reader's cover-colour edges
+get a switch. Lists gain unread badges and sorting, and scans are faster on slow disks.**
+
+### Online matches carry the series' name
+
+- **The cause:**
+  - For a series with no source, Uchiyomi looked its title up on AniList (and MangaDex for art) and took the top answer
+    without checking its name.
+  - Two of **@Kedryn**'s *Morgan Lost* comics got a manga's cover that way
+    ([#168](https://github.com/AngeloSha/uchiyomi/discussions/168)).
+  - The same wrong answer became the series' AniList link, so progress was pushed there, and it could group two unrelated
+    series as duplicates.
+- **Now:** an AniList, MangaDex or Kitsu answer counts only when one of its names is the series' name or one of its other
+  names (a leading "The", "A" or "An" aside when the remaining name is long enough). A spin-off is not the work.
+- **What's already stored gets checked:**
+  - *Check online matches* (Admin → Tasks) goes over every automatic AniList link and every cover or banner found online,
+    a few minutes after the upgrade.
+  - It removes those that belong to another work. It never touches a link you made or your own art choices.
+  - On the maintainer's library the final pre-release dry run kept 192 of 194 links and identified 2 for removal.
+- **Health's *Duplicate series*** only groups links a person made or the check confirmed, so *Fix everything* never merges on a
+  wrong match.
+- **Edit details → Cover → Use the first page** keeps the series' own first page as its cover, whatever a lookup finds. Admin →
+  Art has it too.
+
+### Rescan everything: merged folders and renamed files
+
+- **A chapter follows its renamed or moved file**, keeping everyone's reading history. It no longer shows twice.
+- **Merge "Zagor 1-100" into "Zagor":** when every chapter of a series moved into one other series' folder, the preview offers
+  the merge for you to tick. Reading history, favourites and lists follow. Reported by **@Kedryn**
+  ([#150](https://github.com/AngeloSha/uchiyomi/discussions/150)).
+- **Moves are recognised sooner:**
+  - Files are fingerprinted a few minutes after a scan finds them, and never mid-unpack, so a later move is recognised.
+  - A file moved before it was fingerprinted is recognised by its name and its exact modification time, when exactly one file
+    matches.
+- **The scheduled update check** leaves a series alone while Rescan, a renumber or a download holds it.
+
+### Faster scans on slow disks
+
+A scan reopened the first chapter file of every series to read its details. Now it does so only when that file has changed. On
+2,000 series on a slow disk, a rescan with nothing new went from about 56 seconds to about 13.
+
+### Reader
+
+- **Cover colour at the edges:** the soft wash of the cover's colour at the top and bottom of the reader can be switched off.
+  - It's in *Profile → Settings → Reading* or in the reader's own settings, and on by default.
+  - Asked about by **@jordanske** ([#170](https://github.com/AngeloSha/uchiyomi/discussions/170)).
+- **The controls** no longer leave a thin gap at the screen edge as they spring in. Spotted by **@DannyDynamite39**.
+
+### Lists
+
+Asked for by **@AlexisJAnderson** ([#164](https://github.com/AngeloSha/uchiyomi/discussions/164)):
+
+- **Badges:** every series in a list shows the Library's unread badge, and its NEW, favourite and offline marks.
+- **Sorting:** *Your order*, *A–Z*, *Z–A*, *Last read*, *Most unread* or *Latest chapter*, remembered per list.
+- **Editing:** *Edit* replaces the hidden delete button. It removes a series, or moves it in your own order.
+- **Adding:** a series added to a list goes to its end.
+
+### Smaller
+
+- **Placeholder group names:** sites that label every chapter "Unofficial" or "Unknown" no longer count as one scanlation group,
+  so downloads only take turns between them when their page counts agree
+  ([#158](https://github.com/AngeloSha/uchiyomi/discussions/158)).
+- **Series page:** "File no longer on disk" and "Deleted from the server" are never cut off.
+- **Translations:** every message in the app is now translated, including the last English-only notices and Admin → Art. In
+  Arabic, "99+" reads correctly and counts read correctly for any number.
+- **`LIBRARY_REMATCH`** never moves a series onto a folder that has its own.
+- **Dependencies:** Next.js 16.3.8, Electron 44.5.1, pg 8.23.1, sharp 0.35.5, and others.
+
+### Upgrading
+
+- **Database:** additive columns only:
+  - `series_trackers.checked_at`, `series_art.checked_at`;
+  - `lib_series.info_read`;
+  - `server_settings.match_check_last_run` / `match_check_last_result`.
+
+  v0.55.6 runs on the same database, so going back is one line of your compose file.
+- **After the upgrade:**
+  - *Check online matches* runs in the background, paced for AniList, for a few minutes.
+  - What it removes is listed in its result and in the audit log. A tracker import re-links a series by id.
+- **For scripts** ([api.md](docs/api.md)):
+  - `GET /api/collections/:id` items carry `lastReadAt` and `latestChapterAt`.
+  - New settings keys: `reader.coverEdges` and `listSorts`.
+  - Rescan's plan and apply gain `follow` and `merges`.
+  - The cover mode `first_page`, and the `matches` task.
+  - `ANILIST_API_URL` also moves the title and id lookups.
+
 ## v0.55.6 — 2026-10-06
 
 **A library scan that takes minutes no longer reads "Scan failed": the scan answers at once, and the page follows it

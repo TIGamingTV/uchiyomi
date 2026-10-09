@@ -127,7 +127,8 @@ test('hiding an older-chapters run drops its ghosts from the selection', () => {
   // "Hide un-picks the run's numbers" fails.
   const page = code(read('app/series/page.tsx'));
   assert.match(fn(page, 'toggleRun'), /setPickedGhosts\(/, 'Hide un-picks the run\'s numbers');
-  assert.match(page, /toggleRun\(r\.from, numbers\)/, 'the row hands the run its numbers');
+  assert.match(page, /const keys = runGhosts\.map\(ghostKey\)/, 'the row keeps stable ids for duplicate-number tombstones');
+  assert.match(page, /toggleRun\(r\.from, keys\)/, 'the row hands the run its stable ghost keys');
 });
 
 test('the admin footer of the sources sheet is one row, and a sheet with a footer may take 85vh', () => {
@@ -171,6 +172,33 @@ test('a row caption carries its text as a title, and the desktop grid shows the 
   assert.match(date, /className="lg:hidden">\{relativeTime\(iso\)\}/, 'the phone keeps the long one');
 });
 
+test("a tombstone's words are read whole at every width: a tag of their own that wraps (v0.55.7)", () => {
+  // In the three-column grid at 1280 a row with a full date leaves the caption 51-68 px, and the tombstone chip sat in
+  // the one line that truncates as a whole: "File no longer on disk" read "File no lo…", "Deleted from the server"
+  // "Deleted from th…", and in German not even at 390. Now the words are a tag of their own that takes the line's
+  // width and wraps inside it: the sentence below lg, the short words in the grid, the sentence for a screen reader
+  // and on hover. Reintroduce the chip as it was (`me-1 rounded-full`, one line): "the tombstone's words are cut"
+  // fails; show the sentence in the grid too: "the grid shows the sentence" fails.
+  const page = code(read('app/series/page.tsx'));
+  const cap = page.slice(page.indexOf('function RowCaption('), page.indexOf('function RowDate('));
+  const at = cap.indexOf('<span data-tombstone');
+  assert.ok(at > 0, "the tombstone's words are not a tag of their own");
+  const tag = cap.slice(at, cap.indexOf('{short &&', at));
+  const cls = /className="([^"]*)"/.exec(tag)![1].split(/\s+/);
+  for (const c of ['max-w-full', 'break-words']) assert.ok(cls.includes(c), `the tombstone's words are cut (no ${c})`);
+  assert.ok(!cls.some((c) => /^(truncate|whitespace-nowrap|shrink-0)$/.test(c)), "the tombstone's words are cut (held to one line)");
+  // A box that may take two lines is a squared tag, as the chapter sheet's are; a capsule bent round two lines is not.
+  assert.ok(!cls.includes('rounded-full'), 'a tag that wraps is a capsule');
+  assert.match(tag, /<span aria-hidden="true" className="lg:hidden">\{pruned\.full\}<\/span>/, 'the list below lg does not show the sentence');
+  assert.match(tag, /<span aria-hidden="true" className="hidden lg:inline">\{pruned\.short\}<\/span>/, 'the grid shows the sentence');
+  assert.match(tag, /<span className="sr-only">\{pruned\.full\}<\/span>/, 'a screen reader does not hear the sentence');
+  assert.match(cap, /const title = \[\.\.\.\(pruned \? \[pruned\.full\] : \[\]\)/, 'the hover title does not say the sentence');
+  // In a row that wraps, with the hover title, and the group's caption after it still ending in an ellipsis.
+  const row = cap.slice(cap.lastIndexOf('<div', at), at);
+  assert.match(row, /className=\{`mt-0\.5 flex flex-wrap [^`]*`\} title=\{title\}/, "the tombstone's words are cut (not in a row that wraps)");
+  assert.match(cap, /<span className="min-w-12 flex-1 basis-0 truncate">\{caption\}<\/span>/, "the group's caption beside a tombstone no longer ends in an ellipsis");
+});
+
 // ---- #69: read marks on the grey rows (chapters the server does not hold) -------------------------------
 
 test('a grey row the reader marked reads as read, stays grey, and carries Mark read / Mark unread', () => {
@@ -188,7 +216,7 @@ test('a grey row the reader marked reads as read, stays grey, and carries Mark r
   assert.match(row, /border border-dashed border-ink-600/, 'the thumb stays dashed: still not on the server');
   assert.match(row, /\{onMark && !selectable && \(/, 'the menu hides in select mode');
   assert.match(row, /onMark\(!read\)/, 'the one action toggles');
-  assert.match(page, /onMark=\{\(completed\) => markGhost\(r\.ghost\.number, completed\)\}/, 'the page hands every grey row the action');
+  assert.match(page, /onMark=\{\(completed\) => markGhost\(r\.ghost, completed\)\}/, 'the page hands every grey row the action and its stable identity');
 });
 
 test('select mode marks the grey rows too, through their own route in chunks of its cap', () => {
@@ -197,8 +225,12 @@ test('select mode marks the grey rows too, through their own route in chunks of 
   // enabling the two chips on `pickedBookList.length` again: "enabled with only grey rows picked" fails.
   const page = code(read('app/series/page.tsx'));
   const bulk = fn(page, 'bulkMark');
-  assert.match(bulk, /await markGhosts\(pickedGhostList\.map\(\(g\) => g\.number\), completed\)/, 'the picked grey rows are marked');
-  assert.match(bulk, /await setRead\(pickedBookList, completed\)/, 'and the picked chapters, as before');
+  assert.match(bulk, /const tombstones = pickedGhostList\.flatMap\(\(g\) => g\.bookId \? allBooks\.filter\(\(b\) => b\.id === g\.bookId\) : \[\]\)/,
+    'deleted ghosts resolve to their own book rows, including duplicates on one number');
+  assert.match(bulk, /await setRead\(\[\.\.\.pickedBookList, \.\.\.tombstones\], completed\)/,
+    'picked chapters and deliberate tombstones keep book progress');
+  assert.match(bulk, /const listed = pickedGhostList\.filter\(\(g\) => !g\.bookId\);\s*const ok = listed\.length \? await markGhosts\(listed\.map\(\(g\) => g\.number\), completed\) : true/,
+    'source-only grey rows use the by-number route');
   assert.match(page, /disabled=\{acting \|\| !pickedCount\} onClick=\{\(\) => bulkMark\(true\)\}/, 'Mark read is enabled with only grey rows picked');
   assert.match(page, /disabled=\{acting \|\| !pickedCount\} onClick=\{\(\) => bulkMark\(false\)\}/, 'Mark unread is enabled with only grey rows picked');
   const marks = fn(page, 'markGhosts');
@@ -231,7 +263,8 @@ test('the series page only starts a slow archive; watching it is the band\'s', (
     'Archive slowly is offered on a series already being archived, or with nothing to archive');
   assert.match(page, /\{!archiving && canDownload\(user\) && numbers\.length > 0 && \(/, "the archive's run offers Fetch all");
   assert.match(page, /\{!archiving && mayArchive && numbers\.length > 0 && \(/, "the archive's own run offers to start it again");
-  assert.match(page, /const numbers = filteredGhosts\.filter\(\(g\) => g\.why === r\.why &&/, 'a run hands Hide the other kind\'s numbers');
+  assert.match(page, /const runGhosts = filteredGhosts\.filter\(\(g\) => g\.why === r\.why &&/, 'a run hands Hide the other kind\'s ghosts');
+  assert.match(page, /const numbers = runGhosts\.map\(\(g\) => g\.number\)/, 'a run still hands Fetch all its chapter numbers');
   // The supply line's "not here yet" is what the sweep would take: the archive's numbers are not. Since v0.50.0 the
   // rule is lib/chapterRows.ts countsAsBehind, which chapterRows.test.ts holds to it for every kind of ghost.
   assert.match(page, /notHere: ghosts\.filter\(\(g\) => countsAsBehind\(g\) && !haveNumbers\.has\(g\.number\)\)\.length,/,

@@ -7,7 +7,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'fs';
 import { join } from 'path';
-import { FETCH_CHUNK, GHOST_CAP, chaptersLeft, chunkNumbers, countsAsBehind, heldBy, mergeRows, openableChapters, prunedLabel, runLabel, wholesHeld, whyLabel, type Row } from '../lib/chapterRows';
+import { FETCH_CHUNK, GHOST_CAP, chaptersLeft, chunkNumbers, countsAsBehind, heldBy, mergeRows, openableChapters, prunedLabel, prunedWords, runLabel, wholesHeld, whyLabel, type Row } from '../lib/chapterRows';
 import type { Book, Ghost } from '../lib/types';
 
 const book = (number: number, over: Partial<Book> = {}): Book =>
@@ -299,14 +299,27 @@ test('wholesHeld: every whole number a range file holds, and a huge chapter numb
 });
 
 test('a chapter whose file went from your own folder says so; one the server deleted says that (v0.55.4)', () => {
-  // Rescan everything marks a gone file in a library built by hand 'deleted', as Delete files marks one it removed,
-  // and the book carries the reason (bff ownedCatalog.ts). "Deleted from the server" there blamed the server for a
-  // file the admin moved or deleted by hand. Reintroduce one wording for every tombstone in prunedLabel: the first
-  // assertion reads "Deleted from the server".
-  assert.equal(prunedLabel({ pruned: true, prunedReason: 'deleted', owned: false }), 'File no longer on disk');
+  // Since v0.55.8 the provenance is explicit: Rescan writes `rescan_missing`, while `deleted` always means a
+  // deliberate Delete files / bulk-cleanup action. Ownership no longer has to stand in for that distinction.
+  // Reintroduce one wording for every tombstone in prunedLabel: the first assertion reads "Deleted from the server".
+  assert.equal(prunedLabel({ pruned: true, prunedReason: 'rescan_missing', owned: false }), 'File no longer on disk');
+  assert.equal(prunedLabel({ pruned: true, prunedReason: 'deleted', owned: false }), 'Deleted from the server', 'explicit provenance wins over legacy ownership');
   assert.equal(prunedLabel({ pruned: true, prunedReason: 'deleted', owned: true }), 'Deleted from the server', 'Delete files on a download');
   assert.equal(prunedLabel({ pruned: true, prunedReason: null, owned: true }), 'Deleted from the server', 'the read-chapter cleanup');
   assert.equal(prunedLabel({ pruned: true, prunedReason: 'missing', owned: true }), 'Deleted from the server', "Verify's mark, unchanged");
   assert.equal(prunedLabel({ pruned: true, owned: false }), 'Deleted from the server', 'a server before v0.55.4 sends no reason');
   assert.equal(prunedLabel({ pruned: false, prunedReason: null, owned: false }), null, 'a chapter with its file has no chip');
+});
+
+test('the short words still tell the two apart, and the sentence goes with them (v0.55.7)', () => {
+  // The grid at 1280 has room for a word or two beside a full date, not for the sentence (prunedWords says why).
+  // Reintroduce one short word for both (`short: tr('Gone')` on each branch): the grid could no longer tell a file you
+  // moved from one the server deleted, and this fails.
+  assert.deepEqual(prunedWords({ pruned: true, prunedReason: 'rescan_missing', owned: false }), { full: 'File no longer on disk', short: 'No file' });
+  assert.deepEqual(prunedWords({ pruned: true, prunedReason: null, owned: true }), { full: 'Deleted from the server', short: 'Deleted' });
+  assert.equal(prunedWords({ pruned: false, prunedReason: null, owned: false }), null, 'a chapter with its file has no tag');
+  // prunedLabel is the sentence, always.
+  for (const b of [{ pruned: true, prunedReason: 'rescan_missing' as const, owned: false }, { pruned: true, prunedReason: 'missing' as const, owned: true }]) {
+    assert.equal(prunedLabel(b), prunedWords(b)!.full);
+  }
 });

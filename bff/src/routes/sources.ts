@@ -7,7 +7,7 @@ import { authenticate, userIdOf, roleOf } from '../lib/auth';
 import { getSource, listSources, isSwAdapterId, SW_PREFIX, swAdapterId, withTimeout } from '../lib/sources';
 import { MANGADEX_GROUP } from '../lib/sources/mangadex';
 import type { SourceAdapter, SourceSeries, SourceChapter } from '../lib/sources/types';
-import { sanitize, type DownloadInput } from '../lib/downloader';
+import { chapterFileRel, sanitize, type DownloadInput } from '../lib/downloader';
 import { downloadWithFallback } from '../lib/chapterFallback';
 import { selectChapters, type ChapterFrom } from '../lib/selectChapters';
 import { noteChapterFailure } from '../lib/chapterFailures';
@@ -81,13 +81,13 @@ import { diskSpelling } from '../lib/libraryAdmin';
 import { isDesktop } from '../lib/desktop';
 import { newSeriesId } from '../lib/ids';
 import { cleanDescription } from '../lib/htmlText';
-import { updateSeries } from '../lib/updater';
+import { runsInside, updateSeries } from '../lib/updater';
 import { busyFolders } from '../lib/bulkNewest';
 import { enqueueArchive, archiveBusy, archiveScanPending, archiveSeriesIds, archiveView, type EnqueueOutcome } from '../lib/archive';
 import { registerArchiveRoutes } from './archive';
 import { chooseReleases, groupsOf, releaseOrder } from '../lib/releases';
 import { effectivePrefsFor, readSeriesPrefs } from '../lib/scanlatorPrefs';
-import { copyToChapter, declaredLang, listingRows, replaceListing, sameRelease, type ListingCopy } from '../lib/seriesListing';
+import { automaticChapterAllowedFor, automaticCopiesFor, copyToChapter, declaredLang, listingRows, replaceListing, sameRelease, seriesFollowsSource, type ListingCopy } from '../lib/seriesListing';
 import { cleanSourceOrder } from '../lib/sourcePrefs';
 import { paceLevel, rateKeyOf, restLeft } from '../lib/pace';
 import { haveNumbers } from '../lib/libraryNumbers';
@@ -99,8 +99,10 @@ import {
 import { numKey } from '../lib/postingOrder';
 import { groupStats } from '../lib/groupStats';
 import { fetchAniListArt, fetchTrendingManhwa, TrendingItem } from '../lib/anilist';
-import { learnDirection, directionFromAniListMatch } from '../lib/readingDirection';
-import { learnTypeFromSource, learnTypeFromAniList } from '../lib/seriesType';
+import { automaticAniListAllowed, withAniListMutation } from '../lib/anilistPolicy';
+import { learnDirection, learnDirectionWith, directionFromAniListMatch } from '../lib/readingDirection';
+import { learnTypeFromSource, learnTypeFromAniListWith } from '../lib/seriesType';
+import { linkSeriesWith } from '../lib/trackers';
 import { noticeListed } from '../lib/noticeChapters';
 import { q, one } from '../lib/db';
 import { healthAll, isDisabled, blockedNow, reportLatest, reportFail, reportSlow, classify, noteStage } from '../lib/sourceHealth';
@@ -121,7 +123,7 @@ export const FILL_MAX_CHAPTERS = 300;
 export const REFRESH_BUDGET_MS = 10_000;
 import { logAudit } from '../lib/audit';
 import { autoFollow, refusals, MAX_AUTO_CANDIDATES, type FollowCandidate, type FollowResult } from '../lib/autoFollow';
-import { altTitlesFor, exactHit, learnAltTitles, learnFromMainSource, SEARCH_NAMES } from '../lib/altTitles';
+import { altTitlesFor, exactHit, learnAltTitles, learnFromMainSource, namesOf, SEARCH_NAMES } from '../lib/altTitles';
 import { env } from '../env';
 import { runtime } from '../lib/runtime';
 import { dismissRun, listRuns, requestStop } from '../lib/downloadJobs';
@@ -139,6 +141,8 @@ import { editionFolder, linkEdition, workRows, type WorkRow } from '../lib/editi
 import { effectiveLang, sourceLanguage } from '../lib/seriesLang';
 import { canonLang, sameLanguage } from '../lib/lang';
 import { searchByNames, takeHuntSlot, releaseHuntSlot } from '../lib/sourceHunt';
+import { allWritable, realContainedPath } from '../lib/fsGuard';
+import { deliberatelyDeleted } from '../lib/deletedGhosts';
 
 interface Job {
   title: string; total: number; done: number;
@@ -216,6 +220,37 @@ interface Job {
   origin: Origin;
 }
 const jobs = new Map<string, Job>();
+/**
+ * A helper job owns its folder until its detached tail (settle hooks, scan and stamps included) is finished.
+ * A card may become `error` before that tail ends, so the card status alone is not a writer lock.
+ */
+const activeJobFolders = new Set<string>();
+const pendingJobClaims = new Map<string, symbol>();
+
+/** Opaque synchronous reservation used by routes that must await audit/DB work before starting the job. */
+export interface DownloadJobClaim { readonly folder: string; readonly token: symbol }
+
+/**
+ * Reserve one folder without awaiting. `runsInside` closes the opposite race: updateSeries increments it before
+ * its first await, so either the check owns the series or this claim does, never both.
+ */
+function reserveDownloadJob(folder: string, seriesId: string, waitBehindSharedWriter: boolean): DownloadJobClaim | null {
+  if (activeJobFolders.has(folder) || pendingJobClaims.has(folder) || jobs.get(folder)?.status === 'downloading') return null;
+  if (!waitBehindSharedWriter && busyFolders.has(folder)) return null;
+  if (seriesId && runsInside(seriesId) > 0) return null;
+  const token = Symbol(folder);
+  pendingJobClaims.set(folder, token);
+  return { folder, token };
+}
+
+export function claimDownloadJob(folder: string, seriesId = ''): DownloadJobClaim | null {
+  return reserveDownloadJob(folder, seriesId, false);
+}
+
+/** Release an unconsumed claim. Consumed/stale claims are harmless no-ops. */
+export function releaseDownloadJobClaim(claim: DownloadJobClaim | null | undefined): void {
+  if (claim && pendingJobClaims.get(claim.folder) === claim.token) pendingJobClaims.delete(claim.folder);
+}
 
 /**
  * The jobs a Try again can redo through POST /api/sources/fetch, and so the only ones a `left` is set on. That
@@ -255,13 +290,14 @@ function sweepJobs(now = Date.now()): void {
  * busy" in bulkNewest.int.test.ts starts the second download.
  */
 export function jobBusy(folder: string): boolean {
-  return jobs.get(folder)?.status === 'downloading' || busyFolders.has(folder);
+  return activeJobFolders.has(folder) || pendingJobClaims.has(folder)
+    || jobs.get(folder)?.status === 'downloading' || busyFolders.has(folder);
 }
 // A renumber (lib/numbering.ts) never renames under a job that is writing into the folder, and a failed card's
 // Try again list names the chapters it lacked by number: after a renumber those are other posts, so the list
 // moves with the files -- and a number the renumber has no place for is dropped rather than fetched as the wrong
 // post.
-registerBusyProbe((folder) => jobs.get(folder)?.status === 'downloading');
+registerBusyProbe((folder) => activeJobFolders.has(folder) || pendingJobClaims.has(folder) || jobs.get(folder)?.status === 'downloading');
 
 /**
  * Why a manual fetch or a fill must wait, when it must (#116): a renumber is pending review or half-applied, and
@@ -300,6 +336,8 @@ export interface DownloadJobInput {
    * their behalf. Absent = every source (the admin's routes; admins are unrestricted by construction).
    */
   allowed?: (source: string) => boolean;
+  /** Current authority for the exact source copy, re-read inside its source gate. Pins do not bypass this. */
+  sourceAllowedNow?: (chapter: SourceChapter) => Promise<boolean>;
   /**
    * Called once per chapter with whether it landed: right after its attempt, or at the end of the job for
    * a chapter the job never reached (a full disk, a refusing source, a shutdown). The refetch route uses it
@@ -472,10 +510,25 @@ const JOB_LANES = 3;
 /** How often a job that found its folder taken by another writer looks again (startDownloadJob). */
 const FOLDER_WAIT_MS = 500;
 
-export function startDownloadJob(input: DownloadJobInput): { total: number } {
+export function startDownloadJob(input: DownloadJobInput, reserved: DownloadJobClaim): { total: number };
+export function startDownloadJob(input: DownloadJobInput): { total: number } | null;
+export function startDownloadJob(input: DownloadJobInput, reserved?: DownloadJobClaim): { total: number } | null {
   const { folder, title, seriesId, chapters, meta } = input;
   const origin = input.origin ?? 'fetch';
+  // The no-reservation form keeps the long-standing direct-helper behaviour: if a Rescan acquired its mark
+  // between a route's check and this call, the detached job reserves its card and waits behind it. Routes that
+  // mutate state before start use claimDownloadJob instead, which refuses an already-held shared folder.
+  const claim = reserved ?? reserveDownloadJob(folder, seriesId, true);
+  if (!claim) return null;
+  if (claim.folder !== folder || pendingJobClaims.get(folder) !== claim.token) {
+    if (reserved) throw new Error('download job reservation was lost');
+    return null;
+  }
+  // From this instruction onward another synchronous claimant sees `activeJobFolders`; there is no unlocked turn
+  // between consuming the reservation and publishing the job card.
+  activeJobFolders.add(folder);
   jobs.set(folder, { title, total: chapters.length, done: 0, status: 'downloading', startedAt: Date.now(), origin, ...(input.by ? { by: input.by } : {}) });
+  pendingJobClaims.delete(folder);
   const settle = async (ch: SourceChapter, landed: boolean) => {
     if (!input.onSettled) return;
     // A hook that throws must not take the job's tail with it: the scan and the stamps still have to run.
@@ -523,7 +576,8 @@ export function startDownloadJob(input: DownloadJobInput): { total: number } {
     const alternatesOf = async (n: number): Promise<SourceChapter[]> => {
       const row = await one<{ title: string | null; copies: ListingCopy[] }>(
         'SELECT title, copies FROM series_listing WHERE series_id = $1 AND number = $2::real', [seriesId, n]).catch(() => null);
-      return (row?.copies ?? []).filter((c) => followed.has(c.source)).map((c) => copyToChapter(c, { number: n, title: row!.title }));
+      const open = await automaticCopiesFor(seriesId, row?.copies ?? []);
+      return open.filter((c) => followed.has(c.source)).map((c) => copyToChapter(c, { number: n, title: row!.title }));
     };
 
     // Which other copies each chapter may come from (v0.55.4, #158): the same release on the series' other followed
@@ -549,7 +603,9 @@ export function startDownloadJob(input: DownloadJobInput): { total: number } {
         const row = rows.get(ch.number);
         const own = row?.copies?.find((c) => c.source === ch.source && c.sourceId === ch.sourceId);
         if (!row || !own || picked.has(ch.number)) continue;
-        const same = sameRelease(own, row.copies, { followed, langOf: declaredLang }).slice(1);
+        const open = await automaticCopiesFor(seriesId, row.copies);
+        if (!open.includes(own)) continue;
+        const same = sameRelease(own, open, { followed, langOf: declaredLang }).slice(1);
         if (same.length) copiesOf.set(ch, same.map((c) => copyToChapter(c, { number: ch.number, title: row.title })));
       }
     }
@@ -600,6 +656,17 @@ export function startDownloadJob(input: DownloadJobInput): { total: number } {
       settled.add(ch);
       let out;
       try {
+        // A detached job can outlive a scanlator-settings save. Recheck the selected copy immediately
+        // before the helper starts network work. Only a versions-list pick may deliberately override a
+        // block; if an automatic choice was blocked meanwhile, take the freshly ranked open copy instead.
+        // A brand-new add has no series id (persistScan mints its row after chapter one lands), so there is no
+        // per-series decision to re-read yet. Treating that missing decision as a block drops the first chapter
+        // before downloadChapter can start it. Existing series still re-read the effective blocklist here.
+        if (seriesId && !ch.pinned && !(await automaticChapterAllowedFor(seriesId, use))) {
+          const next = (await alternatesOf(ch.number))[0];
+          if (!next) { await settle(ch, false); return; }
+          use = next;
+        }
         /**
          * `meta` comes from OUR series row, never from the candidate.
          *
@@ -614,6 +681,11 @@ export function startDownloadJob(input: DownloadJobInput): { total: number } {
           seriesId, title, folder, meta, chapter: use,
           alternates: () => alternatesOf(ch.number),
           refusing, allowed: input.allowed, hunt: undefined,
+          // A pre-row helper job has no per-series release policy to re-read. It may bypass that missing decision
+          // only when its caller supplied an exact current-source capability; a blank id by itself stays closed.
+          automaticAllowed: async (candidate) => (!seriesId && !!input.sourceAllowedNow)
+            || await automaticChapterAllowedFor(seriesId, candidate),
+          sourceAllowedNow: input.sourceAllowedNow ?? ((candidate) => seriesFollowsSource(seriesId, candidate.source ?? '')),
         });
       } catch (e: any) {
         const j = jobs.get(folder);
@@ -746,7 +818,15 @@ export function startDownloadJob(input: DownloadJobInput): { total: number } {
       tell(j, ...cancelledParts(j, failures));
     } else if (j && j.status !== 'error') { j.status = failures ? 'error' : 'done'; j.finishedAt = Date.now(); }
     noteLeft();
-  });
+  }).catch((e) => {
+    const j = jobs.get(folder);
+    if (j?.status === 'downloading') {
+      j.status = 'error';
+      j.finishedAt = Date.now();
+      tell(j, say('job.failed', { n: 1, error: String((e as Error)?.message || e).slice(0, 120) }));
+    }
+    console.warn(`[download] ${folder}: detached job threw: ${(e as Error)?.message || e}`);
+  }).finally(() => { activeJobFolders.delete(folder); });
 
   return { total: chapters.length };
 }
@@ -1202,6 +1282,47 @@ async function archiveRest(seriesId: string, a: { by: string | null; ctx: ViewCt
   return held?.held ? 'later' : out;
 }
 
+/**
+ * AniList's art for a series an add just made or found, merged under what it already has: the banner it lacks, and the
+ * cover only when its source gave none. Kept only when AniList's entry is named as the series is (v0.55.7, #168,
+ * lib/onlineMatch.ts namesMatch) -- by every name the series goes by, its source's title and the other names its
+ * description listed (learned before this runs) -- and another work's answer is stored as the miss a 404 is. The same
+ * match's country is the weakest evidence of the reading direction and the type. Detached and best effort: an add
+ * neither waits for AniList nor fails over it. By folder where the add has not learned the id yet.
+ * Reintroduce by keeping AniList's answer unchecked: "an add keeps AniList's art only from an entry named as the
+ * series" in onlineMatch.int.test.ts finds the other work's banner stored.
+ */
+async function artByTitle(where: { id: string } | { folder: string }, title: string): Promise<void> {
+  try {
+    // This add-time enrichment is implicit. Resolve the policy from the series' current library immediately before
+    // sending its title; by-folder covers a fresh download after persistScan, and fails closed if that row vanished.
+    // A manual Admin Art search deliberately bypasses this helper.
+    if (!(await automaticAniListAllowed(where))) return;
+    const names = await namesOf(where);
+    if (!names.includes(title)) names.unshift(title);
+    // Resolving names can await the database while the series is moved.  The destination's privacy choice at the
+    // actual outbound boundary wins over the earlier eligibility read.
+    if (!(await automaticAniListAllowed(where))) return;
+    const a = await fetchAniListArt(title, names);
+    // A move can also happen while AniList is answering.  Its response must not mutate art, links, type or direction
+    // for a series whose new destination has opted out meanwhile.
+    if (!(await automaticAniListAllowed(where))) return;
+    // A source cover can have created the row while automatic lookups were disabled. Completing the lookup later
+    // fills only what is missing. The series/library locks make the final privacy decision and all derived DML one
+    // atomic act: a move or opt-out cannot slip between the last check and art/link/type/direction writes.
+    await withAniListMutation(where, 'automatic', async (qq, seriesId) => {
+      await qq(`INSERT INTO series_art (series_id, banner, cover, checked_at) VALUES ($1, $2, $3, now())
+        ON CONFLICT (series_id) DO UPDATE SET
+          banner = COALESCE(series_art.banner, EXCLUDED.banner),
+          cover = COALESCE(series_art.cover, EXCLUDED.cover),
+          fetched_at = now(), checked_at = now()`, [seriesId, a.banner, a.cover]);
+      if (a.mediaId) await linkSeriesWith(qq, seriesId, a.mediaId, a.mediaTitle ?? null);
+      await learnDirectionWith(qq, { id: seriesId }, directionFromAniListMatch(names, a), 'anilist');
+      await learnTypeFromAniListWith(qq, { id: seriesId }, names, a);
+    });
+  } catch { /* AniList is best effort on an add */ }
+}
+
 /** Add one series from a source to the library (downloads chapter 1 synchronously, the rest in background).
  *  Shared by POST /api/sources/add and the bulk importer. Returns a result instead of touching the reply. */
 export async function addSeriesFromSource(opts: {
@@ -1489,20 +1610,16 @@ export async function addSeriesFromSource(opts: {
       jobs.set(folder, { title, total: 0, done: 0, status: 'done', startedAt: Date.now(), origin: 'add', ...(opts.userId ? { by: opts.userId } : {}), ...(linked ? { edition: linked } : {}) });
       judgeAlsoFollow(folder, id, opts);
     }
+    // The source's own cover, then AniList's art for what it does not have. checked_at (lib/matchCheck.ts): a row
+    // started here holds nothing found by title unchecked -- the source's cover, then AniList's answer held to the
+    // series' names (lib/onlineMatch.ts) -- while a row that was already there keeps its own mark.
     if (series?.coverUrl) {
-      await q(`INSERT INTO series_art (series_id, cover) VALUES ($1, $2)
+      await q(`INSERT INTO series_art (series_id, cover, checked_at) VALUES ($1, $2, NULL)
         ON CONFLICT (series_id) DO UPDATE SET cover = COALESCE(series_art.cover, EXCLUDED.cover)`, [id, series.coverUrl]).catch(() => {});
     }
     await learnDirection({ id }, series?.readingDirection, 'source').catch(() => {});
     await learnTypeFromSource({ id }, series);
-    fetchAniListArt(title)
-      .then(async (a) => {
-        await q(`INSERT INTO series_art (series_id, banner, cover) VALUES ($1, $2, $3)
-          ON CONFLICT (series_id) DO UPDATE SET banner = COALESCE(series_art.banner, EXCLUDED.banner), cover = COALESCE(series_art.cover, EXCLUDED.cover)`, [id, a.banner, a.cover]).catch(() => {});
-        await learnDirection({ id }, directionFromAniListMatch(title, a), 'anilist');
-        await learnTypeFromAniList({ id }, title, a);
-      })
-      .catch(() => {});
+    void artByTitle({ id }, title);
     return { ok: true, status: 200, title, folder, chapters: 0, started: false, nothing: true, seriesId: id, ...(archive ? { archive } : {}), ...(linked ? { edition: linked } : {}) };
   }
 
@@ -1605,19 +1722,10 @@ export async function addSeriesFromSource(opts: {
       }
     }
     if (series?.coverUrl) {
-      await q(`INSERT INTO series_art (series_id, cover) SELECT id, $1 FROM lib_series WHERE folder = $2
+      await q(`INSERT INTO series_art (series_id, cover, checked_at) SELECT id, $1, NULL FROM lib_series WHERE folder = $2
         ON CONFLICT (series_id) DO UPDATE SET cover = COALESCE(series_art.cover, EXCLUDED.cover)`, [series.coverUrl, folder]).catch(() => {});
     }
-    fetchAniListArt(title)
-      .then(async (a) => {
-        await q(`INSERT INTO series_art (series_id, banner, cover) SELECT id, $1, $2 FROM lib_series WHERE folder = $3
-          ON CONFLICT (series_id) DO UPDATE SET banner = COALESCE(series_art.banner, EXCLUDED.banner), cover = COALESCE(series_art.cover, EXCLUDED.cover)`, [a.banner, a.cover, folder]).catch(() => {});
-        // The same match's country, as the weakest evidence of the reading direction, when the entry is visibly
-        // this title (lib/directionSignals.ts directionFromAniListMatch).
-        await learnDirection({ folder }, directionFromAniListMatch(title, a), 'anilist');
-        await learnTypeFromAniList({ folder }, title, a);
-      })
-      .catch(() => {});
+    void artByTitle({ folder }, title);
     return {
       ok: true, status: 200, title, folder, chapters: 0, started: false, alreadyHere: selected.length, seriesId: heldId,
       ...(opts.archive ? { archive: heldArchive ?? 'nothing' } : {}), ...(heldEdition ? { edition: heldEdition } : {}),
@@ -1652,6 +1760,9 @@ export async function addSeriesFromSource(opts: {
       seriesId: existing?.id ?? '', title, folder, meta,
       chapter: { ...chapter, source: source! },
       alternates: async () => [], refusing, allowed: opts.sourceAllowed, hunt: undefined,
+      // The add request names this source and the adapter supplied these chapter ids. A brand-new series has
+      // no follow row yet, so its current authority is this exact one-source selection rather than a DB follow.
+      sourceAllowedNow: async (candidate) => candidate.source === source,
     });
     let firstPages = 0; let blockReason: string | null = null; let diskFull: string | null = null;
     // Found already on disk: part of the result, so checked against the library at the end like what landed.
@@ -1747,19 +1858,10 @@ export async function addSeriesFromSource(opts: {
       judgeAlsoFollow(folder, seriesId, opts);
     }
     if (series?.coverUrl) {
-      await q(`INSERT INTO series_art (series_id, cover) SELECT id, $1 FROM lib_series WHERE folder = $2
+      await q(`INSERT INTO series_art (series_id, cover, checked_at) SELECT id, $1, NULL FROM lib_series WHERE folder = $2
         ON CONFLICT (series_id) DO UPDATE SET cover = COALESCE(series_art.cover, EXCLUDED.cover)`, [series.coverUrl, folder]).catch(() => {});
     }
-    fetchAniListArt(title)
-      .then(async (a) => {
-        await q(`INSERT INTO series_art (series_id, banner, cover) SELECT id, $1, $2 FROM lib_series WHERE folder = $3
-          ON CONFLICT (series_id) DO UPDATE SET banner = COALESCE(series_art.banner, EXCLUDED.banner), cover = COALESCE(series_art.cover, EXCLUDED.cover)`, [a.banner, a.cover, folder]).catch(() => {});
-        // The same match's country, as the weakest evidence of the reading direction, when the entry is visibly
-        // this title (lib/directionSignals.ts directionFromAniListMatch).
-        await learnDirection({ folder }, directionFromAniListMatch(title, a), 'anilist');
-        await learnTypeFromAniList({ folder }, title, a);
-      })
-      .catch(() => {});
+    void artByTitle({ folder }, title);
     void (async () => {
       let failures = 0;
       // As in startDownloadJob: a failed add says what is still to fetch, when the loop stops and at the end.
@@ -2554,24 +2656,171 @@ export default async function sourceRoutes(app: FastifyInstance) {
     if (renumbering) return reply.code(409).send(renumbering);
 
     const picked = auth.chapters;
-    await logAudit('series.fill', {
-      userId: userIdOf(req),
-      detail: { seriesId: plan.seriesId, title: s.title, source, sourceSeriesId, numbers: picked.map((c) => c.number) },
-      req,
-    });
-    // Every copy stamped with the source the person picked: the shared loop routes each chapter by its own.
-    const { total } = startDownloadJob({
-      origin: 'fill',
-      folder: s.folder, title: s.title, seriesId: plan.seriesId,
-      chapters: picked.map((c) => ({ ...c, source })),
-      meta: { series: s.title, summary: s.summary, author: s.author, genres: s.genres, url: s.web, status: s.status },
-      allowed: (id) => {
-        const candidate = getSource(id);
-        return !!candidate && sourceAllowedFor(candidate, maxAgeRating);
-      },
-      by: userIdOf(req),
-    });
-    return { ok: true, started: true, folder: s.folder, total };
+    const claim = claimDownloadJob(s.folder, plan.seriesId);
+    if (!claim) return reply.code(409).send({ error: 'busy' });
+    try {
+      await logAudit('series.fill', {
+        userId: userIdOf(req),
+        detail: { seriesId: plan.seriesId, title: s.title, source, sourceSeriesId, numbers: picked.map((c) => c.number) },
+        req,
+      });
+      // Every copy stamped with the source the person picked: the shared loop routes each chapter by its own.
+      const { total } = startDownloadJob({
+        origin: 'fill',
+        folder: s.folder, title: s.title, seriesId: plan.seriesId,
+        chapters: picked.map((c) => ({ ...c, source })),
+        meta: { series: s.title, summary: s.summary, author: s.author, genres: s.genres, url: s.web, status: s.status },
+        allowed: (id) => {
+          const candidate = getSource(id);
+          return !!candidate && sourceAllowedFor(candidate, maxAgeRating);
+        },
+        sourceAllowedNow: async (candidate) => candidate.source === source
+          && picked.some((chapter) => chapter.sourceId === candidate.sourceId && chapter.number === candidate.number),
+        by: userIdOf(req),
+      }, claim);
+      return { ok: true, started: true, folder: s.folder, total };
+    } finally {
+      releaseDownloadJobClaim(claim);
+    }
+  });
+
+  /**
+   * Put back one chapter that Uchiyomi deliberately deleted.
+   *
+   * The book id is the capability boundary: it resolves through this viewer's normal series visibility,
+   * and the server derives the only permitted source chapter from the tombstone itself. No source id,
+   * chapter id, number or path supplied by a client is ever accepted. Only a canonical file previously
+   * written under DL_ROOT can land on the same row and retain everybody's reading progress. The stamped
+   * source copy is pinned so a blocklist may be overridden by this explicit act but fallback can never
+   * replace it with an arbitrary copy.
+   */
+  app.post('/api/books/:id/refetch', async (req, reply) => {
+    const parsed = z.object({ id: z.string().min(1).max(64) }).safeParse(req.params);
+    if (!parsed.success) return reply.code(404).send({ error: 'not_found' });
+
+    const p = new Params();
+    const rows = await q<{
+      id: string; series_id: string; root: string | null; file: string; number: number; number_end: number | null;
+      title: string | null; chapter_name: string | null; pruned_at: Date | null; pruned_reason: string | null;
+      source_id: string | null; source_chapter_id: string | null; series_source_id: string | null;
+      series_title: string; folder: string; summary: string | null; author: string | null; genres: string[];
+      web: string | null; status: string | null; numbering: string | null; numbering_pending: string | null;
+      renumber_plan: unknown;
+    }>(
+      `SELECT b.id, b.series_id, b.root, b.file, b.number, b.number_end, b.title, b.chapter_name,
+              b.pruned_at, b.pruned_reason, b.source_id, b.source_chapter_id,
+              s.source_id AS series_source_id, s.title AS series_title, s.folder, s.summary, s.author,
+              s.genres, s.web, s.status, s.numbering, s.numbering_pending, s.renumber_plan
+         FROM lib_books b
+         JOIN lib_series s ON s.id = b.series_id
+        WHERE b.id = ${p.add(parsed.data.id)} AND ${visible('s', vc(req), p)}`,
+      p.values,
+    ).catch(() => []);
+    const row = rows[0];
+    // Deliberately indistinguishable from an unknown id for a row outside this account's libraries or age
+    // boundary. The query also hides removed/merged series through visible().
+    if (!row) return reply.code(404).send({ error: 'not_found' });
+
+    const n = Number(row.number);
+    const safePath = row.root === DL_ROOT ? await realContainedPath(DL_ROOT, row.file) : null;
+    const canonical = !!safePath
+      && row.root === DL_ROOT
+      && Number.isFinite(n)
+      && row.number_end == null
+      && row.file === chapterFileRel(row.folder, n)
+      && deliberatelyDeleted({ pruned: row.pruned_at != null, prunedReason: row.pruned_reason })
+      && !!row.source_id
+      && !!row.source_chapter_id;
+    if (!canonical) return reply.code(409).send({ error: 'not_refetchable' });
+
+    const src = getSource(row.source_id!);
+    // An age-capped account gets the same non-disclosing answer as for any other inaccessible row.
+    if (src && !sourceAllowedFor(src, vc(req).maxAgeRating)) {
+      return reply.code(404).send({ error: 'not_found' });
+    }
+    const unavailable = !src
+      || await isDisabled(row.source_id!).catch(() => true)
+      || !!(await blockedNow(row.source_id!).catch(() => true));
+    if (unavailable) return reply.code(409).send({ error: 'not_refetchable' });
+
+    if (jobBusy(row.folder)) return reply.code(409).send({ error: 'busy' });
+    if (renumberRefusal(row, row.source_id!)) return reply.code(409).send({ error: 'not_refetchable' });
+    const writable = await allWritable([DL_ROOT]);
+    if (!writable.ok) return reply.code(409).send({ error: 'not_refetchable', message: writable.reason, fix: writable.fix });
+
+    const claim = claimDownloadJob(row.folder, row.series_id);
+    if (!claim) return reply.code(409).send({ error: 'busy' });
+    const restoreUserId = userIdOf(req);
+    const restoreRole = roleOf(req);
+    const chapter: SourceChapter & { pinned: true } = {
+      source: row.source_id!,
+      sourceId: row.source_chapter_id!,
+      number: n,
+      title: row.chapter_name ?? row.title ?? undefined,
+      pinned: true,
+    };
+    try {
+      // Several source/policy and writability reads happened after the first realpath check. Revalidate after owning
+      // the folder and immediately before publishing the writer, so a symlink swap is a synchronous contract refusal
+      // instead of an asynchronous failed download card.
+      if (!safePath || await realContainedPath(DL_ROOT, row.file) !== safePath) {
+        return reply.code(409).send({ error: 'not_refetchable' });
+      }
+      await q('DELETE FROM chapter_failures WHERE series_id = $1 AND number = $2::real', [row.series_id, n]).catch(() => {});
+      await logAudit('book.refetch', {
+        userId: userIdOf(req),
+        detail: { bookId: row.id, seriesId: row.series_id, source: row.source_id, sourceId: row.source_chapter_id, number: n },
+        req,
+      });
+      const { total } = startDownloadJob({
+        origin: 'refetch',
+        folder: row.folder,
+        title: row.series_title,
+        seriesId: row.series_id,
+        chapters: [chapter],
+        meta: { series: row.series_title, summary: row.summary ?? undefined, author: row.author ?? undefined,
+          genres: row.genres, url: row.web ?? undefined, status: row.status ?? undefined },
+        // Redundant for a pinned job today, and intentional: if the downloader ever grows another recovery
+        // path it still cannot cross this member's age boundary.
+        allowed: (id) => {
+          const candidate = getSource(id);
+          return !!candidate && sourceAllowedFor(candidate, vc(req).maxAgeRating);
+        },
+        // A deliberate tombstone is its own source capability even when that old source is no longer
+        // followed. Re-read the exact book identity, visibility and canonical target inside the source gate;
+        // changing any of them while the detached job waits refuses the request without fallback.
+        sourceAllowedNow: async (candidate) => {
+          if (candidate.source !== row.source_id || candidate.sourceId !== row.source_chapter_id || candidate.number !== n) return false;
+          const currentCtx = await viewCtxFor(restoreUserId, restoreRole).catch(() => null);
+          if (!currentCtx) return false;
+          const nowParams = new Params();
+          const current = (await q<{
+            id: string; series_id: string; root: string | null; file: string; number: number; number_end: number | null;
+            pruned_at: Date | null; pruned_reason: string | null; source_id: string | null; source_chapter_id: string | null;
+            folder: string;
+          }>(
+            `SELECT b.id, b.series_id, b.root, b.file, b.number, b.number_end, b.pruned_at, b.pruned_reason,
+                    b.source_id, b.source_chapter_id, s.folder
+               FROM lib_books b JOIN lib_series s ON s.id = b.series_id
+              WHERE b.id = ${nowParams.add(row.id)} AND ${visible('s', currentCtx, nowParams)}`,
+            nowParams.values,
+          ).catch(() => []))[0];
+          if (!current || current.series_id !== row.series_id || current.root !== DL_ROOT
+              || Number(current.number) !== n || current.number_end != null
+              || current.source_id !== row.source_id || current.source_chapter_id !== row.source_chapter_id
+              || current.file !== chapterFileRel(current.folder, n)
+              || !deliberatelyDeleted({ pruned: current.pruned_at != null, prunedReason: current.pruned_reason })) return false;
+          const currentPath = await realContainedPath(DL_ROOT, current.file);
+          const currentSource = getSource(current.source_id!);
+          return !!currentPath && currentPath === safePath && !!currentSource
+            && sourceAllowedFor(currentSource, currentCtx.maxAgeRating);
+        },
+        by: restoreUserId,
+      }, claim);
+      return { ok: true, started: true, folder: row.folder, total };
+    } finally {
+      releaseDownloadJobClaim(claim);
+    }
   });
 
   /**
@@ -2799,24 +3048,30 @@ export default async function sourceRoutes(app: FastifyInstance) {
       return reply.code(409).send({ error: 'nothing_to_fetch', message, skipped });
     }
 
-    await q('DELETE FROM chapter_failures WHERE series_id = $1 AND number = ANY($2::real[])',
-      [seriesId, chapters.map((c) => c.number)]).catch(() => {});
-    const picks = chapters.filter((c) => pickOf.has(c.number)).map((c) => ({ number: c.number, source: c.source, sourceId: c.sourceId }));
-    await logAudit('series.chapters_fetch', {
-      userId: userIdOf(req),
-      detail: { seriesId, title: s.title, numbers: chapters.map((c) => c.number), ...(picks.length ? { picks } : {}), skipped },
-      req,
-    });
-    const { total } = startDownloadJob({
-      folder: s.folder, title: s.title, seriesId, chapters,
-      meta: { series: s.title, summary: s.summary, author: s.author, genres: s.genres, url: s.web, status: s.status },
-      allowed: (id) => {
-        const candidate = getSource(id);
-        return !!candidate && sourceAllowedFor(candidate, maxAgeRating);
-      },
-      by: userIdOf(req),
-    });
-    return { ok: true, started: true, folder: s.folder, total, skipped };
+    const claim = claimDownloadJob(s.folder, seriesId);
+    if (!claim) return reply.code(409).send({ error: 'busy', message: 'A download for that series is already running.' });
+    try {
+      await q('DELETE FROM chapter_failures WHERE series_id = $1 AND number = ANY($2::real[])',
+        [seriesId, chapters.map((c) => c.number)]).catch(() => {});
+      const picks = chapters.filter((c) => pickOf.has(c.number)).map((c) => ({ number: c.number, source: c.source, sourceId: c.sourceId }));
+      await logAudit('series.chapters_fetch', {
+        userId: userIdOf(req),
+        detail: { seriesId, title: s.title, numbers: chapters.map((c) => c.number), ...(picks.length ? { picks } : {}), skipped },
+        req,
+      });
+      const { total } = startDownloadJob({
+        folder: s.folder, title: s.title, seriesId, chapters,
+        meta: { series: s.title, summary: s.summary, author: s.author, genres: s.genres, url: s.web, status: s.status },
+        allowed: (id) => {
+          const candidate = getSource(id);
+          return !!candidate && sourceAllowedFor(candidate, maxAgeRating);
+        },
+        by: userIdOf(req),
+      }, claim);
+      return { ok: true, started: true, folder: s.folder, total, skipped };
+    } finally {
+      releaseDownloadJobClaim(claim);
+    }
   });
 
   /**

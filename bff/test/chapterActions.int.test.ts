@@ -9,7 +9,7 @@
 // Skipped automatically unless TEST_DATABASE_URL is set.
 import test, { before, after, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync, existsSync, readdirSync, readFileSync, mkdirSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, existsSync, readdirSync, readFileSync, mkdirSync, writeFileSync, symlinkSync, unlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -212,6 +212,7 @@ const post = (url: string, payload: any, tok = adminTok) => app.inject({ method:
 const fetchNums = (numbers: number[], tok = adminTok, seriesId = S) => post('/api/sources/fetch', { seriesId, numbers }, tok);
 const del = (bookIds: string[], tok = adminTok, seriesId = S) => post(`/api/admin/series/${seriesId}/chapters/delete`, { bookIds }, tok);
 const refetch = (bookIds: string[], tok = adminTok) => post(`/api/admin/series/${S}/chapters/refetch`, { bookIds }, tok);
+const refetchBook = (bookId: string, tok = memberTok) => post(`/api/books/${bookId}/refetch`, {}, tok);
 type Pick = { number: number; source: string; sourceId: string };
 const fetchPicks = (picks: Pick[], numbers?: number[], tok = adminTok) => post('/api/sources/fetch', { seriesId: S, picks, ...(numbers ? { numbers } : {}) }, tok);
 const listing = (tok = adminTok) => app.inject({ method: 'GET', url: `/api/series/${S}/listing`, headers: { authorization: tok } });
@@ -225,7 +226,7 @@ async function jobDone(folder = FOLDER): Promise<any> {
   }
   return job;
 }
-const row = async (id: string) => (await q('SELECT id, number, file, pruned_at, scanlator, page_dims FROM lib_books WHERE id = $1', [id]))[0];
+const row = async (id: string) => (await q('SELECT id, number, file, pruned_at, pruned_reason, scanlator, page_dims FROM lib_books WHERE id = $1', [id]))[0];
 const files = () => readdirSync(join(DL, FOLDER)).sort();
 const translator = (abs: string) => new AdmZip(abs).readAsText('ComicInfo.xml').match(/<Translator>([^<]*)<\/Translator>/)?.[1];
 
@@ -370,6 +371,7 @@ test('delete removes the file, keeps the row and the progress, skips the read li
     const b = await row(B.one);
     assert.ok(b, 'the row survives');
     assert.ok(b.pruned_at, 'as a tombstone');
+    assert.equal(b.pruned_reason, 'deleted', 'a deliberate Delete files action keeps deliberate provenance');
     assert.equal((await q('SELECT 1 FROM read_progress WHERE book_id = $1', [B.one])).length, 1, 'progress survives');
   });
   await t.test('a stray set-aside copy goes with the file', () => {
@@ -422,6 +424,7 @@ test('delete from the server, then fetch again', { skip }, async (t) => {
     }
     assert.ok(!existsSync(abs), 'no file appeared');
     assert.ok((await row(B.one)).pruned_at, 'the mark stays: the bytes are still gone');
+    assert.equal((await row(B.one)).pruned_reason, 'deleted', 'a failed restore keeps deliberate provenance');
     assert.ok(!files().some((f) => f.endsWith('.refetch-bak')), `no bak: ${files()}`);
   });
 
@@ -472,6 +475,56 @@ test('the download root itself is never a chapter', { skip }, async () => {
     assert.equal((await refetch(['b_act_root'])).json().skipped[0].reason, 'not_ours', 'nor can it be set aside');
   } finally {
     await q(`DELETE FROM lib_books WHERE id = 'b_act_root'`);
+  }
+});
+
+test('delete and both refetch paths refuse corrupt and symlink-escaping owned rows', { skip }, async () => {
+  const ESC = 's_act_escape', BOOK = 'b_act_escape';
+  const linkTop = 'T!act-escape-link';
+  const folder = `${linkTop}/Escaped Series`;
+  const rel = `${folder}/Chapter 1.cbz`;
+  const outside = join(ROOT, 'outside-download-root');
+  const outsideFile = join(outside, 'Escaped Series', 'Chapter 1.cbz');
+  mkdirSync(join(outsideFile, '..'), { recursive: true });
+  writeFileSync(outsideFile, 'must survive');
+  symlinkSync(outside, join(DL, linkTop), 'dir');
+  await q(`INSERT INTO lib_series
+      (id, source, title, folder, books_count, library_id, source_id, source_series_id, auto_update)
+    VALUES ($1,'T!act','Escaped Series',$2,1,$3,$4,'act-escape',true)`, [ESC, folder, LIB, SRC]);
+  await q(`INSERT INTO lib_books
+      (id, series_id, source, file, number, title, pages, root, source_id, source_chapter_id)
+    VALUES ($1,$2,'T!act',$3,1,'Chapter 1',1,$4,$5,'c/1/Group A')`, [BOOK, ESC, rel, DL, SRC]);
+  try {
+    const deleted = await del([BOOK], adminTok, ESC);
+    assert.equal(deleted.statusCode, 200, deleted.body);
+    assert.deepEqual(deleted.json().skipped, [{ id: BOOK, reason: 'outside_root' }]);
+    assert.equal(readFileSync(outsideFile, 'utf8'), 'must survive');
+    assert.equal((await q('SELECT pruned_at FROM lib_books WHERE id = $1', [BOOK]))[0].pruned_at, null);
+
+    await q(`UPDATE lib_books SET pruned_at = now(), pruned_reason = 'deleted' WHERE id = $1`, [BOOK]);
+    const member = await refetchBook(BOOK);
+    assert.equal(member.statusCode, 409, member.body);
+    assert.equal(member.json().error, 'not_refetchable');
+    const admin = await post(`/api/admin/series/${ESC}/chapters/refetch`, { bookIds: [BOOK] });
+    assert.equal(admin.statusCode, 409, admin.body);
+    assert.deepEqual(admin.json().skipped, [{ id: BOOK, reason: 'not_ours' }]);
+    assert.equal(readFileSync(outsideFile, 'utf8'), 'must survive');
+
+    // A corrupt row with a lexical escape is rejected by the routes and by the shared downloader backstop.
+    await q(`UPDATE lib_series SET folder = '../escaped' WHERE id = $1`, [ESC]);
+    await q(`UPDATE lib_books SET file = '../escaped/Chapter 1.cbz' WHERE id = $1`, [BOOK]);
+    const corrupt = await refetchBook(BOOK);
+    assert.equal(corrupt.statusCode, 409, corrupt.body);
+    assert.equal(corrupt.json().error, 'not_refetchable');
+    const { downloadChapter } = await import('../src/lib/downloader');
+    await assert.rejects(downloadChapter({
+      sourceId: SRC, seriesFolder: '../escaped', chapter: ch(1, 'Group A'), meta: { series: 'Escaped Series' },
+    }), /unsafe download path/i);
+    assert.equal(readFileSync(outsideFile, 'utf8'), 'must survive');
+  } finally {
+    await q('DELETE FROM lib_series WHERE id = $1', [ESC]).catch(() => {});
+    try { unlinkSync(join(DL, linkTop)); } catch { /* already gone */ }
+    rmSync(outside, { recursive: true, force: true });
   }
 });
 
@@ -671,6 +724,129 @@ test('a member cannot reach the admin routes', { skip }, async () => {
   assert.equal((await del([B.two], memberTok)).statusCode, 403);
   assert.equal((await refetch([B.two], memberTok)).statusCode, 403);
   assert.ok(existsSync(join(DL, FOLDER, 'Chapter 2.cbz')));
+});
+
+test('a member can restore only the deliberate tombstone by its stored canonical identity', { skip }, async (t) => {
+  // The provenance stamp is written when a download lands. Spell it out here so this test does not rely
+  // on an earlier test having run a successful refetch first.
+  await q('UPDATE lib_books SET source_id = $2, source_chapter_id = $3 WHERE id = $1', [B.one, SRC, 'c/1/Group A']);
+  const removed = await del([B.one]);
+  assert.equal(removed.statusCode, 200, removed.body);
+  assert.equal((await row(B.one)).pruned_reason, 'deleted');
+
+  await t.test('inaccessible and unknown ids are indistinguishable', async () => {
+    assert.equal((await refetchBook(B.one, cappedTok)).statusCode, 404);
+    assert.equal((await refetchBook('b_act_nope')).statusCode, 404);
+    assert.equal((await refetchBook(B.one, nodlTok)).statusCode, 403, 'the existing canDownload gate still applies');
+  });
+
+  await t.test('the canonical stored source is pinned and the same row comes back', async () => {
+    const r = await refetchBook(B.one);
+    assert.equal(r.statusCode, 200, r.body);
+    assert.deepEqual(r.json(), { ok: true, started: true, folder: FOLDER, total: 1 });
+    const job = await jobDone();
+    assert.equal(job?.status, 'done', JSON.stringify(job));
+    assert.ok(existsSync(join(DL, FOLDER, 'Chapter 1.cbz')));
+    const books = await q('SELECT id, pruned_at, source_id, source_chapter_id FROM lib_books WHERE series_id = $1 AND number = 1', [S]);
+    assert.equal(books.length, 1);
+    assert.deepEqual(books[0], { id: B.one, pruned_at: null, source_id: SRC, source_chapter_id: 'c/1/Group A' });
+    assert.equal((await q('SELECT page FROM read_progress WHERE user_id = $1 AND book_id = $2', [adminId, B.one]))[0]?.page, 1);
+  });
+
+  await t.test('its exact historical source remains refetchable after that source is no longer followed', async () => {
+    const removedAgain = await del([B.one]);
+    assert.equal(removedAgain.statusCode, 200, removedAgain.body);
+    await q('DELETE FROM series_sources WHERE series_id = $1 AND source_id = $2', [S, SRC]);
+    await q('UPDATE lib_series SET source_id = $2, source_series_id = $3 WHERE id = $1', [S, FOL, 'fol-1']);
+    pageCalls.length = 0;
+    try {
+      const r = await refetchBook(B.one);
+      assert.equal(r.statusCode, 200, r.body);
+      const job = await jobDone();
+      assert.equal(job?.status, 'done', JSON.stringify(job));
+      assert.deepEqual(pageCalls, ['c/1/Group A'], 'restore used only the tombstone\'s canonical source identity');
+      assert.equal((await row(B.one)).pruned_at, null);
+    } finally {
+      await q('UPDATE lib_series SET source_id = $2, source_series_id = $3 WHERE id = $1', [S, SRC, 'act-1']);
+    }
+  });
+
+  await t.test('a changed tombstone identity while queued is refused at the source-slot boundary', async () => {
+    const removedAgain = await del([B.one]);
+    assert.equal(removedAgain.statusCode, 200, removedAgain.body);
+    const { underGate } = await import('../src/lib/downloader');
+    let entered = 0;
+    let ready!: () => void;
+    let release!: () => void;
+    const both = new Promise<void>((r) => { ready = r; });
+    const held = new Promise<void>((r) => { release = r; });
+    const occupy = () => underGate(SRC, async () => { if (++entered === 2) ready(); await held; });
+    const holders = [occupy(), occupy()];
+    await both;
+    pageCalls.length = 0;
+    try {
+      const started = await refetchBook(B.one);
+      assert.equal(started.statusCode, 200, started.body);
+      await q('UPDATE lib_books SET source_chapter_id = $2 WHERE id = $1', [B.one, 'c/1/replaced-identity']);
+      release();
+      await Promise.all(holders);
+      const job = await jobDone();
+      assert.notEqual(job?.status, 'downloading', JSON.stringify(job));
+      assert.deepEqual(pageCalls, [], 'the stale stored chapter identity reached the source');
+      assert.equal(existsSync(join(DL, FOLDER, 'Chapter 1.cbz')), false, 'a changed tombstone was restored anyway');
+      assert.ok((await row(B.one)).pruned_at, 'the refused tombstone was resurrected');
+    } finally {
+      release();
+      await Promise.allSettled(holders);
+      await q('UPDATE lib_books SET source_chapter_id = $2 WHERE id = $1', [B.one, 'c/1/Group A']);
+      if ((await row(B.one)).pruned_at) {
+        const restore = await refetchBook(B.one);
+        if (restore.statusCode === 200) await jobDone();
+      }
+    }
+  });
+
+  await t.test('two simultaneous restores reserve one folder and start only one writer', async () => {
+    const removedAgain = await del([B.one]);
+    assert.equal(removedAgain.statusCode, 200, removedAgain.body);
+    slowPages.add('c/1/Group A');
+    pageCalls.length = 0;
+    try {
+      // Both requests traverse the tombstone/source/writable reads together. The synchronous claim immediately
+      // before audit/job creation is the arbiter; the loser must not overwrite the first job card or write beside it.
+      const answers = await Promise.all([refetchBook(B.one), refetchBook(B.one)]);
+      assert.deepEqual(answers.map((r) => r.statusCode).sort((a, b) => a - b), [200, 409], answers.map((r) => r.body).join('\n'));
+      const refused = answers.find((r) => r.statusCode === 409)!;
+      assert.equal(refused.json().error, 'busy');
+      const job = await jobDone();
+      assert.equal(job?.status, 'done', JSON.stringify(job));
+      assert.deepEqual(pageCalls, ['c/1/Group A'], 'both restore requests reached the source');
+      assert.ok(existsSync(join(DL, FOLDER, 'Chapter 1.cbz')));
+      assert.equal((await row(B.one)).pruned_at, null);
+    } finally {
+      slowPages.delete('c/1/Group A');
+    }
+  });
+
+  await t.test('missing evidence, a range, and a noncanonical path are not refetchable', async () => {
+    const cases = [
+      { id: B.two, reason: 'missing', chapter: 'c/2/Group A', end: null, source: SRC },
+      { id: B.three, reason: 'deleted', chapter: 'c/3/Group A', end: 4, source: SRC },
+      { id: B.lib, reason: 'deleted', chapter: 'c/9/Group A', end: null, source: SRC },
+    ];
+    try {
+      for (const c of cases) {
+        await q('UPDATE lib_books SET pruned_at = now(), pruned_reason = $2, source_id = $3, source_chapter_id = $4, number_end = $5 WHERE id = $1',
+          [c.id, c.reason, c.source, c.chapter, c.end]);
+        const r = await refetchBook(c.id);
+        assert.equal(r.statusCode, 409, `${c.id}: ${r.body}`);
+        assert.equal(r.json().error, 'not_refetchable');
+      }
+    } finally {
+      await q('UPDATE lib_books SET pruned_at = NULL, pruned_reason = NULL, number_end = NULL WHERE id = ANY($1)', [[B.two, B.three, B.lib]]);
+      await q('UPDATE lib_books SET source_id = NULL, source_chapter_id = NULL WHERE id = $1', [B.lib]);
+    }
+  });
 });
 
 test('a user who may not download cannot fetch', { skip }, async () => {

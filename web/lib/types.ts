@@ -175,6 +175,12 @@ export interface Series {
    * Absent on older servers.
    */
   autoHero?: { seed: number } | null;
+  /**
+   * A list's items only (GET /api/collections/:id, v0.55.7, #164), for its sorts: when this reader last read in the
+   * series, and when its newest chapter arrived. null for never / no chapter; absent everywhere else.
+   */
+  lastReadAt?: string | null;
+  latestChapterAt?: string | null;
   overrides?: {
     title: string | null; summary: string | null; cover: string | null; banner: string | null;
     author: string | null; status: string | null; genres: string[] | null; ageRating: number | null;
@@ -261,17 +267,16 @@ export interface Book {
    */
   chapterName?: string | null;
   /**
-   * The file was deleted by the server's read-chapter cleanup. The chapter is still part of the series and
-   * still carries everyone's progress -- there are simply no pages behind it any more, and there will not
-   * be again. Nothing may offer to open or download it.
+   * The file is absent but the chapter remains as a tombstone carrying its identity and everyone's progress.
+   * `prunedReason` distinguishes deliberate deletion from a file that Verify or Rescan found missing.
    */
   pruned?: boolean;
   /**
-   * Why a pruned chapter's file is gone (v0.55.4): 'deleted' by Delete files or by Rescan everything, 'missing' by
-   * Verify chapter files, null for the read-chapter cleanup, a chapter's own delete or an older mark. Null or absent
-   * while the chapter has its file, and from a server before v0.55.4. The row's chip is worded by it (prunedLabel).
+   * Why a pruned chapter's file is gone: 'deleted' by a deliberate delete, 'missing' by Verify chapter files,
+   * 'rescan_missing' when Rescan found somebody's own file absent, and null for the read cleanup, a chapter's own
+   * delete or an older mark. Null or absent while the chapter has its file. The row's chip is worded by it.
    */
-  prunedReason?: 'deleted' | 'missing' | null;
+  prunedReason?: 'deleted' | 'missing' | 'rescan_missing' | null;
   /**
    * The file lives under the downloads root, i.e. Uchiyomi fetched it and can fetch it again. Only these
    * may be deleted from the server or fetched again: a chapter in a library somebody assembled by hand is
@@ -299,12 +304,18 @@ export interface Book {
  *   floor    below the series' Latest-N floor; Find missing chapters is the way to reach it
  *   archive  an active slow archive will fetch it (#117): available, under the retry cap, below its boundary
  *   covered  another site's split of a chapter this server holds (v0.50.0): never fetched by itself, still fetchable
+ *   deleted  never sent by the server: a chapter whose file was deleted on purpose, drawn as a ghost on the series
+ *            page under the admin's "Show deleted chapters as ghosts" (lib/chapterRows.ts ghostOfDeleted)
  */
-export type GhostWhy = 'missing' | 'held' | 'blocked' | 'failed' | 'floor' | 'archive' | 'covered';
+export type GhostWhy = 'missing' | 'held' | 'blocked' | 'failed' | 'floor' | 'archive' | 'covered' | 'deleted';
 
 /** A chapter the sources list that has no row in the library: what the updater knows about it, as of its last check. */
 export interface Ghost {
+  /** A deliberate tombstone keeps its original identity; absent for a source-only listing row. */
+  bookId?: string;
   number: number;
+  /** End of a deleted range chapter. Source-only listing rows are one number. */
+  numberEnd?: number | null;
   title: string | null;
   publishedAt: string | null;
   /** The group of the copy the scanlator rules would take. Null when the source did not say. */
@@ -314,6 +325,8 @@ export interface Ghost {
   sourceId: string;
   sourceName: string;
   why: GhostWhy;
+  /** True only for an existing lib_books tombstone rendered with the ghost treatment. */
+  deleted?: true;
   attempts?: number;
   /** The downloader's last error text. Admins only; absent for everyone else. */
   reason?: string;
@@ -339,6 +352,11 @@ export interface Listing {
   archive?: import('./archive').ListingArchive | null;
   /** How the series is numbered and what waits for an admin (v0.49.0, #116; lib/numbering.ts). Absent from an older server. */
   numbering?: import('./numbering').NumberingSummary | null;
+  /**
+   * The admin's "Show deleted chapters as ghosts" (bff lib/deletedGhosts.ts): a chapter whose file was deleted on
+   * purpose is drawn as a ghost row rather than as a deleted chapter. Absent from an older server, which reads as off.
+   */
+  deletedAsGhosts?: boolean;
 }
 
 /** How often a group ships, read off the median gap of its last dated releases. `unknown` with fewer than two dates. */

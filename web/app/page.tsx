@@ -24,8 +24,16 @@ interface CollectionRow { id: string; name: string; accent: string | null; item_
 
 /** One home rail per (non-empty) collection, capped at 3 — links through to the collection page. */
 function CollectionRails() {
+  const { user } = useAuth();
   const { data } = useQuery({ queryKey: ['collections'], queryFn: () => api<{ content: CollectionRow[] }>('/api/collections'), staleTime: 300000 });
-  const cols = (data?.content ?? []).filter((c) => c.item_count > 0).slice(0, 3);
+  const all = data?.content ?? [];
+  const saved = user?.settings?.homeCollections;
+  // No setting means the pre-v0.55.8 behaviour.  Once a reader makes an explicit choice, including choosing
+  // none, that exact order wins.  Empty selected lists remain in the setting but their rail stays quiet until
+  // something is added; stale or foreign ids cannot occur in this account-scoped response and are ignored.
+  const cols = Array.isArray(saved)
+    ? saved.slice(0, 3).map((id) => all.find((c) => c.id === id)).filter((c): c is CollectionRow => !!c)
+    : all.filter((c) => Number(c.item_count) > 0).slice(0, 3);
   if (!cols.length) return null;
   return (
     <>
@@ -55,12 +63,18 @@ function CollectionRail({ col }: { col: CollectionRow }) {
   );
 }
 
-function greeting() {
+/**
+ * The line above Home's rails, as one sentence per time of day, with the reader's name and without: the greeting
+ * was English in every language, and its ", {name}." glued on after it would be English punctuation in Japanese,
+ * Chinese and Arabic too. The name is isolated: a Latin name inside an Arabic sentence takes its order.
+ */
+function greeting(name?: string) {
   const h = new Date().getHours();
-  if (h < 5) return 'Late night reading';
-  if (h < 12) return 'Good morning';
-  if (h < 18) return 'Good afternoon';
-  return 'Good evening';
+  const who = name ? { name: `\u2068${name}\u2069` } : null;
+  if (h < 5) return who ? tr('Late night reading, {name}.', who) : tr('Late night reading.');
+  if (h < 12) return who ? tr('Good morning, {name}.', who) : tr('Good morning.');
+  if (h < 18) return who ? tr('Good afternoon, {name}.', who) : tr('Good afternoon.');
+  return who ? tr('Good evening, {name}.', who) : tr('Good evening.');
 }
 
 export default function HomePage() {
@@ -146,7 +160,7 @@ export default function HomePage() {
           so it is where the way back has to be. */}
       <div className="flex items-center justify-between gap-3 px-5 pt-6 lg:px-0">
         <p className="min-w-0 text-sm text-fog-400 lg:text-base">
-          {greeting()}{user?.displayName && user.displayName !== 'me' ? `, ${user.displayName}` : ''}.
+          {greeting(user?.displayName && user.displayName !== 'me' ? user.displayName : undefined)}
         </p>
         <AdultToggle className="shrink-0" alsoWhen={adultFilter} />
       </div>

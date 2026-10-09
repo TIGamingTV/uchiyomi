@@ -23,7 +23,10 @@ import { q, one } from './db';
 import { getSource, SourceChapter } from './sources';
 import { classify, noteStage, reportFail, blockedNow, isDisabled } from './sourceHealth';
 import { writeAtomic } from './fsAtomic';
-import { downloadChapter, fetchPages, underGate, type DownloadInput } from './downloader';
+import {
+  assertDownloadPreflight, downloadChapter, DownloadPreflightError, fetchPages, underGate,
+  type DownloadInput, type DownloadPreflight,
+} from './downloader';
 import { healFinished } from './downloadActivity';
 // eslint-disable-next-line @typescript-eslint/no-var-requires
 const AdmZip = require('adm-zip');
@@ -185,14 +188,39 @@ type Completion = 'completed' | 'improved' | 'unchanged' | 'gone';
  * the same-copy pass works before it lands, and a missing module simply ends the attempt at 'unchanged'.
  */
 export async function completePartial(
-  book: { id: string; series_id: string; root: string; file: string; number: number; missing_pages: number[]; source_id: string | null },
+  book: { id: string; series_id: string; root: string; file: string; number: number; missing_pages: number[]; source_id: string | null; scanlator?: string | null },
   ctx: {
     alternates: () => Promise<SourceChapter[]>;
     /** The sweep's age rule. It applies to the old copy as well as every fallback copy. */
     allowed?: (source: string) => boolean;
+    /** Current scanlator rules for the original copy. Re-read before every source operation. */
+    automaticAllowed?: (chapter: SourceChapter) => Promise<boolean>;
+    /** Current caller-specific ownership of a source copy; unlike the scanlator rule, pins never bypass it. */
+    sourceAllowedNow?: (chapter: SourceChapter) => Promise<boolean>;
     hunt?: (why: string) => Promise<SourceChapter | null>;
+    /** Last-responsible-moment admission for the nightly completion pass. Manual callers may omit it. */
+    admit?: () => Promise<boolean>;
   },
 ): Promise<Completion> {
+  const admitted = (): Promise<boolean> => ctx.admit
+    ? ctx.admit().catch(() => false)
+    : Promise.resolve(true);
+  const automaticallyAllowed = async (candidate: SourceChapter): Promise<boolean> => {
+    // A partial on disk is not a pin for tonight's unattended repair. It is merely the copy that landed on
+    // an earlier run, so a group blocked since then must not receive another request. Preference read errors
+    // fail closed, matching the other automatic download paths.
+    return ctx.automaticAllowed ? ctx.automaticAllowed(candidate).catch(() => false) : Promise.resolve(true);
+  };
+  const sourceAllowed = (candidate: SourceChapter): Promise<boolean> => ctx.sourceAllowedNow
+    ? ctx.sourceAllowedNow(candidate).catch(() => false) : Promise.resolve(true);
+  const preflightFor = (candidate: SourceChapter, sourceId: string, writing = false): DownloadPreflight => async () => {
+    if (!(await admitted())) return 'paused';
+    if (!getSource(sourceId) || (ctx.allowed && !ctx.allowed(sourceId)) || !(await sourceAllowed(candidate))) return 'source';
+    if (!(await automaticallyAllowed(candidate))) return 'policy';
+    if (await isDisabled(sourceId).catch(() => true)) return 'disabled';
+    if (!writing && await blockedNow(sourceId).then(Boolean, () => true)) return 'cooldown';
+    return null;
+  };
   const abs = join(book.root, book.file);
   let manifest: PartialManifest | null;
   try {
@@ -224,7 +252,12 @@ export async function completePartial(
   // dirnameRel, not dirname: book.file is the stored `/` form (lib/relPath.ts), and this folder is handed
   // back to the downloader, whose chapterFileRel must land on the same row.
   const seriesFolder = dirnameRel(book.file);
-  const chapter: SourceChapter = { sourceId: manifest.chapterSourceId, number: book.number };
+  const chapter: SourceChapter = {
+    sourceId: manifest.chapterSourceId,
+    number: book.number,
+    source: manifest.source,
+    ...(book.scanlator ? { scanlator: book.scanlator } : {}),
+  };
   const label = `[partial] "${title}" ch ${book.number}`;
   let result: Completion = 'unchanged';
   const before = (await stat(abs)).size;
@@ -234,20 +267,41 @@ export async function completePartial(
   const askable = src && (!ctx.allowed || ctx.allowed(src.id))
     && !(await isDisabled(src.id).catch(() => false))
     && !(await blockedNow(src.id).catch(() => null));
-  if (src && askable) {
+  sameCopy: if (src && askable) {
     let urls: string[] | null = null;
+    if (!(await admitted())) return result;
+    if (!(await automaticallyAllowed(chapter))) break sameCopy;
     try {
+      await assertDownloadPreflight(preflightFor(chapter, src.id));
       urls = await src.getPageUrls(manifest.chapterSourceId);
     } catch (e) {
+      if (e instanceof DownloadPreflightError) {
+        if (e.reason === 'paused') return result;
+        break sameCopy;
+      }
       const st = classify(e);
       if (st) await reportFail(src.id, st, (e as Error)?.message || 'getPageUrls failed');
       void noteStage(src.id, 'pages', 'fail', { error: (e as Error)?.message || 'getPageUrls failed' }); // #115
     }
     if (urls && urls.length === manifest.expected) {
       // `retry: false`: the source sees exactly one request per hole, tonight and again tomorrow.
-      const got = await underGate(src.id, () => fetchPages(src, urls!, missing, { chapterSourceId: manifest.chapterSourceId, retry: false }));
+      if (!(await admitted())) return result;
+      if (!(await automaticallyAllowed(chapter))) break sameCopy;
+      let got: Awaited<ReturnType<typeof fetchPages>>;
+      try {
+        got = await underGate(src.id, async () => {
+          await assertDownloadPreflight(preflightFor(chapter, src.id));
+          return fetchPages(src, urls!, missing, { chapterSourceId: manifest.chapterSourceId, retry: false });
+        });
+      } catch (e) {
+        if (!(e instanceof DownloadPreflightError)) throw e;
+        if (e.reason === 'paused') return result;
+        break sameCopy;
+      }
       const filled = missing.filter((i) => got.page[i]);
       if (filled.length) {
+        if (!(await admitted())) return result;
+        if (!(await automaticallyAllowed(chapter))) return result;
         const still = missing.filter((i) => !got.page[i]);
         // Merge by index name: the placeholder entry for a filled index goes, the real page takes its slot
         // (possibly under another extension), every other entry keeps its bytes exactly.
@@ -273,6 +327,15 @@ export async function completePartial(
           const next: PartialManifest = { ...manifest, missing: still, writtenAt: new Date().toISOString() };
           out.addFile(PARTIAL_MANIFEST, Buffer.from(JSON.stringify(next, null, 2)));
         }
+        try {
+          // Reading the old ZIP, rendering entries and assembling the replacement all await. Re-read at the
+          // actual atomic-write boundary so an unfollow/block/pause during that work cannot replace the file.
+          await assertDownloadPreflight(preflightFor(chapter, src.id, true));
+        } catch (e) {
+          if (!(e instanceof DownloadPreflightError)) throw e;
+          if (e.reason === 'paused') return result;
+          break sameCopy;
+        }
         await writeAtomic(abs, out.toBuffer());
         await restampBook(book.id, abs, still);
         console.log(`${label}: ${filled.length} of ${missing.length} missing page${missing.length === 1 ? '' : 's'} fetched from ${src.id}${still.length ? `, ${still.length} still missing` : ''}`);
@@ -291,7 +354,12 @@ export async function completePartial(
       // The source re-sliced the chapter since the partial was written: index 149 of 155 is not index
       // 149 of 150. Fetch it whole, and keep the new copy only when it is complete or has fewer holes.
       try {
-        const r = await downloadChapter({ sourceId: src.id, seriesFolder, chapter, meta }, { replace: true });
+        if (!(await admitted())) return result;
+        if (!(await automaticallyAllowed(chapter))) break sameCopy;
+        const r = await downloadChapter(
+          { sourceId: src.id, seriesFolder, chapter, meta },
+          { replace: true, preflight: preflightFor(chapter, src.id) },
+        );
         if (r) {
           await restampBook(book.id, abs, []);
           console.warn(`${label}: re-sliced on ${src.id} (${manifest.expected} → ${urls.length} pages), fetched whole`);
@@ -301,7 +369,15 @@ export async function completePartial(
         if (e?.diskFull) throw e;
         const hold = e?.partial;
         if (hold && hold.missing.length < missing.length) {
-          await hold.write();
+          if (!(await admitted()) || !(await automaticallyAllowed(chapter))) { hold.drop?.(); return result; }
+          try {
+            await hold.write(preflightFor(chapter, src.id, true));
+          } catch (writeError) {
+            if (!(writeError instanceof DownloadPreflightError)) throw writeError;
+            hold.drop?.();
+            if (writeError.reason === 'paused') return result;
+            break sameCopy;
+          }
           await restampBook(book.id, abs, hold.missing);
           console.warn(`${label}: re-sliced on ${src.id} (${manifest.expected} → ${urls.length} pages), saved with ${hold.missing.length} missing`);
           missing = [...hold.missing];
@@ -332,6 +408,9 @@ export async function completePartial(
     refusing: new Set([manifest.source]),
     allowed: ctx.allowed,
     hunt: ctx.hunt,
+    admit: ctx.admit,
+    automaticAllowed: ctx.automaticAllowed,
+    sourceAllowedNow: ctx.sourceAllowedNow,
     replace: true,
     // Decide before `PartialHold.write()` replaces the canonical archive. The old write-then-restore
     // sequence had a crash window in which a worse copy could become permanent while the DB still

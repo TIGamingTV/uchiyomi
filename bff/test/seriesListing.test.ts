@@ -16,11 +16,13 @@ let listingRows: typeof import('../src/lib/seriesListing')['listingRows'];
 let whyOf: typeof import('../src/lib/seriesListing')['whyOf'];
 let copyToChapter: typeof import('../src/lib/seriesListing')['copyToChapter'];
 let sameRelease: typeof import('../src/lib/seriesListing')['sameRelease'];
+let resolveListingRow: typeof import('../src/lib/seriesListing')['resolveListingRow'];
+let automaticCopies: typeof import('../src/lib/seriesListing')['automaticCopies'];
 let chooseReleases: typeof import('../src/lib/releases')['chooseReleases'];
 let releaseOrder: typeof import('../src/lib/releases')['releaseOrder'];
 let CHAPTER_RETRY_CAP: number;
 before(async () => {
-  ({ listingRows, whyOf, copyToChapter, sameRelease } = await import('../src/lib/seriesListing'));
+  ({ listingRows, whyOf, copyToChapter, sameRelease, resolveListingRow, automaticCopies } = await import('../src/lib/seriesListing'));
   ({ chooseReleases, releaseOrder } = await import('../src/lib/releases'));
   ({ CHAPTER_RETRY_CAP } = await import('../src/lib/updater'));
 });
@@ -142,6 +144,41 @@ test('a number the chooser is holding for the preferred group is held', () => {
   assert.equal(rows[0].scanlator, 'Group A', 'and the copy on offer today is still the row\'s copy');
 });
 
+test('a block reapply recomputes every chosen field and preserves the natural held state', () => {
+  const now = Date.now();
+  const fresh = new Date(now).toISOString();
+  const tagged = [
+    ch(9, { title: 'Bad title', scanlator: 'Bad', groups: ['Bad'], source: 'pri', pages: 10, publishedAt: fresh }),
+    ch(9, { title: 'Good title', scanlator: 'Good', groups: ['Good'], source: 'fol', pages: 12, publishedAt: fresh }),
+  ];
+  const [base] = listingRows(tagged, tagged.slice(0, 1), new Set(), 'pri');
+  const sourceRanked = resolveListingRow(base, noPrefs, { sourceRank: (source) => source === 'fol' ? 0 : 1 });
+  assert.equal(sourceRanked.sourceId, 'fol', 'the current source priority/follow order participates in the rebuild');
+  const blocked = resolveListingRow(base, { priority: ['Preferred'], blocked: ['Bad', 'Good'], patienceMs: 2 * 86_400_000 });
+  assert.equal(blocked.status, 'blocked');
+  assert.equal(blocked.unblockedStatus, 'held', 'lifting the block restores the chooser\'s wait');
+
+  const open = resolveListingRow(blocked, { priority: ['Good'], blocked: ['Bad'], patienceMs: 2 * 86_400_000 });
+  assert.equal(open.status, 'available');
+  assert.equal(open.sourceId, 'fol');
+  assert.equal(open.title, 'Good title');
+  assert.equal(open.scanlator, 'Good');
+  assert.equal(open.publishedAt, fresh);
+  assert.equal(open.chosen.sourceId, 'c/9/Good');
+  assert.equal(open.copies.length, 2, 'blocked copies remain stored for a later unblock');
+});
+
+test('automatic fallbacks drop blocked copies while an explicit picker can retain the original list', () => {
+  const copies = [
+    copy('pri', { groups: ['Blocked'] }),
+    copy('a', { groups: ['Open'] }),
+    copy('b', { groups: ['Blocked', 'Open'] }),
+  ];
+  const out = automaticCopies(copies, { priority: [], blocked: ['blocked'], patienceMs: 0 });
+  assert.deepEqual(out.map((c) => c.source), ['a', 'b'], 'joint releases survive when one contributing group is open');
+  assert.equal(copies.length, 3, 'the stored list stays intact for an explicit versions pick');
+});
+
 test('a copy an adapter tagged with nothing falls back to the series\' own source', () => {
   const tagged = [ch(1)];
   const rows = listingRows(tagged, tagged, new Set(), 'pri');
@@ -223,6 +260,29 @@ test('copies that name no group match only each other, in one language, with pag
   // And a chosen copy that names a group never matches one that names none, whatever its pages.
   assert.deepEqual(sameRelease(copy('pri', { groups: ['Group A'] }), [copy('a', {})], { followed: FOLLOWED }).map((c) => c.source), ['pri'],
     'a no-group copy was taken for a named group\'s release');
+});
+
+test('a placeholder where the group goes is no group: two "Unofficial" copies are held to their page counts', () => {
+  // v0.55.7 (#158). Aggregators label every chapter "Unofficial" or "Unknown". Reintroduce by keeping the placeholders
+  // as group names (keysOf without PLACEHOLDER_GROUPS): "two Unofficial copies with other page counts are other
+  // releases" takes b's 18 pages, paired by the label alone.
+  // As the listing stores them: `groups` already split from the site's label (listingRows, groupsOf).
+  const chosen = copy('pri', { groups: ['Unofficial'], scanlator: 'Unofficial', pages: 20 });
+  const copies = [
+    chosen,
+    copy('a', { groups: ['unofficial'], scanlator: 'unofficial', pages: 20 }), // the same label, spelt another way, and the pages agree
+    copy('b', { groups: ['Unofficial'], scanlator: 'Unofficial', pages: 18 }), // the same label, and another release by its pages
+    copy('c', { pages: 20 }), // no label at all: no group either
+    copy('d', { groups: ['N/A'], scanlator: 'N/A', pages: null }), // a count nobody knows contradicts nothing
+    copy('e', { groups: ['Group A'], pages: 20 }), // a real group is never the no-group release
+  ];
+  const out = sameRelease(chosen, copies, { followed: FOLLOWED }).map((c) => c.source);
+  assert.ok(!out.includes('b'), 'two Unofficial copies with other page counts are other releases');
+  assert.ok(!out.includes('e'), 'a named group was taken for the no-group release');
+  assert.deepEqual(out, ['pri', 'a', 'c', 'd'], 'a placeholder label is no group: it pairs with copies naming none when the pages agree');
+  // A real group beside a placeholder is that group's release, and "Unknown" never makes it another.
+  assert.deepEqual(sameRelease(copy('pri', { groups: ['Group A', 'Unknown'] }), [copy('a', { groups: ['Group A'] }), copy('b', { groups: ['No Group'] })],
+    { followed: FOLLOWED }).map((c) => c.source), ['pri', 'a'], 'the placeholder beside a real group changed which release it is');
 });
 
 test('a copy that names no language takes its source\'s, and an external link is never a release', () => {

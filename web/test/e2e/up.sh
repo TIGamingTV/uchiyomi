@@ -16,11 +16,16 @@
 #     app's archive timing, and a walk without it skips the archive checks that need that timing
 #   E2E_NO_WALK=1 skips the run.mjs walk at the end (with KEEP=1: just bring an instance up to poke at)
 #   E2E_MIN_FREE_GB=0 on a host with less than 10 GiB free: the downloader's floor refuses every download under it
+#   KEEP=1 E2E_SKIP_BUILD=1 E2E_IMAGE=uchiyomi:e2e-final E2E_NO_WALK=1 bash web/test/e2e/up.sh
+#     reuses that already-built AIO image. Skip mode requires an explicit E2E_IMAGE, verifies it before changing any
+#     stack state, and runs its resolved image ID, so every phase can exercise the exact same final build.
 #   KEEP=1 E2E_ENGINE=fake E2E_FAKE_EXTRA=v54 E2E_NO_WALK=1 bash web/test/e2e/up.sh   # the stack for walk49's replace
 #   KEEP=1 E2E_ENGINE=fake E2E_FAKE_EXTRA=v55 E2E_MAX_SOURCES=2 E2E_NO_WALK=1 bash web/test/e2e/up.sh   # walk49's autofix
 #   KEEP=1 E2E_SOLVERS=1 E2E_NO_WALK=1 bash web/test/e2e/up.sh   # walk49's solver: a main and a backup solver, fake-b
 #     behind a fake Cloudflare
 #   KEEP=1 E2E_EMPTY_LIBRARY=1 E2E_NO_WALK=1 bash web/test/e2e/up.sh   # walk49's find: a new server, nothing in its library
+#   KEEP=1 E2E_ANILIST=1 E2E_NO_WALK=1 bash web/test/e2e/up.sh   # walk49's matches: a fake AniList (fakeAniList.mjs) as
+#     ANILIST_API_URL, so nothing on the instance asks the real AniList
 #
 # The embedded leg is the proof that the one-container layout behaves like the two-container one, in the
 # only place both are actually driven end to end. CI runs both.
@@ -41,6 +46,7 @@ FAKE_D="$NET-fake-d"
 ENGINE_C="$NET-engine"
 SOLVER_MAIN="$NET-solver-main"
 SOLVER_BACKUP="$NET-solver-backup"
+ANILIST_C="$NET-anilist"
 # Docker's default address pools can be exhausted on a busy host, so the subnet is pinned rather than left
 # to chance -- an unexplained "all predefined address pools have been fully subnetted" is a bad first
 # impression of a test suite.
@@ -70,6 +76,11 @@ ENGINE_PORT=${E2E_ENGINE_PORT:-$((23000 + PORT % 1000))}
 SOLVERS=${E2E_SOLVERS:-0}
 SOLVER_MAIN_PORT=${E2E_SOLVER_MAIN_PORT:-$((26000 + (PORT % 1000) * 2))}
 SOLVER_BACKUP_PORT=$((SOLVER_MAIN_PORT + 1))
+# v0.55.7, E2E_ANILIST=1: a fake AniList (fakeAniList.mjs) as the app's ANILIST_API_URL -- every AniList call, the title
+# lookups for covers, banners and links included (bff lib/anilist.ts) -- for walk49's matches phase (v557Walk.mjs). Unset,
+# the app asks the real AniList, as every walk before did. Its control port from a range of its own: 28000-28999.
+ANILIST=${E2E_ANILIST:-0}
+ANILIST_PORT=${E2E_ANILIST_PORT:-$((28000 + PORT % 1000))}
 # E2E_ENGINE=fake: the strict fake Suwayomi v2.3.2243 (bff/test/fixtures/fakeSuwayomiEngine.mjs) as the extension
 # engine, in E2E_ENGINE_MODE (up, down, slow, extension_error; /__mode switches it later). Unset: no engine at
 # all, SUWAYOMI_URL empty -- the "No extension engine is set up" state (#72).
@@ -77,6 +88,20 @@ ENGINE=${E2E_ENGINE:-}
 # The image's tag: its own per run when several instances are built at once (parallel lanes), so one run never
 # starts another's build.
 IMAGE=${E2E_IMAGE:-uchiyomi:e2e}
+SKIP_BUILD=${E2E_SKIP_BUILD:-0}
+case "$SKIP_BUILD" in
+  0) ;;
+  1)
+    # Fail before mktemp, container removal or network creation. A typo must not silently run whatever happens to be
+    # tagged uchiyomi:e2e, and resolving the explicit ref now keeps this stack on one immutable local image ID.
+    [ -n "${E2E_IMAGE:-}" ] || { echo "E2E_SKIP_BUILD=1 requires an explicit E2E_IMAGE" >&2; exit 1; }
+    IMAGE_ID=$(docker image inspect --format '{{.Id}}' "$IMAGE" 2>/dev/null) \
+      || { echo "E2E_SKIP_BUILD=1 image does not exist: $IMAGE" >&2; exit 1; }
+    [ -n "$IMAGE_ID" ] || { echo "E2E_SKIP_BUILD=1 could not resolve image: $IMAGE" >&2; exit 1; }
+    IMAGE="$IMAGE_ID"
+    ;;
+  *) echo "E2E_SKIP_BUILD must be 0 or 1" >&2; exit 1 ;;
+esac
 LIB=$(mktemp -d)
 DATA=$(mktemp -d)
 # The v0.42.0 walk needs one provider that declares itself adult, to prove the "Show 18+" reveal keeps it
@@ -117,19 +142,20 @@ if [ "$SOLVERS" = "1" ]; then
 else
   CLOUDFLARE_B="no"
 fi
+if [ "$ANILIST" = "1" ]; then APP_ENV+=(-e "ANILIST_API_URL=http://$ANILIST_C:$ANILIST_PORT/"); fi
 
 cleanup() {
-  [ "${KEEP:-0}" = "1" ] && { echo "kept: $NET on :$PORT, fake sources on :$FAKE_A_PORT/:$FAKE_B_PORT${ENGINE:+, fake engine on :$ENGINE_PORT}$([ "$OWNER" = "1" ] && echo ", fake-c/fake-d on :$FAKE_C_PORT/:$FAKE_D_PORT")$([ "$SOLVERS" = "1" ] && echo ", solvers on :$SOLVER_MAIN_PORT/:$SOLVER_BACKUP_PORT") (library $LIB, data $DATA)"; return; }
+  [ "${KEEP:-0}" = "1" ] && { echo "kept: $NET on :$PORT, fake sources on :$FAKE_A_PORT/:$FAKE_B_PORT${ENGINE:+, fake engine on :$ENGINE_PORT}$([ "$OWNER" = "1" ] && echo ", fake-c/fake-d on :$FAKE_C_PORT/:$FAKE_D_PORT")$([ "$SOLVERS" = "1" ] && echo ", solvers on :$SOLVER_MAIN_PORT/:$SOLVER_BACKUP_PORT")$([ "$ANILIST" = "1" ] && echo ", fake AniList on :$ANILIST_PORT") (library $LIB, data $DATA)"; return; }
   # -v: postgres:16-alpine declares its data directory a volume, and every run left that anonymous volume behind
   # (about 49 MB); nothing else here has one to leave.
-  docker rm -f -v "$APP" "$DB" "$FAKE_A" "$FAKE_B" "$FAKE_C" "$FAKE_D" "$ENGINE_C" "$SOLVER_MAIN" "$SOLVER_BACKUP" >/dev/null 2>&1 || true
+  docker rm -f -v "$APP" "$DB" "$FAKE_A" "$FAKE_B" "$FAKE_C" "$FAKE_D" "$ENGINE_C" "$SOLVER_MAIN" "$SOLVER_BACKUP" "$ANILIST_C" >/dev/null 2>&1 || true
   docker network rm "$NET" >/dev/null 2>&1 || true
   # /data is written by the container as PUID (our own uid), so a plain rm works.
   rm -rf "$LIB" "$DATA"
 }
 trap cleanup EXIT INT TERM
 
-docker rm -f -v "$APP" "$DB" "$FAKE_A" "$FAKE_B" "$FAKE_C" "$FAKE_D" "$ENGINE_C" "$SOLVER_MAIN" "$SOLVER_BACKUP" >/dev/null 2>&1 || true
+docker rm -f -v "$APP" "$DB" "$FAKE_A" "$FAKE_B" "$FAKE_C" "$FAKE_D" "$ENGINE_C" "$SOLVER_MAIN" "$SOLVER_BACKUP" "$ANILIST_C" >/dev/null 2>&1 || true
 docker network rm "$NET" >/dev/null 2>&1 || true
 docker network create --subnet "$SUBNET" "$NET" >/dev/null
 
@@ -164,6 +190,13 @@ if [ "$SOLVERS" = "1" ]; then
     -v "$REPO:/repo:ro" -w /repo node:24-alpine \
     node web/test/e2e/fakeSolver.mjs --name backup --port 8191 --greeting flaresolverr --version 3.5.2 >/dev/null
   STUBS="$STUBS http://127.0.0.1:$SOLVER_MAIN_PORT/__mode http://127.0.0.1:$SOLVER_BACKUP_PORT/__mode"
+fi
+if [ "$ANILIST" = "1" ]; then
+  echo "· and a fake AniList"
+  docker run -d --name "$ANILIST_C" --network "$NET" -p "127.0.0.1:$ANILIST_PORT:$ANILIST_PORT" \
+    -v "$REPO:/repo:ro" -w /repo node:24-alpine \
+    node web/test/e2e/fakeAniList.mjs --port "$ANILIST_PORT" --host "$ANILIST_C:$ANILIST_PORT" >/dev/null
+  STUBS="$STUBS http://127.0.0.1:$ANILIST_PORT/__log"
 fi
 for stub in $STUBS; do
   ready=0
@@ -202,8 +235,12 @@ else
   python3 "$REPO/web/test/e2e/seed.py" "$LIB"
 fi
 
-echo "· building the all-in-one image"
-docker build -q -f "$REPO/Dockerfile.aio" -t "$IMAGE" "$REPO" >/dev/null
+if [ "$SKIP_BUILD" = "1" ]; then
+  echo "· using the prebuilt all-in-one image $IMAGE"
+else
+  echo "· building the all-in-one image"
+  docker build -q -f "$REPO/Dockerfile.aio" -t "$IMAGE" "$REPO" >/dev/null
+fi
 
 if [ "$EMBEDDED" = "1" ]; then
   echo "· embedded database: no Postgres container, DATABASE_URL unset, /data mounted"
@@ -251,4 +288,8 @@ sleep 4
 
 echo "· driving the browser"
 cd "$REPO/web"
-BASE="http://127.0.0.1:$PORT" E2E_USER="$USER" E2E_PASS="$PASS" node test/e2e/run.mjs
+WALK_SCRIPT=${E2E_WALK_SCRIPT:-test/e2e/run.mjs}
+# LIB and E2E_NET are harmless extras for the original walk and are the only safe handles the feature walks use to
+# seed their disposable filesystem/database. Keeping the selected script inside this process means this file's EXIT
+# trap owns cleanup and, with `set -e`, the browser's exact exit code reaches CI.
+BASE="http://127.0.0.1:$PORT" E2E_USER="$USER" E2E_PASS="$PASS" LIB="$LIB" E2E_NET="$NET" node "$WALK_SCRIPT"

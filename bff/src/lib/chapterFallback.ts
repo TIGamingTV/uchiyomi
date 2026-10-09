@@ -31,7 +31,10 @@
 //
 // Every step is a real request to a site. The caps here (two alternates, one hunt, one write) are the
 // whole of what one failed chapter may cost, and the reviewers count them.
-import { downloadChapter, type DownloadInput, type PartialHold } from './downloader';
+import {
+  downloadChapter, DownloadPreflightError,
+  type DownloadInput, type DownloadPreflight, type DownloadPreflightReason, type PartialHold,
+} from './downloader';
 import { getSource, type SourceChapter } from './sources';
 import { isDisabled, blockedNow, classify } from './sourceHealth';
 
@@ -74,6 +77,22 @@ export interface FallbackInput {
    * the one the outcome names: an alternate that refused on the way is a site that said no too.
    */
   onAsked?: (source: string, err: unknown) => void;
+  /**
+   * Last-responsible-moment admission for unattended work. Checked before the chosen download, every
+   * alternate, and both the hunt and its download. Manual callers omit it and remain admitted.
+   */
+  admit?: () => Promise<boolean>;
+  /**
+   * Re-read the current series/source/scanlator rules immediately before every automatic copy is contacted and
+   * before a partial hold is written.  Only a chapter explicitly pinned by a person bypasses this predicate.
+   */
+  automaticAllowed?: (chapter: SourceChapter) => Promise<boolean>;
+  /**
+   * Re-read the caller-specific source capability at the source-slot boundary. Ordinary jobs require the
+   * source still be primary/followed; a fill requires its still-authorised plan copy; tombstone restore
+   * requires the exact stored book identity. Unlike automaticAllowed this is never bypassed by a pin.
+   */
+  sourceAllowedNow?: (chapter: SourceChapter) => Promise<boolean>;
 }
 
 export type FallbackOutcome =
@@ -83,7 +102,7 @@ export type FallbackOutcome =
    * copy's source is refusing this run and no other copy could be asked (`refusing`). The second is the
    * old loops' `continue`: the chapter was never asked, so it is not a failure and earns no ledger row.
    */
-  | { kind: 'skipped'; why: 'on_disk' | 'refusing' }
+  | { kind: 'skipped'; why: 'on_disk' | 'refusing' | 'paused' }
   | { kind: 'partial'; via: string; pages: number; missing: number[]; chapterUsed: SourceChapter; switched?: { from: string; why: string } }
   | { kind: 'failed'; via: string; err: any };
 
@@ -120,6 +139,27 @@ async function tryEachCopy(f: FallbackInput, offered: PartialHold[]): Promise<Fa
   const via = f.chapter.source ?? '';
   const n = f.chapter.number;
   const label = `"${f.title}" ch ${n}`;
+  const admitted = () => f.admit ? f.admit().catch(() => false) : Promise.resolve(true);
+  const automaticallyAllowed = (chapter: SourceChapter): Promise<boolean> => (chapter as SourceChapter & { pinned?: boolean }).pinned
+    ? Promise.resolve(true)
+    : f.automaticAllowed ? f.automaticAllowed(chapter).catch(() => false) : Promise.resolve(true);
+  const sourceAllowed = (chapter: SourceChapter): Promise<boolean> => f.sourceAllowedNow
+    ? f.sourceAllowedNow(chapter).catch(() => false) : Promise.resolve(true);
+  const preflightFor = (chapter: SourceChapter, src: string, writing = false): DownloadPreflight => async () => {
+    if (!(await admitted())) return 'paused';
+    // Loaded + viewer/sweep scope and current caller-specific ownership are source authorization, and a pin
+    // overrides none of them. It overrides only the scanlator block below.
+    if (!getSource(src) || (f.allowed && !f.allowed(src)) || !(await sourceAllowed(chapter))) return 'source';
+    if (!(await automaticallyAllowed(chapter))) return 'policy';
+    // Health is mutable too. A database read failure is uncertainty and therefore closed at this outbound
+    // boundary; it must not turn a disabled source into a best-effort request.
+    if (await isDisabled(src).catch(() => true)) return 'disabled';
+    // A non-refusal shortfall may itself have just earned a cooldown. That cooldown stops the next network
+    // request, not saving the already-fetched readable pages. Delayed writes still recheck every authority and
+    // a hard disable; only their no-network boundary omits cooldown.
+    if (!writing && await blockedNow(src).then(Boolean, () => true)) return 'cooldown';
+    return null;
+  };
   if (!via) return { kind: 'failed', via, err: new Error(`${label}: the copy names no source`) };
 
   // The error of the CHOSEN copy: what the reason is worded from and what decides whether a hunt is
@@ -130,12 +170,22 @@ async function tryEachCopy(f: FallbackInput, offered: PartialHold[]): Promise<Fa
   let last = null as { via: string; err: any } | null;
   // The hold with the fewest missing pages across every copy asked. Kept, not written, until the end.
   let best = null as { hold: PartialHold; via: string; chapter: SourceChapter } | null;
+  let asked = 0;
 
-  const attempt = async (ch: SourceChapter, src: string, chosen = false): Promise<{ file: string; pages: number } | null | 'failed'> => {
+  const attempt = async (
+    ch: SourceChapter, src: string, chosen = false,
+  ): Promise<{ file: string; pages: number } | null | 'failed' | { preflight: DownloadPreflightReason }> => {
     let done: { file: string; pages: number } | null;
     try {
-      done = await downloadChapter({ sourceId: src, seriesFolder: f.folder, chapter: ch, meta: f.meta }, { replace: f.replace });
+      done = await downloadChapter(
+        { sourceId: src, seriesFolder: f.folder, chapter: ch, meta: f.meta },
+        { replace: f.replace, preflight: preflightFor(ch, src) },
+      );
     } catch (e: any) {
+      // Refused before fetchChapter began: no request, no source failure, and no onAsked/rest/backoff. A
+      // non-paused refusal merely removes this stale copy and lets a currently authorised alternate win.
+      if (e instanceof DownloadPreflightError) return { preflight: e.reason };
+      asked++;
       f.onAsked?.(src, e);
       // The library disk at its floor is nobody's fault here, and no other source can fix it.
       if (e?.diskFull) throw e;
@@ -149,6 +199,8 @@ async function tryEachCopy(f: FallbackInput, offered: PartialHold[]): Promise<Fa
       if (chosen) first = last;
       return 'failed';
     }
+    if (done === null) return null;
+    asked++;
     // Outside the try: a caller's hook that throws is not a download that failed.
     f.onAsked?.(src, undefined);
     return done;
@@ -165,12 +217,12 @@ async function tryEachCopy(f: FallbackInput, offered: PartialHold[]): Promise<Fa
   );
 
   // ── 1 + 2. the chosen copy ────────────────────────────────────────────────────────────────────────
-  let asked = 0;
   if (!f.refusing.has(via) && !off) {
-    asked++;
+    if (!(await admitted())) return { kind: 'skipped', why: 'paused' };
     const r = await attempt(f.chapter, via, true);
     if (r === null) return { kind: 'skipped', why: 'on_disk' };
-    if (r !== 'failed') return { kind: 'landed', via, pages: r.pages, chapterUsed: f.chapter };
+    if (typeof r === 'object' && 'preflight' in r && r.preflight === 'paused') return { kind: 'skipped', why: 'paused' };
+    if (r !== 'failed' && !(typeof r === 'object' && 'preflight' in r)) return { kind: 'landed', via, pages: r.pages, chapterUsed: f.chapter };
   }
 
   // ── 3. the same number from another followed source ───────────────────────────────────────────────
@@ -188,11 +240,15 @@ async function tryEachCopy(f: FallbackInput, offered: PartialHold[]): Promise<Fa
       if (!getSource(src)) continue;
       if (await isDisabled(src).catch(() => false)) continue;
       if (await blockedNow(src).catch(() => null)) continue;
-      tried++;
-      asked++;
+      if (!(await admitted())) return { kind: 'skipped', why: 'paused' };
       const r = await attempt(alt, src);
-      if (r === 'failed') continue;
       if (r === null) return { kind: 'skipped', why: 'on_disk' };
+      if (typeof r === 'object' && 'preflight' in r) {
+        if (r.preflight === 'paused') return { kind: 'skipped', why: 'paused' };
+        continue;
+      }
+      tried++;
+      if (r === 'failed') continue;
       tookFrom(src, []);
       return { kind: 'landed', via: src, pages: r.pages, chapterUsed: alt, switched: switched() };
     }
@@ -205,14 +261,19 @@ async function tryEachCopy(f: FallbackInput, offered: PartialHold[]): Promise<Fa
     // Reintroduce by dropping `|| f.persistent`: "a persistent refusal may hunt, and still never writes a
     // partial" in chapterFallback.int.test.ts counts zero hunts.
     if (f.hunt && first && (!isRefusal(first.err) || f.persistent)) {
+      if (!(await admitted())) return { kind: 'skipped', why: 'paused' };
       const why = whyOf(first.err);
       const found = await f.hunt(why).catch((e) => { console.warn(`[download] ${label}: the source hunt failed: ${(e as Error)?.message || e}`); return null; });
+      // A hunt may spend several provider calls. Unmonitor can land while it is in flight, including when
+      // it finds nothing, so re-read admission before considering its answer or writing a saved partial.
+      if (!(await admitted())) return { kind: 'skipped', why: 'paused' };
       const src = found?.source ?? '';
       if (found && src && src !== via && !f.refusing.has(src) && (!f.allowed || f.allowed(src)) && getSource(src)) {
-        asked++;
+        if (!(await admitted())) return { kind: 'skipped', why: 'paused' };
         const r = await attempt(found, src);
         if (r === null) return { kind: 'skipped', why: 'on_disk' };
-        if (r !== 'failed') {
+        if (typeof r === 'object' && 'preflight' in r && r.preflight === 'paused') return { kind: 'skipped', why: 'paused' };
+        if (r !== 'failed' && !(typeof r === 'object' && 'preflight' in r)) {
           tookFrom(src, []);
           return { kind: 'landed', via: src, pages: r.pages, chapterUsed: found, switched: switched() };
         }
@@ -225,13 +286,20 @@ async function tryEachCopy(f: FallbackInput, offered: PartialHold[]): Promise<Fa
   // pins that), and this is the point at which everything that could have served the chapter whole has
   // been asked. The hold with the fewest holes wins, whichever source it came from.
   if (best && (!f.acceptPartial || f.acceptPartial(best.hold, best.via))) {
-    const w = await best.hold.write();
-    if (best.via !== via) tookFrom(best.via, w.missing);
-    else console.warn(`[download] ${label}: saved with ${w.missing.length} page${w.missing.length === 1 ? '' : 's'} missing from ${via}`);
-    return {
-      kind: 'partial', via: best.via, pages: w.pages, missing: w.missing, chapterUsed: best.chapter,
-      ...(best.via !== via ? { switched: switched() } : {}),
-    };
+    try {
+      const w = await best.hold.write(preflightFor(best.chapter, best.via, true));
+      if (best.via !== via) tookFrom(best.via, w.missing);
+      else console.warn(`[download] ${label}: saved with ${w.missing.length} page${w.missing.length === 1 ? '' : 's'} missing from ${via}`);
+      return {
+        kind: 'partial', via: best.via, pages: w.pages, missing: w.missing, chapterUsed: best.chapter,
+        ...(best.via !== via ? { switched: switched() } : {}),
+      };
+    } catch (e) {
+      if (!(e instanceof DownloadPreflightError)) throw e;
+      if (e.reason === 'paused') return { kind: 'skipped', why: 'paused' };
+      // The partial was assembled under stale authority. Keep the prior network failure as the outcome;
+      // do not replace the canonical chapter after the policy/source changed.
+    }
   }
 
   // ── 6. nothing ────────────────────────────────────────────────────────────────────────────────────

@@ -94,8 +94,29 @@ to the end first. Each cover shows a **NEW** ribbon when
 there are unread chapters. Click a cover to open the series. The ✦ **Surprise me** button picks one at random from whatever the
 filters currently show.
 
+Since v0.55.8 ([discussion #150](https://github.com/AngeloSha/uchiyomi/discussions/150)), the sort you click —
+**Updated**, **Newest**, **A–Z** or **Most unread** — becomes this account's Library default on every device. A valid
+`sort` in a shared Library URL wins for that visit without changing the saved default; only clicking the sort control
+saves one. The grid stays in the order you picked if saving fails, while the former default is kept for the next visit.
+
 The top bar has **Home** (a daily-pick hero + "For you" rails), **Library**, **Lists** and **Discover**,
 plus search, the updates bell, a refresh button, and your profile.
+
+**Lists** are your own shelves — *Plan to read*, *Reading now*, anything. Make one under **Lists** with **New**, and
+add series to it from a series page with **Add to collection**. A list shows its series with the Library's covers
+(since v0.55.7, [#164](https://github.com/AngeloSha/uchiyomi/discussions/164)): the unread count, the **NEW** ribbon and
+the favourite heart, counted from your own reading. **Sort by** orders it: **Your order** (the list as you arranged it,
+the default), **A–Z**, **Z–A**, **Last read** (what you read most recently first), **Most unread** and **Latest chapter**
+(the series whose newest chapter came most recently first). Each list remembers its own order, on your account, so it
+opens the same way on your other devices. **Edit** removes series from the list and moves them within your order with
+the arrows; a series added to a list goes to its end.
+
+Each List card also has **Show on Home** (v0.55.8, the remaining part of
+[#164](https://github.com/AngeloSha/uchiyomi/discussions/164)). Pick zero to three and arrange their Home positions
+with the earlier/later arrows. Home follows that order and shows up to twelve series per rail. An empty selected List
+keeps its position and appears as soon as it has a series; a deleted List is ignored and disappears from the saved
+choice on the next edit. Choosing none is deliberate and shows no List rails. Until you edit this once, Home keeps the
+old behaviour: the first three nonempty Lists.
 
 **Right-click a series** anywhere it appears — the library grid, Home's rails, Up next in the reader — or press
 and hold it on a touchscreen, for a short menu (since v0.48.0): **Open in a new tab**, **Copy link**,
@@ -213,6 +234,10 @@ genres, description, and the **chapter list**.
   page holding the chapter *Continue* would open, so a reader on chapter 956 lands among the 900s. Picking a
   page keeps you there; a new series, sort order or filter goes back to following *Continue*. Every chapter
   is listed — before this, the list and the reader's chapter list stopped at chapter 1000.
+- **Show all chapters at once** (**Profile → Settings → Appearance**, off by default, saved to your account so
+  every device you sign in on follows it): the whole list on one page, with no pager. Every grey row is shown
+  too — no *Show all {n}* row — and the runs of older chapters start unfolded; *Hide* on one still folds it for
+  as long as you are on the page.
 - **Right-click a chapter** (or press and hold it on a touchscreen, or Shift+F10 on the keyboard) for the same
   menu its ⋯ button opens: mark it read or unread, mark everything before it read, its versions, and for an
   admin its number and title (since v0.48.0).
@@ -278,6 +303,23 @@ says how many are in hand. The chips:
 - **Find other sources** (since v0.49.1) — admins only, behind **More**. It searches the other sources for every
   selected series and follows the ones whose title and chapter numbers match (section 4, *Find other sources*); the
   message says where to watch it, *Library → Downloads*.
+- **Monitor** and **Unmonitor** — admins only, behind **More**. They switch each selected series' *Auto-update
+  new chapters* (**Edit details → New chapters**) on or off. An unmonitored series gets no new chapter searched
+  for or downloaded by anything that runs by itself: the hourly check, its pass over chapters saved with pages
+  missing, the nightly repair, *Fix everything* and the slow archive (whose queue entry waits where it is until
+  the series is monitored again). *Check now*, *Fetch*, *Fetch again* and *Fill now* on the series still work.
+- **Delete chapters** — admins only, behind **More**. It deletes the chapters Uchiyomi downloaded for every
+  selected series, as the series page's *Remove chapters* would, except each series' cover chapter, so the
+  tiles keep their covers. Files in a library you built by hand and bookmarked chapters are left alone, the
+  chapters stay listed with everyone's reading history, and *Fetch again* brings one back. **Also stop updates
+  for these series**, ticked by default, unmonitors them too — otherwise the next check downloads their newest
+  chapters again. **Deleting a chapter somebody is reading can lose their position in that file**, which the
+  confirmation says before it starts. The cleanup is a saved server job: its window shows series and chapter
+  progress, may be closed, and rejoins after a reload or proxy timeout instead of starting an unknown second delete.
+  **Stop after this series** requests cancellation between series, never while a file is being removed. A series that
+  is hidden, merged or busy when its turn arrives is skipped and named; a server restart marks the unfinished run
+  interrupted. This is not *Delete files*, which takes a series' whole folder and stays a per-title step on
+  **Content → Library**.
 - **Cancel** leaves select mode. It stays live during a *Fetch newest* run: tapping it stops watching the
   run and leaves select mode, and the fetch itself finishes on the server.
 
@@ -305,6 +347,33 @@ says how many are in hand. The chips:
   hidden when the library is rescanned instead of reappearing as a new one, and adding the same title again
   from a source puts the same series back, history and all. What each kind of delete does and does not
   erase is spelled out in section 12, *Where your data lives and how to delete for good*.
+
+### Cover and banner
+
+When nobody chose a picture, a series is shown with:
+
+- **its cover**: the cover of the source it was added from; else AniList's, when AniList's entry carries the series'
+  name; else its own first page.
+- **its banner**: AniList's (or its anime adaptation's) on the same condition; else one made from the series' own
+  pages (*New banner* in *Edit details* picks another).
+
+Since v0.55.7 ([#168](https://github.com/AngeloSha/uchiyomi/discussions/168)) an online match counts only when one of the
+entry's names — its romaji, English or native title, or a synonym — is exactly one of the series' names: its title, the
+title you set in *Edit details*, its *Other names* (below), with case, accents, punctuation and bracketed asides set
+aside, and a leading *The*, *A* or *An* ignored when at least six letters remain. A name that merely contains the
+series' name is another work: *Morgan Lost: Dark Novels* is not *Morgan Lost*.
+The same rule picks the AniList entry a series is linked to for tracker sync (section 10), and the art backfill under
+**Admin → Content → Art** follows it too. What was matched before v0.55.7 is checked again in the background
+(**Admin → Tasks → Check online matches**, section 8): a link to another work is removed, and a cover or banner that
+came from another work is cleared, so the series shows its source's cover or its own first page.
+
+In **Edit details** (the art column, or the *Art* tab on a phone) the cover has **Upload**, **From a link** and **⋯**:
+
+- **Use the first page** makes the series' own first page its cover for good: nothing found online replaces it, and
+  unless you set a banner yourself, its banner is made from its pages too. **Admin → Content → Art** offers it as well.
+- **Reset to automatic** goes back to the automatic cover described above.
+
+The line under the cover says which it is.
 
 ### Sources & translations
 
@@ -390,9 +459,19 @@ own row, each tap saved at once. A preferred group's
 copy is taken first whenever it exists; a blocked group's copy is never taken while another copy exists. A
 joint release belongs to every group listed on it: it counts as the preferred group's when any of them is
 preferred, and it is blocked only when *all* of them are. A chapter that only blocked groups have released
-is never fetched on its own — its grey row is still listed, and counted in the line's *{n} not here yet*,
-so you know it exists — until someone else releases it; unblock the group if you would rather have their
-copy than none.
+— one group, or several that are all blocked — is **not shown** and never downloaded: it leaves the chapter
+list, the *{n} not here yet* count and the list Mihon and your trackers read the moment you tap **Block**, with
+no check needed, and nothing fetches it (the hourly check, the slow archive, *Fetch*). A chapter an unblocked
+group has also released stays, and its copy becomes that group's. **Unblock** brings the hidden chapters back
+just as fast, as chapters you can fetch. The same goes for a group blocked for every series under **Admin →
+Settings → Scanlators**. A chapter already downloaded from a group you block stays on the shelf.
+
+In v0.55.8 the preference and every affected stored chapter choice change together. If the rebuild cannot finish,
+nothing is saved and the page reports the failure; a concurrent check cannot put an older blocklist back over the new
+one. Unblocking restores whether a chapter was naturally available, held or covered by another split, rather than
+turning every row available. Fetch, slow-archive recovery, partial repair and same-release rotation all obey the same
+block. The one exception is a copy you deliberately tap in **Versions**: that named copy may be blocked, but it is
+pinned and never falls back to a different source.
 
 **Patience** is how long a new chapter waits for a preferred group before the best available copy is
 fetched instead. The default is 2 days, which is roughly how far behind the second group on a popular
@@ -624,7 +703,8 @@ full speed before one that is slowed, and up to three chapters at once, one per 
 series side by side. Two sites whose pages come from one image server count as one. A site that is switched off,
 cooling down, refusing or above your age limit is skipped, and nothing moves for a version you picked by name, for a
 series with its own source order (*Preferring one source*) or for one numbered by posting order. The download card
-counts them as one job. The slow archive takes turns the same way (*Fetching a whole series slowly*, below).
+counts them as one job. The slow archive takes turns the same way (*Fetching a whole series slowly*, below). A label
+that stands where a group's name goes ("Unofficial", "Unknown") names no group (v0.55.7).
 
 If at least four pages in five arrived after an ordinary page failure, the chapter is kept with a numbered
 placeholder at every missing position rather than thrown away. Its row says how many pages are missing. The
@@ -725,7 +805,9 @@ sites at once; the series queued on one site take turns, so ten of them share it
 **One release on several sites.** Since v0.55.4 ([#158](https://github.com/AngeloSha/uchiyomi/discussions/158)), a
 series that follows more than one source takes its chapters from them in turn when they carry the same release: the
 same scanlation group, or — on sites that name no group, as most aggregators don't — no group, the same language and
-the same page count wherever both say. While one site is in its break the next chapter comes from another, the one that
+the same page count wherever both say. Since v0.55.7 a label that stands where a group goes ("Unofficial", "Unknown",
+"No group", "None", "N/A") counts as no group, so two sites that both say "Unofficial" are paired by their page counts,
+never by the label alone. While one site is in its break the next chapter comes from another, the one that
 was asked longest ago, so a series on two such sites is archived about twice as fast while each site still sees only
 its own pace. Two sites whose pages come from one image server (Natomanga and Mangakakalot share one) count as one site:
 one chapter at a time between them, and a break or a refusal on either holds both. It never takes another group's copy
@@ -813,10 +895,8 @@ hold. Each grey row's caption says why it is not here:
 - **failed {n} times**, in amber — the download was attempted and gave up; the updater will not try again on
   its own. *Fetch* resets that and tries once more. Admins see the last error at the top of the chapter's
   sheet.
-- **only a blocked group has it · {group}** — every copy on offer is from a blocked group. It is shown so you
-  know it exists; unblock the group if you would rather have their copy than none. The row has no cloud
-  icon and the selection bar's *Fetch* skips it; **Fetch** on the copy itself, in the chapter's sheet, does
-  take it.
+- **only a blocked group has it · {group}** — no longer shown: a chapter only blocked groups released leaves the
+  list as soon as the group is blocked (see *Sources & translations* above), and comes back when it is unblocked.
 - **another split · {group} · via {source}** (since v0.50.0; the row's tooltip says *another split of a chapter you
   have*) — a followed site splits or numbers this chapter's parts differently, and the chapter is already here
   the other way: its 78.1 … 78.9 beside the 78 you have as one file. The updater leaves it alone and it is not
@@ -1055,7 +1135,9 @@ folder is in *Edit details* (**Folder on the server**), with a Copy beside each 
 An admin can free the space a chapter takes without losing the record of it. **Remove** in the select bar,
 confirmed with **Delete from server**, removes the file and keeps everything else: the chapter row, marked
 *Deleted from the server*, everyone's reading progress on it, and every count — the series' unread number does
-not move, and nothing is pushed to AniList. If the chapter was the one the series' cover came from, the cover
+not move, and nothing is pushed to AniList. (Where the chapter list is a grid, on a wide screen, the mark says just
+*Deleted* — or *No file* for *File no longer on disk* — and the whole sentence shows when you point at the row;
+since v0.55.7 the mark is never cut off.) If the chapter was the one the series' cover came from, the cover
 moves to the lowest chapter that still has a file. It is the same tombstone the scheduled cleanup in section 8
 leaves, and it has the same two rules: **only a chapter downloaded by Uchiyomi** — one in its own downloads
 folder — is ever deleted, and **a chapter anyone has bookmarked is kept**, because the bookmark names a page
@@ -1091,6 +1173,12 @@ you keep scrolling through a series without interruption.
 - **Pinch / double-tap** to zoom (width multiplier); with a mouse, **double-click**. A double-click only zooms: it
   never turns the page as well, however slow your computer's double-click setting is (since v0.47.1).
 - **Themes:** AMOLED black, sepia, or gray, from the reader settings.
+- **Cover colour at the edges:** a soft wash of the series' cover colour across the top and bottom of the screen,
+  so a gold cover tints the edges gold. To read with plain black edges, switch **Cover colour at the edges** off in
+  the reader's settings sheet or under Profile → Settings → Reading (since v0.55.7,
+  [#170](https://github.com/AngeloSha/uchiyomi/discussions/170)). It is one setting for every title, saved to your
+  account. The top and bottom bars' dark shading now also runs past the screen edge, so no strip of page shows
+  while they spring into place.
 - **Per-series memory:** your zoom/theme choices are remembered per title.
 - **Jump to a chapter:** the chapter button in the top bar opens the full list, at every screen size. On a
   desktop `[` / `]` step to the previous/next chapter as well.
@@ -1124,10 +1212,10 @@ fix the title's direction: it keeps following the profile. (Before v0.48.0 it di
 kept reading left to right whatever the profile said; those accidental *Series default* pins are ignored now.
 A *Left to right* or *Right to left* chosen for one title in those versions is kept.)
 
-**Reader defaults** — mode (webtoon scroll or paged), theme, repeated pages, fit, page gap, auto-scroll and
-brightness — live under **Profile → Settings → Reading**, where each one saves as you change it and says
-*Saved* beside the row. The reader's own sheet still changes them for the session you are in, and a series
-you have adjusted keeps its own memory, which wins over the defaults. The weekly goal, offline downloads and
+**Reader defaults** — mode (webtoon scroll or paged), theme, the cover colour at the edges, repeated pages, fit,
+page gap, auto-scroll and brightness — live under **Profile → Settings → Reading**, where each one saves as you
+change it and says *Saved* beside the row. The reader's own sheet still changes them for the session you are in,
+and a series you have adjusted keeps its own memory, which wins over the defaults. The weekly goal, offline downloads and
 new-chapter alerts are on the same tab.
 
 **A default per source.** A source is usually one format: a webtoon site wants the continuous vertical scroll,
@@ -1947,7 +2035,7 @@ Three tasks on **Admin → Tasks** look at your chapter files, and each does one
 
 | | What it does | What it never does |
 |---|---|---|
-| **Library scan** | Adds every chapter file it finds and updates the ones it knows. A file that comes back after it was marked gone is picked up again, on the same row. | Remove anything: a chapter whose file is gone stays listed as it was. |
+| **Library scan** | Adds every chapter file it finds and updates the ones it knows. A file that comes back after it was marked gone is picked up again, on the same row. Since v0.55.7 it reads a series' details (ComicInfo) from its first chapter file only when that file changed since the scan before, so a rescan of a large library on a slow share opens far fewer files. | Remove anything: a chapter whose file is gone stays listed as it was. |
 | **Verify chapter files** | After a database restored without its files (section 12): marks the chapters Uchiyomi *downloaded* whose file is gone, so the next sweep downloads them again onto the same rows. | Mark a chapter in a library you built by hand; it only counts those. |
 | **Rescan everything** (since v0.55.4) | For a library you built by hand: finds the chapters whose file is gone from your own folders, shows you first, and marks them *File no longer on disk* when you press **Apply**. | Erase a chapter, touch a file, hide a series, or change what anyone has read. |
 
@@ -1961,13 +2049,39 @@ nothing left*.
   disk* (never *Deleted from the server*: nothing deleted it), and everyone's progress, bookmarks and notes stay on it;
   the sweep does not fetch it back. Put the file back and the next scan picks it up again on the same row.
 - **Moved or renamed (kept)**: a file renamed in place, or moved into another folder, is a new chapter to the scanner,
-  and its old row looks gone. When the old file's fingerprint matches a file that is there, the old row is kept as it
-  is — the reading history is on it — and listed under *Which ones were probably moved or renamed*.
+  and its old row looks gone. When the old file's fingerprint matches a file that is there, the old row is kept — the
+  reading history is on it — and listed under *Which ones were probably moved or renamed*. Since v0.55.7, when both are
+  in the same series, **Apply** points the old chapter at the new file and removes the copy the scan made, so the
+  chapter shows once, with everyone's progress, bookmarks and notes (*3 files were moved or renamed within their series:
+  on Apply their chapters follow them, reading history kept*). A new copy someone has already opened is never removed:
+  both are kept (*1 moved file kept beside its old chapter: both have reading history*). A file moved into another
+  series is left as it is.
+- **Fingerprints** are what tell a moved file from a gone one, and a file can only be recognised after a move if it was
+  fingerprinted before it. Since v0.55.7 that happens a few minutes after a scan finds a new file (and every six hours,
+  as before), so if you reorganise files you have only just added, give it those few minutes after the scan first. A
+  chapter that was never fingerprinted is recognised by its file instead: moving a file keeps its name, its time and
+  its size, so a file of the same name in another folder, with exactly the same time (and size, when both are known),
+  that turned up after the chapter's own file was last seen, counts as the moved file — but only when no other file
+  anywhere could be it. Two copies with the same name and time, a file that was already there beside it (two folders
+  unpacked at the same moment), or a file renamed as well as moved, are not guessed at: the chapter is listed as gone,
+  as before.
+  Admin → Tasks → **Fingerprint library files** says what its last pass did, including files left for the next pass
+  because they were still being written.
 - **In the download folder**: chapters Uchiyomi downloaded are *Verify chapter files*' to mark, so that the sweep
   fetches them again; here they are only counted.
 - **Series with nothing left**: every chapter's file is gone. Each one is a link, and nothing is hidden or removed:
-  open one to *Remove* it, or to merge it with the series its files went to (a renamed folder becomes a new series
-  unless `LIBRARY_REMATCH` is on, see CONFIGURATION.md).
+  open one to *Remove* it. When all its files went into one other series, it says which (*Its files are now in
+  “Zagor”*). *Which ones were probably moved or renamed* lists up to 200 files, then how many more.
+- **Merge into the series their files went to** (since v0.55.7, optional): when every chapter file of a series moved
+  into one other series — you unpacked *Zagor* into folders of 100 chapters, each became a series, and then you moved
+  them all into one *Zagor* folder — the preview offers *Merge “Zagor 1-100” into “Zagor”*. Tick the ones you want:
+  **Apply** merges each into the other series, with everyone's reading history, bookmarks, favourites, ratings, lists
+  and the tracker link (when the other series has none), and its chapters follow their files as above, so each chapter
+  shows once. A list that held the old series holds the other one, once. An AniList link found automatically goes
+  across as *Check online matches* would judge it there: it counts as checked only when the other series goes by every
+  name the old one did, otherwise the check looks at it again (and until then *Duplicate series* does not group by it). Apply checks each one again first — a series that got a file back, or one hidden, merged or being renumbered
+  since the preview, is left alone (*1 merge left alone: the series changed since the preview*). Nothing is merged
+  without its tick, and nothing on disk is touched.
 - A folder (`/library`, `/library-dl`) with no file behind any of its chapters, or with more than nine in ten gone,
   *looks unmounted*, and nothing under it is touched — the rule *Verify chapter files* follows. A file that could not
   be checked at all (a permission, a disk error) is never called gone.
@@ -1980,7 +2094,8 @@ nothing left*.
 - A series that is downloading or being checked when Apply reaches it — a *Fetch*, the slow archive's next chapter,
   *Fetch newest*, a check for new chapters — is left alone, neither marked nor renumbered (*1 series had a download or a
   check running and was left alone*): run it again when that is done. Every other series it changes waits for it: a
-  *Fetch* there says a download is already running, and the slow archive takes its next chapter once Apply has finished.
+  *Fetch* there says a download is already running, the slow archive takes its next chapter once Apply has finished,
+  and (since v0.55.7) the chapter sweep comes back to it later in the same sweep, or checks it first next time.
 - It never runs by itself — not at start-up, not on a schedule — for Verify's reason: a share that is not mounted yet
   looks exactly like a library with every file gone.
 
@@ -2050,6 +2165,19 @@ as *Completed* — a chapter that can never be read is listed, not counted as un
 sees these rows: the app, OPDS and offline reading list what is on disk exactly as before, and turning the
 switch off puts the list back at once.
 
+**Show deleted chapters as ghosts** (**Admin → Settings → Library housekeeping**, off by default) changes how a
+chapter whose file was deleted on purpose looks — by the cleanup above, *Remove chapters*, *Delete chapters* or
+*Delete files*. Instead of a row marked *Deleted from the server*, the series page shows it like a chapter not
+downloaded yet: a grey row saying *deleted*, with its read tick, **Mark read / unread** and ☁ **Fetch** to bring
+it back; Mihon lists it as *not downloaded*, as the switch above would. Nothing else moves: the chapter keeps its
+place, everyone's reading history and its counts, and it is still not downloaded again by itself. A chapter whose
+file *Verify chapter files* found missing is not one of these — the hourly check fetches those back — and keeps its
+own look, as does a file gone from a library you built by hand (*File no longer on disk*). A copy saved on your
+device keeps the row a chapter you can open. Anyone allowed to download may press ☁: Uchiyomi restores only the exact
+source copy recorded on that deleted row, if the series still follows that source and it is safe and available. It
+never guesses another copy or fallback, and a manual-library file or a file holding a chapter range is left for an
+admin to restore by hand.
+
 Since v0.43.0 the missing chapters can be marked read on the series page (section 4, *Marking chapters you
 don't have as read*), and with this switch on the marks reach Mihon:
 
@@ -2104,6 +2232,14 @@ source names sorted last and flagged `source?`.
 `Manga/Seinen` belongs to the inner one: the most specific folder wins, whichever library holds it and however
 many other folders either library holds. Removing the inner one, or taking `Manga/Seinen` out of it, hands its
 series back to `Manga`, not to the default.
+
+**AniList privacy per library** (v0.55.8,
+[#168](https://github.com/AngeloSha/uchiyomi/discussions/168)). Each library card, the default library included, has
+**Look up art and metadata on AniList automatically**. Turn it off to stop background art, title/id, reading-direction
+and type lookups for series currently filed there, including the startup online-match check and scheduled enrichment.
+Nothing already learned is erased, and moving a series follows the destination library's choice. Admin Art, Relink,
+Check online matches, tracker import/sync and Discover still work when you choose them; those manual actions say that
+they may contact AniList.
 
 **Age rating.** A library can carry one, and everything in it inherits it, so marking a shelf 18+ is one
 action rather than two hundred. A single title can still be rated differently from its own page, which is
@@ -2305,6 +2441,13 @@ runs by itself: it is the repair for a database restored without its chapter fil
 when to run it and what it will not do. Like the sweep, it starts in the background and its line shows what
 it found when it is done. **Rescan everything** (since v0.55.4) is its counterpart for a library you built by hand:
 *Library maintenance* above says what it shows before it changes anything, and what it never does.
+
+**Check online matches** (since v0.55.7) holds the AniList links, covers and banners matched by title before v0.55.7 to
+the rule *Cover and banner* (section 4) describes: a link to another work is removed, and a cover or banner of another
+work is cleared. It runs by itself a couple of minutes after the server starts, and then every 6 hours on anything not
+checked yet; **Run now** checks everything again. A link you made by importing your list, a picture you chose and a
+source's own cover are never touched. Its line says how many it checked and how many were another work, for example
+*194 matches checked, 7 removed as another work*, and **Admin → People → Activity** names them.
 
 **Repair library** is the nightly that fixes what Health used to only report (the Health section above lists
 what it does and the two things it never does). Its schedule reads *every 24h · never during a chapter
@@ -2533,6 +2676,10 @@ in place until you paste a new one. A service that is blocking or rate-limiting 
 error to retry on the next chapter, never a verdict on the token, so it does not disconnect anything.
 Disconnect at any time. MyAnimeList and Kitsu connect the same way, each on its own row, and more than one can
 be connected at once; each syncs on its own.
+
+Uchiyomi finds each series' AniList entry by itself, from the same lookup its art comes from, and since v0.55.7 only
+an entry that carries the series' name (section 4, *Cover and banner*); a series it cannot match has no link, and
+importing your list (below) links every title on it to its own entry.
 
 **Bringing your list over.** The same connection reads in the other direction, once: on the import page
 (section 8, *Sources → Import a list*) the *From your tracker* box loads the account's manga list — the
@@ -2860,6 +3007,9 @@ scrolls under it, momentum scrolling, covers that sharpen in. On a modest PC tho
 measured in headless browsers on a 200-series library at 1440 px, switching it on took scrolling from about
 40 to 60 frames a second in Chrome at a 4× CPU throttle, and from under 8 to about 58 in Firefox. It turns
 off:
+
+Since v0.55.8 ([#174](https://github.com/AngeloSha/uchiyomi/issues/174)), client-side links switch pages
+synchronously in this mode; the outgoing page cannot leave the main body hidden while the next route is already open.
 
 - the animated background, the film grain and the vignette;
 - every backdrop blur, with the glass panels turning solid;

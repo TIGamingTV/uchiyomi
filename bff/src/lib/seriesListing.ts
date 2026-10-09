@@ -17,7 +17,7 @@
 // same reason (a chapter URL never crosses the wire).
 import { q, one, tx } from './db';
 import { getSource, type SourceChapter } from './sources';
-import { groupsOf, normGroup } from './releases';
+import { chooseReleases, groupsOf, mergePrefs, normGroup, releaseOrder, type ChooseOpts, type ReleasePrefs, type StoredPrefs } from './releases';
 import { CHAPTER_RETRY_CAP } from './updater';
 import { chapterName } from './library';
 import { HEALED_NAME } from './naming';
@@ -26,6 +26,7 @@ import { effectivePrefsFor, readSeriesPrefs } from './scanlatorPrefs';
 import { listedShown } from './noticeChapters';
 import { sameLanguage } from './lang';
 import { sourceLanguage } from './seriesLang';
+import { cleanSourceOrder, rankSources, type SourcePriority } from './sourcePrefs';
 
 /**
  * `covered` (v0.50.0, lib/partAlias.ts R2): another site's split of a chapter on disk -- its 78.1 ... 78.9 where 78
@@ -33,6 +34,7 @@ import { sourceLanguage } from './seriesLang';
  * sweep or the slow archive (both take `available` only), never counted as missing, not a Komga ghost.
  */
 export type ListingStatus = 'available' | 'held' | 'blocked' | 'covered';
+export type UnblockedListingStatus = Exclude<ListingStatus, 'blocked'>;
 
 /**
  * One copy of a number as the listing stores it: what the versions view shows, what the group panel
@@ -71,6 +73,8 @@ export interface ListingRow {
   /** EVERY copy of the number, the chosen one first, the rest as the release rules would rank them. */
   copies: ListingCopy[];
   status: ListingStatus;
+  /** What this row is when at least one copy survives the blocklist. Persisted across block/unblock changes. */
+  unblockedStatus?: UnblockedListingStatus;
 }
 
 /**
@@ -149,12 +153,154 @@ export function listingRows(
       chosen: shown,
       copies: [shown, ...others].map(toCopy),
       status: !chosen ? 'blocked' : covered.has(number) ? 'covered' : held.has(number) ? 'held' : 'available',
+      // Kept even while every copy is blocked, so lifting a block restores `covered`/`held` rather than
+      // flattening every row to `available`. `replaceListing` recalculates held under the preferences it
+      // reads inside its serialised transaction; this value principally carries the covered bit that the
+      // chooser cannot derive from copies alone.
+      unblockedStatus: covered.has(number) ? 'covered' : held.has(number) ? 'held' : 'available',
     });
   }
   return out;
 }
 
-/** Rows per INSERT statement. Parameters are 10 per row, and Postgres takes 65,535 per statement. */
+type ListingQuery = <R = any>(text: string, params?: any[]) => Promise<R[]>;
+
+const storedPrefs = (value: unknown, fallback: StoredPrefs): StoredPrefs => {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return { ...fallback };
+  const o = value as Record<string, unknown>;
+  const names = (v: unknown) => Array.isArray(v)
+    ? v.filter((x): x is string => typeof x === 'string' && x.trim().length > 0)
+    : [];
+  const days = o.patienceDays;
+  return {
+    priority: names(o.priority),
+    blocked: names(o.blocked),
+    patienceDays: days === null ? null
+      : typeof days === 'number' && Number.isInteger(days) && days >= 0 ? Math.min(days, 30)
+      : fallback.patienceDays,
+  };
+};
+
+/**
+ * Lock order shared by listing refreshes and preference saves: series row, then a per-series transaction
+ * advisory lock. The row lock keeps a concurrent delete in the established row-before-children order; the
+ * advisory lock serialises writers that otherwise touch disjoint listing rows. Preferences are deliberately
+ * read only after both locks, so a refresh that began under yesterday's blocklist cannot commit over a save.
+ */
+type Decision = { prefs: ReleasePrefs; opts: ChooseOpts };
+type DecisionRow = {
+  scanlator_prefs: unknown;
+  source_prefs: unknown;
+  source_id: string | null;
+};
+
+const priorityFrom = (order: string[]): SourcePriority => {
+  const at = new Map(order.map((id, i) => [id, i] as const));
+  return { order, rank: (id) => (id && at.has(id) ? at.get(id)! : order.length) };
+};
+
+async function decisionAfterSeries(qq: ListingQuery, seriesId: string, series: DecisionRow): Promise<Decision> {
+  const global = (await qq<{ scanlator_prefs: unknown; source_prefs: unknown }>(
+    'SELECT scanlator_prefs, source_prefs FROM server_settings WHERE id = 1'))[0];
+  const follows = (await qq<{ source_id: string }>(
+    'SELECT source_id FROM series_sources WHERE series_id = $1 ORDER BY created_at, source_id', [seriesId]))
+    .map((r) => r.source_id).filter((id) => id !== series.source_id);
+  const ownSources = cleanSourceOrder((series.source_prefs as { priority?: unknown } | null)?.priority);
+  const globalSources = cleanSourceOrder((global?.source_prefs as { priority?: unknown } | null)?.priority);
+  const followOrder = [...(series.source_id ? [series.source_id] : []), ...follows];
+  return {
+    prefs: mergePrefs(
+      storedPrefs(global?.scanlator_prefs, { priority: [], blocked: [], patienceDays: 2 }),
+      series.scanlator_prefs == null
+        ? null
+        : storedPrefs(series.scanlator_prefs, { priority: [], blocked: [], patienceDays: null }),
+    ),
+    opts: { sourceRank: rankSources(priorityFrom(ownSources.length ? ownSources : globalSources), followOrder) },
+  };
+}
+
+async function currentDecision(qq: ListingQuery, seriesId: string): Promise<Decision | null> {
+  const series = (await qq<DecisionRow>(
+    'SELECT scanlator_prefs, source_prefs, source_id FROM lib_series WHERE id = $1', [seriesId]))[0];
+  return series ? decisionAfterSeries(qq, seriesId, series) : null;
+}
+
+async function lockedDecision(qq: ListingQuery, seriesId: string): Promise<Decision | null> {
+  const series = (await qq<DecisionRow>(
+    'SELECT scanlator_prefs, source_prefs, source_id FROM lib_series WHERE id = $1 FOR UPDATE', [seriesId]))[0];
+  if (!series) return null;
+  await qq('SELECT pg_advisory_xact_lock(hashtextextended($1, 5578))', [seriesId]);
+  // Re-read after the advisory wait. READ COMMITTED gives this statement the newest committed value, while
+  // the row lock above prevents a per-series preference update until this transaction finishes.
+  const current = (await qq<DecisionRow>(
+    'SELECT scanlator_prefs, source_prefs, source_id FROM lib_series WHERE id = $1', [seriesId]))[0];
+  if (!current) return null;
+  return decisionAfterSeries(qq, seriesId, current);
+}
+
+const dateOrNull = (v: unknown): string | null => {
+  if (v == null) return null;
+  const text = v instanceof Date ? v.toISOString() : String(v);
+  return Number.isFinite(Date.parse(text)) ? new Date(text).toISOString() : null;
+};
+
+/**
+ * Re-run the release rules over every stored copy. This is used both for a fresh listing and for an
+ * immediate preference reapply; consequently every denormalised chosen field comes from one decision.
+ */
+export function resolveListingRow(row: ListingRow, prefs: ReleasePrefs, opts: ChooseOpts = {}): ListingRow {
+  if (!row.copies.length) {
+    // Legacy blocked rows have no trustworthy natural state. Hold them until a source refresh rebuilds
+    // their copies rather than silently making them available on an unblock.
+    const natural = row.unblockedStatus ?? (row.status === 'blocked' ? 'held' : row.status);
+    return { ...row, unblockedStatus: natural };
+  }
+
+  const chapters = row.copies.map((c) => copyToChapter(c, { number: row.number, title: row.title }));
+  const current = chooseReleases(chapters, prefs, opts);
+  // The durable state underneath a block. `covered` is structural and comes from part-aliasing; held is
+  // recalculated as though the block were lifted, so an unblock restores the chooser's real result.
+  const withoutBlocks = chooseReleases(chapters, { ...prefs, blocked: [] }, opts);
+  const structural = row.unblockedStatus === 'covered' || row.status === 'covered';
+  const unblockedStatus: UnblockedListingStatus = structural ? 'covered'
+    : withoutBlocks.waiting.includes(row.number) ? 'held' : 'available';
+  const chosen = current.releases[0] ?? withoutBlocks.releases[0] ?? chapters[0];
+  const chosenIndex = chapters.indexOf(chosen);
+  const rules = releaseOrder(prefs, opts);
+  const rest = chapters.map((chapter, index) => ({ chapter, copy: row.copies[index], index }))
+    .filter(({ index }) => index !== chosenIndex)
+    .sort((a, b) => rules(a.chapter, b.chapter) || a.index - b.index)
+    .map(({ copy }) => copy);
+  const chosenCopy = row.copies[Math.max(0, chosenIndex)];
+  const groups: string[] = [];
+  const seen = new Set<string>();
+  for (const copy of row.copies) {
+    for (const name of groupsOf({ groups: copy.groups, scanlator: copy.scanlator ?? undefined })) {
+      const key = normGroup(name);
+      if (!key || seen.has(key)) continue;
+      seen.add(key);
+      groups.push(name);
+    }
+  }
+  const source = chosen.source ?? chosenCopy?.source ?? row.sourceId;
+  const picked: SourceChapter = { ...chosen, source };
+  return {
+    ...row,
+    title: chosen.title ?? null,
+    publishedAt: dateOrNull(chosen.publishedAt),
+    scanlator: chosen.scanlator ?? null,
+    groups,
+    sourceId: source,
+    chosen: picked,
+    copies: [chosenCopy, ...rest].filter((c): c is ListingCopy => !!c),
+    status: current.releases.length === 0 ? 'blocked'
+      : structural ? 'covered'
+      : current.waiting.includes(row.number) ? 'held' : 'available',
+    unblockedStatus,
+  };
+}
+
+/** Rows per INSERT statement. Parameters are 11 per row, and Postgres takes 65,535 per statement. */
 const CHUNK = 500;
 
 /**
@@ -169,26 +315,28 @@ export async function replaceListing(seriesId: string, rows: ListingRow[]): Prom
     // DELETE below locked the listing rows, and the INSERT's foreign-key check then waited on the series row --
     // a series deleted while a listing refresh was mid-write deadlocked with it, and Postgres could pick the
     // delete as the victim. The follow route starts exactly such a refresh in the background, and a test that
-    // dropped its series a moment later failed at random with "deadlock detected". KEY SHARE is the lock that
-    // foreign-key check takes anyway, so the sweep's own updates of the row never wait on it. A series deleted
-    // first is gone once its delete commits, and there is nothing left to list.
+    // dropped its series a moment later failed at random with "deadlock detected". A full row lock also
+    // serialises preference changes with this replacement; since the row is still locked before any child,
+    // a delete keeps the same ordering. A series deleted first is gone once it commits and there is nothing to list.
     // Reintroduce by dropping this SELECT: "a series deleted while its listing is written" in
     // seriesListing.int.test.ts reads "deadlock detected".
-    if (!(await qq('SELECT 1 FROM lib_series WHERE id = $1 FOR KEY SHARE', [seriesId])).length) return;
+    const decision = await lockedDecision(qq, seriesId);
+    if (!decision) return;
+    const resolved = rows.map((r) => resolveListingRow(r, decision.prefs, decision.opts));
     await qq('DELETE FROM series_listing WHERE series_id = $1', [seriesId]);
-    for (let i = 0; i < rows.length; i += CHUNK) {
+    for (let i = 0; i < resolved.length; i += CHUNK) {
       const params: any[] = [seriesId];
       const tuples: string[] = [];
-      for (const r of rows.slice(i, i + CHUNK)) {
+      for (const r of resolved.slice(i, i + CHUNK)) {
         const b = params.length;
-        tuples.push(`($1, $${b + 1}::real, $${b + 2}, $${b + 3}::timestamptz, $${b + 4}, $${b + 5}::text[], $${b + 6}, $${b + 7}::jsonb, $${b + 8}, $${b + 9}::jsonb)`);
+        tuples.push(`($1, $${b + 1}::real, $${b + 2}, $${b + 3}::timestamptz, $${b + 4}, $${b + 5}::text[], $${b + 6}, $${b + 7}::jsonb, $${b + 8}, $${b + 9}::jsonb, $${b + 10})`);
         // An unparsable date is stored as no date rather than failing the whole listing: the source's
         // string is best-effort on scraped sites, and setBookDates already treats it that way.
         const at = r.publishedAt && Number.isFinite(Date.parse(r.publishedAt)) ? r.publishedAt : null;
-        params.push(r.number, r.title, at, r.scanlator, r.groups, r.sourceId, JSON.stringify(r.chosen), r.status, JSON.stringify(r.copies));
+        params.push(r.number, r.title, at, r.scanlator, r.groups, r.sourceId, JSON.stringify(r.chosen), r.status, JSON.stringify(r.copies), r.unblockedStatus);
       }
       await qq(
-        `INSERT INTO series_listing (series_id, number, title, published_at, scanlator, groups, source_id, chosen, status, copies)
+        `INSERT INTO series_listing (series_id, number, title, published_at, scanlator, groups, source_id, chosen, status, copies, unblocked_status)
          VALUES ${tuples.join(',')}`,
         params,
       );
@@ -223,7 +371,7 @@ export async function replaceListing(seriesId: string, rows: ListingRow[]): Prom
      * post whose name the heal gave it.
      */
     const named = new Map<number, string>();
-    for (const r of rows) {
+    for (const r of resolved) {
       const name = Number.isFinite(r.number) ? chapterName(r.title, r.number) : null;
       if (name && !named.has(r.number)) named.set(r.number, name);
     }
@@ -275,6 +423,17 @@ export function copyToChapter(copy: ListingCopy, row: { number: number; title: s
 }
 
 /**
+ * What sites write where a group's name goes when they do not know it (v0.55.7, #158), as normGroup keys: unofficial,
+ * unknown, unknown group, no group, none, n/a -- and "-", which normGroup already makes nothing. Aggregators label every
+ * chapter "Unofficial" or "Unknown", and as a NAME two such copies were "the same group": sameRelease paired them with no
+ * page check, so two different scanlations re-hosted under one label could stand in for each other (DannyDynamite39).
+ * They name no group, and sameRelease now reads them so. Kept short on purpose: a real group that happened to be called
+ * one of these would be paired like the copies that name nobody. In sameRelease ONLY -- the scanlator preference, "Who
+ * scanlates this" and the listing still read and show the label as the site wrote it.
+ */
+const PLACEHOLDER_GROUPS: ReadonlySet<string> = new Set(['unofficial', 'unknown', 'unknowngroup', 'nogroup', 'none', 'na']);
+
+/**
  * The copies of one number that are the SAME RELEASE as `chosen` (v0.55.4, #158): what a download may take from
  * another followed source instead, so that a long series is spread over the sites that carry it rather than asked of
  * one. DannyDynamite39's case is the common one: several aggregators re-host one group's scanlation, and asking them in
@@ -290,6 +449,9 @@ export function copyToChapter(copy: ListingCopy, row: { number: number; title: s
  * what `langOf` says its source publishes in, else the server's unstated language (lib/lang.ts sameLanguage). An
  * external link (`pages === 0`) is never a release here, and a chosen external copy has no other.
  *
+ * A placeholder where a group goes ("Unofficial", "Unknown": PLACEHOLDER_GROUPS) names no group, so two such copies
+ * are held to the page counts as well (v0.55.7).
+ *
  * Pure, over the stored copies: which sources may actually be asked -- loaded, allowed, resting or not -- is the
  * caller's (the slow archive, lib/archive.ts; the job card, routes/sources.ts startDownloadJob).
  * Reintroduce by comparing the first group only: "a copy by another group is never the same release" in
@@ -303,7 +465,8 @@ export function sameRelease(
   const out = [chosen];
   if (chosen.pages === 0) return out;
   const followed = new Set(o.followed);
-  const keysOf = (c: ListingCopy) => new Set(groupsOf({ groups: c.groups, scanlator: c.scanlator ?? undefined }).map(normGroup).filter(Boolean));
+  const keysOf = (c: ListingCopy) => new Set(groupsOf({ groups: c.groups, scanlator: c.scanlator ?? undefined })
+    .map(normGroup).filter((k) => k && !PLACEHOLDER_GROUPS.has(k)));
   const langOf = (c: ListingCopy) => c.lang ?? o.langOf?.(c.source) ?? null;
   const mine = keysOf(chosen);
   const lang = langOf(chosen);
@@ -328,6 +491,160 @@ export const declaredLang = (source: string): string | null => {
   const l = sourceLanguage(source);
   return l === 'any' ? null : l;
 };
+
+/**
+ * A copy every known group of which is blocked: chooseReleases' rule, verbatim (lib/releases.ts). A copy naming no
+ * group is never blocked, and a joint release is blocked only when ALL its groups are.
+ */
+export const copyBlocked = (c: { groups?: string[]; scanlator?: string | null }, blocked: ReadonlySet<string>): boolean => {
+  const keys = groupsOf({ groups: c.groups, scanlator: c.scanlator ?? undefined }).map(normGroup).filter(Boolean);
+  return keys.length > 0 && keys.every((k) => blocked.has(k));
+};
+
+/** The copies an automatic action may use, under the blocklist as it stands at the call. */
+export function automaticCopies(copies: readonly ListingCopy[], prefs: ReleasePrefs, opts: ChooseOpts = {}): ListingCopy[] {
+  const blocked = new Set(prefs.blocked.map(normGroup).filter(Boolean));
+  const rules = releaseOrder(prefs, opts);
+  return copies.map((copy, index) => ({ copy, index, chapter: copyToChapter(copy, { number: 0, title: null }) }))
+    .filter(({ copy }) => !copyBlocked(copy, blocked))
+    .sort((a, b) => rules(a.chapter, b.chapter) || a.index - b.index)
+    .map(({ copy }) => copy);
+}
+
+/** Read current preferences at the last responsible moment for an automatic fallback/repair/archive action. */
+export async function automaticCopiesFor(seriesId: string, copies: readonly ListingCopy[]): Promise<ListingCopy[]> {
+  const decision = await currentDecision(q, seriesId);
+  return decision ? automaticCopies(copies, decision.prefs, decision.opts) : [];
+}
+
+/** Whether one automatically selected chapter still survives the series' current blocklist. */
+export async function automaticChapterAllowedFor(
+  seriesId: string,
+  chapter: Pick<SourceChapter, 'groups' | 'scanlator'>,
+): Promise<boolean> {
+  const decision = await currentDecision(q, seriesId);
+  return !!decision && !copyBlocked(chapter, new Set(decision.prefs.blocked.map(normGroup).filter(Boolean)));
+}
+
+/**
+ * Whether a source is still one of this series' owned copies now (primary or followed).
+ *
+ * Listing rows and detached jobs may outlive an unfollow. Every ordinary automatic/manual version download
+ * re-reads this at its outbound boundary; a stale listing is evidence of what once existed, not permission to
+ * contact a source the series no longer follows. Tombstone restore deliberately uses its stricter stored-book
+ * identity instead, because an old canonical deletion can outlive a follow.
+ */
+export async function seriesFollowsSource(seriesId: string, sourceId: string): Promise<boolean> {
+  if (!seriesId || !sourceId) return false;
+  return !!(await one<{ ok: number }>(
+    `SELECT 1 AS ok FROM lib_series s
+      WHERE s.id = $1 AND (s.source_id = $2 OR EXISTS (
+        SELECT 1 FROM series_sources ss WHERE ss.series_id = s.id AND ss.source_id = $2
+      ))`,
+    [seriesId, sourceId],
+  ));
+}
+
+/**
+ * Apply the blocklist AS IT STANDS NOW to the stored listing, without asking any source.
+ *
+ * A number whose every copy is from a blocked group is `blocked`: never shown on the series page or to Mihon, and never
+ * downloaded -- by the sweep, the slow archive or a plain Fetch. The status used to be decided only at the next check,
+ * so blocking a group left its chapters on the page and in the archive's queue for up to a day, and unblocking it left
+ * them hidden as long. A preferences save calls this, so the next request already reads the new state:
+ *   * every copy blocked now, and the row was not:   `blocked` (its chosen copy kept, for display);
+ *   * `blocked`, and a copy is no longer:            `available`, the best unblocked copy chosen (copies are stored
+ *                                                    best first), which the next check refines as it always does;
+ *   * not blocked, but its chosen copy is now:       the best unblocked copy chosen instead, status kept.
+ * Only what changes is written. `seriesIds` absent: every series with a listing (a global blocklist change).
+ * Answers how many rows changed.
+ * Reintroduce by leaving the status to the next sweep: "blocking a group hides its only-copy chapters at once" in
+ * blockedGroups.int.test.ts finds the chapter still listed.
+ */
+type StoredListingRow = {
+  number: number;
+  title: string | null;
+  published_at: Date | string | null;
+  scanlator: string | null;
+  groups: string[] | null;
+  source_id: string;
+  chosen: SourceChapter;
+  status: ListingStatus;
+  copies: ListingCopy[] | null;
+  unblocked_status: UnblockedListingStatus | null;
+};
+
+/**
+ * Transaction-scoped form for a preference route: write the preference, then call this before commit.
+ * The caller must lock `server_settings` first for a global change. Series are always processed in ID order.
+ */
+export async function reapplyBlocklistInTransaction(
+  qq: ListingQuery,
+  seriesIds?: readonly string[],
+): Promise<number> {
+  const ids = seriesIds ?? (await qq<{ id: string }>(
+    'SELECT DISTINCT series_id AS id FROM series_listing')).map((r) => r.id);
+  let changed = 0;
+  for (const id of [...new Set(ids)].sort()) {
+    const decision = await lockedDecision(qq, id);
+    if (!decision) continue;
+    const rows = await qq<StoredListingRow>(
+      `SELECT number, title, published_at, scanlator, groups, source_id, chosen, status, copies, unblocked_status
+         FROM series_listing WHERE series_id = $1 ORDER BY number`, [id]);
+    for (const stored of rows) {
+      const row: ListingRow = {
+        number: Number(stored.number), title: stored.title, publishedAt: dateOrNull(stored.published_at),
+        scanlator: stored.scanlator, groups: stored.groups ?? [], sourceId: stored.source_id,
+        chosen: stored.chosen, copies: stored.copies ?? [], status: stored.status,
+        // Before the column existed, a blocked row did not retain whether it had been held. Fail closed:
+        // the next source refresh will calculate the exact natural state from fresh copies.
+        unblockedStatus: stored.unblocked_status ?? (stored.status === 'blocked' ? 'held' : stored.status),
+      };
+      const out = resolveListingRow(row, decision.prefs, decision.opts);
+      const updated = await qq(
+        `UPDATE series_listing
+            SET title = $3, published_at = $4::timestamptz, scanlator = $5, groups = $6::text[],
+                source_id = $7, chosen = $8::jsonb, status = $9, copies = $10::jsonb,
+                unblocked_status = $11, updated_at = now()
+          WHERE series_id = $1 AND number = $2::real
+            AND (title, published_at, scanlator, groups, source_id, chosen, status, copies, unblocked_status)
+                IS DISTINCT FROM
+                ($3, $4::timestamptz, $5, $6::text[], $7, $8::jsonb, $9, $10::jsonb, $11)
+          RETURNING 1`,
+        [id, out.number, out.title, out.publishedAt, out.scanlator, out.groups, out.sourceId,
+          JSON.stringify(out.chosen), out.status, JSON.stringify(out.copies), out.unblockedStatus],
+      );
+      changed += updated.length;
+    }
+  }
+  return changed;
+}
+
+export async function reapplyBlocklist(seriesIds?: readonly string[]): Promise<number> {
+  const ids = seriesIds ?? (await q<{ id: string }>(
+    'SELECT DISTINCT series_id AS id FROM series_listing')).map((r) => r.id);
+  let changed = 0;
+  // One transaction per series keeps a global save from holding hundreds of row locks at once. The admin
+  // route uses reapplyBlocklistInTransaction instead when preference write + application must be atomic.
+  for (const id of [...new Set(ids)].sort()) {
+    changed += await tx((qq) => reapplyBlocklistInTransaction(qq, [id]));
+  }
+  return changed;
+}
+
+/**
+ * The series a change to these groups' blocking can touch: those whose listing names one of them. For a global
+ * blocklist save, so it does not re-read every listing on the server -- plus every series with a `blocked` row, which
+ * an unblock may free.
+ */
+export async function seriesListingGroups(groups: readonly string[]): Promise<string[]> {
+  const keys = new Set(groups.map(normGroup).filter(Boolean));
+  if (!keys.size) return [];
+  const rows = await q<{ id: string; groups: string[] | null; blocked: boolean }>(
+    `SELECT series_id AS id, array_agg(DISTINCT g) AS groups, bool_or(status = 'blocked') AS blocked
+       FROM series_listing LEFT JOIN LATERAL unnest(groups) g ON true GROUP BY series_id`);
+  return rows.filter((r) => r.blocked || (r.groups ?? []).some((g) => g && keys.has(normGroup(g)))).map((r) => r.id);
+}
 
 export type GhostWhy = 'missing' | 'held' | 'blocked' | 'failed' | 'floor' | 'archive' | 'covered';
 
@@ -451,6 +768,10 @@ export async function listingFor(seriesId: string, opts: { floor: number | null;
         -- A notice chapter the admin hides (lib/noticeChapters.ts) is not missing: it is not a chapter here at all.
         -- Kept in the listing, so switching the hide off shows it again at once.
         AND ${listedShown('s_l', 'l')}
+        -- A chapter only blocked groups released is not shown (reapplyBlocklist keeps the status current): it
+        -- cannot be fetched while the block stands, and a group blocked is a group the reader does not want to see.
+        -- Kept in the listing, so unblocking the group shows it again at once.
+        AND l.status <> 'blocked'
         AND NOT EXISTS (
           SELECT 1 FROM lib_books b
             LEFT JOIN book_overrides ov ON ov.book_id = b.id
