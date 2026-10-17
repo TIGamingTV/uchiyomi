@@ -11,6 +11,9 @@
 // Skipped automatically unless TEST_DATABASE_URL is set (CI provides a throwaway Postgres service).
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 const DSN = process.env.TEST_DATABASE_URL;
 if (DSN) {
@@ -290,7 +293,7 @@ test('the engine being off is the reason, not the source limit', { skip: DSN ? f
   await q(`INSERT INTO lib_series (id, source, title, folder, books_count, source_id, source_series_id)
            VALUES ($1, 'test', 'Room Fixture', $1, 2, 'sw:health-room', '1')`, [S_ROOM]);
   try {
-    const detail = async (engine: 'off' | 'switched_off' | 'unreachable' | 'up', title: string) => {
+    const detail = async (engine: 'off' | 'switched_off' | 'unreachable' | 'incompatible' | 'up', title: string) => {
       const c = await frozenSeries(noIgnores(), engine);
       await assertSaid([c]);
       return { detail: c.items.find((i) => i.title === title)!.detail, note: c.note ?? '' };
@@ -302,6 +305,10 @@ test('the engine being off is the reason, not the source limit', { skip: DSN ? f
       assert.match(r.note, /^Series that came from extensions wait for the extension engine; Admin → Sources shows how to bring it back\. /);
     }
     assert.match((await detail('unreachable', 'Engine Fixture')).detail, /because the extension engine isn’t answering$/);
+    // The engine upgrade: an engine that answers and refuses is not one that is down, nor one switched off. Reintroduce
+    // the two-way choice in frozenSeries (`engine === 'unreachable' ? engineDown : engineOff`): this reads "is off".
+    assert.match((await detail('incompatible', 'Engine Fixture')).detail,
+      /^12 chapters; its source Engine Source can’t be reached because the extension engine does not match this Uchiyomi$/);
     const actions = async (engine: 'off' | 'up', title: string) => (await frozenSeries(noIgnores(), engine)).items.find((i) => i.title === title)!;
     // v0.55.1: switched on and not loaded is over the limit only when the last load says it left the source out
     // (register.ts leftOutByLimit, which the sources overview reads too). Before any such load, an extension the engine
@@ -955,6 +962,89 @@ test('a short chapter offers Fix only for a file we downloaded, and a confirmed 
   }
 });
 
+const S_STRIP = 's_health_strip';
+
+/**
+ * A chapter stitched into one or two long strips is a whole chapter (v0.55.10, lib/longStrip.ts): on the live server 6 of
+ * the 20 "short" chapters were, Eleceed 215 two 689 x 54,000 strips among them, and a file in the read library is never
+ * the repair's to look at, so each stayed a finding until somebody pressed "It's fine". Measured from the file once, into
+ * the reader's cache. Reintroduce by dropping the `longStrip` test in shortChapters(): chapter 1 is listed.
+ */
+test('a chapter stitched into long strips is not short', { skip: DSN ? false : 'set TEST_DATABASE_URL to run' }, async () => {
+  const { migrate } = await import('../src/lib/migrate');
+  const { q } = await import('../src/lib/db');
+  const { runHealthChecks } = await import('../src/lib/health');
+  const sharp = (await import('sharp')).default;
+  const AdmZip = require('adm-zip');
+  await migrate();
+  const root = mkdtempSync(join(tmpdir(), 'uchi-strip-'));
+  const cbz = async (file: string, pages: Array<[number, number]>) => {
+    const z = new AdmZip();
+    for (const [i, [width, height]] of pages.entries()) {
+      z.addFile(`${String(i + 1).padStart(3, '0')}.png`, await sharp({ create: { width, height, channels: 3, background: '#777' } }).png().toBuffer());
+    }
+    mkdirSync(join(root, S_STRIP), { recursive: true });
+    writeFileSync(join(root, file), z.toBuffer());
+  };
+  await q('DELETE FROM lib_series WHERE id = $1', [S_STRIP]);
+  await q(`INSERT INTO lib_series (id, source, title, folder) VALUES ($1,'test','Strip Fixture',$1)`, [S_STRIP]);
+  const book = (n: number, pages: number) =>
+    q(`INSERT INTO lib_books (id, series_id, source, file, title, number, pages, root) VALUES ($1,$2,'test',$3,$4,$5,$6,$7)`,
+      [`b_${S_STRIP}_${n}`, S_STRIP, `${S_STRIP}/Ch ${n}.cbz`, `Chapter ${n}`, n, pages, root]);
+  // Two strips 7 widths tall each, 14 together; a credits banner wider than tall; a notice 5.4 widths tall.
+  await cbz(`${S_STRIP}/Ch 1.cbz`, [[10, 70], [10, 70]]);
+  await cbz(`${S_STRIP}/Ch 2.cbz`, [[76, 44]]);
+  await cbz(`${S_STRIP}/Ch 3.cbz`, [[20, 108]]);
+  await book(1, 2);
+  await book(2, 1);
+  await book(3, 1);
+  await book(4, 1); // its file is gone: nothing to measure
+  try {
+    const c = (await runHealthChecks()).checks.find((x: any) => x.id === 'short-chapters');
+    const listed = (n: number) => c.items.some((i: any) => i.bookId === `b_${S_STRIP}_${n}`);
+    assert.equal(listed(1), false, 'two long strips are a whole chapter');
+    assert.ok(listed(2), 'a banner wider than tall is what a failed download leaves');
+    assert.ok(listed(3), 'and so is a notice five widths tall');
+    assert.ok(listed(4), 'a chapter that cannot be measured stays a finding');
+    const [cached] = await q<{ page_dims: Array<{ width: number; height: number }> }>(
+      'SELECT page_dims FROM lib_books WHERE id = $1', [`b_${S_STRIP}_1`]);
+    assert.deepEqual(cached.page_dims.map((d) => [d.width, d.height]), [[10, 70], [10, 70]], "measured once, into the reader's cache");
+  } finally {
+    await q('DELETE FROM lib_series WHERE id = $1', [S_STRIP]);
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+/**
+ * "It keeps taking longer than 15 s" is about browsing today (v0.55.10, lib/sourceHealth.ts slowStreakNow): one evening's
+ * slow searches through a busy solver held four sources on the card for six days of fast answers. Reintroduce by reading
+ * `slow_streak` as stored in sourceTrouble(): the six-day-old streak is listed.
+ */
+test('a slow streak nobody has added to in a day is no finding', { skip: DSN ? false : 'set TEST_DATABASE_URL to run' }, async () => {
+  const { migrate } = await import('../src/lib/migrate');
+  const { q } = await import('../src/lib/db');
+  const { runHealthChecks } = await import('../src/lib/health');
+  await migrate();
+  const SRC = 'hs-slow-stale', S = 's_health_slow_stale';
+  await q('DELETE FROM lib_series WHERE id = $1', [S]);
+  await q('DELETE FROM source_health WHERE source_id = $1', [SRC]);
+  await q(`INSERT INTO lib_series (id, source, title, folder, source_id) VALUES ($1,'test','Slow Fixture',$1,$2)`, [S, SRC]);
+  await q(`INSERT INTO source_health (source_id, slow_streak, last_slow_at, last_error)
+           VALUES ($1, 5, now() - interval '6 days', 'timeout after 15000ms')`, [SRC]);
+  try {
+    const row = async () => (await runHealthChecks()).checks.find((x: any) => x.id === 'sources').items.find((i: any) => i.sourceId === SRC);
+    assert.equal(await row(), undefined, 'six days on, a slow streak says nothing about the next search');
+    await q(`UPDATE source_health SET last_slow_at = now() - interval '1 hour' WHERE source_id = $1`, [SRC]);
+    const fresh = await row();
+    assert.ok(fresh, 'while somebody is still running into it, it is listed');
+    assert.equal(fresh.state, 'slow');
+    assert.notEqual(fresh.info, true, 'and it is a finding: a series uses the source');
+  } finally {
+    await q('DELETE FROM lib_series WHERE id = $1', [S]);
+    await q('DELETE FROM source_health WHERE source_id = $1', [SRC]);
+  }
+});
+
 const S_GR = 's_health_gapsresult';
 
 /**
@@ -1550,10 +1640,10 @@ test('trawl answering at its root is trawl, named and held against its own relea
   globalThis.fetch = (async (u: any) => {
     const url = String(u);
     // Each repository's own latest: trawl is current, FlareSolverr's is a number trawl's must never be held against.
-    if (url.includes('/repos/germondai/trawl/')) return json({ tag_name: 'v1.7.0' });
+    if (url.includes('/repos/germondai/trawl/')) return json({ tag_name: 'v1.8.0' });
     if (url.startsWith('https://api.github.com/')) return json({ tag_name: 'v3.6.0' });
-    // trawl 1.7.0's own greeting, as the live one answered it (2026-10-04).
-    return json({ msg: 'TRAWL is ready!', version: '1.7.0', uptime: 7 });
+    // trawl 1.8.0's own greeting, as one answered it (2026-10-14).
+    return json({ msg: 'TRAWL is ready!', version: '1.8.0', uptime: 7 });
   }) as typeof fetch;
   resetSolverVersionCache();
   forgetSolverPing();
@@ -1564,7 +1654,7 @@ test('trawl answering at its root is trawl, named and held against its own relea
     forgetSolverPing();
     const row = await solverHealth();
     assert.equal(row.status, 'ok');
-    assert.equal(row.summary, 'Ready (trawl v1.7.0)', "trawl is named, and is not behind FlareSolverr's releases");
+    assert.equal(row.summary, 'Ready (trawl v1.8.0)', "trawl is named, and is not behind FlareSolverr's releases");
     assert.equal(englishOf(row.summarySaid), row.summary, 'the codes say the same');
     assert.equal(row.items.length, 0, 'no "newer solver" row');
   } finally {
@@ -1598,10 +1688,10 @@ test('with a backup, the card lists both solvers and says which one is not answe
   const refused = () => Promise.reject(Object.assign(new TypeError('fetch failed'), { cause: { code: 'ECONNREFUSED' } }));
   globalThis.fetch = (async (u: any) => {
     const url = String(u);
-    if (url.includes('/repos/germondai/trawl/')) return json({ tag_name: 'v1.7.0' });
+    if (url.includes('/repos/germondai/trawl/')) return json({ tag_name: 'v1.8.0' });
     if (url.startsWith('https://api.github.com/')) return json({ tag_name: 'v3.6.0' });
     // The owner's plan: trawl as the main, FlareSolverr kept as the backup.
-    if (url.startsWith(MAIN)) return up.main ? json({ msg: 'TRAWL is ready!', version: '1.7.0' }) : refused();
+    if (url.startsWith(MAIN)) return up.main ? json({ msg: 'TRAWL is ready!', version: '1.8.0' }) : refused();
     if (url.startsWith(BACKUP)) return up.backup ? json({ msg: 'FlareSolverr is ready!', version: '3.4.6' }) : refused();
     return realFetch(u);
   }) as typeof fetch;
@@ -1617,9 +1707,9 @@ test('with a backup, the card lists both solvers and says which one is not answe
   try {
     let c = await card(true, true);
     assert.equal(c.status, 'ok');
-    assert.equal(c.summary, 'Ready (trawl v1.7.0)');
+    assert.equal(c.summary, 'Ready (trawl v1.8.0)');
     assert.deepEqual(c.items.map((i: any) => [i.title, i.detail, !!i.info]), [
-      ['Main solver', `Ready (trawl v1.7.0) · ${MAIN}`, true],
+      ['Main solver', `Ready (trawl v1.8.0) · ${MAIN}`, true],
       ['Backup solver', `Ready (FlareSolverr v3.4.6) — v3.6.0 is available · ${BACKUP}`, true],
     ], 'the card lists both solvers, each with its kind, its version and its own newer release');
 
@@ -1634,7 +1724,7 @@ test('with a backup, the card lists both solvers and says which one is not answe
 
     c = await card(true, false);
     assert.equal(c.status, 'warn', 'a backup that would not answer turns the card amber');
-    assert.equal(c.summary, 'Ready (trawl v1.7.0); the backup is not answering');
+    assert.equal(c.summary, 'Ready (trawl v1.8.0); the backup is not answering');
     assert.deepEqual(c.items.map((i: any) => [i.title, !!i.info]), [['Main solver', true], ['Backup solver', false]]);
 
     c = await card(false, false);

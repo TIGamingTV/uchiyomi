@@ -17,8 +17,9 @@ import { TraceStrip } from '@/components/TraceStrip';
 import { Modal, msgOf } from '@/components/ConfirmDialog';
 import { Backdrop } from '@/components/ui';
 import { useToast } from '@/components/Toast';
-import { IcSparkle, IcChevronRight, IcPlay, IcRefresh, IcSettings, IcLogOut, IcMoments } from '@/components/icons';
+import { IcSparkle, IcPlay, IcRefresh, IcSettings, IcLogOut, IcMoments } from '@/components/icons';
 import { BadgesCard, ListsCard, StudioCard, type Stats } from '@/components/ProfileYou';
+import { ProfileInsights } from '@/components/ProfileInsights';
 import { ProfileSettings } from '@/components/ProfileSettings';
 import { ProfileConnections } from '@/components/ProfileConnections';
 import { ProfileAccount } from '@/components/ProfileAccount';
@@ -29,7 +30,8 @@ import { hiddenOnDesktop, isDesktop, visibleGroups, DESKTOP_HIDDEN } from '@/lib
  * One group, four entries, so `flat` drops the group eyebrow and the phone group sheet: profile has an index,
  * not an information architecture. The seventeen sections underneath used to be one 5000px column.
  *
- * You is the person (badges, the reading studio, lists); Settings is how the app behaves for them
+ * You is the person (badges, the reading studio, lists); Insights is what their reading adds up to (v0.75.0, from #249:
+ * the backlog, the series begun, this month's mix, finish dates, their best day and week); Settings is how the app behaves for them
  * (appearance, reader defaults, downloads, this device); Connections is everything that talks to another
  * service (trackers, OPDS readers, API tokens); Account is who they are here (password, 2FA, sessions,
  * sign out). Until v0.39.0 the second tab was "Reading" and held device settings plus one chart, Settings
@@ -39,7 +41,7 @@ import { hiddenOnDesktop, isDesktop, visibleGroups, DESKTOP_HIDDEN } from '@/lib
 const PROFILE_GROUPS = [
   // `keys()` is the identity function; it exists so these reach the translation extractor. ConsoleNav
   // renders them as `tr(tab)`, which a scan for inline tr() calls cannot see. See lib/i18n.ts.
-  { id: 'you', label: 'You', tabs: keys('You', 'Settings', 'Connections', 'Account') },
+  { id: 'you', label: 'You', tabs: keys('You', 'Insights', 'Settings', 'Connections', 'Account') },
 ] as const;
 const PROFILE_TABS = PROFILE_GROUPS[0].tabs;
 type Tab = (typeof PROFILE_TABS)[number];
@@ -197,6 +199,8 @@ function ProfileInner() {
       <StudioCard span="wide" />
       <ListsCard />
     </div>
+  ) : tab === 'Insights' ? (
+    <ProfileInsights />
   ) : tab === 'Settings' ? (
     <ProfileSettings weeklyGoal={stats?.weeklyGoal ?? 0} />
   ) : tab === 'Connections' ? (
@@ -230,7 +234,7 @@ function ProfileInner() {
             style={{ background: 'radial-gradient(70% 110% at var(--start) 100%, rgb(var(--accent) / 0.26), transparent 62%)' }} />
 
           <div className="absolute inset-0 flex flex-col justify-end">
-            <div className="px-4 pb-4 lg:px-8 lg:pb-6">
+            <div className="bleed-pad pb-4 lg:pb-6">
               <div className="lg:flex lg:items-end lg:justify-between lg:gap-10">
                 <motion.div className="min-w-0 lg:max-w-2xl"
                   initial={still ? false : { opacity: 0, y: 12 }} animate={{ opacity: 1, y: 0 }}
@@ -340,7 +344,7 @@ function ProfileInner() {
           behind a board of eight cards. They belong to the person, not to a panel, so they live on the rail.
           The nav is labelled "Profile", not "You": that was the first tab's name doubling as the name of the
           whole list, which read as "You › You" to a screen reader and in the phone sheet's heading. */}
-      <ConsoleNav groups={isDesktop() ? visibleGroups(PROFILE_GROUPS, DESKTOP_HIDDEN.profileTabs) : PROFILE_GROUPS} tab={tab} onTab={setTab} ariaLabel={tr('Profile')} flat
+      <ConsoleNav groups={isDesktop() ? visibleGroups(PROFILE_GROUPS, DESKTOP_HIDDEN.profileTabs) : PROFILE_GROUPS} tab={tab} onTab={setTab} ariaLabel={tr('Profile')} flat strip
         footer={<RailActions isAdmin={isAdmin} />}>
         {hiddenTab ? null : panel}
       </ConsoleNav>
@@ -362,20 +366,15 @@ function ProfileInner() {
  */
 function RailActions({ isAdmin }: { isAdmin: boolean }) {
   const { logout } = useAuth();
-  // Two shapes, one markup. On a desktop these are rail rows under the tab list; on a phone the rail does
-  // not exist and they sit under the pill row, so they take the pill's shape and wrap instead of stacking
-  // three full-width bars above the content.
-  const row = 'flex items-center gap-2 rounded-full border border-ink-700 px-3 py-1.5 text-start text-sm transition ' +
-    'lg:w-full lg:rounded-lg lg:border-0';
-  // Mirrored under RTL like LinkRow's: in Arabic the rail's chevrons pointed away from the door.
-  const chev = 'ms-auto hidden shrink-0 opacity-60 lg:block rtl:-scale-x-100';
+  // Keys (UI refresh): at the end of the tab row on a desktop, under it on a phone, where they wrap rather than stacking
+  // three full-width bars above the content. They were rail rows with a chevron, and pills on a phone.
+  const row = 'btn-key h-9 gap-2 text-sm';
   return (
     <>
       {isAdmin && (
         <Link href="/admin/" className={`${row} text-fog-400 hover:bg-ink-800/60 hover:text-fog-100`}>
           <IcSettings width={16} height={16} className="shrink-0" />
           <span className="min-w-0 truncate">{tr('Admin')}</span>
-          <IcChevronRight width={15} height={15} className={chev} />
         </Link>
       )}
       {/* Promoted out of the bottom of the Account tab, where it sat behind eight cards and a scroll. It is
@@ -385,7 +384,6 @@ function RailActions({ isAdmin }: { isAdmin: boolean }) {
         className={`${row} text-fog-400 hover:bg-ink-800/60 hover:text-fog-100`}>
         <span aria-hidden className="shrink-0 text-base leading-none">☕</span>
         <span className="min-w-0 truncate">{tr('Support Uchiyomi')}</span>
-        <IcChevronRight width={15} height={15} className={chev} />
       </a>
       {/* Not on desktop: the app signs itself back in at once, so "Sign out" there would do nothing visible. */}
       {!isDesktop() && (

@@ -20,6 +20,10 @@ import { t as tr, LOCALES, keys } from '@/lib/i18n';
 import { useT } from '@/lib/I18nProvider';
 import { SETTINGS_GRID, Section, Row, SwitchRow, Segmented, NumberRow, RangeRow, LinkRow, useAutosave } from '@/components/settings';
 import { inDesktopWindow, isDesktop } from '@/lib/desktop';
+import { useIncognito } from '@/components/IncognitoBanner';
+import { INCOGNITO_TEXT } from '@/lib/incognito';
+import { TONES, toneOf, type Tone } from '@/lib/tone';
+import { useReduceEffects } from '@/lib/useReduceEffects';
 
 /**
  * The profile's Settings tab: Appearance · Reading · Downloads · This device.
@@ -111,11 +115,24 @@ function AppearanceSection() {
       .then((ok) => { if (!ok) { setAccent(prev); setSettings({ accent: prev }); } });
   };
 
+  // The background tone (lib/tone.ts): on the account like the accent, applied the moment it is picked -- `setSettings`
+  // puts it on <html> and the browser bar -- and put back if the server refuses, so the pressed swatch is always the tone
+  // the account holds.
+  const toneSave = useAutosave();
+  const tone = toneOf(user?.settings?.tone);
+  const pickTone = (next: Tone) => {
+    if (next === tone) return;
+    const prev = user?.settings?.tone ?? null;
+    setSettings({ tone: next });
+    void toneSave.run(() => api('/api/settings', { method: 'PUT', json: { tone: next } }))
+      .then((ok) => { if (!ok) setSettings({ tone: prev }); });
+  };
+
   // Reduce effects (#71): the performance mode. Stored on the account like the accent, so it follows the
   // person to another device, and applied the moment it is flipped -- `setSettings` sets html.reduce-effects
   // and its mirror (lib/effects.ts) -- then put back if the server refuses, so the switch never shows a
   // state the account does not hold.
-  const reduceEffects = user?.settings?.reduceEffects === true;
+  const [reduceEffects, saveReduceEffects] = useReduceEffects();
   // Read after mount: localStorage is not there during the static export's render.
   const [typeSearch, setTypeSearch] = useState(true);
   useEffect(() => { setTypeSearch(typeToSearchOn()); }, []);
@@ -123,12 +140,6 @@ function AppearanceSection() {
   useEffect(() => { setCompactList(compactChaptersOn()); }, []);
   const [contextMenus, setContextMenus] = useState(true);
   useEffect(() => { setContextMenus(contextMenusOn()); }, []);
-  const saveReduceEffects = async (next: boolean) => {
-    const prev = reduceEffects;
-    setSettings({ reduceEffects: next });
-    try { await api('/api/settings', { method: 'PUT', json: { reduceEffects: next } }); }
-    catch (e) { setSettings({ reduceEffects: prev }); throw e; }
-  };
   // Show all chapters at once (lib/showAllChapters.ts): on the account like Reduce effects, so every device the
   // reader signs in on opens the whole list; optimistic, and put back when the server refuses.
   const showAllChapters = showAllChaptersOn(user?.settings);
@@ -182,6 +193,32 @@ function AppearanceSection() {
               )}
             </button>
           ))}
+        </div>
+      </Row>
+
+      {/* Three curated tones, each drawn in its own colours whatever tone is on: the page, a card on it, and the accent.
+          OLED black is first and the default. */}
+      <Row stacked label={tr('Background')} help={tr('True black suits OLED screens. Graphite and Midnight are softer on other displays.')}
+        status={toneSave.status}>
+        <div className="grid max-w-md grid-cols-3 gap-2.5">
+          {TONES.map((t) => {
+            const on = tone === t.key;
+            return (
+              <button key={t.key} type="button" onClick={() => pickTone(t.key)} aria-pressed={on} data-tone-choice={t.key}
+                className={`rounded-xl border p-1.5 text-start transition ${on ? 'border-accent bg-accent-soft' : 'border-ink-700 hover:border-ink-500'}`}>
+                <span aria-hidden className="relative block h-14 overflow-hidden rounded-lg" style={{ background: t.page, boxShadow: `inset 0 0 0 1px ${t.line}` }}>
+                  <span className="absolute inset-x-2 bottom-2 top-5 rounded-md" style={{ background: t.surface, boxShadow: `inset 0 0 0 1px ${t.line}` }} />
+                  <span className="absolute start-2 top-2 h-1.5 w-7 rounded-[2px] bg-accent" />
+                  <span className="absolute start-4 top-7 h-1 w-10 rounded-[2px] bg-fog-300/70" />
+                  <span className="absolute start-4 top-9 h-1 w-6 rounded-[2px] bg-fog-500/70" />
+                </span>
+                <span className="mt-1.5 flex items-center gap-1 px-0.5 text-xs font-medium text-fog-100">
+                  {on && <IcCheck width={12} height={12} className="shrink-0 text-accent" aria-hidden />}
+                  <span className="truncate">{tr(t.label)}</span>
+                </span>
+              </button>
+            );
+          })}
         </div>
       </Row>
 
@@ -270,6 +307,7 @@ function ReadingSection({ weeklyGoal }: { weeklyGoal: number }) {
     return () => { live = false; };
   }, []);
   const set = (p: Partial<ReaderPrefs>) => { const n = { ...prefs, ...p }; setPrefs(n); savePrefs(n); };
+  const incognito = useIncognito();
 
   return (
     <Section id="reading" title={tr('Reading')} icon={<IcMoments width={18} height={18} />}
@@ -281,6 +319,10 @@ function ReadingSection({ weeklyGoal }: { weeklyGoal: number }) {
       <Choice label={tr('Mode')} value={prefs.mode}
         options={[{ value: 'vertical', label: tr('Webtoon (scroll)') }, { value: 'paged', label: tr('Paged (swipe)') }]}
         onChange={(mode) => set({ mode })} />
+      {/* v0.61.0: the mode above is then the default only for a title the pick cannot place. Through `set`, the one writer. */}
+      <SwitchRow label={tr('Pick the mode for each series')}
+        help={tr('Long strips and webtoons open in Webtoon mode, manga and right-to-left series in Paged. A series or a source you have set yourself keeps its own.')}
+        on={prefs.autoMode} onChange={(autoMode) => set({ autoMode })} />
       <Choice label={tr('Theme')} value={prefs.theme}
         options={[{ value: 'amoled', label: tr('AMOLED') }, { value: 'sepia', label: tr('Sepia') }, { value: 'gray', label: tr('Gray') }]}
         onChange={(theme) => set({ theme })} />
@@ -289,6 +331,8 @@ function ReadingSection({ weeklyGoal }: { weeklyGoal: number }) {
       <SwitchRow label={tr('Cover colour at the edges')}
         help={tr('A soft wash of the cover’s colour across the top and bottom of the reader.')}
         on={prefs.coverEdges} onChange={(coverEdges) => set({ coverEdges })} />
+      {/* v0.61.0: the account's, not this device's (lib/incognito.ts); the reader's sheet has the same switch. */}
+      <SwitchRow label={tr(INCOGNITO_TEXT[0])} help={tr(INCOGNITO_TEXT[1])} on={incognito.on} onChange={incognito.set} />
       {prefs.mode === 'paged' && (
         <Choice label={tr('Pages per view')} value={prefs.spread ? 'double' : 'single'}
           options={[{ value: 'single', label: tr('Single') }, { value: 'double', label: tr('Double spread') }]}
@@ -299,6 +343,18 @@ function ReadingSection({ weeklyGoal }: { weeklyGoal: number }) {
           options={[{ value: 'series', label: tr('Series default') }, { value: 'ltr', label: tr('Left to right') }, { value: 'rtl', label: tr('Right to left') }]}
           onChange={(v) => set({ pagedDirection: v })} />
       )}
+      {/* v0.61.0: what a double-page spread becomes on a screen held upright. Through `set`, the one writer. */}
+      <Choice label={tr('Wide pages')} value={prefs.widePages}
+        help={tr('On a screen held upright, a double-page spread can be split into its two pages, or turned on its side to fill the screen.')}
+        options={[{ value: 'whole', label: tr('Whole') }, { value: 'split', label: tr('Split') }, { value: 'rotate', label: tr('Rotate') }]}
+        onChange={(widePages) => set({ widePages })} />
+      {/* #229: off until chosen; in Paged mode, whatever the default mode here, since a series can open paged anyway. */}
+      <SwitchRow label={tr('Join split double pages')}
+        help={tr('Shows two pages that a source cut from one double-page spread as that spread, in Paged mode. The server looks for them when a chapter is first opened, so they join a moment later. On a screen held upright, Wide pages applies to them.')}
+        on={prefs.joinSplit} onChange={(joinSplit) => set({ joinSplit })} />
+      <SwitchRow label={tr('Crop page borders')}
+        help={tr('Trims the blank margins around scanned pages. In Webtoon mode only the sides are trimmed, by the same amount for a whole chapter.')}
+        on={prefs.cropBorders} onChange={(cropBorders) => set({ cropBorders })} />
       {/* Set in both modes. ⚠️ It cannot LOOK the same in both: a page-by-page view has no thin slide --
           every slide is exactly one viewport wide -- so Collapse falls back to removing there, where an
           unwanted page costs one swipe rather than a scroll and there is no flow to interrupt. */}

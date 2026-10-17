@@ -43,6 +43,13 @@ export interface EngineReport {
   lastTry?: string | null;
   lastTryOk?: boolean | null;
   engine?: string;
+  /** The engine upgrade (absent from an older server): "Stable" or "Preview", and how its version stands. */
+  buildType?: string | null;
+  tested?: string;
+  oldest?: string;
+  standing?: 'same' | 'older' | 'tooOld' | 'newer' | 'unknown';
+  /** What it refused, by operation, in its own words: non-empty, it answers and does not match this Uchiyomi. */
+  refused?: Array<{ op: string; message: string; at: string }>;
   solver?: {
     supported: boolean;
     enabled: boolean;
@@ -69,7 +76,7 @@ export function defaultPlatform(s: Pick<EngineReport, 'platform'>): Platform {
 }
 
 /** The pinned engine. bff/test/enginePins.test.ts holds this equal to every other pin. */
-export const ENGINE_IMAGE = 'ghcr.io/suwayomi/suwayomi-server:v2.3.2243';
+export const ENGINE_IMAGE = 'ghcr.io/suwayomi/suwayomi-server:v2.4.2366';
 const RAW = 'https://raw.githubusercontent.com/AngeloSha/uchiyomi/main';
 
 /**
@@ -94,6 +101,7 @@ export const STEP_TEXT = keys(
   // Unraid
   'In Unraid, open Apps, search for {name} and install it.',
   'Before its first start, create its folder from the Unraid terminal (the engine runs as user 1000):',
+  'It asks for a password when you install it. On the uchiyomi container, set {user} to its user name ({default} unless you changed it) and {password} to that password.',
   'Then set {name} on the uchiyomi container to this address, with your server’s IP, and apply:',
   'On the Docker tab, start {name}. If it keeps stopping, its log says why.',
   'Check that {name} on the uchiyomi container is still this address, with your server’s IP:',
@@ -190,6 +198,12 @@ export function onSteps(p: Platform, h: Headline): Step[] {
       return [
         { text: 'In Unraid, open Apps, search for {name} and install it.', vars: { name: ENGINE } },
         { text: 'Before its first start, create its folder from the Unraid terminal (the engine runs as user 1000):', command: `mkdir -p /mnt/user/appdata/${ENGINE} && chown 1000:1000 /mnt/user/appdata/${ENGINE}` },
+        // v0.73.0: the Unraid template publishes the engine's port, so a new install asks for a password (AUTH_MODE
+        // basic_auth) and Uchiyomi has to send the same pair. An install from before keeps its own settings.
+        {
+          text: 'It asks for a password when you install it. On the uchiyomi container, set {user} to its user name ({default} unless you changed it) and {password} to that password.',
+          vars: { user: 'SUWAYOMI_USERNAME', default: 'uchiyomi', password: 'SUWAYOMI_PASSWORD' },
+        },
         { text: 'Then set {name} on the uchiyomi container to this address, with your server’s IP, and apply:', vars: { name: URL_VAR }, command: 'http://YOUR-SERVER-IP:4567' },
       ];
     case 'casaos':
@@ -213,8 +227,8 @@ export function onSteps(p: Platform, h: Headline): Step[] {
       return [
         {
           text: 'Run the engine where Uchiyomi can reach it, with its data in a volume that stays. These are the settings the shipped files use:',
-          command: `docker run -d --name ${ENGINE} --restart unless-stopped --memory=1536m -p 4567:4567 `
-            + `-v uchiyomi_suwayomi:/home/suwayomi/.local/share/Tachidesk -e JAVA_TOOL_OPTIONS="-Xmx768m -XX:+UseSerialGC" `
+          command: `docker run -d --name ${ENGINE} --restart unless-stopped --memory=2048m -p 4567:4567 `
+            + `-v uchiyomi_suwayomi:/home/suwayomi/.local/share/Tachidesk -e JAVA_TOOL_OPTIONS="-Xmx768m -XX:+UseSerialGC" -e MALLOC_ARENA_MAX=2 `
             + '-e AUTO_DOWNLOAD_CHAPTERS=false -e DOWNLOAD_AS_CBZ=true -e WEB_UI_ENABLED=false '
             + `-e FLARESOLVERR_ENABLED=true -e FLARESOLVERR_URL=http://YOUR-SOLVER:8191 ${ENGINE_IMAGE}`,
         },

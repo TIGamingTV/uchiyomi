@@ -3,6 +3,7 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { useEffect, useLayoutEffect, useState, ReactNode } from 'react';
 import Lenis from 'lenis';
 import { effectsReduced, restoreReduceEffects, useReduceEffects } from '@/lib/effects';
+import { restoreTone } from '@/lib/tone';
 import { AuthProvider } from '@/lib/auth';
 import { ToastProvider } from '@/components/Toast';
 import { I18nProvider } from '@/lib/I18nProvider';
@@ -56,6 +57,9 @@ export function Providers({ children }: { children: ReactNode }) {
   // The device's copy of Reduce effects, before the first paint of the splash or the sign-in screen. The
   // account's own value replaces it the moment /auth/refresh answers (lib/auth.tsx).
   useLayoutEffect(restoreReduceEffects, []);
+  // The background tone's too (lib/tone.ts). The <head> script has usually put it on <html> already; this also sets the
+  // browser bar's colour, which that script runs too early to find.
+  useLayoutEffect(restoreTone, []);
   const reduceEffects = useReduceEffects();
 
   // Momentum scroll on desktop wheel (native touch on mobile; reader opts out via data-lenis-prevent).
@@ -70,11 +74,23 @@ export function Providers({ children }: { children: ReactNode }) {
     if (reduceEffects || effectsReduced()) return;
     if (window.matchMedia('(prefers-reduced-motion: reduce)').matches) return;
     const lenis = new Lenis({ duration: 1.05, smoothWheel: true });
-    let raf = requestAnimationFrame(function loop(t) {
+    // Lenis animates nothing but a wheel turn (touch scrolls natively), so a device with no mouse or trackpad starts the
+    // frame loop at its first wheel, never before. A phone ran this requestAnimationFrame every frame of every page -- the
+    // reader's included -- for nothing: a main-thread wake-up 60 or 120 times a second that only ever returned. A mouse
+    // or trackpad (`any-pointer: fine`) keeps it running from the start, exactly as before.
+    let raf = 0;
+    const loop = (t: number) => {
       lenis.raf(t);
       raf = requestAnimationFrame(loop);
-    });
+    };
+    const start = () => { if (!raf) raf = requestAnimationFrame(loop); };
+    const fine = window.matchMedia('(any-pointer: fine)');
+    if (fine.matches) start();
+    window.addEventListener('wheel', start, { passive: true });
+    fine.addEventListener('change', start);
     return () => {
+      window.removeEventListener('wheel', start);
+      fine.removeEventListener('change', start);
       cancelAnimationFrame(raf);
       lenis.destroy();
     };

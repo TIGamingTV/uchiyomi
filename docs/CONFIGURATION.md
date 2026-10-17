@@ -15,6 +15,15 @@ The ones worth knowing:
 - `WEB_PORT`: host port the app is published on — `8080` everywhere. (`SPLIT_WEB_PORT`, default `8081`, is
   the split's own port under `--profile split`, so both can run side by side.)
 - `PUBLIC_ORIGIN`: the URL the app is served from (match your domain behind a reverse proxy).
+- `TRUST_PROXY`: which peers may tell the app the visitor's address in `X-Forwarded-For` (sign-in rate limits and
+  the activity log use it). The default, `loopback, linklocal, uniquelocal`, trusts a proxy on this machine, in
+  Docker or on your LAN: nginx, Nginx Proxy Manager, Caddy, Traefik, an Umbrel or CasaOS app proxy, a Cloudflare
+  tunnel container. A proxy on a public address, or one that reaches the server over Tailscale (`100.x`), needs
+  adding, with the default names kept so a hop between it and the app on this machine or in Docker stays trusted
+  (`TRUST_PROXY=loopback, linklocal, uniquelocal, 203.0.113.9`, addresses or CIDR ranges). `true` trusts every
+  peer, which lets anyone who can reach the port directly choose their own address. Behind Cloudflare's proxy (the
+  orange cloud) the visitor reaches you through Cloudflare's own addresses: have your reverse proxy restore the real
+  address from `CF-Connecting-IP`, or add Cloudflare's published ranges the same way, or the log shows Cloudflare's.
 - **Database** — `DATABASE_URL`, on the app container. **Unset** (the shipped one-container file leaves it
   unset on purpose): the container runs its own Postgres 16 in `/data/pg` (the `uchiyomi_data` volume), on a
   unix socket only — no network listener, no password — and the nightly task dumps it into `/backups` like
@@ -79,9 +88,21 @@ an empty string to make sure it can never send anything regardless of the settin
 
 ### Progress trackers
 
-The tracker calls are the only ones this server makes **with your token**: AniList, MyAnimeList and Kitsu,
+The tracker calls are the only ones this server makes **with your token**: AniList, MyAnimeList, Kitsu and MangaUpdates,
 each connected by you under **Profile → Connections → Progress tracking**, and only for reading your list (the
-import) and reporting what you finished. Nothing carrying a token goes to a tracker you have not connected.
+import, and since v0.71.0 Discover's *Recommended for you*), reporting what you finished, and asking MyAnimeList what its
+readers recommend after a few titles of your own list (its API needs a token for that). Nothing carrying a token goes
+to a tracker you have not connected.
+
+**Recommended for you** (since v0.71.0) reads a person's connected lists when they open Discover, at most every 12
+hours, and keeps the list in the database (`tracker_list_cache`, removed when they disconnect or sign in as someone
+else). For up to eight titles of their AniList list and five of their MyAnimeList list, it asks what readers recommend
+next: AniList **without** a token (public queries, the AniList ids of those titles), MyAnimeList with theirs, and, for
+what MyAnimeList answers, one AniList query by those MyAnimeList ids for the age rating. Each title's answer is kept two
+weeks for the whole server (`tracker_rec_cache`), so a title two people rated is asked once. Series of the library they
+rated or read count too, but only ones they may open, in a library with *Look up art and metadata on AniList
+automatically* on, through a checked link. An account that may not add series, or has no tracker connected, sends
+nothing.
 
 Two of those services are also asked **without** any token, by title, whether or not anyone has connected
 them. By default, every series added gets its title sent to AniList (`graphql.anilist.co`) once, for banner and cover
@@ -89,8 +110,12 @@ art; a series with no art on record is looked up the same way the first time its
 match also records the AniList id progress sync writes against. The admin panel's **Cover & banner health**
 card — its *Backfill*, and picking art for one series by hand — asks AniList again and, for wide cover art,
 Kitsu (`kitsu.io`), and `POST /api/admin/trackers/relink` asks AniList for every unlinked series. Discover's
-*Trending* rail is AniList's own trending list, fetched at most once every six hours. These lookups carry
-your server's IP address and the title asked for, and nothing else. Of the knobs below, only `ANILIST_API_URL`
+*Trending* rail is AniList's own trending list, fetched at most once every six hours. Since v0.73.0, with **Fill in
+missing details** switched on (off by default), the nightly repair also asks AniList for the description and genres of
+series linked there that have none — by AniList id, fifty to a request, never by title. These lookups carry
+your server's IP address and the title or id asked for, and nothing else. Since v0.73.0 every AniList request the
+server makes, these and the tracker pushes alike, is spaced to stay under the limit AniList states for your address, and
+a request AniList asks to wait waits. Of the knobs below, only `ANILIST_API_URL`
 moves them (AniList's, since v0.55.7); the other two point only the token-bearing tracker calls elsewhere.
 
 Since v0.55.8 ([discussion #168](https://github.com/AngeloSha/uchiyomi/discussions/168)), each library — the default
@@ -101,9 +126,23 @@ is off, clears none of the art, links, type or direction it already learned, and
 policy when a series moves. Explicit Admin Art, Relink, Check online matches, tracker import/sync and Discover actions
 remain available and can contact AniList because they are actions you asked for, rather than background enrichment.
 
-`ANILIST_API_URL`, `MYANIMELIST_API_URL` and `KITSU_API_URL` are **test knobs**: they point an adapter at a
+Since v0.58.0, every six hours (the first time a few minutes after a start), the server asks AniList for the score and
+popularity of the series it holds AniList ids for: a checked link only, never a guessed one, 50 ids to a request, and
+only those missing or more than three days old. It sends the **AniList ids** and nothing else, skips the series of any
+library with *Look up art and metadata on AniList automatically* off, and keeps the answers for the series page's
+ratings panel and the *Most popular* and *Top rated* sorts. `ANILIST_API_URL` moves it with the rest.
+
+Since v0.56.0, Discover asks which work each title it shows is, so that a series several sources name differently is
+one card and one you already have stays out of the browsing views. Each name is asked once, in the background:
+AniList first, then MangaDex (`api.mangadex.org`), then MangaUpdates (`api.mangaupdates.com`), and the answer is
+kept. These carry your server's IP address and the title shown in Discover, nothing about your library. Switch them
+off with **Match Discover titles online** under Admin → Settings; cards then fold by their names alone.
+`MANGADEX_API_URL` and `MANGAUPDATES_API_URL` are test knobs like the ones below (defaults `https://api.mangadex.org`
+and `https://api.mangaupdates.com/v1`); `MANGADEX_API_URL` moves every MangaDex request, the MangaDex sources' included.
+
+`ANILIST_API_URL`, `MYANIMELIST_API_URL`, `KITSU_API_URL` and `MANGAUPDATES_API_URL` are **test knobs**: they point an adapter at a
 stand-in server instead of the real service (the defaults are `https://graphql.anilist.co`,
-`https://api.myanimelist.net/v2` and `https://kitsu.app/api/edge`). They exist so the browser tests can
+`https://api.myanimelist.net/v2`, `https://kitsu.app/api/edge` and `https://api.mangaupdates.com/v1`). They exist so the browser tests can
 drive a tracker import without a real account — and, `ANILIST_API_URL` since v0.55.7, check online matches
 against a fake AniList, so it moves every AniList call, the title lookups above included. There is no reason to
 set them on an install you read on — a wrong value here makes every tracker call fail, or worse, sends your token
@@ -188,6 +227,10 @@ also bounds every call inside the test, and a test that runs out of it is report
 rather than as a failure: raise it for extension sources behind a slow Cloudflare check that keep reading so. The
 Test key counts against it, plus a few seconds of margin (*Testing… 0:12 of up to 0:53* at the default).
 `SOURCE_LATEST_TIMEOUT_MS` (default `8000`) is how long a source's newest page may take before it counts as slow.
+`SOURCE_LATEST_SOLVER_TIMEOUT_MS` (default `45000`, since v0.59.0) is the same for a site this server opens through the
+Cloudflare solver (below): the first page of the day waits for a fresh solve, measured at 15–25 s, so the bare budget
+lost exactly these sites. It is never less than `SOURCE_LATEST_TIMEOUT_MS`. Only a source's first page counts
+toward *slow*; later pages, asked while you scroll, never do.
 
 ## The Cloudflare solver
 
@@ -246,7 +289,7 @@ services:
       FLARESOLVERR_FALLBACK_URL: http://uchiyomi-flaresolverr:8191
 
   uchiyomi-trawl:
-    image: ghcr.io/germondai/trawl:1.7.0   # pinned: it is young, and has changed a setting once already
+    image: ghcr.io/germondai/trawl:1.8.0   # pinned: it is young and changes quickly. 1.8.0 or later (below)
     container_name: uchiyomi-trawl
     restart: unless-stopped
     shm_size: 1gb
@@ -267,7 +310,10 @@ services:
 Then `docker compose up -d`. To go back, put `FLARESOLVERR_URL` back to `http://uchiyomi-flaresolverr:8191` and drop
 the other line (and the service, if you like). The extension engine keeps the solver its own container names
 (FlareSolverr, in the shipped files); for extension sources to go through trawl too, set `FLARESOLVERR_URL` on the
-`uchiyomi-suwayomi` service to `http://uchiyomi-trawl:8191` as well. It has no backup of its own.
+`uchiyomi-suwayomi` service to `http://uchiyomi-trawl:8191` as well. It has no backup of its own. That needs trawl
+**1.8.0 or later**: the engine asks for a Madara site's lists and searches with a form post it sends without a
+`Content-Type`, and trawl 1.7.0 refuses every one (HTTP 400, *body requires a Content-Type header to be set*), so those
+lists fail on a Cloudflare-protected site. 1.8.0 sends the body as a form.
 
 ## Downloading
 
@@ -334,11 +380,16 @@ ever hit.
   own rate limits towards the site, so the one-at-a-time pacing above was only slowing extension downloads
   down for nothing. The first 429 from the engine drops the chapter back to one page at a time for the rest
   of the download.
-- `SUWAYOMI_MEM_LIMIT` (default `1536m`) and `SUWAYOMI_JAVA_OPTS` (default `-Xmx768m -XX:+UseSerialGC`): the
-  extension engine's memory ceiling and its Java options. These are read by Docker Compose for the engine's
-  own container, not by Uchiyomi. Without them a JVM sizes its heap from the host — a quarter of its memory —
-  so they are set in every shipped compose file; raise both together for a very long extension list, keeping
-  the ceiling well above the `-Xmx` heap for the memory Java uses outside it.
+- `SUWAYOMI_MEM_LIMIT` (default `2048m`; `1536m` before [#275](https://github.com/AngeloSha/uchiyomi/issues/275)) and
+  `SUWAYOMI_JAVA_OPTS` (default `-Xmx768m -XX:+UseSerialGC`): the extension engine's memory ceiling and its Java
+  options. These are read by Docker Compose for the engine's own container, not by Uchiyomi. Without them a JVM sizes
+  its heap from the host — a quarter of its memory — so they are set in every shipped compose file. The ceiling holds
+  more than the heap: Java's own native memory and the Chromium and Xvfb the engine's image runs came to 770 MB beside
+  a 630 MB heap on a server with 45 extensions. Keep the ceiling at least 1.25 GB above `-Xmx`, and raise `-Xmx` (and
+  the ceiling by as much) only when the engine's log says `java.lang.OutOfMemoryError: Java heap space`. On a host
+  without swap the ceiling is a hard wall: the kernel kills the engine there and Docker starts it again
+  ([If the engine keeps restarting](extensions.md#if-the-engine-keeps-restarting)). The same container sets
+  `MALLOC_ARENA_MAX=2`, which the C library reads.
 - `DOWNLOAD_RESUME_WAIT_MS` (default `5000,10000,20000`): waits before the three attempts to resume a
   chapter after a 429. A source's longer `Retry-After` is always the floor. Every chapter on the source waits the same
   wait, not only the refused one. A 429 also raises that source's in-memory pace level (0–4): slowed levels download
@@ -363,6 +414,9 @@ ever hit.
   borrowing is switched on (step 7 below).
 - `REPAIR_DIRECTIONS_MAX` (default `500`, 1–5000): series one run asks each service — MangaDex, then AniList —
   about their reading direction (step 8 below): at most five and ten requests a night at the default.
+- `REPAIR_DETAILS_MAX` (default `15`, 1–200): series one run asks their own source and the ones they follow about a
+  missing description, genres, author or cover, when Fill in missing details is switched on (step 9 below). AniList's
+  part is one batched request per fifty series and has its own fixed ceiling of 500.
 - `REPAIR_PACE_MS` (default `1500`, 0 or more): the pause between two series the repair's *Retry now* step
   re-checks. `0` is a legitimate value and means no pause at all. Fix everything paces every series of its
   failures, short and gap steps by it too.
@@ -377,11 +431,14 @@ ever hit.
   `AUTOFIX_MAX_MINUTES` is spent, and the next run continues down the list. `0` switches its extensions phase off. A
   package that carries none of the series it was searched for is removed again at once, and is not tried for those
   series again for a month.
+- `MAX_FOLLOWED_SOURCES` (default `2`, 1 to 6): how many sources besides the main one a series may follow, by hand or
+  automatically. A failed chapter may be asked from that many of them, up to four. Each one is another chapter list
+  read on every sweep, for every series.
 - `MIN_FREE_GB` (default `10`): refuse to start a download when the download disk has less than this free.
   `0` disables the floor. Fails open if free space cannot be measured.
 
-An ordinary chapter failure may continue from up to two sources already followed for that series. A copy
-explicitly picked by a person never switches. A 403/429 never becomes a partial chapter or starts a hunt;
+An ordinary chapter failure may continue from up to `MAX_FOLLOWED_SOURCES` (default two, at most four) of the sources
+already followed for that series. A copy explicitly picked by a person never switches. A 403/429 never becomes a partial chapter or starts a hunt;
 the refusing source cools down, while an already-followed copy can keep the queue moving. The sweep can also
 find a new matching source when **Admin → Settings → Updates & schedules → Look for failed chapters on other
 sources** is on (the default): once per series per day, at most six candidates and five hunts per
@@ -476,6 +533,16 @@ provable on their own, and two more only when you switch them on, in this order:
    asked for the original language of the ones that follow it, then AniList for the country of origin of the ones
    linked there — at most `REPAIR_DIRECTIONS_MAX` series from each in a run, picked at random. Only the reading
    direction is ever written, and never over one set by hand.
+9. **Missing details** (since v0.73.0), **off** until **Admin → Settings → Library housekeeping → Fill in missing
+   details** is switched on. A series with no description, genres or author of its own is given them: first by
+   AniList, for series linked there with a checked link, in libraries whose AniList lookups are on, in English, at most
+   500 a run in requests of fifty by id; then, for at most `REPAIR_DETAILS_MAX` series that are kept updated, by the
+   series' own source and the ones it follows in its language, each lookup bounded by the source's own time budget and
+   only of sources that are not off, failing or cooling down. A series with no chapters yet also gets a cover. What it
+   finds is kept in a layer of its own (`series_auto_details`) that a series shows only where its own details and an
+   admin's edit are both empty, so a scan never fights it and nothing is ever replaced; the 18+ filter judges the
+   genres it adds. A series asked is left for 30 days. Nothing here is reported to source health. Switching it off
+   deletes the layer and puts back any cover it set.
 
 Fixed rather than configurable, because they are the blast radius rather than a preference: 5 searches for a
 whole run, shared by steps 3–5, of which the short step may spend at most 2 — so a library full of short

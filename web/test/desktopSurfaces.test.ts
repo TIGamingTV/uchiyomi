@@ -11,6 +11,7 @@ import assert from 'node:assert/strict';
 import { readFileSync, readdirSync, statSync, existsSync } from 'fs';
 import { join } from 'path';
 import { DESKTOP_HIDDEN } from '../lib/desktop';
+import { offlineKeyShown } from '../lib/seriesActions';
 
 const ROOT = join(__dirname, '..');
 const read = (p: string) => readFileSync(join(ROOT, p), 'utf8');
@@ -83,7 +84,7 @@ test('the admin and profile consoles hide tabs by filtering what the rail receiv
   assert.match(admin, /\{hiddenTab \? null : panel\}/, 'a hidden tab\'s panel renders');
   const profile = code(read('app/profile/page.tsx'));
   assert.match(profile, /const \[tab, setTab\] = useTabParam<Tab>\(PROFILE_TABS, 'You'\);/, 'the pinned profile useTabParam line changed');
-  assert.match(profile, /keys\('You', 'Settings', 'Connections', 'Account'\)/, 'the pinned profile tab literal changed');
+  assert.match(profile, /keys\('You', 'Insights', 'Settings', 'Connections', 'Account'\)/, 'the pinned profile tab literal changed');
   assert.match(profile, /<ConsoleNav groups=\{isDesktop\(\) \? visibleGroups\(PROFILE_GROUPS, DESKTOP_HIDDEN\.profileTabs\) : PROFILE_GROUPS\}/, 'the profile rail still lists Account on desktop');
   assert.match(profile, /useEffect\(\(\) => \{ if \(hiddenTab\) setTab\('You'\); \}, \[hiddenTab\]\);/, 'a deep link to Account does not fall back to You');
   assert.match(profile, /\{hiddenTab \? null : panel\}/, 'the Account panel renders on desktop');
@@ -191,7 +192,8 @@ test('Admin → Settings hides registration, the install count and the Mihon row
   const src = code(read('components/AdminSettings.tsx'));
   const server = slice(src, 'function ServerSection(', 'function SchedulesSection(');
   assert.match(server, /queryFn: \(\) => api<[^\n]*'\/api\/admin\/install-ping\/preview'\),\s*staleTime: 60_000,\s*enabled: !desktop,/, 'the install-count preview is requested on desktop');
-  assert.match(server, /\{!desktop && \(\s*<SwitchRow label=\{tr\('Open registration'\)\}/, 'the registration switch shows on desktop');
+  // `!ssoOnly(authConfig)` since v0.63.0: an SSO-only server has no sign-up either (web/test/ssoOnly.test.ts).
+  assert.match(server, /\{!desktop && !ssoOnly\(authConfig\) && \(\s*<SwitchRow label=\{tr\('Open registration'\)\}/, 'the registration switch shows on desktop');
   assert.match(server, /\{!desktop && <SwitchWithMore label=\{tr\('Count this server in the anonymous install count'\)\}/, 'the install count shows on desktop');
   const house = slice(src, 'function HousekeepingSection(', 'const NO_PREFS');
   assert.match(house, /\{!isDesktop\(\) && \(\s*<SwitchRow label=\{tr\('Show missing chapters in Mihon'\)\}/, 'the Mihon row shows on desktop');
@@ -202,10 +204,15 @@ test('Admin → Settings hides registration, the install count and the Mihon row
 });
 
 test('"Save offline" and the Offline tab are hidden on desktop, and smart offline never runs there', () => {
-  // The chapters ARE on this disk; copying them into the window's storage stores every one twice. Reintroduce
-  // by dropping `!isDesktop() &&` from "Save all offline": "Save all offline shows on desktop" fails.
+  // The chapters ARE on this disk; copying them into the window's storage stores every one twice. Since v0.60.0
+  // "Save all offline" is the series page's Offline key, drawn when lib/seriesActions.ts offlineKeyShown says so.
+  // Reintroduce it on desktop -- drop `!x.desktop` there, or draw the key without asking it -- and "Save all offline
+  // shows on desktop" fails.
   const series = code(read('app/series/page.tsx'));
-  assert.match(series, /\{!nothingYet && !isDesktop\(\) && \(/, 'Save all offline shows on desktop');
+  assert.match(series, /\{offlineKeyShown\(\{ nothingYet, desktop: isDesktop\(\) \}\) && \(\s*<SeriesKey [\s\S]{0,300}?name=\{downloadingAll \? tr\('Saving…'\) : tr\('Save all offline'\)\}/,
+    'Save all offline shows on desktop');
+  assert.equal(offlineKeyShown({ nothingYet: false, desktop: true }), false, 'Save all offline shows on desktop');
+  assert.equal(offlineKeyShown({ nothingYet: false, desktop: false }), true, 'Save all offline is gone from the server build too');
   assert.match(series, /\{!isDesktop\(\) && <button\s+onClick=\{async \(\) => \{\s*if \(busy\) return;\s*setBusy\(true\);\s*try \{ await onToggleDownload\(\); \}/, 'a chapter row offers Save offline on desktop');
   assert.match(series, /\{!isDesktop\(\) && <button disabled=\{acting \|\| !saveable\.length\} onClick=\{bulkSave\}/, 'select mode offers Save offline on desktop');
   // The nav and the palette keep the entries (the server build shows them) and filter them on desktop.

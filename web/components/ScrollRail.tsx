@@ -16,6 +16,14 @@ import { t as tr } from '@/lib/i18n';
  * from 0 down to -(scrollWidth - clientWidth). This app mirrors fully, so the sign comes from the computed
  * direction rather than being assumed, and the ends are measured on the absolute offset.
  */
+/**
+ * The card rails' scroller (UI refresh): Home's, a series page's, the reader's end card. Inside the content column
+ * like the old Rail, with room above for a card's hover lift and below for the bar, and snapping to the gutter
+ * rather than under it. Every card rail goes through ScrollRail now (rails.test.ts): the old Rail had no arrows and
+ * hid its bar, so a mouse could not move it.
+ */
+export const CARD_RAIL = 'flex gap-3 px-4 pb-3 pt-2 scroll-px-4 [scroll-snap-type:x_mandatory]';
+
 export function ScrollRail({ children, className = '', size = 'md', label }: {
   children: ReactNode;
   /** Applied to the scroller itself, for layout: `bleed`, flex direction, gap, padding. */
@@ -65,7 +73,10 @@ export function ScrollRail({ children, className = '', size = 'md', label }: {
 
   return (
     <div className="relative" role={label ? 'group' : undefined} aria-label={label}>
-      <div ref={ref} onScroll={measure} className={`overflow-x-auto ${className}`} data-lenis-prevent>
+      {/* Lenis steps aside for a SIDEWAYS gesture only (a trackpad swipe, Shift+wheel): the plain data-lenis-prevent also
+          handed it a vertical wheel, and with Lenis still easing the page from the wheel before, the page stopped dead
+          wherever a card was under the pointer -- scrolling Home with a mouse took the scrollbar. */}
+      <div ref={ref} onScroll={measure} className={`overflow-x-auto ${className}`} data-lenis-prevent-horizontal>
         {children}
       </div>
       <button type="button" onClick={() => go(-1)} disabled={ends.start} aria-label={tr('Previous')}

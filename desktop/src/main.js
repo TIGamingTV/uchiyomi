@@ -50,6 +50,7 @@ const { restore, inspectBackup } = require('./restore');
 const { pickLang, translator, pageStrings } = require('./i18n');
 const { startSolver, setUserAgent } = require('./solver');
 const { installSessionEnd } = require('./sessionend');
+const { catchUncaught } = require('./uncaught');
 const {
   probeServer, hopFetch, certSummary, certDecision, pinsOf, pinUpdate, pickStartup, appOriginFor, navDecision,
   forgetServerState, relaunchArgs, pinHost, originHost, serverPins, loadFailedStep, afterServerCheck,
@@ -81,6 +82,9 @@ app.setPath('userData', L.electron);
 app.setAppLogsPath(L.logs);
 
 const MODE = args.smoke ? 'smoke' : args['quit-for-update'] ? 'quit-for-update' : 'app';
+// --smoke: an uncaught exception or unhandled rejection here is logged with its stack and fails the smoke, instead of
+// Electron's modal error box freezing it until CI's timeout (uncaught.js). The app keeps Electron's own behaviour.
+const uncaught = MODE === 'smoke' ? catchUncaught(log) : [];
 log.info(`Uchiyomi Desktop ${app.getVersion()} starting`, {
   mode: MODE, root, packaged: app.isPackaged, electron: process.versions.electron, node: process.versions.node,
   chrome: process.versions.chrome, platform: process.platform, arch: process.arch, pid: process.pid,
@@ -1280,7 +1284,8 @@ async function runSmoke() {
     res.timeline = sup?.relTimeline();
     res.sinceMainStart = Date.now() - T0;
   }
-  res.ok = !res.error && Object.values(c).every((x) => x.pass !== false) && res.stop.pass;
+  res.uncaught = uncaught;
+  res.ok = !res.error && !uncaught.length && Object.values(c).every((x) => x.pass !== false) && res.stop.pass;
   const out = typeof args.result === 'string' ? args.result : path.join(L.logs, 'smoke-result.json');
   fs.writeFileSync(out, JSON.stringify(res, null, 2));
   log.info(`SMOKE ${res.ok ? 'PASS' : 'FAIL'}`, res);
@@ -1301,8 +1306,8 @@ async function smokeEngine(base, token) {
   }
   const installMs = Date.now() - t0;
   await Promise.race([restarted, new Promise((r) => setTimeout(r, 90_000))]);
-  const creds = s.secrets;
-  const about = await fetch(`http://127.0.0.1:${s.state.enginePort}/api/v1/settings/about`, { headers: { authorization: `Basic ${Buffer.from(`${creds.engineUser}:${creds.enginePass}`).toString('base64')}` } }).then((r) => r.status).catch(() => 0);
+  const creds = s.engineCreds;
+  const about = await fetch(`http://127.0.0.1:${s.state.enginePort}/api/v1/settings/about`, { headers: { authorization: `Basic ${Buffer.from(`${creds.user}:${creds.pass}`).toString('base64')}` } }).then((r) => r.status).catch(() => 0);
   const anon = await fetch(`http://127.0.0.1:${s.state.enginePort}/api/v1/settings/about`).then((r) => r.status).catch(() => 0);
   // A fresh token: the bff restarted since the first one was issued (same JWT secret, so it may still work).
   const tok = await fetch(`${base}/auth/desktop`, { method: 'POST', headers: { [HEADER]: s.o.secret } }).then((r) => r.json()).then((j) => j.accessToken).catch(() => token);

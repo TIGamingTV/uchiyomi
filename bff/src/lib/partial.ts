@@ -34,6 +34,7 @@ const AdmZip = require('adm-zip');
 // invariant pinned by zipExtractionGuard.test.ts) and use the streaming reader for manifests/entries.
 // eslint-disable-next-line @typescript-eslint/no-var-requires
 const StreamZip = require('node-stream-zip');
+import { MAX_META_BYTES, zipEntryCapped } from './archiveCaps';
 
 /** The manifest's entry name at the archive root. Not an image extension, so the scanner never counts it. */
 export const PARTIAL_MANIFEST = 'uchiyomi-partial.json';
@@ -102,7 +103,7 @@ export async function readPartialManifest(abs: string): Promise<PartialManifest 
     const entries = await zip.entries();
     if (!entries[PARTIAL_MANIFEST] || entries[PARTIAL_MANIFEST].isDirectory) return null;
     let m: any;
-    try { m = JSON.parse((await zip.entryData(PARTIAL_MANIFEST)).toString('utf8')); }
+    try { m = JSON.parse((await zipEntryCapped(zip, PARTIAL_MANIFEST, MAX_META_BYTES)).toString('utf8')); }
     catch { throw new Error(`invalid ${PARTIAL_MANIFEST}: malformed JSON`); }
     if (m?.version !== 1 || typeof m.source !== 'string' || typeof m.chapterSourceId !== 'string' ||
         !Number.isInteger(m.expected) || m.expected < 1 || !Array.isArray(m.missing) ||
@@ -152,7 +153,8 @@ export async function restampBook(bookId: string, abs: string, missing0: number[
   const params: any[] = [bookId, missing0.length ? missing0.map((i) => i + 1) : null, pages, size];
   if (via) {
     params.push(via.source, via.scanlator ?? null);
-    set.push(`source_id = $${params.length - 1}`, `scanlator = $${params.length}`);
+    // In its source's language, as any file that lands (lib/library.ts setBookMeta): the row's kept language goes.
+    set.push(`source_id = $${params.length - 1}`, `scanlator = $${params.length}`, 'lang = NULL');
     // The post the new file was written from (#116): a group upgrade or a completion from another copy is a
     // landing too, and left alone the stamp named the REPLACED copy -- which the versions view trusts first
     // (routes/catalog.ts onDisk) and every later remap takes as proof of which post the file is. Reintroduce by
@@ -313,7 +315,7 @@ export async function completePartial(
           const entries = await old.entries();
           for (const name of Object.keys(entries)) {
             if (entries[name].isDirectory || name === PARTIAL_MANIFEST || replaced.has(name)) continue;
-            keep.push([name, await old.entryData(name)]);
+            keep.push([name, await zipEntryCapped(old, name)]);
           }
         } finally {
           await old.close();

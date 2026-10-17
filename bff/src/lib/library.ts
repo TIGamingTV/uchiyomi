@@ -16,6 +16,7 @@ import { typeFromGenres, SERIES_TYPE_FROM } from './seriesTypeSignals';
 import { reconcileListingProgress } from './listingProgress';
 import { holdsRaw, isRange } from './chapterRanges';
 import { cleanGenres } from './genres';
+import { setAsideByRoot, stillSetAside, type SetAsideFile } from './setAside';
 
 // node-stream-zip reads the central directory only (cheap) and can stream a single entry.
 // eslint-disable-next-line @typescript-eslint/no-var-requires
@@ -23,6 +24,7 @@ const StreamZip = require('node-stream-zip');
 // node-unrar-js: pure-wasm RAR reader (no native build) for .cbr comic archives.
 // eslint-disable-next-line @typescript-eslint/no-var-requires
 const { createExtractorFromData } = require('node-unrar-js');
+import { MAX_META_BYTES, EntryTooLarge, zipEntryCapped, regularFiles, readRegularFile, rarEntryAllowed } from './archiveCaps';
 // PDF and image-EPUB chapters. Both live in their own modules: EPUB is a zip and reuses this file's zip
 // reader, needing only its own page ORDER, while PDF is genuinely different and reads nothing from here.
 import { pdfPages, pdfPageBytes, pdfPageCount, pdfPageDims, pdfPageIndex, pdfPageName } from './readers/pdf';
@@ -230,7 +232,10 @@ async function rarExtractor(path: string): Promise<any> {
 async function rarHeaders(ex: any): Promise<any[]> {
   return [...ex.getFileList().fileHeaders].filter((h: any) => !h.flags?.directory);
 }
-async function rarExtract(ex: any, name: string): Promise<Buffer> {
+async function rarExtract(ex: any, name: string, cap?: number): Promise<Buffer> {
+  // Judged on the header before anything is extracted: node-unrar-js has no streaming read, it hands back the whole
+  // entry, so the declared unpacked size is the only place a bomb can be refused (lib/archiveCaps.ts).
+  if (!rarEntryAllowed((await rarHeaders(ex)).find((h: any) => h.name === name), cap)) throw new EntryTooLarge(name);
   const files = [...ex.extract({ files: [name] }).files];
   const f = files.find((x: any) => x.fileHeader?.name === name) || files[0];
   if (!f?.extraction) throw new Error('rar entry not found');
@@ -265,9 +270,9 @@ async function readArchive(path: string): Promise<{ xml: string; pages: number }
   if (k === 'pdf') return { xml: '', pages: await pdfPageCount(path) };
   if (k === 'epub') return { xml: '', pages: (await epubPages(path)).length };
   if (k === 'dir') {
-    const names = await readdir(path).catch(() => []);
+    const names = await regularFiles(path, () => true);
     const xmlName = names.find((n) => /comicinfo\.xml$/i.test(n));
-    const xml = xmlName ? await readFile(join(path, xmlName), 'utf8').catch(() => '') : '';
+    const xml = xmlName ? await readRegularFile(path, xmlName, MAX_META_BYTES).then((b) => b.toString('utf8')).catch(() => '') : '';
     return { xml, pages: names.filter((n) => IMG.test(n)).length };
   }
   if (k === 'rar') {
@@ -275,7 +280,7 @@ async function readArchive(path: string): Promise<{ xml: string; pages: number }
     const headers = await rarHeaders(ex);
     const xmlH = headers.find((h) => /comicinfo\.xml$/i.test(h.name));
     let xml = '';
-    if (xmlH) { try { xml = (await rarExtract(ex, xmlH.name)).toString('utf8'); } catch {} }
+    if (xmlH) { try { xml = (await rarExtract(ex, xmlH.name, MAX_META_BYTES)).toString('utf8'); } catch {} }
     return { xml, pages: headers.filter((h) => IMG.test(h.name)).length };
   }
   const zip = new StreamZip.async({ file: path });
@@ -285,7 +290,8 @@ async function readArchive(path: string): Promise<{ xml: string; pages: number }
     for (const name of Object.keys(entries)) {
       if (entries[name].isDirectory) continue;
       if (IMG.test(name)) pages++;
-      else if (/comicinfo\.xml$/i.test(name)) xml = (await zip.entryData(name)).toString('utf8');
+      // Capped, and a refused one reads as no ComicInfo: the scan goes on with the folder's other facts.
+      else if (/comicinfo\.xml$/i.test(name)) xml = await zipEntryCapped(zip, name, MAX_META_BYTES).then((b) => b.toString('utf8')).catch(() => '');
     }
     return { xml, pages };
   } finally {
@@ -298,7 +304,7 @@ export async function cbzPages(path: string): Promise<string[]> {
   const k = chapterKind(path);
   if (k === 'pdf') return pdfPages(path);
   if (k === 'epub') return epubPages(path);   // already in spine order; do NOT re-sort
-  if (k === 'dir') return (await readdir(path).catch(() => [])).filter((n) => IMG.test(n)).sort(naturalCmp);
+  if (k === 'dir') return regularFiles(path, (n) => IMG.test(n), naturalCmp);
   if (k === 'rar') return (await rarHeaders(await rarExtractor(path))).map((h) => h.name).filter((n) => IMG.test(n)).sort(naturalCmp);
   const zip = new StreamZip.async({ file: path });
   try {
@@ -313,11 +319,11 @@ export async function cbzPages(path: string): Promise<string[]> {
 export async function cbzEntry(path: string, name: string): Promise<Buffer> {
   const k = chapterKind(path);
   if (k === 'pdf') return pdfPageBytes(path, pdfPageIndex(name));
-  if (k === 'dir') return readFile(join(path, name));
+  if (k === 'dir') return readRegularFile(path, name);
   if (k === 'rar') return rarExtract(await rarExtractor(path), name);
   const zip = new StreamZip.async({ file: path });
   try {
-    return await zip.entryData(name);
+    return await zipEntryCapped(zip, name);
   } finally {
     await zip.close();
   }
@@ -348,13 +354,13 @@ export async function cbzPageAt(
     const name = names[index];
     if (!name) return null;
     const zip = new StreamZip.async({ file: path });
-    try { return { name, bytes: await zip.entryData(name), total: names.length }; }
+    try { return { name, bytes: await zipEntryCapped(zip, name), total: names.length }; }
     finally { await zip.close(); }
   }
   if (k === 'dir') {
-    const names = (await readdir(path).catch(() => [])).filter((n) => IMG.test(n)).sort(naturalCmp);
+    const names = await regularFiles(path, (n) => IMG.test(n), naturalCmp);
     const name = names[index];
-    return name ? { name, bytes: await readFile(join(path, name)), total: names.length } : null;
+    return name ? { name, bytes: await readRegularFile(path, name), total: names.length } : null;
   }
   if (k === 'rar') {
     const ex = await rarExtractor(path); // one extractor for both the listing and the read
@@ -367,7 +373,7 @@ export async function cbzPageAt(
     const entries = await zip.entries();
     const names = Object.keys(entries).filter((n) => !entries[n].isDirectory && IMG.test(n)).sort(naturalCmp);
     const name = names[index];
-    return name ? { name, bytes: await zip.entryData(name), total: names.length } : null;
+    return name ? { name, bytes: await zipEntryCapped(zip, name), total: names.length } : null;
   } finally {
     await zip.close();
   }
@@ -390,12 +396,43 @@ export async function cbzPageDims(path: string): Promise<Array<{ name: string; w
     const zip = new StreamZip.async({ file: path });
     try {
       const entries = await zip.entries();
-      for (const name of Object.keys(entries).filter((n) => !entries[n].isDirectory && IMG.test(n)).sort(naturalCmp)) await dim(name, await zip.entryData(name));
+      for (const name of Object.keys(entries).filter((n) => !entries[n].isDirectory && IMG.test(n)).sort(naturalCmp)) {
+        // A page over the cap is measured as unknown rather than failing the whole chapter's dimensions.
+        const bytes = await zipEntryCapped(zip, name).catch(() => null);
+        if (bytes) await dim(name, bytes); else out.push({ name, width: null, height: null });
+      }
     } finally { await zip.close(); }
     return out;
   }
-  for (const name of await cbzPages(path)) await dim(name, await cbzEntry(path, name));
+  for (const name of await cbzPages(path)) {
+    const bytes = await cbzEntry(path, name).catch(() => null);
+    if (bytes) await dim(name, bytes); else out.push({ name, width: null, height: null });
+  }
   return out;
+}
+
+/**
+ * Every page's bytes in the reader's order, the archive opened once for a CBZ (#229: spread joining's background measure,
+ * lib/spreadMeasure.ts). `fn` gets each page in turn, null for one that cannot be read (over the cap, a broken entry), so
+ * the rest keep their numbers. Answers how many pages there were; an archive that cannot be opened throws. A PDF hands
+ * over nothing and answers 0: its pages are drawn, not stored, and the measure has nothing to read.
+ */
+export async function eachPageBytes(path: string, fn: (bytes: Buffer | null) => Promise<void>): Promise<number> {
+  const kind = chapterKind(path);
+  if (kind === 'pdf') return 0;
+  if (kind === 'zip') {
+    const zip = new StreamZip.async({ file: path });
+    try {
+      const entries = await zip.entries();
+      const names = Object.keys(entries).filter((n) => !entries[n].isDirectory && IMG.test(n)).sort(naturalCmp);
+      for (const name of names) await fn(await zipEntryCapped(zip, name).catch(() => null));
+      return names.length;
+    } finally { await zip.close(); }
+  }
+  // A folder, a CBR or an EPUB (spine order), page by page as cbzPageDims reads them.
+  const names = await cbzPages(path);
+  for (const name of names) await fn(await cbzEntry(path, name).catch(() => null));
+  return names.length;
 }
 
 // Owned download dir (writable; separate from Suwayomi's read library so permissions stay clean).
@@ -798,6 +835,23 @@ const tracked = (run: Promise<ScanResult>): Promise<ScanResult> => run
     throw e;
   })
   .finally(() => { progress = null; });
+
+/**
+ * A folder's chapter files without those set aside (lib/setAside.ts): a file that is still the one set aside is passed
+ * over; a different file at its path -- a chapter downloaded there since, a file copied over it -- is indexed, and its
+ * set-aside row goes.
+ */
+async function notSetAside(root: string, folderRel: string, folderAbs: string, files: readonly string[], aside: Map<string, SetAsideFile>): Promise<string[]> {
+  const out: string[] = [];
+  for (const f of files) {
+    const rel = `${folderRel}/${f}`;
+    const was = aside.get(rel);
+    if (was && await stillSetAside(root, rel, was, await stat(join(folderAbs, f)).catch(() => null))) continue;
+    out.push(f);
+  }
+  return out;
+}
+
 /**
  * Scan every root into lib_series/lib_books. One scan at a time.
  *
@@ -910,10 +964,18 @@ async function scanOnce(): Promise<ScanResult> {
   // Loaded once per scan. Longest prefix wins, so a declared subdirectory beats library zero.
   const libs = await libraryRows();
   progress = { ...progress!, phase: 'indexing', total: walks.reduce((n, w) => n + w.found.length, 0) };
+  // v0.57.0: the files a merge took off the list and left on disk, because the server may not delete them there
+  // (lib/setAside.ts, lib/extraCopies.ts). Indexed, each would be its chapter's second copy again, so they are passed
+  // over -- each only while it is the file that was set aside. Reintroduce by indexing every file: "a set-aside copy
+  // stays off the list through a scan" in extraCopies.int.test.ts finds it listed again.
+  const setAside = await setAsideByRoot();
   for (const { root, found: foundInRoot } of walks) {
+    const aside = setAside.get(root);
     for (const found of foundInRoot) {
-      const { folderRel, folderAbs, source: srcName, chapters: files } = found;
+      const { folderRel, folderAbs, source: srcName } = found;
       progress!.done++;
+      const files = aside?.size ? await notSetAside(root, folderRel, folderAbs, found.chapters, aside) : found.chapters;
+      if (!files.length) continue;
       // ⚠️ ONE FOLDER, NOT THE SCAN (#109). A folder the scanner cannot index -- a ComicInfo field Postgres
       // refuses, a constraint, anything -- used to throw out of the whole pass, and every caller swallowed it
       // (`persistScan().catch(() => {})`). The scan simply stopped there, on every run, and everything after
@@ -1098,6 +1160,12 @@ async function scanOnce(): Promise<ScanResult> {
           // (fp_at is never retried) or as half a chapter. Kept, Rescan everything could never pair the file once it
           // moved. Cleared, the next pass reads it again; the count below arms that pass. Reintroduce by dropping the
           // four CASEs: "a file whose mtime moved is fingerprinted again" in scan.int.test.ts reads the old fingerprint.
+          //
+          // So does the page count's stamp (v0.72.0): `pages_checked_at` says the nightly count opened THIS file, and with
+          // `pages = 0` it is what Health's Chapter files card lists (lib/healthFiles.ts). A file whose mtime moved -- a
+          // Fetch again that landed, a copy replaced by hand -- is counted again the next night, and leaves the card now.
+          // Only rows still at 0 pages are ever counted (lib/repair.ts stepCount), so clearing it on any other row changes
+          // nothing. Reintroduce by dropping the CASE: "a file whose mtime moved is counted again" in scan.int.test.ts.
           const [up] = await qq<{ unprinted: number }>(
             `WITH up AS (
                INSERT INTO lib_books (id, series_id, source, file, number, title, mtime, root, name_rule, number_end, created_at) VALUES ${tuples.join(',')}
@@ -1107,7 +1175,8 @@ async function scanOnce(): Promise<ScanResult> {
                  fingerprint = CASE WHEN lib_books.mtime <> EXCLUDED.mtime THEN NULL ELSE lib_books.fingerprint END,
                  fp_kind = CASE WHEN lib_books.mtime <> EXCLUDED.mtime THEN NULL ELSE lib_books.fp_kind END,
                  fp_at = CASE WHEN lib_books.mtime <> EXCLUDED.mtime THEN NULL ELSE lib_books.fp_at END,
-                 size = CASE WHEN lib_books.mtime <> EXCLUDED.mtime THEN NULL ELSE lib_books.size END
+                 size = CASE WHEN lib_books.mtime <> EXCLUDED.mtime THEN NULL ELSE lib_books.size END,
+                 pages_checked_at = CASE WHEN lib_books.mtime <> EXCLUDED.mtime THEN NULL ELSE lib_books.pages_checked_at END
                RETURNING fp_at)
              SELECT count(*) FILTER (WHERE fp_at IS NULL)::int AS unprinted FROM up`,
             params,
@@ -1254,17 +1323,21 @@ export async function setBookMeta(folder: string, landed: Array<{ number: number
     values.push(`($${params.length - 5}::real, $${params.length - 4}::text, $${params.length - 3}::text, $${params.length - 2}::int[], $${params.length - 1}::text, $${params.length}::text)`);
   }
   await q(
-    // An own name replaces a borrowed one (lib/borrowNames.ts), and takes its donor mark with it.
+    // An own name replaces a borrowed one (lib/borrowNames.ts), and takes its donor mark with it. A file that landed
+    // is in its source's language (v0.62.0: every MangaDex adapter lists its own alone), so a language the row kept
+    // for the file it replaces goes (migrate.ts, lib_books.lang).
     `UPDATE lib_books b SET scanlator = v.grp, source_id = v.src, missing_pages = v.miss,
             chapter_name = COALESCE(v.name, b.chapter_name),
             chapter_name_source = CASE WHEN v.name IS NOT NULL THEN NULL ELSE b.chapter_name_source END,
-            source_chapter_id = COALESCE(v.cid, b.source_chapter_id)
+            source_chapter_id = COALESCE(v.cid, b.source_chapter_id),
+            lang = NULL
      FROM (VALUES ${values.join(',')}) AS v(n, grp, src, miss, name, cid), lib_series s
      WHERE s.folder = $1 AND b.series_id = s.id AND ${BOOK_NUMBER} = v.n AND NOT ${isRange('b')}
        AND (b.scanlator IS DISTINCT FROM v.grp OR b.source_id IS DISTINCT FROM v.src
             OR b.missing_pages IS DISTINCT FROM v.miss
             OR (v.name IS NOT NULL AND b.chapter_name IS DISTINCT FROM v.name)
-            OR (v.cid IS NOT NULL AND b.source_chapter_id IS DISTINCT FROM v.cid))`,
+            OR (v.cid IS NOT NULL AND b.source_chapter_id IS DISTINCT FROM v.cid)
+            OR b.lang IS NOT NULL)`,
     params,
   );
 }

@@ -137,6 +137,11 @@
 //   the series page, the reader and every count while its twenty-page 3.5 stays; switched off, all of it is back; and
 //   the Library grid's request takes as long off as it did before the switch was ever on.
 //
+//   hiddenchapters -- #240 by @Squeaks72, rebuilt to hide only, on a plain up.sh stack with LIB (hiddenChaptersWalk.mjs):
+//   at 1280, 390 and 390 in Arabic, a row's ⋯ hides chapter 3 and Select hides 1 and 5, each asked first in a dialog
+//   that is not the red one, and they leave the series page and its count while the files stay; More -> Show hidden
+//   chapters lists them with Restore, and Restore all brings every one back.
+//
 //   solver -- v0.55.3, the backup Cloudflare solver (FLARESOLVERR_FALLBACK_URL), on up.sh's E2E_SOLVERS=1 stack
 //   (solverWalk.mjs): at 1280, 390 and 390 in Arabic, the main solver (greeting as trawl) and the backup (FlareSolverr)
 //   both on Health's card, trawl never held against FlareSolverr's releases; the main stopped -- the card amber, "the
@@ -180,7 +185,7 @@
 //   links under reduced motion, not page.goto reloads.
 //
 //   Run order, whatever PHASES lists, is the release plan's (design critic): notices, archive, numbering, sources,
-//   libraries, nosource, filenames, noticechapters, replace, autofix, solver, find, rescan, multisource, adultsearch,
+//   libraries, nosource, filenames, noticechapters, hiddenchapters, replace, autofix, solver, find, rescan, multisource, adultsearch,
 //   matches, rescanmerge, readeredges, lists, librarysort, homelists, anilistprivacy, bulkdelete, engine. The engine phase resets the fake engine
 //   and takes it down, so nothing that needs it can follow; a sources run that stops half-way leaves fake-a's search
 //   failing, which only the engine phase then meets, and it never searches.
@@ -192,6 +197,8 @@ import { mkdirSync, readFileSync } from 'node:fs';
 // The fake extension engine's own seed, so the numbering phase expects what the engine serves rather than a copy
 // of it (the same file up.sh starts the engine from).
 import { SOURCE_IDS, SEQUENTIAL_KEY, defaultSeed, istreveliaPosts, webtoonsNumbers } from '../../../bff/test/fixtures/fakeSuwayomiEngine.mjs';
+// The series page's More (v0.60.0): Edit details and Archive slowly are its items now.
+import { openSeriesMore, pressSeriesMoreItem, seriesMoreOffers } from './seriesMore.mjs';
 
 const BASE = process.env.BASE || 'http://127.0.0.1:18149';
 const USER = process.env.E2E_USER || 'e2e';
@@ -227,7 +234,7 @@ const waitFor = async (fn, ms = 10_000, step = 150) => {
 
 // Only the phases this walk has. Anything else in PHASES -- a typo, or the release plan's name for a phase that
 // lives in another walk -- used to be ignored without a word, and a run of nothing but that read green.
-const KNOWN_PHASES = ['notices', 'archive', 'numbering', 'sources', 'libraries', 'nosource', 'filenames', 'noticechapters', 'replace', 'autofix', 'solver',
+const KNOWN_PHASES = ['notices', 'archive', 'numbering', 'sources', 'libraries', 'nosource', 'filenames', 'noticechapters', 'hiddenchapters', 'replace', 'autofix', 'solver',
   'find', 'rescan', 'multisource', 'adultsearch', 'matches', 'rescanmerge', 'readeredges', 'lists',
   'librarysort', 'homelists', 'anilistprivacy', 'bulkdelete', 'engine'];
 const unknownPhases = PHASES.filter((p) => !KNOWN_PHASES.includes(p));
@@ -518,6 +525,8 @@ async function notices(width) {
   // 4. Edit details (a dialog of its own; Check now is on its New chapters tab) and Sources & translations (a Sheet), each
   // with Check now
   await go(`/series/?id=${tale.id}`);
+  // Edit details is an item of More since v0.60.0 (a menu from lg up, a sheet on a phone).
+  await openSeriesMore(page);
   await press('Edit details');
   await sleep(700);
   await press('New chapters', '[role="dialog"]');
@@ -599,6 +608,7 @@ async function notices(width) {
   if (wide) return;
   // 6. motion: a busy notice turns and drains; under reduced motion it does neither
   await go(`/series/?id=${tale.id}`);
+  await openSeriesMore(page);
   await press('Edit details');
   await sleep(700);
   await press('New chapters', '[role="dialog"]');
@@ -611,6 +621,7 @@ async function notices(width) {
   await sleep(6000);
   await page.emulateMediaFeatures([{ name: 'prefers-reduced-motion', value: 'reduce' }]);
   await go(`/series/?id=${tale.id}`);
+  await openSeriesMore(page);
   await press('Edit details');
   await sleep(700);
   await press('New chapters', '[role="dialog"]');
@@ -786,12 +797,13 @@ async function archive(width) {
   if (wide) {
     // 1'. The series page's "Archive slowly", then its band -- the one place on the page to watch it.
     await go(`/series/?id=${gap.id}`, 3000);
-    const key = await page.$('button[data-archive-slowly]');
-    check(`${tag}: the series page offers Archive slowly`, !!key);
-    await key?.click();
+    // An item of More since v0.60.0 -- a menu at this width -- found by its hook (lib/seriesActions.ts).
+    check(`${tag}: the series page offers Archive slowly, in More`, await pressSeriesMoreItem(page, 'archive-slowly'));
     const band = await waitFor(() => page.$('[data-band-state="archive"]'), 15_000);
     check(`${tag}: the band above the chapters shows the archive`, !!band);
-    check(`${tag}: once queued, the page no longer offers to start it`, !(await page.$('[data-archive-slowly]')));
+    // Neither More nor the older-chapters row offers it again.
+    check(`${tag}: once queued, the page no longer offers to start it`,
+      !(await page.$('[data-archive-slowly]')) && !(await seriesMoreOffers(page, 'archive-slowly')));
     const run = await page.$('[data-run="archive"]');
     check(`${tag}: the older chapters read as a run the archive is fetching, with no Fetch all`, !!run
       && !/Fetch all/.test(await run.evaluate((el) => el.textContent ?? '')));
@@ -968,7 +980,7 @@ async function memberSeesNoKeys(tag, gap) {
     const inBand = band ? await keysIn('[data-band-state="archive"]') : ['(no band)'];
     check(`${tag}: the member's series band shows the archive with no key to press`, inBand.length === 0, JSON.stringify(inBand));
     check(`${tag}: ...its Details still there`, !!band && (await band.evaluate((el) => [...el.querySelectorAll('button')].some((b) => b.textContent?.trim() === 'Details'))));
-    check(`${tag}: ...and no Archive slowly while it runs`, !(await m.$('[data-archive-slowly]')));
+    check(`${tag}: ...and no Archive slowly while it runs`, !(await m.$('[data-archive-slowly]')) && !(await seriesMoreOffers(m, 'archive-slowly')));
     await band?.evaluate((el) => el.scrollIntoView({ block: 'center' }));
     await sleep(300);
     await shot(`${tag}-12-member-band`, m);
@@ -1483,6 +1495,10 @@ try {
   if (PHASES.includes('noticechapters')) {
     const { noticeChaptersWalk } = await import('./noticeChaptersWalk.mjs');
     await noticeChaptersWalk({ page, go, shot, check, waitFor, sleep, base: BASE, token: TOKEN, lib: process.env.LIB });
+  }
+  if (PHASES.includes('hiddenchapters')) {
+    const { hiddenChaptersWalk } = await import('./hiddenChaptersWalk.mjs');
+    await hiddenChaptersWalk({ page, go, shot, check, waitFor, sleep, base: BASE, token: TOKEN, lib: process.env.LIB });
   }
   // v0.54.0: Replace a source, Make main, Turn off all and the old tabs' addresses (replaceWalk.mjs; up.sh with
   // E2E_ENGINE=fake E2E_FAKE_EXTRA=v54, and E2E_NET on this command). Before engine, which takes the engine down.

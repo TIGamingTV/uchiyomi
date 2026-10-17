@@ -1,23 +1,26 @@
 'use client';
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import Link from 'next/link';
-import { useQuery, useQueryClient } from '@tanstack/react-query';
+import { useSearchParams } from 'next/navigation';
+import { useQueries, useQuery, useQueryClient } from '@tanstack/react-query';
 import { api } from '@/lib/api';
 import { ART } from '@/lib/art';
 import { relativeTime } from '@/lib/format';
 import { useAuth, canDownload } from '@/lib/auth';
-import { t as tr } from '@/lib/i18n';
+import { keys, t as tr } from '@/lib/i18n';
 import { reasonText } from '@/lib/said';
 import { isDesktop } from '@/lib/desktop';
 import { EmptyState } from '@/components/EmptyState';
 import { ProgressBar, Reveal } from '@/components/ui';
-import { SourceCard, SourceItem } from '@/components/cards';
+import { SourceCard, SourceItem, StillLoadingCard } from '@/components/cards';
 import { ScrollRail } from '@/components/ScrollRail';
 import { DiscoverHero, TrendingCard, Trending } from '@/components/DiscoverHero';
+import { RecommendationRail } from '@/components/RecommendationRail';
 import { SourcePicker, SourceLatest, Src, SrcState } from '@/components/SourcePicker';
-import { aloneEmpty, budgetForMode, type ListMode } from '@/lib/sourceGroups';
+import { aloneEmpty, answeredPage, budgetForMode, WALL_IN_FLIGHT, type ListMode, type SrcExtension, type StackSource } from '@/lib/sourceGroups';
 import { normTitle } from '@/lib/normTitle';
-import { foldByTitle, type WallProvider } from '@/lib/wall';
+import { applyWorks, foldByWork, followWorks, mergeGroups, unknownWorks, workKey, type WallProvider } from '@/lib/wall';
+import { useLiveWorks } from '@/lib/useLiveWorks';
 import { AddSeriesDialog, AddSeed } from '@/components/AddSeriesDialog';
 import { AdultToggle, useAdultShown } from '@/components/AdultToggle';
 import { IcChevronLeft, IcSearch, IcSparkle, IcX } from '@/components/icons';
@@ -28,11 +31,14 @@ import { useServerDownloads } from '@/lib/useServerDownloads';
  * One search card. Since v0.52.0 (#72) `inLibrary` means held in every provider's language, `libraryLangs` the
  * languages the library holds the title in, and each provider carries its own `lang` and `inLibrary`. Since v0.55.4
  * (#158) `rating` says what the card is known to be -- 18+ when any provider's result is -- and is absent when nothing
- * says (most extensions name no genres in a search).
+ * says (most extensions name no genres in a search). Since v0.56.0 `work` is which work the group is -- the server
+ * merges its groups by it, so their providers' titles may differ -- and `owned` whether the library holds it in any
+ * language; both absent from an older server.
  */
 interface SearchGroup {
   title: string; coverUrl?: string; inLibrary?: boolean; librarySeriesId?: string; libraryLangs?: string[]; updatedAt?: string;
   rating?: 'adult' | 'safe';
+  work?: string; owned?: boolean;
   providers: { source: string; name: string; sourceId: string; title: string; coverUrl?: string; lang?: string | null; inLibrary?: boolean; rating?: 'adult' | 'safe' }[];
 }
 /** What a search shows (v0.55.4): everything, everything not known to be 18+, or only what is. */
@@ -56,8 +62,14 @@ const SEARCH_FIRST_WAIT_MS = 6000;
 const SEARCH_POLL_WAIT_MS = 1500;
 /** How often to poll while the answer says some sources are still pending. */
 const SEARCH_POLL_MS = 1500;
-/** How many pending sources the progress line names before "and N more". */
+/** How many pending sources the progress line names before "and N more", and the wall's last card before "+N". */
 const SEARCH_NAMES_SHOWN = 3;
+/**
+ * How many sources the hero's add looks a title up on, best-ranked first. GET /api/sources/find asks every source it is
+ * given at once -- it has no gate like the wall's four-at-a-time -- so when the wall began asking every source
+ * (v0.58.0) this stayed the most the wall had asked before: ten.
+ */
+const HERO_FIND_SOURCES = 10;
 
 /**
  * How many titles the hero rotates through.
@@ -68,6 +80,41 @@ const SEARCH_NAMES_SHOWN = 3;
 const HERO_SLIDES = 10;
 
 /**
+ * The trending rails under the wall (v0.61.0), by AniList's country of origin: Korea's (manhwa -- the hero shows its
+ * first ten, as it always has, and the rail the rest), then Japan's (manga) and China's (manhua). What each is called,
+ * in the same order, declared for the translators: the rails render it through a variable.
+ */
+const TREND_RAILS = ['KR', 'JP', 'CN'] as const;
+const TREND_LABELS = keys('Trending manhwa', 'Trending manga', 'Trending manhua');
+/** An AniList rail's card, as the page remembers what this visit added from it: by its entry, else its title. */
+const railKey = (t: Trending): string => (t.id != null ? `al:${t.id}` : `t:${normTitle(t.title)}`);
+
+/**
+ * One of Discover's AniList rails (v0.61.0): Because you read above the wall, and the trending rails under it. Every
+ * one goes through this one ScrollRail -- a strip a mouse can move (rails.test.ts) -- and a card opens the add dialog,
+ * which looks the title up on the best-ranked sources.
+ */
+function AniListRail({ kind, title, items, onPick, className = 'pb-6' }: {
+  kind: string; title: string; items: Trending[]; onPick: (t: Trending) => void; className?: string;
+}) {
+  return (
+    <section className={className} data-anilist-rail={kind}>
+      <h2 className="mb-3 font-display text-lg font-semibold tracking-tight text-fog-50 lg:text-xl">{title}</h2>
+      {/* pb-3 rather than pb-1: the global scrollbar is 8px and used to be hidden, so the rail had no
+          room for it and it would have sat on the card captions. */}
+      <ScrollRail label={title}
+        className="bleed bleed-pad flex gap-3 pb-3 [scroll-snap-type:x_mandatory]">
+        {items.map((t, i) => (
+          <Reveal key={railKey(t)} delay={Math.min(i, 12) * 28}>
+            <TrendingCard t={t} onPick={onPick} />
+          </Reveal>
+        ))}
+      </ScrollRail>
+    </section>
+  );
+}
+
+/**
  * Discover, rebuilt around what people actually do here.
  *
  * This is the only page that adds new series from the internet, and it was a bare search box on black with a
@@ -76,22 +123,29 @@ const HERO_SLIDES = 10;
  * separate button was the entire point of the page, and the search box that dominated it was unused.
  *
  * So: a wall of what your sources published, led by a full-bleed hero built from AniList key art that
- * `/api/discover/trending` has been returning all along and this page rendered as a 144px thumbnail. The 45
- * sources are ranked and the best few are fetched at once. Search survives as a field, with a
+ * `/api/discover/trending` has been returning all along and this page rendered as a 144px thumbnail. The
+ * sources are ranked and every one of them is asked, the best first, four at a time (v0.58.0: it was the best
+ * six to ten, and the owner's 29 sources were mostly never on the wall). Search survives as a field, with a
  * way back out that it never had.
  *
- * `/api/sources/latest` takes up to fifteen seconds, so the six sources are fetched independently and the
- * wall fills in as each lands, in arrival order. Nothing already on screen ever moves: only mangadex
- * populates `updatedAt`, so "newest across six sources" is not a sortable quantity and pretending otherwise
- * would reflow tiles under a reading thumb.
+ * `/api/sources/latest` takes up to fifteen seconds, so the sources are fetched independently and the
+ * wall fills in as each lands, in arrival order, with a card at its end naming who is still loading. Nothing
+ * already on screen ever moves: only mangadex populates `updatedAt`, so "newest across every source" is not a
+ * sortable quantity and pretending otherwise would reflow tiles under a reading thumb.
  */
-export default function DiscoverPage() {
+function DiscoverInner() {
   const qc = useQueryClient();
   const { user, isAdmin } = useAuth();
 
   // Not fired at all for an account that may not add series: every route behind this page answers 403 for
   // them, and a query whose only possible outcome is a refusal is noise in the console and in the log.
   const mayAdd = canDownload(user);
+
+  // v0.61.0: `/discover/?q=<title>` -- where the series page's Related and the reader's Next in the story send a work the
+  // library does not hold -- opens on a search for it. Read once, here, as Library and Admin → Sources read their
+  // `?view=`; afterwards the page writes the address itself (writeQ below), so a reload stays on what is on screen.
+  const params = useSearchParams();
+  const [arrivedQ] = useState(() => (params.get('q') ?? '').trim().slice(0, 200));
 
   const { data: sourcesData } = useQuery({
     queryKey: ['sources'],
@@ -119,15 +173,34 @@ export default function DiscoverPage() {
     // Series[]. This is /api/discover/trending, which is AniList and carries genres, banner and score. They
     // shared a key, so arriving here from the home page handed this the wrong shape out of the cache and the
     // hero threw on `genres.slice`. A direct page load was fine, which is why it looked intermittent.
-    queryKey: ['discover-trending'],
-    queryFn: () => api<{ content: Trending[] }>('/api/discover/trending'),
+    // v0.61.0: one key per country of origin; this one is Korea's, the hero's and the first rail's.
+    queryKey: ['discover-trending', 'KR'],
+    queryFn: () => api<{ content: Trending[] }>('/api/discover/trending?country=KR'),
     enabled: mayAdd,
     staleTime: 0,
     refetchOnMount: 'always',
   });
 
   // ---------------------------------------------------------------- the wall
-  const [mode, setMode] = useState<'newest' | 'search'>('newest');
+  const [mode, setMode] = useState<'newest' | 'search'>(arrivedQ ? 'search' : 'newest');
+  // v0.61.0: the manga and manhua rails under the wall -- while browsing, each country its own answer and its own key.
+  const moreTrending = useQueries({
+    queries: TREND_RAILS.slice(1).map((country) => ({
+      queryKey: ['discover-trending', country],
+      queryFn: () => api<{ content: Trending[] }>(`/api/discover/trending?country=${country}`),
+      enabled: mayAdd && mode === 'newest',
+      staleTime: 0,
+      refetchOnMount: 'always' as const,
+    })),
+  });
+  // v0.61.0: "Because you read {title}" above the wall -- what AniList's readers recommend after something this account
+  // read lately, less what the server holds. The server answers from its stored copy; nothing asks AniList here.
+  const { data: because } = useQuery({
+    queryKey: ['discover-because'],
+    queryFn: () => api<{ seed: { id: string; title: string } | null; content: Trending[] }>('/api/discover/because'),
+    enabled: mayAdd && mode === 'newest',
+    staleTime: 5 * 60_000,
+  });
   /**
    * Which listing the wall shows, and which single source (if any) is shown alone.
    *
@@ -136,43 +209,48 @@ export default function DiscoverPage() {
    */
   const [listMode, setListMode] = useState<ListMode>('newest');
   const [selected, setSelected] = useState<string | null>(null);
-  const [q, setQ] = useState('');
+  const [q, setQ] = useState(arrivedQ);
   // What was SUBMITTED, as opposed to `q`, which is whatever is in the field. The search is keyed on this, so
   // typing never fires a request and a term is searched exactly once per five minutes however it is reached.
-  const [term, setTerm] = useState('');
+  // An arrival's `?q=` is submitted as it lands (v0.61.0).
+  const [term, setTerm] = useState(arrivedQ);
   const [page, setPage] = useState(1);
   const [byId, setById] = useState<Record<string, SourceItem[]>>({});
   const [order, setOrder] = useState<string[]>([]);
   const [states, setStates] = useState<Record<string, SrcState>>({});
+  // The furthest page each source has answered, by the same `${listMode}:${id}` keys (v0.58.0): the gate and the paging
+  // go by the page being fetched, so page 2 asks four at a time as page 1 does.
+  const [upTo, setUpTo] = useState<Record<string, number>>({});
   const [seed, setSeed] = useState<AddSeed | null>(null);
+  /**
+   * What this visit added, by work (v0.56.0; by title before): off the wall at once, and "In library" in a search, with
+   * no refetch. `fromKey` is the work of the card the open dialog came from -- null from the hero, which has none.
+   */
   const [added, setAdded] = useState<Set<string>>(new Set());
+  const fromKey = useRef<string | null>(null);
+  /**
+   * The AniList rails' cards this visit added (v0.61.0): off their rail at once, as an added card leaves the wall.
+   * `fromRail` is the rail card the open dialog came from -- null from the wall or the hero -- and forgotten when the
+   * dialog closes, so a later add from the hero never takes a rail card with it.
+   */
+  const [railAdded, setRailAdded] = useState<Set<string>>(new Set());
+  const fromRail = useRef<string | null>(null);
+  useEffect(() => { if (!seed) fromRail.current = null; }, [seed]);
+  const pickRail = (t: Trending) => { fromKey.current = null; fromRail.current = railKey(t); setSeed({ kind: 'trending', title: t.title }); };
 
   // Every source that can answer this listing, best first. A source that cannot answer the chosen listing is
   // not in the pool at all, the same way one without `latest` has never been. Popular is universal among
   // extensions but absent from a few site engines.
   //
-  // The pool is what the chip COUNTS. It used to count the ranked list below, and that list is capped at
-  // twelve, so a 14-source install read "All sources · 12 sources" over a sheet listing nine -- three numbers
-  // for one pool. The cap is a fetch budget, not a fact about the install.
+  // The pool is what the chip COUNTS, and since v0.58.0 it is also what the wall asks (`budget` below). The chip
+  // once counted a ranked list capped at twelve, so a 14-source install read "All sources · 12 sources" over a
+  // sheet listing nine -- three numbers for one pool.
   const pool = useMemo(() => budgetForMode(sources, listMode, Infinity), [sources, listMode]);
-  // Ranked once; how many of them are actually asked grows as answers come back.
-  const ranked = useMemo(() => pool.slice(0, 12), [pool]);
 
   // Nothing resets the wall any more. That reset -- and specifically resetting it WITHOUT remounting the
   // children, which kept their React keys and their cached queries -- is what left the page counting sources
   // it had just forgotten, with skeletons that never resolved. See the warning on SourceLatest.
 
-  /**
-   * Six sources, plus one more for every one that came back with nothing.
-   *
-   * Ranking by what the library actually came from is right, and on a real install it turned out that four
-   * of that reader's own six top sources answer "newest" with an empty page: their Cloudflare challenge
-   * fails and the adapter returns [] rather than throwing, so nothing marks them unhealthy and nothing
-   * moves them down. A fixed six then spends most of the wall on sources that cannot fill it.
-   *
-   * Each replacement is only requested after an earlier source has settled, so this widens the wall without
-   * widening the burst. Bounded twice over: by the ranked list and by the cap.
-   */
   // Everything the wall accumulates is keyed `${listMode}:${sourceId}`, never bare. That is what lets the
   // Newest/Popular toggle work WITHOUT clearing anything: switching simply reads a different set of keys,
   // and switching back shows what was already loaded, instantly. Clearing is the one thing that has ever
@@ -183,32 +261,53 @@ export default function DiscoverPage() {
     [listMode],
   );
 
-  const emptied = mine(states).filter(([, v]) => v === 'empty' || v === 'blocked').length;
-  const budget = useMemo(
-    () => ranked.slice(0, Math.min(ranked.length, 10, 6 + emptied)),
-    [ranked, emptied],
-  );
+  // What the server has placed since it answered (v0.56.0). The names it had not (`n:…`) are asked about again while
+  // the wall is on screen (lib/useLiveWorks.ts), and every source's rows are read through the answers: a card joins
+  // the one its work already has, and one the library turns out to hold leaves the wall. An add follows its work.
+  const wallKeys = useMemo(() => unknownWorks(mine(byId).flatMap(([, list]) => list)), [byId, mine]);
+  const wallWorks = useLiveWorks(wallKeys, mayAdd && mode === 'newest');
+  const rows = useMemo(() => Object.fromEntries(mine(byId).map(([k, list]) => [k, applyWorks(list, wallWorks)])), [byId, mine, wallWorks]);
+  const wallAdded = useMemo(() => followWorks(added, wallWorks), [added, wallWorks]);
 
+  /**
+   * Which sources the wall asks: every one in the pool, best-ranked first (v0.58.0).
+   *
+   * It was six, plus one more for every one that came back with nothing, ten at most: on a real install four of a
+   * reader's own top six answered "newest" with an empty page (their Cloudflare challenge failed and the adapter
+   * returned [] rather than throwing), so a fixed six spent the wall on sources that could not fill it. The owner then
+   * asked for all 29 of his on the wall. The burst is the same either way: the gate below lets four ask at a time and
+   * each answer releases the next, so more sources only means the wall keeps filling for longer -- and its last card
+   * says who it is still waiting on.
+   */
+  const budget = pool;
+
+  // Where the hero's add looks a title up: the best-ranked HERO_FIND_SOURCES (v0.58.0 kept it there when the wall
+  // began asking every source -- /api/sources/find asks all it is given at once, with no gate like the wall's).
   // AddSeriesDialog's effect depends on this list. Built inline it was a fresh array every render, so with
   // the hero's add dialog open every settling source refired /api/sources/find -- a fan-out with a
   // 25-second per-source timeout, repeatedly, while the wall filled in behind it.
-  const budgetIds = useMemo(() => budget.map((s) => s.id), [budget]);
+  const budgetIds = useMemo(() => budget.slice(0, HERO_FIND_SOURCES).map((s) => s.id), [budget]);
 
-  const onSettled = useCallback((id: string, items: SourceItem[], ok: boolean) => {
+  const onSettled = useCallback((id: string, items: SourceItem[], ok: boolean, at = 1) => {
     setById((prev) => (prev[id]?.length && !items.length ? prev : { ...prev, [id]: [...(prev[id] ?? []), ...items] }));
     setOrder((prev) => (prev.includes(id) ? prev : [...prev, id]));
     setStates((prev) => ({ ...prev, [id]: !ok ? 'blocked' : items.length ? 'ok' : 'empty' }));
+    setUpTo((prev) => ((prev[id] ?? 0) >= at ? prev : { ...prev, [id]: at }));
   }, []);
 
-  // The concurrency gate. Four at a time; each settle releases the next. Counted within the current
-  // listing only, or switching modes would look already-finished and never fetch.
+  // How many sources have answered at all: the heading's "{done} of {total} sources", the picker's hairline and the
+  // skeletons. Counted within the current listing only, or switching modes would look already-finished.
   const settled = order.filter((k) => k.startsWith(`${listMode}:`)).length;
-  const gate = 4 + settled;
+  // The concurrency gate. Four at a time; each settle releases the next -- on every page. Counted by the page being
+  // fetched (v0.58.0): `settled` counts a source once, so from page 2 on it opened the gate to every source at once,
+  // and with every source asked that would have been a burst of all of them.
+  const answered = answeredPage(budget.map((s) => kOf(s.id)), upTo, page);
+  const gate = WALL_IN_FLIGHT + answered;
 
   const nameOf = useCallback((id: string) => sources.find((s) => s.id === id)?.name, [sources]);
   // The page's own ranking, so a folded card's "preferred" provider is the one the page would have asked
   // first, not whichever answered first. Unranked sources sort last.
-  const rankOf = useCallback((id: string) => { const i = ranked.findIndex((s) => s.id === id); return i < 0 ? ranked.length : i; }, [ranked]);
+  const rankOf = useCallback((id: string) => { const i = pool.findIndex((s) => s.id === id); return i < 0 ? pool.length : i; }, [pool]);
 
   // ---------------------------------------------------------------- search
   /**
@@ -245,7 +344,8 @@ export default function DiscoverPage() {
       const rated = ratingAsked === 'all' ? '' : `&rating=${ratingAsked}`;
       return api<SearchAnswer>(`/api/sources/search-all?q=${encodeURIComponent(term)}&wait=${first ? SEARCH_FIRST_WAIT_MS : SEARCH_POLL_WAIT_MS}${only}${rated}`, { signal });
     },
-    enabled: mode === 'search' && !!term,
+    // `mayAdd` (v0.61.0): an arrival's `?q=` starts in search mode, and an account the server refuses is not asked.
+    enabled: mode === 'search' && !!term && mayAdd,
     // A failed search is shown as one; retrying it would be another fan-out to every source.
     retry: false,
     staleTime: 5 * 60_000,
@@ -257,9 +357,16 @@ export default function DiscoverPage() {
   useEffect(() => {
     if (adultOn && ratingAsked !== 'safe' && searchQ.data?.rating === 'safe') setCapped(true);
   }, [adultOn, ratingAsked, searchQ.data]);
-  // The grouped hits as wall rows, under today's mapping: the first provider's ids are the card's, the badge
-  // counts every provider. Derived, so a poll's answer replaces the rows without anything being cleared.
-  const searchHits = useMemo<SourceItem[]>(() => (searchQ.data?.content ?? []).flatMap((g) => {
+  // The search's own unplaced names, asked about while its results are on screen, as the wall's are (v0.56.0).
+  const searchKeys = useMemo(() => unknownWorks(searchQ.data?.content ?? []), [searchQ.data]);
+  const searchWorks = useLiveWorks(searchKeys, mayAdd && mode === 'search');
+  const searchAdded = useMemo(() => followWorks(added, searchWorks), [added, searchWorks]);
+  // The answer's groups read through what the server has placed since, one per work: two it could not tell apart when
+  // it answered are one card once it can (lib/wall.ts mergeGroups). Owned ones stay -- search shows what you have, with
+  // its ribbon. Derived, so a poll's answer replaces them without anything being cleared.
+  const searchGroups = useMemo(() => mergeGroups(applyWorks(searchQ.data?.content ?? [], searchWorks)), [searchQ.data, searchWorks]);
+  // The grouped hits as wall rows, under today's mapping: the first provider's ids are the card's.
+  const searchHits = useMemo<SourceItem[]>(() => searchGroups.flatMap((g) => {
     // With a source chosen the server has already asked only that one, so this is belt-and-braces: keep
     // the card only if that source is among its providers, and let that provider be the card's own, so
     // tapping it opens the source being browsed rather than whichever the fold happened to rank first.
@@ -268,21 +375,20 @@ export default function DiscoverPage() {
     return [{
       source: pick.source ?? '', sourceId: pick.sourceId ?? g.title,
       title: g.title, coverUrl: g.coverUrl, updatedAt: g.updatedAt,
-      inLibrary: g.inLibrary, librarySeriesId: g.librarySeriesId, providerCount: g.providers.length,
+      inLibrary: g.inLibrary, librarySeriesId: g.librarySeriesId,
+      ...(g.work ? { work: g.work } : {}),
       ...(g.libraryLangs ? { libraryLangs: g.libraryLangs } : {}), ...(pick.lang !== undefined ? { lang: pick.lang } : {}),
       ...(g.rating === 'adult' ? { rating: 'adult' as const } : {}),
     }];
-  }), [searchQ.data, selected]);
-  const groupsRef = useRef<Record<string, SearchGroup['providers']>>({});
-  // What each search stored, keyed the way the wall's own fold is, so open() offers the providers of a hit
-  // the same way it offers the providers of a folded card. Written from the answer, never from state.
-  useEffect(() => {
-    // Replace the submitted term's provider map rather than accumulating past searches. Two different
-    // searches can fold to the same normalised title; retaining the old entry would let a freshly painted
-    // card briefly open the previous search's providers before this answer added its own.
-    groupsRef.current = {};
-    (searchQ.data?.content ?? []).forEach((g) => { groupsRef.current[normTitle(g.title)] = g.providers; });
-  }, [searchQ.data]);
+  }), [searchGroups, selected]);
+  // Each hit's providers, keyed by work the way the wall's fold keys its own (by title until v0.56.0): what a card's
+  // icons draw and what open() offers. A memo of the answer, where open() alone once read a ref an effect filled: the
+  // icons read it while rendering, and there a ref is one answer behind.
+  const searchProviders = useMemo(() => {
+    const by: Record<string, WallProvider[]> = {};
+    for (const g of searchGroups) { const k = workKey(g); if (k) by[k] = g.providers; }
+    return by;
+  }, [searchGroups]);
   // How many sources the search is still waiting on, from the latest answer; zero in every other mode and
   // on an older server that does not report it.
   const stillAsking = mode === 'search' ? (searchQ.data?.pending ?? 0) : 0;
@@ -304,10 +410,20 @@ export default function DiscoverPage() {
     const names = more > 1 ? `${shown} ${tr('and {n} more', { n: more })}` : more === 1 ? `${shown} ${tr('and 1 more')}` : shown;
     return tr('{n} of {m} sources answered · still asking {names}', { n, m, names });
   }, [mode, searchQ.data]);
+  /**
+   * Who the page is still waiting on, by name: the wall's last card, "Still loading" (v0.58.0). Asking every source
+   * fills the wall for longer, and someone scrolling down reached its end with nothing to say more was coming. In
+   * browsing, the sources asked for the page being fetched that have not answered it (only the one browsed alone,
+   * when one is); in a search, the ones its latest answer says are still being asked. Empty once all have answered.
+   */
+  const waitingOn = useMemo(() => {
+    if (mode === 'search') return (searchQ.data?.sources ?? []).filter((s) => s.state === 'pending').map((s) => s.name);
+    return budget.filter((s) => (!selected || s.id === selected) && (upTo[kOf(s.id)] ?? 0) < page).map((s) => s.name);
+  }, [mode, searchQ.data, budget, selected, upTo, kOf, page]);
 
   const wall = useMemo(() => {
-    // Search arrives already folded: the server grouped it and the effect above stored the groups in groupsRef.
-    if (mode === 'search') return { items: searchHits, groups: {} as Record<string, WallProvider[]> };
+    // Search arrives already folded: the server grouped it, and searchGroups merges what it has placed since.
+    if (mode === 'search') return { items: searchHits, groups: searchProviders };
     const seen = new Set<string>();
     const out: SourceItem[] = [];
     // Strict arrival order. Interleaving by rank would push already-read tiles down as a slow source lands.
@@ -316,22 +432,32 @@ export default function DiscoverPage() {
       // Filtering is display-only: everything stays loaded, this just decides what is shown. That is why
       // tapping a chip is instant and why it cannot strand the wall the way restarting it used to.
       if (selected && key !== `${listMode}:${selected}`) continue;
-      for (const it of byId[key] ?? []) {
+      for (const it of rows[key] ?? []) {
         const k = `${it.source}:${it.sourceId}`;
         if (seen.has(k)) continue;
         seen.add(k);
         out.push(it);
       }
     }
-    // Then one card per title, the way search already is. Folding AFTER the flatten keeps the arrival order:
-    // the first source to land a title keeps the card, later ones only join its provider list, so the
-    // badge lights and the add dialog offers a choice without anything on screen moving.
-    return foldByTitle(out, nameOf, rankOf);
-  }, [mode, listMode, selected, searchHits, order, byId, nameOf, rankOf]);
+    // Then one card per work, the way search already is, without what the library holds or this visit added.
+    // Folding AFTER the flatten keeps the arrival order: the first source to land a work keeps the card, later
+    // ones only join its provider list, so its icons grow and the add dialog offers a choice without anything
+    // on screen moving.
+    return foldByWork(out, nameOf, rankOf, wallAdded);
+  }, [mode, listMode, selected, searchHits, searchProviders, order, rows, nameOf, rankOf, wallAdded]);
+  // What this visit added, in the keys of the view on screen: each view follows the works through its own answers.
+  const shownAdded = mode === 'search' ? searchAdded : wallAdded;
+  // Each card's icons: every provider behind it, with the extension it came out of, so MangaDex's languages are one
+  // icon (lib/sourceGroups.ts iconStack). A row the fold passed through untouched is its one source.
+  const extOf = useMemo(() => new Map<string, SrcExtension | null>(sources.map((s) => [s.id, s.extension ?? null])), [sources]);
+  const stackOf = (it: SourceItem): StackSource[] =>
+    (wall.groups[workKey(it)] ?? [{ source: it.source, name: nameOf(it.source) ?? it.source }])
+      .map((p) => ({ source: p.source, name: p.name, extension: extOf.get(p.source) ?? null }));
 
-  // Skeleton tiles: in search mode only until the FIRST answer (or a failure) -- after that the wall shows
-  // what has landed and the progress line says what has not, so a skeleton would sit beside real tiles and
-  // read as a stuck load.
+  // Skeleton tiles: only until the FIRST cards land -- in search mode until the first answer (or a failure).
+  // After that the wall shows what has landed and its last card (and in a search the progress line) says what has
+  // not, so a skeleton would sit beside real tiles and read as a stuck load. Since v0.58.0 browsing too: with every
+  // source asked, eighteen skeletons sat under the covers for as long as the slowest source took.
   const pending = mode === 'newest' ? Math.max(0, budget.length - settled) : (!searchQ.data && !searchQ.isError ? 3 : 0);
 
   // The empty card for ONE source browsed alone says that source's own reason and wait, the way its sheet
@@ -342,11 +468,24 @@ export default function DiscoverPage() {
     ? aloneEmpty(budget.find((s) => s.id === selected) ?? { id: selected, name: selected, lang: null }, states[kOf(selected)] ?? 'idle')
     : null;
 
+  /**
+   * The address says what is on screen (v0.61.0): `?q=` while a search is, nothing while browsing -- replaced, never
+   * pushed, so Back leaves Discover instead of stepping through its searches.
+   */
+  const writeQ = (value: string) => {
+    try {
+      const u = new URL(window.location.href);
+      if (value) u.searchParams.set('q', value); else u.searchParams.delete('q');
+      window.history.replaceState(window.history.state, '', `${u.pathname}${u.search}${u.hash}`);
+    } catch { /* the page works the same without it */ }
+  };
+
   const search = (e?: React.FormEvent) => {
     e?.preventDefault();
     const next = q.trim();
     if (!next) return;
     setMode('search');
+    writeQ(next);
     // The same term submitted again while its answer is on screen is a refetch -- a failed search has no
     // other way back, and a finished one costs the server nothing (it answers from its entry). Not while
     // one is in flight: `refetch()` cancels the running request by default, so a second tap of Search during
@@ -357,17 +496,18 @@ export default function DiscoverPage() {
   };
   // `term` is kept: the query is disabled by the mode, and keeping its observer keeps the answer cached, so
   // searching the same title again after browsing is instant.
-  const backToNewest = () => { setQ(''); setMode('newest'); };
+  const backToNewest = () => { setQ(''); setMode('newest'); writeQ(''); };
 
   const open = (it: SourceItem) => {
-    const key = normTitle(it.title);
+    const key = workKey(it);
     // Only a card held in every provider's language is done with (v0.52.0): one held in another language opens the
     // dialog, which offers the new language as an edition and says which the library has.
-    if (it.inLibrary || added.has(key)) return;
+    if (it.inLibrary || shownAdded.has(key)) return;
     // What the library holds of this title, for the dialog's "In your library in English" and its edition block.
     const library = it.librarySeriesId && it.libraryLangs?.length ? { seriesId: it.librarySeriesId, langs: it.libraryLangs } : undefined;
-    // The wall's own fold first, then what the last search stored: both are keyed the same way.
-    const providers = wall.groups[key] ?? groupsRef.current[key];
+    // Every provider behind the card: the wall's fold, or the search's groups -- both keyed by work.
+    const providers = wall.groups[key];
+    fromKey.current = key || null;
     if (providers?.length) setSeed({ kind: 'group', title: it.title, providers, ...(library ? { library } : {}) });
     else {
       setSeed({
@@ -380,7 +520,10 @@ export default function DiscoverPage() {
 
   // ---------------------------------------------------------------- more
   const sentinel = useRef<HTMLDivElement>(null);
-  const canPage = mode === 'newest' && settled >= budget.length && budget.length > 0 && page < 5;
+  // The next page once every source has answered this one (v0.58.0: once each had answered at all, so a page could
+  // start while the last one was still being asked -- and with the gate counting by page, the sources it had not
+  // reached yet would have been skipped).
+  const canPage = mode === 'newest' && answered >= budget.length && budget.length > 0 && page < 5;
   useEffect(() => {
     const el = sentinel.current;
     if (!el || !canPage) return;
@@ -419,6 +562,13 @@ export default function DiscoverPage() {
     const lead = new Set(heroSlides.map((s) => s.title));
     return (trending?.content ?? []).filter((t) => !lead.has(t.title));
   }, [trending, heroSlides]);
+  // Each AniList rail's cards, less what this visit added from them (v0.61.0): Korea's (what the hero did not take),
+  // Japan's, China's, in TREND_RAILS' order; and Because you read's.
+  const jpTrending = moreTrending[0]?.data;
+  const cnTrending = moreTrending[1]?.data;
+  const trendRails = useMemo(() => [rail, jpTrending?.content ?? [], cnTrending?.content ?? []]
+    .map((list) => list.filter((t) => !railAdded.has(railKey(t)))), [rail, jpTrending, cnTrending, railAdded]);
+  const becauseRail = useMemo(() => (because?.content ?? []).filter((t) => !railAdded.has(railKey(t))), [because, railAdded]);
 
   // ---------------------------------------------------------------- may they be here at all
   // The tab is hidden for this account and every route this page calls now refuses it, so a typed URL would
@@ -501,6 +651,17 @@ export default function DiscoverPage() {
         </div>
       </header>
 
+      {mode === 'newest' && <RecommendationRail enabled={mayAdd} onPick={(title) => setSeed({ kind: 'trending', title })} />}
+
+      {/* v0.61.0: "Because you read {title}", above the wall while browsing, only with something on it -- under the
+          header, so the source picker stays beside the wall it narrows. The title is isolated: a Latin title inside an
+          Arabic sentence takes its order, as Home's rail of that name does. */}
+      {mode === 'newest' && because?.seed && becauseRail.length > 0 && (
+        <AniListRail kind="because" className="pt-6"
+          title={tr('Because you read {title}', { title: `\u2068${because.seed.title}\u2069` })}
+          items={becauseRail} onPick={pickRail} />
+      )}
+
       {/*
         In both modes, not just while browsing. The picker is the only place the chosen source is visible or
         clearable, so hiding it during a search -- while the search itself is narrowed to that source --
@@ -509,16 +670,17 @@ export default function DiscoverPage() {
       */}
       <SourcePicker
         sources={budget} states={states} settled={settled} total={budget.length}
-        // The chip's number is the whole pool, not the budget and not the ranked list: the budget widens
-        // as sources answer empty, and a count that ticks upward on its own reads as a bug; the ranked
-        // list is capped at twelve, and "12 sources" on a 14-source install is simply false.
+        // The chip's number is the whole pool: every source that can answer this listing. Since v0.58.0 that is
+        // also every source asked; it was a budget of six widening to ten, and a ranked list capped at twelve,
+        // and "12 sources" on a 14-source install was simply false.
         count={pool.length}
         selected={selected} onSelect={setSelected}
         mode={listMode}
         onMode={(m) => { setListMode(m); setSelected(null); setPage(1); if (mode === 'search') backToNewest(); }}
       />
 
-      {/* One mounted child per budgeted source. Renders nothing; owns one request.
+      {/* One mounted child per source asked -- every one in the pool -- and `enabled` only while the gate lets it
+          (four at a time). Renders nothing; owns one request.
           The key carries the listing mode, so switching Newest/Popular REMOUNTS these and they fetch the
           other listing. That pairing is not optional: a child that keeps its key keeps its cached query,
           never re-reports, and the wall waits forever on a source it thinks it has not heard from. */}
@@ -607,14 +769,18 @@ export default function DiscoverPage() {
       </div>
 
       <div className="grid grid-cols-3 gap-x-3 gap-y-5 sm:grid-cols-4 md:grid-cols-5 lg:grid-cols-7 lg:gap-x-4 xl:grid-cols-8 2xl:grid-cols-9 3xl:grid-cols-10">
+        {/* Every card names its sources, one of them or five, in Newest, Popular and search alike (v0.56.0). */}
         {wall.items.map((it, i) => (
-          <SourceCard key={`${it.source}:${it.sourceId}`} item={{ ...it, inLibrary: it.inLibrary || added.has(normTitle(it.title)) }}
-            sourceName={mode === 'newest' && order.length > 1 ? nameOf(it.source) : undefined}
+          <SourceCard key={`${it.source}:${it.sourceId}`} item={{ ...it, inLibrary: it.inLibrary || shownAdded.has(workKey(it)) }}
+            providers={stackOf(it)}
             onAdd={() => open(it)} eager={i < 12} />
         ))}
-        {Array.from({ length: Math.min(18, pending * 6) }).map((_, i) => (
+        {!wall.items.length && Array.from({ length: Math.min(18, pending * 6) }).map((_, i) => (
           <div key={`sk${i}`} className="skeleton aspect-[2/3] rounded-2xl" />
         ))}
+        {/* The last tile while any source asked has not answered (v0.58.0): who, so the end of the wall says more is
+            coming. Gone once every one has. */}
+        {waitingOn.length > 0 && <StillLoadingCard names={waitingOn} shown={SEARCH_NAMES_SHOWN} />}
       </div>
 
       {/* No "no results" while sources are still being asked: the first answer often has nothing yet and the
@@ -642,21 +808,10 @@ export default function DiscoverPage() {
 
       <div ref={sentinel} className="h-16" />
 
-      {mode === 'newest' && rail.length > 0 && (
-        <section className="pb-6">
-          <h2 className="mb-3 font-display text-lg font-semibold tracking-tight text-fog-50 lg:text-xl">{tr('Trending manhwa')}</h2>
-          {/* pb-3 rather than pb-1: the global scrollbar is 8px and used to be hidden, so the rail had no
-              room for it and it would have sat on the card captions. */}
-          <ScrollRail label={tr('Trending manhwa')}
-            className="bleed flex gap-3 px-4 pb-3 lg:px-8 [scroll-snap-type:x_mandatory]">
-            {rail.map((t, i) => (
-              <Reveal key={t.title} delay={Math.min(i, 12) * 28}>
-                <TrendingCard t={t} onPick={(x) => setSeed({ kind: 'trending', title: x.title })} />
-              </Reveal>
-            ))}
-          </ScrollRail>
-        </section>
-      )}
+      {/* The trending rails (v0.61.0: manga and manhua beside the manhwa), each only with something on it. */}
+      {mode === 'newest' && TREND_RAILS.map((country, i) => trendRails[i].length > 0 && (
+        <AniListRail key={country} kind={country} title={tr(TREND_LABELS[i])} items={trendRails[i]} onPick={pickRail} />
+      ))}
 
       {seed && (
         <AddSeriesDialog
@@ -665,13 +820,32 @@ export default function DiscoverPage() {
           // Following a source is an admin act, like the manual follow route and the sheet's ×: a member
           // who may add must not be able to follow two sources they could never unfollow.
           mayFollow={isAdmin}
-          onClose={() => setSeed(null)}
+          onClose={() => { fromKey.current = null; setSeed(null); }}
           onAdded={(r) => {
-            setAdded((prev) => new Set(prev).add(normTitle(r.title)));
+            // The card the dialog came from, by its work: off the wall, "In library" in a search. From the hero there is
+            // no card, and every card under the added title goes, as the title flipped them before v0.56.0.
+            const title = normTitle(r.title);
+            const keys = fromKey.current ? [fromKey.current] : title ? wall.items.filter((c) => normTitle(c.title) === title).map(workKey) : [];
+            setAdded((prev) => new Set([...prev, ...keys.filter(Boolean)]));
+            // From an AniList rail (v0.61.0): that card leaves its rail.
+            const railCard = fromRail.current;
+            if (railCard) setRailAdded((prev) => new Set(prev).add(railCard));
             qc.invalidateQueries({ queryKey: ['source-jobs'] });
           }}
         />
       )}
     </div>
+  );
+}
+
+/**
+ * The page, inside the Suspense boundary `useSearchParams` needs in a static export (v0.61.0: `?q=`), as the Library's
+ * and a List's pages are: the build refuses a page that reads the address outside one.
+ */
+export default function DiscoverPage() {
+  return (
+    <Suspense fallback={<div className="min-h-screen-d" />}>
+      <DiscoverInner />
+    </Suspense>
   );
 }

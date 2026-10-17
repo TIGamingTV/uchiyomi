@@ -95,13 +95,35 @@ export function parseResults(h: string, sourceId: string): SourceSeries[] {
   return dropRepeatedCovers(out);
 }
 
-export function makeMadara(cfg: { id: string; name: string; base: string; order?: number }): SourceAdapter {
+/**
+ * Whether a page is a listing at all (v0.60.0): a search or the manga archive. Every Madara listing -- search, Newest
+ * and Popular -- is a WordPress search (`/?s=…&post_type=wp-manga`), and WordPress marks that page's <body> `search`
+ * (the manga archive, which some sites redirect an empty search to, `post-type-archive-wp-manga`). ManhuaPlus moved off
+ * Madara: its search now redirects to /home, a page with no such class whose fifteen widget titles the parser read as
+ * results -- "love" found "Magic Emperor", and Newest and Popular were the same six titles on every call. A page with
+ * no <body> at all is left to the parser, as before. Reintroduce by parsing whatever came back: "a search the site
+ * answers with its homepage fails" in madaraListing.test.ts finds the widgets as results.
+ */
+export function isListingPage(h: string): boolean {
+  const body = /<body\b[^>]*>/i.exec(h);
+  if (!body) return true;
+  const cls = /\bclass\s*=\s*["']([^"']*)["']/i.exec(body[0])?.[1] ?? '';
+  return /(^|\s)(search|post-type-archive-wp-manga)(\s|$)/.test(cls);
+}
+
+export function makeMadara(cfg: { id: string; name: string; base: string; order?: number; lang?: string }): SourceAdapter {
   const base = cfg.base.replace(/\/$/, '');
   const mangaUrl = (id: string) => (id.startsWith('http') ? rebase(id, base) : `${base}/manga/${id}/`);
   // Parsing lives at module scope so it can be tested against real markup; see madaraListing.test.ts.
   // A listing that parsed to nothing is either an empty answer or the site's offline notice (lib/sources/offline.ts):
   // the second throws, so nothing downstream mistakes a site that is down for one with nothing on it.
   const listing = (h: string): SourceSeries[] => {
+    // Not a listing: the site's offline notice says so (site_offline), anything else is the site no longer answering
+    // a Madara search -- a failure, never results (isListingPage).
+    if (!isListingPage(h)) {
+      throwIfOffline(h, MADARA_MARKUP);
+      throw Object.assign(new Error(`${cfg.name}: the search answered with a page that is not a listing`), { statusCode: 502 });
+    }
     const out = parseResults(h, cfg.id);
     if (!out.length) throwIfOffline(h, MADARA_MARKUP);
     return out;
@@ -110,6 +132,8 @@ export function makeMadara(cfg: { id: string; name: string; base: string; order?
   return {
     id: cfg.id,
     name: cfg.name,
+    // The site's own language (v0.62.0, customSites.ts Site.lang); absent, the unstated one.
+    ...(cfg.lang ? { lang: cfg.lang } : {}),
     base,
     imageReferer: `${base}/`, // covers/images often live on a separate hotlink-protected CDN that wants the SITE origin as Referer
     // Madara sites serve pages + images from behind Cloudflare. Also read by the diagnosis layer: it is

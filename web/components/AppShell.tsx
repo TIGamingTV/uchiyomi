@@ -5,17 +5,24 @@ import { useAuth } from '@/lib/auth';
 import { runSmartOffline } from '@/lib/offlineSync';
 import { BottomNav } from './BottomNav';
 import { TopNav } from './TopNav';
+import { Sidebar } from './Sidebar';
 import { HealthBanner } from './HealthAlert';
+import { TrackerAlert } from './TrackerAlert';
 import { LoginScreen } from './LoginScreen';
 import { DesktopReconnect } from './DesktopReconnect';
 import { CinematicFX } from './CinematicFX';
 import { PageTransition } from './PageTransition';
 import { CommandPalette, usePaletteHotkeys } from './CommandPalette';
+import { useWideViewport } from './ui';
 import { Mark } from './Brand';
 import { IcWifiOff } from './icons';
 import { t as tr } from '@/lib/i18n';
 import { desktopShell, isDesktop } from '@/lib/desktop';
 import { useServerDownloads } from '@/lib/useServerDownloads';
+import { IncognitoBanner, useIncognito } from './IncognitoBanner';
+import { AdultBanner } from './AdultToggle';
+import { usePrefetchSeriesOnClick } from '@/lib/seriesPrefetch';
+import { scrollMemory } from '@/lib/scrollMemory';
 
 function Splash() {
   return (
@@ -51,7 +58,7 @@ function OfflineLanding() {
  */
 function OfflineBanner({ name }: { name: string }) {
   return (
-    <div className="flex items-center justify-center gap-2 bg-ink-800 px-4 py-1.5 text-[11px] text-fog-300">
+    <div className="flex items-center justify-center gap-2 bg-ink-800 px-4 py-1.5 text-[11px] text-fog-300 lg:ps-[calc(var(--rail-w)+1rem)]">
       <IcWifiOff width={12} height={12} />
       <span>{tr('Offline — showing {name}’s downloads', { name })}</span>
     </div>
@@ -64,6 +71,8 @@ export function AppShell({ children }: { children: React.ReactNode }) {
   const router = useRouter();
   const [palette, setPalette] = useState(false);
   const [paletteSeed, setPaletteSeed] = useState('');
+  // The desktop's sidebar is mounted from lg up only: on a phone none of it is in the document (components/Sidebar.tsx).
+  const wide = useWideViewport();
 
   /**
    * An offline launch arrives at `/` -- the manifest's `start_url` -- which is a home screen assembled
@@ -84,6 +93,15 @@ export function AppShell({ children }: { children: React.ReactNode }) {
   useServerDownloads({ poll: true, enabled: !path.startsWith('/reader') });
   // Ctrl/Cmd+K, "/", or just typing, anywhere in the app (reader keeps its own keys; palette skipped there)
   usePaletteHotkeys(setPalette, status === 'authed' && !path.startsWith('/reader'), setPaletteSeed);
+  // Incognito reading (v0.61.0): kept here, above every early return, so the reader's progress payload knows it on the
+  // reader's own route too, where this shell renders nothing of its own (components/IncognitoBanner.tsx).
+  useIncognito();
+  // A series and its chapters are asked for at the click that opens it, not a fade later (lib/seriesPrefetch.ts). Above
+  // every early return, with the rest.
+  usePrefetchSeriesOnClick(status === 'authed');
+  // Where each page was left, for Back and Forward to put back (lib/scrollMemory.ts) -- from the first page on, the reader
+  // included, which is not inside the page fade that otherwise installs it.
+  useEffect(() => { scrollMemory(); }, []);
 
   // smart offline: keep favorites' latest unread chapters downloaded. Never on desktop, where "Save offline"
   // is hidden: it would copy chapters already on this disk into the window's storage (lib/desktop.ts).
@@ -118,9 +136,18 @@ export function AppShell({ children }: { children: React.ReactNode }) {
   return (
     <>
       <CinematicFX />
-      {status === 'offline' && <OfflineBanner name={user?.displayName || ''} />}
+      {/* Above the top bar (UI refresh): nothing sits between the bar and a page's art, which starts under it. One stack, so
+          only its first line meets an installed app's status bar (app/globals.css .banner-stack): two `safe-top` lines,
+          Health's and a tracker's to reconnect (#246), left a notch's worth of gap between them on a phone. */}
+      <div className="banner-stack" data-banner-stack>
+        {status === 'offline' && <OfflineBanner name={user?.displayName || ''} />}
+        {status === 'authed' && <IncognitoBanner />}
+        {status === 'authed' && <AdultBanner />}
+        {status === 'authed' && <HealthBanner />}
+        {status === 'authed' && <TrackerAlert />}
+      </div>
       <TopNav onSearchFocus={() => { setPaletteSeed(''); setPalette(true); }} />
-      {status === 'authed' && <HealthBanner />}
+      {wide && <Sidebar />}
       <main className="shell relative z-[1] pb-28 lg:pb-12">
         <PageTransition>{children}</PageTransition>
       </main>

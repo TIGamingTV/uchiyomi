@@ -102,6 +102,12 @@ const schema = z.object({
   // admin instead. argon2 hashes contain '$' which breaks compose ${} interpolation -> carried base64-encoded.
   INITIAL_USER_PASSWORD_HASH_B64: z.string().optional(),
   PUBLIC_ORIGIN: z.string().url().default('http://localhost:3000'),
+  // Which peers may tell us the client's address in X-Forwarded-For (v0.69.1). It used to be every peer, so a client
+  // talking to the app port directly chose its own address for the sign-in rate limits and the activity log. The
+  // default trusts the proxies a home server actually has -- loopback, link-local and private networks (Docker, an
+  // Umbrel app proxy, nginx or Nginx Proxy Manager on the LAN). `true` trusts every peer as before; `false` none; or a
+  // comma list of addresses and CIDR ranges (for a proxy on a public address).
+  TRUST_PROXY: z.string().default('loopback, linklocal, uniquelocal'),
   CACHE_DIR: z.string().default('/cache'),
   CONFIG_DIR: z.string().default('/config'),
   // Optional OIDC / SSO. Everything stays off unless an issuer and client id are set, so an install that
@@ -119,6 +125,14 @@ const schema = z.object({
   OIDC_LINK_BY_USERNAME: envFlag(false),
   // Users in this IdP group become admins here (leave empty to keep roles managed locally).
   OIDC_ADMIN_GROUP: z.string().default(''),
+  // v0.63.0 (#208), lib/authMode.ts, which reads these three when asked. `oidc-only` makes the provider the only way to
+  // sign in: no setup form, no passwords. A plain string, so a typo reaches the boot check, which refuses to start and
+  // says why: a mode that quietly fell back to `local` would leave the password routes open.
+  AUTH_MODE: z.string().default('local'),
+  // SSO-only mode: the provider's subject (`sub`) of the person whose first sign-in makes a new server's first admin.
+  OIDC_BOOTSTRAP_ADMIN_SUB: z.string().default(''),
+  // SSO-only mode's way back in: password sign-in reopened for this one admin account while it is set.
+  AUTH_RESCUE_ADMIN: z.string().default(''),
   // Optional Suwayomi server used purely as an extension engine: it runs Mihon/Tachiyomi's Kotlin extensions
   // on the JVM and exposes them over GraphQL. Empty issuer = feature off, exactly like OIDC. Uchiyomi keeps
   // owning the library, reader, downloads and updates; Suwayomi only answers search/chapters/pages.
@@ -141,6 +155,8 @@ const schema = z.object({
   // FlareSolverr-backed site -- so a single slow source stalled the whole wall for over a minute. Settable
   // because an operator on a slow link may want more, and because a test cannot afford to wait 8 seconds.
   SOURCE_LATEST_TIMEOUT_MS: z.coerce.number().int().min(100).max(120000).default(8000),
+  /** A listing page's budget for a source behind the Cloudflare solver (v0.59.0, lib/sources/budget.ts listBudgetFor). */
+  SOURCE_LATEST_SOLVER_TIMEOUT_MS: z.coerce.number().int().min(1000).max(180000).default(45000),
   // How long the admin "test this source" probe gets, end to end. It exercises search -> series -> chapters
   // -> pages, and each of those can reach FlareSolverr's own 95s abort, so the original 30s Promise.race on
   // the add-a-site path was guarding a 380s worst case (four search terms, serially). This is a wall-clock

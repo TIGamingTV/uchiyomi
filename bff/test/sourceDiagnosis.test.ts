@@ -56,8 +56,9 @@ test('THE MIS-DIAGNOSIS: "challenge" in a solver error must not read as the site
 // --- trawl's own failures (v0.55.3) ----------------------------------------------------------------------------
 // ⚠️ Not from a production last_error: the side-by-side benchmark on the owner's pages (2026-10-04) had trawl answer all
 // fourteen, so these are trawl 1.7.0's own messages, read from its source (apps/api/src/routes/v1.ts, packages/tiers
-// orchestrator.ts and tiers/3.ts), in the shape the client stores them: `flaresolverr: <message>`. Without a residential
-// proxy, a wall its browser cannot pass ends as "Tier 3 failed (<reason>). Set RESIDENTIAL_PROXY_URL …".
+// orchestrator.ts and tiers/3.ts; 1.8.0's are the same, re-read 2026-10-14), in the shape the client stores them:
+// `flaresolverr: <message>`. Without a residential proxy, a wall its browser cannot pass ends as "Tier 3 failed
+// (<reason>). Set RESIDENTIAL_PROXY_URL …".
 const TRAWL_TIER4 = 'Set RESIDENTIAL_PROXY_URL (or pass a proxy per-request) to enable Tier 4 proxy escalation.';
 const trawl = (reason: string) => `flaresolverr: Tier 3 failed (${reason}). ${TRAWL_TIER4}`;
 
@@ -67,6 +68,9 @@ test("trawl's own failures are named for what broke", () => {
   // as unknown.
   const code = (err: string) => diagnose(facts({ lastError: err })).code;
   assert.equal(code(trawl('cloudflare-challenge-timeout')), 'solver_timeout', 'its browser ran out of time on the wall');
+  // trawl 1.8.0's words for the same thing. Reintroduce by matching 1.7.0's alone: this reads unknown (and classify(),
+  // pinned in sourceEvidence.test.ts, gave the source no cooldown either).
+  assert.equal(code('Scrape deadline exceeded'), 'solver_timeout', "trawl 1.8.0's timeout");
   const blocked = diagnose(facts({ lastError: trawl('datacenter-ip-blocked (cf_clearance obtained but redirect never completed — needs residential proxy)') }));
   assert.equal(blocked.code, 'edge_403', 'past the challenge, and the site still refuses this address');
   assert.equal(blocked.fixSaid?.code, 'fix.ipBlocked');
@@ -169,6 +173,8 @@ test('NO PUBLIC SENTENCE LEAKS INFRASTRUCTURE', () => {
     ['edge_403', [facts({ lastError: 'HTTP 403 Forbidden' })]],
     ['rate_limited', [facts({ lastError: '429 too many requests' })]],
     ['upstream_down', [facts({ lastError: 'suwayomi 502' })]],
+    // The engine upgrade: the engine refusing the query itself (an engine this Uchiyomi does not match).
+    ['engine_incompatible', [facts({ lastError: REFUSED })]],
     // #115: the engine's own answer (its message and host must not leak), and chapters with no usable number.
     ['extension_error', [facts({ lastError: null }), { adapterOk: false, failure: { stage: 'search', kind: 'error', error: MANGA_BALL } }]],
     ['unnumbered', [facts({ lastError: null }), { adapterOk: false, failure: { stage: 'chapters', kind: 'unnumbered' } }]],
@@ -350,6 +356,26 @@ test('THE BLAMED CONTAINER (#115): the engine answering with the extension\'s er
   assert.match(d.fix, /Admin → Sources/);
   // The same words stored by traffic diagnose the same way.
   assert.equal(diagnose(facts({ lastError: MANGA_BALL })).code, 'extension_error');
+});
+
+const REFUSED = "suwayomi: Validation error (FieldUndefined@[fetchMangaAndChapters/chapters/sourceOrder]) : Field 'sourceOrder' in type 'ChapterType' is undefined";
+
+test('the engine refusing the query is not the extension failing, nor the engine being down', () => {
+  // Reintroduce by deleting the engine_incompatible rule: the refusal falls to the /^suwayomi: / rule and reads
+  // extension_error -- "update the extension" -- for an engine that does not match this Uchiyomi.
+  for (const e of [REFUSED, "suwayomi: Variable 'id' has an invalid value: Expected a value that can be converted to type 'Int'",
+    "suwayomi: Invalid syntax with offending token '}' at line 1 column 9",
+    "suwayomi: The variables input contains a field name 'x' that is not defined for input object type 'Y' "]) {
+    const d = diagnose(facts({ lastError: e }));
+    assert.equal(d.code, 'engine_incompatible', e);
+    assert.match(d.fix, /older or newer than the version this Uchiyomi works with/);
+    assert.doesNotMatch(d.fix, /Check that container|update the extension/i);
+  }
+  // Anchored: the extension's own exception quoting those words is still the extension's.
+  const quoted = 'suwayomi: Exception while fetching data (/fetchSourceManga) : Validation error (FieldUndefined@[x]) : no';
+  assert.equal(diagnose(facts({ lastError: quoted })).code, 'extension_error');
+  // Above every site rule: a refusal naming a field with "challenge" in it is still the engine's.
+  assert.equal(diagnose(facts({ lastError: "suwayomi: Validation error (FieldUndefined@[settings/challengeTimeout]) : x" })).code, 'engine_incompatible');
 });
 
 test('the engine not answering still blames the engine, and its 403 is not the site\'s CDN', () => {

@@ -1,5 +1,7 @@
 # Extensions (Mihon / Tachiyomi sources)
 
+> 🌐 Adding a repository, with pictures: [uchiyomi.com/extensions](https://uchiyomi.com/extensions). What a server adds to Mihon: [uchiyomi.com/mihon-server](https://uchiyomi.com/mihon-server).
+
 Uchiyomi ships **generic engines** that reach whole families of manga sites by URL, and MangaDex. On top of
 that it can use the **Mihon / Tachiyomi extension ecosystem** — the same extensions those apps use, well over a
 thousand of them.
@@ -14,7 +16,7 @@ were two; `?tab=Extensions` leads there.)
 - [Choose your extensions](#choose-your-extensions) · [An extension's own settings](#an-extensions-own-settings)
 - [Automatic updates](#automatic-updates) · [Why there is a second container](#why-there-is-a-second-container) ·
   [How it behaves](#how-it-behaves) · [Turning it off](#turning-it-off) · [Your engine's data](#your-engines-data) ·
-  [Settings](#settings)
+  [Updating the engine](#updating-the-engine) · [Settings](#settings)
 - [Komga-compatible API](#komga-compatible-api) (Mihon reading Uchiyomi, the other direction)
 
 ## What you need first: the extension engine
@@ -28,11 +30,11 @@ Where it comes from depends on how you run Uchiyomi:
 | **Uchiyomi Desktop, on this computer** | A download of about 200 MB, once: **Admin → Sources** → **Download the extension engine (about 200 MB)**. Step by step in [the desktop guide](DESKTOP.md#add-your-first-sources). |
 | **Uchiyomi Desktop, connected to your server** | Your server's. Nothing runs on the computer; Admin → Sources is the server's own. |
 | **CasaOS** | An add-on beside the listing. Import [`deploy/casaos/uchiyomi-suwayomi.yml`](../deploy/casaos/uchiyomi-suwayomi.yml) as a custom app (its tips give the one folder command to run first), then set `SUWAYOMI_URL` to `http://uchiyomi-suwayomi:4567` in Uchiyomi's settings. |
-| **Unraid** | A template of its own: install **uchiyomi-suwayomi** from Apps ([`templates/uchiyomi-suwayomi.xml`](../templates/uchiyomi-suwayomi.xml): pinned, memory-capped, chapter downloads off, Cloudflare helper on). Set its *FLARESOLVERR_URL* to the solver Uchiyomi uses, then set Uchiyomi's advanced *SUWAYOMI_URL* to `http://YOUR-SERVER-IP:4567`. |
+| **Unraid** | A template of its own: install **uchiyomi-suwayomi** from Apps ([`templates/uchiyomi-suwayomi.xml`](../templates/uchiyomi-suwayomi.xml): pinned, memory-capped, chapter downloads off, Cloudflare helper on, and a password on its port). Choose its password (*AUTH_PASSWORD*) when it asks, and set its *FLARESOLVERR_URL* to the solver Uchiyomi uses. Then set Uchiyomi's advanced *SUWAYOMI_URL* to `http://YOUR-SERVER-IP:4567`, *SUWAYOMI_USERNAME* to the engine's user name (`uchiyomi` unless you changed it) and *SUWAYOMI_PASSWORD* to its password. An engine installed before v0.73.0 has no password: [A password on the engine](#a-password-on-the-engine) says how to add one. |
 | **Umbrel** | Not available. An Umbrel app cannot offer an optional second container, and putting the engine in the package would cost every Umbrel install about 800 MB whether it uses extensions or not. MangaDex and sites you add by address work there as everywhere. |
 
 When the engine is there, the top of **Admin → Sources** is a slim strip of two cells (since v0.53.0): **Extension
-engine** — *Ready*, with its version and how many sources are on under it (*v2.3.2243 · 12 of 25 sources on*) — and
+engine** — *Ready*, with its version and how many sources are on under it (*v2.4.2366 · 12 of 25 sources on*) — and
 **Cloudflare helper**: *Connected*, or *Not connected* with **Connect** ([how it behaves](#how-it-behaves)). The engine's
 **⋯** holds **Turning it off** ([below](#turning-it-off)); on a phone the two cells stack.
 When it is not, a **setup card** stands there instead (since v0.49.0; until v0.54.0 it was the whole tab — the
@@ -58,7 +60,8 @@ Uchiyomi keeps trying on its own too: 5 s, 15 s, 30 s, 1 min and 2 min after a f
 four minutes, and an engine that came up later — a slow NAS, a template installed after Uchiyomi, a container
 restarted by hand, a **Reload sources** during an outage — stayed missing until someone reloaded by hand.
 
-It costs memory: about **750 MB** once running (731 MiB measured on a server with 22 extensions installed).
+It costs memory: **1 to 1.5 GB** once it has run a while, under a 2 GB ceiling
+([Why there is a second container](#why-there-is-a-second-container)).
 
 ## Add an extension repository — step by step
 
@@ -198,7 +201,7 @@ shown again, and the Health page names them. A switch in an extension's sheet is
 this standing choice alone; the sheet marks a language you hid here *Hidden in every extension*.
 
 **Only 25 extension sources can be switched on at once** (`SUWAYOMI_MAX_SOURCES`, 25 by default), because every
-one of them is searched together. The engine's strip counts them (*v2.3.2243 · 12 of 25 sources on*); when more are
+one of them is searched together. The engine's strip counts them (*v2.4.2366 · 12 of 25 sources on*); when more are
 switched on than that, the count turns amber, a line under the strip says how many were left out and how to get under
 the limit, and **Content → Health** lists them under *Extension source limit*. Hiding languages is the cheap way under it. On a Docker install, raising `SUWAYOMI_MAX_SOURCES` is the other;
 the desktop app has no setting for it. Since v0.55.0 the sources your series read through (as their main source or one
@@ -301,17 +304,43 @@ Uchiyomi configures itself to talk to it, and you never open it. Uchiyomi keeps 
 downloads, updates, users and UI; the engine only answers "search this", "list these chapters", "give me this
 chapter's pages".
 
-The cost is honest: it is a JVM, and it uses about 750 MB of memory once running (731 MiB measured on a
-server with 22 extensions installed).
+The cost is honest: it is a JVM, and it uses 1 to 1.5 GB of memory once it has run a while. Less than half of that
+is Java's heap. On a server with 45 extensions the engine held 1.4 GB after two days, 630 MB of it heap; the rest
+was Java's own native memory, and the Chromium (the engine's WebView) and Xvfb that its image runs beside it.
 
-**Since v0.46.0 the compose files cap it**, with the desktop app's own numbers: a 768 MB Java heap under a
-1.5 GB ceiling for the container. Before that there was no cap at all, and a JVM without one sizes its heap
-from the host's memory — up to a quarter of it, 15.7 GiB on a 62 GB server — so on a small NAS the engine could
-take far more than 750 MB. A long extension list may need more: set `SUWAYOMI_MEM_LIMIT` and
-`SUWAYOMI_JAVA_OPTS` ([CONFIGURATION.md](CONFIGURATION.md)). ⚠️ **Updating the image does not update your compose
-file.** An install set up before v0.46.0 gets the cap by downloading the current
-[`deploy/docker-compose.yml`](../deploy/docker-compose.yml) again, or by adding its two lines — `mem_limit` and
-`JAVA_TOOL_OPTIONS` under `uchiyomi-suwayomi` — to the file you have.
+**The compose files cap it** (since v0.46.0): a 768 MB Java heap, the desktop app's number, under a 2 GB ceiling for
+the container. Before v0.46.0 there was no cap at all, and a JVM without one sizes its heap from the host's memory —
+up to a quarter of it, 15.7 GiB on a 62 GB server. The ceiling was 1.5 GB until
+[#275](https://github.com/AngeloSha/uchiyomi/issues/275): the desktop app's engine fits in that, because it runs without
+Chromium, but the one in Docker does not. A long extension list may need more: set `SUWAYOMI_MEM_LIMIT` and
+`SUWAYOMI_JAVA_OPTS` ([CONFIGURATION.md](CONFIGURATION.md)), keeping the ceiling at least 1.25 GB above the heap.
+⚠️ **Updating the image does not update your compose file**: see below for the lines to add.
+
+### If the engine keeps restarting
+
+A container that reaches its memory ceiling is killed by the kernel and started again by Docker. A host with swap
+moves the overflow to disk instead, which is why the same ceiling can hold on one server and kill the engine on
+another: Unraid has no swap unless you add it. To check, run this on the host:
+
+```bash
+docker inspect uchiyomi-suwayomi --format '{{.State.OOMKilled}} {{.State.ExitCode}} {{.RestartCount}}'
+```
+
+`true 137` means the ceiling. Two settings fix it. An install set up before #275 has neither, because an update
+changes the image, never your compose file or template:
+
+- **A 2 GB ceiling.** Docker Compose: `mem_limit: ${SUWAYOMI_MEM_LIMIT:-2048m}` under `uchiyomi-suwayomi` (an older
+  file says `1536m` there, or has no `mem_limit` at all if it is from before v0.46.0). Unraid: edit
+  **uchiyomi-suwayomi**, switch on **Advanced View** and set **Extra Parameters** to `--memory=2048m`. CasaOS: the
+  app's memory limit.
+- **`MALLOC_ARENA_MAX=2`**, a variable on the engine's container: `MALLOC_ARENA_MAX: "2"` under its `environment:`, or
+  on Unraid **Add another Path, Port, Variable, Label or Device** → **Variable**, key `MALLOC_ARENA_MAX`, value `2`.
+  The C library otherwise gives every thread that allocates memory an arena of its own, up to eight per CPU core,
+  and what a thread frees stays in its arena: on that server 94 arenas held 428 MB, and two held about 120 MB less
+  under the same load. A server with more cores has more of them.
+
+Leave `-Xmx768m` as it is unless the engine's log says `java.lang.OutOfMemoryError: Java heap space`. That one is the
+heap: raise `-Xmx` and the ceiling by the same amount.
 
 ## How it behaves
 
@@ -419,16 +448,127 @@ On Unraid and CasaOS, copy the folder above the same way, with the engine stoppe
 **Turning it off** says how many series depend on it, and warns you never to delete it: turning the engine off is safe, deleting its data is
 not. Moving it between setups is in [MIGRATING.md](MIGRATING.md#adding-or-removing-the-extension-engine).
 
+## Updating the engine
+
+The engine is **pinned**: every file Uchiyomi ships names one version of it, the one the release was tested with —
+**v2.4.2366** since v0.69.0, v2.3.2243 before — and a pinned tag never moves by itself. `docker compose pull`,
+Watchtower and Unraid's update check all fetch the same version again; only the extensions inside it update
+themselves ([Automatic updates](#automatic-updates)).
+
+When a release moves the pin, its notes say so, and **Admin → Health** tells a server still on the old one: the
+*Extension engine* row adds *v2.3.2243 is older than the version this Uchiyomi was tested with (v2.4.2366). It works;
+updating it is recommended*, then the backup and the step for your platform. There is no hurry: this Uchiyomi works
+with every engine from v2.3.2243 up, and only one older than that is a warning.
+
+⚠️ **Updating is one way.** The engine upgrades its database the first time a newer version starts on it, and the
+older version cannot read it again. Back up first, keep the backup until you are happy, and go back only by restoring
+it.
+
+### Docker Compose
+
+1. Stop the engine and back its data up, through the stopped container's own mount ([why](#your-engines-data)):
+
+   ```bash
+   docker compose stop uchiyomi-suwayomi
+   docker run --rm --volumes-from uchiyomi-suwayomi -v "$PWD":/b alpine tar czf /b/engine-v2.3.2243.tgz -C /home/suwayomi/.local/share/Tachidesk .
+   ```
+
+2. In `docker-compose.yml`, change only the engine's `image:` line, to `ghcr.io/suwayomi/suwayomi-server:v2.4.2366` —
+   or take the release's new file, if you never edited yours.
+3. `docker compose up -d uchiyomi-suwayomi`: it pulls the new image and upgrades its database on the way up (a
+   minute or two).
+4. Check: in **Admin → Health**, *Extension engine* reads *Ready … (v2.4.2366)* with no version row under it, and
+   **Admin → Sources** lists the extensions and repositories you had. Search one extension source.
+
+**Going back** takes the backup from step 1. It empties the volume, restores the copy with its owner (uid 1000, the
+engine's user) and nothing else:
+
+```bash
+docker compose stop uchiyomi-suwayomi
+docker run --rm --volumes-from uchiyomi-suwayomi -v "$PWD":/b alpine sh -c 'find /home/suwayomi/.local/share/Tachidesk -mindepth 1 -delete && tar xzf /b/engine-v2.3.2243.tgz -C /home/suwayomi/.local/share/Tachidesk'
+```
+
+Then put the old tag back on the `image:` line and run `docker compose up -d uchiyomi-suwayomi`. The development stack
+is the same with `yomi-suwayomi` in the root `docker-compose.yml`.
+
+### Unraid
+
+1. On the **Docker** tab, stop **uchiyomi-suwayomi**, then back its folder up in the Unraid terminal:
+
+   ```bash
+   tar czf /mnt/user/appdata/engine-v2.3.2243.tgz -C /mnt/user/appdata/uchiyomi-suwayomi .
+   ```
+
+2. Edit **uchiyomi-suwayomi**, set its **Repository** to `ghcr.io/suwayomi/suwayomi-server:v2.4.2366` and **Apply**:
+   Unraid pulls it and starts it.
+3. Check Admin → Health as above.
+
+Going back: stop it, run
+`find /mnt/user/appdata/uchiyomi-suwayomi -mindepth 1 -delete && tar xzf /mnt/user/appdata/engine-v2.3.2243.tgz -C /mnt/user/appdata/uchiyomi-suwayomi`,
+set the Repository back and **Apply**.
+
+### CasaOS
+
+1. Stop the **uchiyomi-suwayomi** app, then back its folder up over SSH:
+
+   ```bash
+   sudo tar czf /DATA/AppData/engine-v2.3.2243.tgz -C /DATA/AppData/uchiyomi-suwayomi .
+   ```
+
+2. In the app's settings, set its image to `ghcr.io/suwayomi/suwayomi-server:v2.4.2366` and **Save**.
+3. Check Admin → Health as above.
+
+Going back: stop it, run
+`sudo find /DATA/AppData/uchiyomi-suwayomi -mindepth 1 -delete && sudo tar xzf /DATA/AppData/engine-v2.3.2243.tgz -C /DATA/AppData/uchiyomi-suwayomi`,
+set the image back and **Save**.
+
+### Uchiyomi Desktop
+
+Nothing to do. On a computer that had the engine, an app update that moves the pin fetches the new one by itself
+(about 200 MB) the next time Uchiyomi starts, and before the new version first opens the engine's data, the app keeps
+a copy of its database in its data folder ([where that is](DESKTOP.md#7-where-your-files-live)):
+`engine-snapshots/before-v2.4.2366/` holds `database.mv.db`, `server.conf` and `snapshot.json`, which says what
+wrote them. The two newest copies are kept. If the copy cannot be made — a full disk — the new engine is not started,
+and the Extensions card says why.
+
+Going back means the older app too: quit Uchiyomi, install the older version, copy `database.mv.db` and `server.conf`
+from the snapshot over the ones in the `engine` folder, delete `engine/uchiyomi-engine.json`, start Uchiyomi, and
+download the extension engine again when **Admin → Sources** offers it.
+
+### An engine you run yourself
+
+The same three steps: back its data up with it stopped, change its tag, start it. This Uchiyomi works with v2.3.2243
+and newer and was tested with v2.4.2366. Health calls a newer one *newer than the version this Uchiyomi was tested
+with*: likely fine, and only a backup from before takes you back.
+
+## A password on the engine
+
+On Unraid the engine's port is published to your network, because Uchiyomi reaches it at your server's address, so it
+should ask for a password. Since v0.73.0 the Unraid template turns the engine's own sign-in on for a **new** install
+(`AUTH_MODE` `basic_auth`) and asks for one. An engine installed before that keeps the settings it has, with no
+password, until you add one:
+
+1. On the **Docker** tab, edit **uchiyomi-suwayomi**. Under *Show more settings*, set **AUTH_MODE** to `basic_auth`,
+   **AUTH_USERNAME** to a user name (`uchiyomi`, say) and **AUTH_PASSWORD** to a password, and **Apply**.
+2. Edit **uchiyomi**. Under *Show more settings*, set **SUWAYOMI_USERNAME** and **SUWAYOMI_PASSWORD** to the same two,
+   and **Apply**.
+3. Admin → Sources should say *Ready* again. *The extension engine refused Uchiyomi's login* means the two pairs differ.
+
+The Docker Compose files never publish the engine's port: it is reachable only from Uchiyomi's own network, and needs no
+password. On CasaOS the add-on is on that network too. The desktop app gives its engine a new random password every time
+it starts, which only the app knows.
+
 ## Settings
 
 | Variable | Default | What it does |
 | --- | --- | --- |
 | `EXTENSION_ENGINE` | `1` | `0` doesn't run the bundled engine: Compose scales it to zero, and the app treats extensions as off. Read by both, from the same `.env` line. Compose only accepts `0` or `1` here (it is the engine's replica count, and any other value stops `docker compose up` for the whole stack); the app also reads `off`, `false` and `no`, for setups that don't pass the line to Compose. Only applies while `SUWAYOMI_URL` names the bundled container (`uchiyomi-suwayomi`, or `yomi-suwayomi` in the development stack). |
 | `SUWAYOMI_URL` | the bundled engine | Where the extension engine is. Empty turns the feature off (in the v0.49.0 compose files and later). A trailing slash (or two), a query string or a fragment on this value is ignored; the scheme, host, port and any sub-path are what count. |
-| `SUWAYOMI_USERNAME` / `SUWAYOMI_PASSWORD` | empty | Only if your engine has authentication enabled. |
-| `SUWAYOMI_MAX_SOURCES` | `25` | Ceiling on how many extension sources register at once. |
+| `SUWAYOMI_USERNAME` / `SUWAYOMI_PASSWORD` | empty | The engine's user name and password, when it asks for them: the Unraid template's engine does since v0.73.0 ([A password on the engine](#a-password-on-the-engine)). Sent only to `SUWAYOMI_URL`. |
+| `SUWAYOMI_MAX_SOURCES` | `25` | Ceiling on how many extension sources register at once. The sources a series reads through register first, then the rest; since v0.59.0 a source switched off in Health registers last of all, so it never holds a slot a working source needs, and switching one off or on there while the limit is full applies at once. |
 | `SUWAYOMI_PAGE_CONCURRENCY` | `4` | Pages of one chapter fetched from the engine at once (1-8). The engine rate-limits the site itself, so extension downloads skip the one-at-a-time pacing that scraped sites need; a 429 from the engine drops back to one for the rest of the chapter. |
 | `SOURCE_LATEST_TIMEOUT_MS` | `8000` | How long one source gets to answer "what's new" on Discover before it is given up on and marked unhealthy. A source that keeps overrunning it is diagnosed *answers, but more slowly than it is given* — since v0.37.0 by the admin *Test* button and the daily source check too, not only Discover's health view — and the fix sentence names this budget. |
+| `SOURCE_LATEST_SOLVER_TIMEOUT_MS` | `45000` | Since v0.59.0, the same budget for a site this server opens through the Cloudflare solver (a site added by address, a built-in engine). An extension source is fetched by the engine, with the engine's own solver, so it keeps `SOURCE_LATEST_TIMEOUT_MS`. |
 
 The update check's own settings live in **Admin → Settings → Updates & schedules**, not here: *Update extensions
 automatically* (on by default) and *Extension check interval (hours)* (6). The switch saves as it flips; the interval saves when you leave the field or press Enter, and the row says *Saved*.
@@ -442,8 +582,9 @@ as not adult, the same way an unrated series stays visible instead of vanishing 
 You can point `SUWAYOMI_URL` at a Suwayomi you already run instead of the bundled one; Uchiyomi doesn't care
 whose it is.
 
-The image is pinned rather than tracking `:stable`, because `:stable` is older than the extension API today's
-repository indexes require and would show an empty catalogue.
+The image is pinned rather than tracking `:stable`: an engine upgrades its database one way when a newer version first
+starts on it, so it moves only with a release that was tested with the next one and says so —
+[Updating the engine](#updating-the-engine).
 
 ## Komga-compatible API
 

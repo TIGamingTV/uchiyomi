@@ -24,6 +24,7 @@ import { API_TOKEN_PREFIX, resolveApiToken, resolveApiTokenById, type ResolvedTo
 import { SESSION_COOKIE, mintSession, verifySession, shouldRemint } from '../lib/komgaSession';
 import { owned, UnsupportedFilter } from '../lib/ownedCatalog';
 import { viewCtxFor, seriesVisible, browsable, Params, type ViewCtx } from '../lib/visibility';
+import { AUTO_DETAILS, authorOf } from '../lib/autoDetailsSql';
 import { q, one } from '../lib/db';
 import { pushSeriesProgressAsync } from '../lib/trackers';
 import { serveLibSeriesThumb, serveLibBookThumb, serveLibBookPage } from './images';
@@ -337,11 +338,20 @@ export default async function komgaCompatRoutes(app: FastifyInstance) {
   app.get('/api/v1/series/:id/thumbnail', (req, reply) => serveLibSeriesThumb(req, reply, (req.params as { id: string }).id));
 
   // ---- books -------------------------------------------------------------------------------------------
-  // The extension's "Books" search type. This library has no chapter-level search; an empty page is what the
-  // client handles gracefully (it reads `content` and `last`), and it is honest.
+  // Every chapter the viewer may list, a page at a time (v0.61.2, #204), as Komga answers it: the extension's "Books"
+  // type, and the chapter count a Komga client reads from `totalElements` -- Homepage's Komga widget shows it as its
+  // Books tile. It was always an empty page, which kept that tile at 0 on every library. By series and number;
+  // `search` matches a chapter or its series by name; `library_id` and `media_status=READY` read as the chapter list
+  // reads them. Reintroduce the empty page: "the books list is every chapter the token may see" in
+  // komgaCompat.int.test.ts finds 0.
   app.get('/api/v1/books', async (req) => {
     const parsed = parseBooksQuery(req.query as Record<string, unknown>);
-    return springPage([], 0, parsed.page, parsed.size);
+    const res = await owned.allBooks(vc(req), {
+      page: parsed.page, size: parsed.size, desc: /desc/i.test(parsed.sort), search: parsed.fullTextSearch,
+      libraryIds: parsed.libraryIds, readyOnly: parsed.readyOnly,
+    });
+    const policy = await absencePolicy();
+    return springPage(res.content.map((b: any) => komgaBook(b, { absent: absentBook(b, policy) })), res.totalElements, parsed.page, parsed.size);
   });
 
   const bookOr404 = async (req: FastifyRequest, reply: FastifyReply, id: string) => {
@@ -426,9 +436,10 @@ export default async function komgaCompatRoutes(app: FastifyInstance) {
   app.get('/api/v1/authors', async (req) => {
     const p = new Params();
     const rows = await q<{ author: string }>(
-      `SELECT DISTINCT COALESCE(o.author, s.author) AS author
+      `SELECT DISTINCT ${authorOf('o', 's', 'sad')} AS author
          FROM lib_series s LEFT JOIN series_overrides o ON o.series_id = s.id
-        WHERE ${browsable('s', vc(req), p)} AND btrim(COALESCE(o.author, s.author, '')) <> ''
+         LEFT JOIN ${AUTO_DETAILS} sad ON sad.series_id = s.id
+        WHERE ${browsable('s', vc(req), p)} AND btrim(COALESCE(${authorOf('o', 's', 'sad')}, '')) <> ''
         ORDER BY author`,
       p.values as any[],
     );

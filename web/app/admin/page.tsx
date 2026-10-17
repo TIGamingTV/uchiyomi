@@ -8,7 +8,7 @@ import { api, ApiError, img } from '@/lib/api';
 import { useAuth } from '@/lib/auth';
 import { triggerRefresh } from '@/lib/refresh';
 import { scheduleText, taskResult } from '@/lib/tasks';
-import { bytes, relativeTime } from '@/lib/format';
+import { bytes, numberText, relativeTime } from '@/lib/format';
 import { shownDeviceName } from '@/lib/device';
 import { useToast } from '@/components/Toast';
 import { ConfirmDialog, Modal, msgOf } from '@/components/ConfirmDialog';
@@ -17,7 +17,7 @@ import { IcChevronLeft, IcChevronRight, IcTrash, IcPlus, IcRefresh, IcX } from '
 import { LibraryFolders } from '@/components/LibraryFolders';
 import { addFolder, foldersOf, heldByOthers, heldByText, previewQuery, previewText, sameFolders, toggleFolder, typedFolder } from '@/lib/libraryFolders';
 import { CardProgress, HealthCardActions, HealthRow, hasCardActions, scanState, scanWorking } from '@/components/HealthActions';
-import { FixEverythingDialog, FixEverythingKey, SafeRepairLine } from '@/components/FixEverythingDialog';
+import { FixEverythingDialog, FixEverythingKey, LastFixLine, SafeRepairLine } from '@/components/FixEverythingDialog';
 import { AutofixRunProvider } from '@/lib/useAutofixRun';
 import { RepairHistory, RepairLiveStrip, RepairTaskLines } from '@/components/RepairLive';
 import { RESCAN_KEY, RescanPanel } from '@/components/RescanTask';
@@ -34,6 +34,7 @@ import { SeriesCard } from '@/components/cards';
 import { ConsoleNav } from '@/components/ConsoleNav';
 import { motion, useReducedMotion } from 'framer-motion';
 import { t as tr, keys } from '@/lib/i18n';
+import { bustCover } from '@/lib/coverBust';
 import type { HealthCheck, Series } from '@/lib/types';
 import { bridge, hiddenOnDesktop, isDesktop, visibleGroups, DESKTOP_HIDDEN, type UpdateStatus } from '@/lib/desktop';
 import { SourcesPanel } from '@/components/SourcesPanel';
@@ -44,8 +45,12 @@ import Link from 'next/link';
 import { healthLinks } from '@/lib/healthLinks';
 import { useLayer } from '@/lib/layers';
 import { SourceHealthBody } from '@/components/SourceHealthBody';
+import { HealthBySeries } from '@/components/HealthBySeries';
+import { Segmented } from '@/components/settings';
+import { healthQuery, healthView, setHealthView, type HealthView } from '@/lib/healthBySeries';
 import { releaseHref, shownVersion, updateState, type UpdateState } from '@/lib/versionLine';
 import { useSectionArrival } from '@/lib/useSectionArrival';
+import { joinsOnTheirOwn, memberDefaultsOf, type MemberDefaults } from '@/lib/memberDefaults';
 
 /** A name or a title inside a sentence, isolated: in Arabic a Latin one otherwise takes the sentence's order. */
 const iso = (s: string): string => `\u2068${s}\u2069`;
@@ -121,7 +126,7 @@ function AdminInner() {
 
   return (
     <div className="min-h-screen-d px-4 lg:px-0">
-      <AdminHero onBack={() => router.back()} />
+      <AdminHero onBack={() => router.back()} compact={tab !== 'Overview'} />
 
       {/* The foot of the rail says which Uchiyomi this is (v0.55.4, #150): the place people looked for it. */}
       <ConsoleNav groups={isDesktop() ? visibleGroups(GROUPS, DESKTOP_HIDDEN.adminTabs) : GROUPS} tab={tab} onTab={setTab} ariaLabel={tr('Admin')}
@@ -143,13 +148,14 @@ function AdminInner() {
  * blurred and drowned under a gradient), and the headline is the verdict rather than a row of numbers. The
  * counts are still there, just demoted to the line that supports it.
  */
-function AdminHero({ onBack }: { onBack: () => void; onScan?: undefined }) {
+/**
+ * `compact` (UI refresh): every tab but Overview. The verdict and its facts stay -- an admin opening Settings still sees
+ * at a glance that a check failed -- but in a band, not the ~480 px that pushed Settings and Members below the fold.
+ */
+function AdminHero({ onBack, compact = false }: { onBack: () => void; onScan?: undefined; compact?: boolean }) {
   const qc = useQueryClient();
   const { data: stats } = useQuery({ queryKey: ['admin-stats'], queryFn: () => api<any>('/api/admin/stats') });
-  const { data: health } = useQuery({
-    queryKey: ['admin-health'],
-    queryFn: () => api<{ generatedAt: string; checks: HealthCheck[] }>('/api/admin/health'),
-  });
+  const { data: health } = useQuery(healthQuery);
   // One random series for the wash. `keepPreviousData` is deliberately off: a different backdrop on each
   // visit is the point, and it is the cheapest way to make the panel feel like part of the library.
   const { data: rnd } = useQuery({
@@ -180,7 +186,11 @@ function AdminHero({ onBack }: { onBack: () => void; onScan?: undefined }) {
   // Intl.PluralRules and a rules table; "1 members" does need fixing, and every language here can express
   // both forms as two strings.
   const facts = [
-    stats ? (stats.seriesTotal === 1 ? tr('1 series') : tr('{n} series', { n: stats.seriesTotal })) : null,
+    stats ? (stats.seriesTotal === 1 ? tr('1 series') : tr('{n} series', { n: numberText(stats.seriesTotal) })) : null,
+    // v0.61.2 (#204): every chapter across them, as the series list counts them; grouped, because it runs to tens of
+    // thousands. A server older than the field sends none, and the fact is simply left out.
+    typeof stats?.booksTotal === 'number'
+      ? (stats.booksTotal === 1 ? tr('1 chapter') : tr('{n} chapters', { n: numberText(stats.booksTotal) })) : null,
     // Desktop is one person: "1 member" there would describe a household that does not exist.
     stats && !isDesktop() ? (stats.members === 1 ? tr('1 member') : tr('{n} members', { n: stats.members })) : null,
     stats ? tr('{size} cached', { size: bytes(stats.cacheBytes) }) : null,
@@ -199,7 +209,7 @@ function AdminHero({ onBack }: { onBack: () => void; onScan?: undefined }) {
   const running: string | null = bridge()?.version || stats?.version || null;
 
   return (
-    <div className="bleed relative isolate mb-6 overflow-hidden lg:mt-2 lg:rounded-b-3xl">
+    <div data-admin-hero={compact ? 'compact' : 'full'} className={`bleed relative isolate overflow-hidden lg:mt-2 lg:rounded-b-3xl ${compact ? 'mb-4' : 'mb-6'}`}>
       {rnd?.seriesId && <Backdrop seriesId={rnd.seriesId} className="absolute inset-0" />}
       {/* Drowned deliberately: this is a wash to sit text on, not a picture to look at. */}
       <div className="absolute inset-0 bg-linear-to-t from-ink-950 via-ink-950/90 to-ink-950/70" />
@@ -208,11 +218,11 @@ function AdminHero({ onBack }: { onBack: () => void; onScan?: undefined }) {
       <div aria-hidden className="pointer-events-none absolute inset-0"
         style={{ background: `radial-gradient(75% 120% at var(--start) 0%, ${bad ? 'rgba(245,158,11,0.20)' : 'rgb(var(--accent) / 0.22)'}, transparent 60%)` }} />
 
-      <div className="relative px-4 pb-6 pt-[max(0.9rem,calc(env(safe-area-inset-top)+0.5rem))] lg:px-8 lg:pb-8 lg:pt-8">
-        <div className="mb-5 flex items-center gap-2">
+      <div className={`bleed-pad relative pt-[max(0.9rem,calc(env(safe-area-inset-top)+0.5rem))] ${compact ? 'pb-4 lg:pb-5 lg:pt-5' : 'pb-6 lg:pb-8 lg:pt-8'}`}>
+        <div className={`flex items-center gap-2 ${compact ? 'mb-3' : 'mb-5'}`}>
           <button onClick={onBack} aria-label={tr('Back')}
             className="grid h-10 w-10 place-items-center rounded-full bg-black/40 text-fog-100 backdrop-blur">
-            <IcChevronLeft width={22} height={22} />
+            <IcChevronLeft width={22} height={22} className="rtl:-scale-x-100" />
           </button>
           <span className="text-xs font-semibold uppercase tracking-wider text-fog-500">{tr('Admin')}</span>
         </div>
@@ -223,7 +233,7 @@ function AdminHero({ onBack }: { onBack: () => void; onScan?: undefined }) {
             <span aria-hidden className={`size-2.5 shrink-0 rounded-full ${
               !health ? 'bg-fog-600' : bad ? 'bg-amber-400' : 'bg-emerald-400'
             } ${!health ? 'animate-pulse' : ''}`} />
-            <h1 className="font-display text-2xl font-bold leading-tight text-fog-50 lg:text-4xl">{verdict}</h1>
+            <h1 className={`font-display font-bold leading-tight text-fog-50 ${compact ? 'text-xl lg:text-2xl' : 'text-2xl lg:text-4xl'}`}>{verdict}</h1>
           </div>
           {(facts.length > 0 || running) && (
             <p className="mt-2 text-sm text-fog-400">
@@ -238,8 +248,8 @@ function AdminHero({ onBack }: { onBack: () => void; onScan?: undefined }) {
         </motion.div>
 
         <motion.div initial={{ opacity: 0, y: 12 }} animate={{ opacity: 1, y: 0 }}
-          transition={{ duration: 0.5, delay: 0.08, ease: [0.22, 0.61, 0.36, 1] }} className="mt-5">
-          <button onClick={scan} disabled={scanned?.kind === 'working'} data-hero-scan className="btn-accent px-5 py-2.5 text-sm disabled:opacity-60">
+          transition={{ duration: 0.5, delay: 0.08, ease: [0.22, 0.61, 0.36, 1] }} className={compact ? 'mt-3' : 'mt-5'}>
+          <button onClick={scan} disabled={scanned?.kind === 'working'} data-hero-scan className={`btn-accent disabled:opacity-60 ${compact ? 'px-4 py-2 text-xs' : 'px-5 py-2.5 text-sm'}`}>
             <IcRefresh width={16} height={16} />{scanned?.kind === 'working' ? tr('Scanning library…') : tr('Scan library now')}
           </button>
           {scanned && scanned.kind !== 'working' && <div data-hero-scan-result className="max-w-xl"><ActionStatus state={scanned} /></div>}
@@ -261,10 +271,7 @@ function AdminHero({ onBack }: { onBack: () => void; onScan?: undefined }) {
  */
 function VersionLine() {
   const { data: stats } = useQuery({ queryKey: ['admin-stats'], queryFn: () => api<any>('/api/admin/stats') });
-  const { data: health } = useQuery({
-    queryKey: ['admin-health'],
-    queryFn: () => api<{ generatedAt: string; checks: HealthCheck[] }>('/api/admin/health'),
-  });
+  const { data: health } = useQuery(healthQuery);
   const running: string | null = bridge()?.version || stats?.version || null;
   if (!running) return null;
   return (
@@ -306,10 +313,7 @@ function VersionFacts({ running, update }: { running: string; update: UpdateStat
 function Overview({ onTab }: { onTab: (t: Tab) => void }) {
   const still = useReducedMotion();
   const { data: stats } = useQuery({ queryKey: ['admin-stats'], queryFn: () => api<any>('/api/admin/stats') });
-  const { data: health } = useQuery({
-    queryKey: ['admin-health'],
-    queryFn: () => api<{ generatedAt: string; checks: HealthCheck[] }>('/api/admin/health'),
-  });
+  const { data: health } = useQuery(healthQuery);
   // What the household is actually reading, cross-user and last-14-days. The endpoint has existed since the
   // home screen shipped and admin has never called it; it is the best available answer to "is anyone
   // reading any of this", for one query and no new component.
@@ -377,7 +381,7 @@ function Overview({ onTab }: { onTab: (t: Tab) => void }) {
         <div className="full">
           <h2 className="mb-2 font-display text-base font-semibold">{tr('Top 10 in your library')}</h2>
           <div className="hide-scrollbar -mx-4 flex gap-3 overflow-x-auto px-4 pb-1 [scroll-snap-type:x_mandatory] lg:mx-0 lg:px-0"
-            data-lenis-prevent>
+            data-lenis-prevent-horizontal>
             {/* The heading says ten. */}
             {rail.slice(0, 10).map((sx) => <SeriesCard key={sx.id} series={sx} />)}
           </div>
@@ -471,7 +475,15 @@ function Members() {
   const { user } = useAuth();
   const toast = useToast();
   const qc = useQueryClient();
-  const { data } = useQuery({ queryKey: ['admin-users'], queryFn: () => api<{ content: any[] }>('/api/admin/users') });
+  const { data } = useQuery({
+    queryKey: ['admin-users'],
+    queryFn: () => api<{ content: any[]; auth?: { mode: 'local' | 'oidc-only'; sso: string | null; signup: boolean } }>('/api/admin/users'),
+  });
+  // SSO-only mode (v0.63.0, #208): accounts come from the provider. No New account, no password to reset -- the server
+  // refuses both -- and a card that says where accounts come from instead. Reintroduce the form and "Members offers no
+  // New account and no password in SSO-only mode" in web/test/ssoOnly.test.ts fails.
+  const ssoOnly = data?.auth?.mode === 'oidc-only';
+  const provider = data?.auth?.sso ?? '';
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
   const [displayName, setDisplayName] = useState('');
@@ -506,6 +518,18 @@ function Members() {
 
   return (
     <div className="board">
+      {ssoOnly ? (
+        <div className="card grad-border p-4" data-sso-accounts>
+          <h2 className="mb-2 font-display text-base font-semibold">{tr('New accounts')}</h2>
+          <p className="text-sm leading-relaxed text-fog-300">
+            {data?.auth?.signup
+              ? tr('This server signs in through {name} only. Anyone {name} lets in gets an account the first time they sign in, so choose who in {name}.', { name: iso(provider) })
+              : tr('This server signs in through {name} only, and makes no new accounts: only accounts already linked to {name} can sign in. OIDC_ALLOW_SIGNUP lets new people in.', { name: iso(provider) })}
+          </p>
+          {/* What those accounts start with (#208, item 6): the chips of the card below in local mode. */}
+          <NewMemberDefaults sso provider={provider} signup={!!data?.auth?.signup} />
+        </div>
+      ) : (
       <form onSubmit={create} className="card grad-border p-4">
         <h2 className="mb-3 font-display text-base font-semibold">{tr('New account')}</h2>
         <div className="space-y-2">
@@ -516,6 +540,11 @@ function Members() {
         </div>
         <button type="submit" disabled={busy || !username.trim() || password.length < 8} className="btn-accent mt-3 w-full disabled:opacity-50"><IcPlus width={18} height={18} /> {busy ? tr('Creating…') : tr('Create account')}</button>
       </form>
+      )}
+      {/* #208, item 6: what a member who signs up starts with. A card of its own beside New account, which is an admin
+          choosing and is left alone by it. After the users list has answered, which says whether the provider makes
+          accounts too. */}
+      {!ssoOnly && data && <NewMemberDefaults provider={provider} signup={!!data.auth?.signup} />}
 
       {(data?.content ?? []).map((u: any) => {
         const self = u.id === user?.id;
@@ -530,23 +559,30 @@ function Members() {
               </div>
               {!self && (
                 <button onClick={() => setDeleting(u)} aria-label={tr('Remove')}
-                  className="grid h-9 w-9 shrink-0 place-items-center rounded-full border border-ink-700 text-red-300"><IcTrash width={16} height={16} /></button>
+                  className="btn-key btn-key-danger h-9 w-9 px-0"><IcTrash width={16} height={16} /></button>
               )}
             </div>
             <p className="mt-2 text-[11px] text-fog-500">
-              {[roleText(u.role), self ? tr('you') : null, u.disabled ? tr('disabled') : null, u.totp_enabled ? '2FA' : null].filter(Boolean).join(' · ')}
+              {/* The provider's name on an account linked to it (v0.63.0), as 2FA marks the accounts that have it. */}
+              {[roleText(u.role), self ? tr('you') : null, u.disabled ? tr('disabled') : null, u.totp_enabled ? '2FA' : null, u.sso && provider ? provider : null].filter(Boolean).join(' · ')}
             </p>
+            {/* Keys (UI refresh): each acts on the account. The choices inside the library and age panels stay chips. */}
             <div className="mt-2.5 flex flex-wrap gap-1.5">
-              <button onClick={() => setResetting(u)} className="chip text-xs">{tr('Reset')}</button>
+              {!ssoOnly && <button onClick={() => setResetting(u)} className="btn-key">{tr('Reset')}</button>}
               {!self && (
                 <>
-                  <button onClick={() => patch(u, { role: u.role === 'admin' ? 'user' : 'admin' }, tr('Role updated'))} className="chip text-xs">{u.role === 'admin' ? tr('Make member') : tr('Make admin')}</button>
-                  <button onClick={() => patch(u, { disabled: !u.disabled }, u.disabled ? tr('Account enabled') : tr('Account disabled'))} className="chip text-xs">{u.disabled ? tr('Enable') : tr('Disable')}</button>
-                  <button onClick={() => patch(u, { perms: { ...u.perms, canDownload: !canDl } }, tr('Permission updated'))} className="chip text-xs">{canDl ? tr('Deny downloads') : tr('Allow downloads')}</button>
+                  <button onClick={() => patch(u, { role: u.role === 'admin' ? 'user' : 'admin' }, tr('Role updated'))} className="btn-key">{u.role === 'admin' ? tr('Make member') : tr('Make admin')}</button>
+                  <button onClick={() => patch(u, { disabled: !u.disabled }, u.disabled ? tr('Account enabled') : tr('Account disabled'))} className="btn-key">{u.disabled ? tr('Enable') : tr('Disable')}</button>
+                  {/* A member's, like the two below: an admin downloads whatever the flag says (routes/sources.ts), so on an
+                      admin's card it toggled nothing -- and one the provider made carries the new-member default for
+                      the day it is made a member, which read here as a refusal it is not. */}
+                  {u.role !== 'admin' && <button onClick={() => patch(u, { perms: { ...u.perms, canDownload: !canDl } }, tr('Permission updated'))} className="btn-key">{canDl ? tr('Deny downloads') : tr('Allow downloads')}</button>}
                   {/* Library access. "All libraries" is the ABSENCE of grant rows, not a full set of them, so a
                       library added next month is visible to unrestricted accounts without editing anyone. */}
-                  {u.role !== 'admin' && <LibraryAccess user={u} onSaved={inval} />}
-                  {u.role !== 'admin' && <AgeCap user={u} onSaved={inval} />}
+                  {u.role !== 'admin' && <LibraryAccess granted={u.libraries ?? null} onSaved={inval}
+                    save={(libraries) => api(`/api/admin/users/${u.id}`, { method: 'PATCH', json: { libraries } })} />}
+                  {u.role !== 'admin' && <AgeCap cap={u.max_age_rating ?? null} onSaved={inval}
+                    save={(maxAgeRating) => api(`/api/admin/users/${u.id}`, { method: 'PATCH', json: { maxAgeRating } })} />}
                 </>
               )}
             </div>
@@ -579,6 +615,67 @@ function Members() {
           onConfirm={() => del(deleting)}
           onClose={() => setDeleting(null)}
         />
+      )}
+    </div>
+  );
+}
+
+/**
+ * What a member the server makes by itself starts with (#208, item 6; bff lib/memberDefaults.ts): one who signs up, or
+ * who signs in through the provider for the first time while it makes accounts (OIDC_ALLOW_SIGNUP). A member card's own
+ * three chips -- downloads, libraries, age limit -- with the same panels and meanings, saved to the server's settings
+ * rather than to an account: what is set here is what that account's card shows on its first day.
+ *
+ * A card of its own after New account, which is an admin choosing and is left alone by these, as every account that
+ * exists is; in SSO-only mode, inside the card that says where accounts come from. When nobody can sign up, the card
+ * says so, rather than reading as a setting that does nothing.
+ */
+function NewMemberDefaults({ sso, provider, signup }: { sso?: boolean; provider: string; signup: boolean }) {
+  const toast = useToast();
+  const qc = useQueryClient();
+  const [busy, setBusy] = useState(false);
+  // Admin → Settings' own query: one answer and one refetch for both tabs.
+  const { data } = useQuery({ queryKey: ['admin-settings'], queryFn: () => api<any>('/api/admin/settings') });
+  if (!data) return null;
+  const d = memberDefaultsOf(data);
+  // Resolves once the refetch has landed, so a chip stays busy until it shows what was saved.
+  const saved = () => qc.invalidateQueries({ queryKey: ['admin-settings'] });
+  const save = (patch: Partial<MemberDefaults>) => api('/api/admin/settings', { method: 'PATCH', json: { newMemberDefaults: patch } });
+  const canDl = d.perms.canDownload !== false;
+  const flipDownloads = async () => {
+    setBusy(true);
+    try { await save({ perms: canDl ? { canDownload: false } : {} }); toast(tr('Permission updated'), 'success'); await saved(); }
+    catch (e) { toast(msgOf(e, tr('Could not update')), 'error'); }
+    setBusy(false);
+  };
+  // The keys say what a new member gets, lit where that is less than everything, as LibraryAccess and AgeCap are.
+  const chips = (
+    <div className="mt-2.5 flex flex-wrap gap-1.5" data-member-defaults>
+      <button onClick={flipDownloads} disabled={busy} className={`btn-key ${canDl ? '' : 'btn-key-accent'}`}>{canDl ? tr('Can download') : tr('No downloads')}</button>
+      <LibraryAccess granted={d.libraries} save={(libraries) => save({ libraries })} onSaved={saved} nothing={tr('New members would see nothing.')} />
+      <AgeCap cap={d.maxAgeRating} save={(maxAgeRating) => save({ maxAgeRating })} onSaved={saved} />
+    </div>
+  );
+  if (sso) {
+    return (
+      <div className="mt-3 border-t border-ink-800 pt-3">
+        <p className="text-[11px] leading-relaxed text-fog-500">{tr('Each new member starts with these. Existing accounts are not affected.')}</p>
+        {chips}
+      </div>
+    );
+  }
+  return (
+    <div className="card grad-border p-4">
+      <h2 className="mb-2 font-display text-base font-semibold">{tr('When someone signs up')}</h2>
+      <p className="text-sm leading-relaxed text-fog-300">
+        {provider && signup
+          ? tr('A member who signs up, or signs in with {name} for the first time, starts with these.', { name: iso(provider) })
+          : tr('A member who signs up starts with these.')}
+      </p>
+      {chips}
+      <p className="mt-2.5 text-[11px] leading-relaxed text-fog-500">{tr('Existing accounts, and accounts you make here, are not affected.')}</p>
+      {!joinsOnTheirOwn({ registration: !!data.allow_registration, provider: provider || null, signup }) && (
+        <p className="mt-1 text-[11px] leading-relaxed text-fog-400">{tr('Nobody can sign up right now: Open registration is off in Settings.')}</p>
       )}
     </div>
   );
@@ -680,7 +777,7 @@ function ArtReview() {
       {/* The row as the gallery has it now, not as it was when the picker opened: after Use the first page or a reset the
           picker's keys follow what the series has. */}
       {open && <ArtPicker row={(data?.content ?? []).find((r) => r.id === open.id) ?? open} onClose={() => setOpen(null)}
-        onApplied={() => { setBust((b) => ({ ...b, [open.id]: Date.now() })); qc.invalidateQueries({ queryKey: ['admin-art'] }); }} />}
+        onApplied={() => { bustCover(open.id); setBust((b) => ({ ...b, [open.id]: Date.now() })); qc.invalidateQueries({ queryKey: ['admin-art'] }); }} />}
     </div>
   );
 }
@@ -996,6 +1093,8 @@ interface LibraryRow {
   age_rating: number | null;
   /** Automatic, implicit title/id lookups may contact AniList for series currently filed here. */
   anilist_lookup: boolean;
+  /** Reading defaults for its series (bff lib/libraryReader.ts): mode, pages per view, direction; null when it has none. */
+  reader_prefs?: { mode?: string; spread?: boolean; pagedDirection?: string } | null;
   /** How many of its series were placed here by hand rather than by the folder rule. */
   pinned: number;
   /** Who can open it. Includes members with no restriction at all, who see every library. */
@@ -1013,7 +1112,7 @@ interface FolderPage { path: string; parent: string | null; folders: FolderRow[]
  * promoting one of those makes a "library" named after a scraper. Those candidates are flagged as such.
  */
 /**
- * Which libraries one member may see.
+ * Which libraries one member may see -- or, on When someone signs up, the ones a member who signs up starts with.
  *
  * "All libraries" is the absence of grant rows, not a full set of them. That distinction matters on upgrade
  * (nobody's access changes) and later (a library created next month is visible to unrestricted accounts
@@ -1022,7 +1121,7 @@ interface FolderPage { path: string; parent: string | null; folders: FolderRow[]
  * Admins are unrestricted by definition and never get this control.
  */
 /**
- * The highest age rating one member may see.
+ * The highest age rating one member may see -- or, on When someone signs up, the one a member who signs up starts with.
  *
  * Mirrors LibraryAccess deliberately: null means no cap, the same way no grant rows means every library, so
  * an account with neither restriction behaves exactly as it did before either existed.
@@ -1033,25 +1132,25 @@ interface FolderPage { path: string; parent: string | null; folders: FolderRow[]
  */
 const AGE_CAPS = [6, 10, 13, 15, 17, 18];
 
-function AgeCap({ user, onSaved }: { user: any; onSaved: () => void }) {
+function AgeCap({ cap, save: store, onSaved }: { cap: number | null; save: (next: number | null) => Promise<unknown>; onSaved: () => unknown }) {
   const toast = useToast();
   const [open, setOpen] = useState(false);
   const [busy, setBusy] = useState(false);
-  const cap: number | null = user.max_age_rating ?? null;
 
   const save = async (next: number | null) => {
     setBusy(true);
     try {
-      await api(`/api/admin/users/${user.id}`, { method: 'PATCH', json: { maxAgeRating: next } });
+      await store(next);
       toast(next === null ? tr('No age limit') : tr('Limited to {age}+ and below', { age: next }), 'success');
-      onSaved();
+      // Busy until the refetch has landed: a click before it would save from the old value.
+      await onSaved();
     } catch (e) { toast(msgOf(e, tr('Could not change that')), 'error'); }
     setBusy(false);
   };
 
   return (
     <>
-      <button onClick={() => setOpen((v) => !v)} className={`chip text-xs ${cap !== null ? 'chip-active' : ''}`}>
+      <button onClick={() => setOpen((v) => !v)} aria-expanded={open} className={`btn-key ${cap !== null ? 'btn-key-accent' : ''}`}>
         {cap === null ? tr('Any age rating') : tr('{age}+ and below', { age: cap })}
       </button>
       {open && (
@@ -1084,7 +1183,13 @@ function AgeCap({ user, onSaved }: { user: any; onSaved: () => void }) {
   );
 }
 
-function LibraryAccess({ user, onSaved }: { user: any; onSaved: () => void }) {
+function LibraryAccess({ granted, save: store, onSaved, nothing }: {
+  granted: string[] | null;
+  save: (next: string[] | null) => Promise<unknown>;
+  onSaved: () => unknown;
+  /** What the panel says when none are ticked. */
+  nothing?: string;
+}) {
   const toast = useToast();
   const [open, setOpen] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -1094,14 +1199,14 @@ function LibraryAccess({ user, onSaved }: { user: any; onSaved: () => void }) {
     enabled: open,
   });
   const libs = data?.content ?? [];
-  const granted: string[] | null = user.libraries ?? null;
 
   const save = async (next: string[] | null) => {
     setBusy(true);
     try {
-      await api(`/api/admin/users/${user.id}`, { method: 'PATCH', json: { libraries: next } });
+      await store(next);
       toast(!next ? tr('All libraries') : next.length === 1 ? tr('Limited to 1 library') : tr('Limited to {n} libraries', { n: next.length }), 'success');
-      onSaved();
+      // Busy until the refetch has landed: two quick ticks both worked from the old list, and the second undid the first.
+      await onSaved();
     } catch (e) { toast(msgOf(e, tr('Could not change that')), 'error'); }
     setBusy(false);
   };
@@ -1114,14 +1219,15 @@ function LibraryAccess({ user, onSaved }: { user: any; onSaved: () => void }) {
   // Only worth showing once there is more than one library to choose between.
   return (
     <>
-      <button onClick={() => setOpen((v) => !v)} className={`chip text-xs ${granted ? 'chip-active' : ''}`}>
+      <button onClick={() => setOpen((v) => !v)} aria-expanded={open} className={`btn-key ${granted ? 'btn-key-accent' : ''}`}>
         {!granted ? tr('All libraries') : granted.length === 1 ? tr('1 library') : tr('{n} libraries', { n: granted.length })}
       </button>
       {open && (
         <div className="mt-1.5 w-full rounded-xl border border-ink-700 p-2.5">
           <label className="flex cursor-pointer items-center justify-between gap-3 text-xs">
             <span className="text-fog-200">{tr('All libraries')}<span className="ms-1 text-fog-500">{tr('(including any added later)')}</span></span>
-            <input type="checkbox" checked={!granted} disabled={busy}
+            {/* Not before the list has loaded: unticked over an empty list, "every library" was saved as none. */}
+            <input type="checkbox" checked={!granted} disabled={busy || !data}
               onChange={(e) => save(e.target.checked ? null : libs.map((l) => l.id))}
               className="size-4 shrink-0 accent-accent" />
           </label>
@@ -1133,7 +1239,7 @@ function LibraryAccess({ user, onSaved }: { user: any; onSaved: () => void }) {
                   {l.name}
                 </button>
               ))}
-              {!granted.length && <p className="text-[11px] text-amber-300">{tr('This member currently sees nothing.')}</p>}
+              {!granted.length && <p className="text-[11px] text-amber-300">{nothing ?? tr('This member currently sees nothing.')}</p>}
             </div>
           )}
         </div>
@@ -1226,6 +1332,17 @@ function LibraryDialog({ editing, start, libs, onClose, onSaved }: {
   const [typed, setTyped] = useState('');
   const [age, setAge] = useState<string>(editing?.age_rating == null ? '' : String(editing.age_rating));
   const [anilistLookup, setAniListLookup] = useState(editing?.anilist_lookup ?? true);
+  const [look, setLook] = useState<Record<string, string>>(() => {
+    const r = editing?.reader_prefs;
+    return { mode: r?.mode ?? '', spread: r?.spread === undefined ? '' : String(r.spread), pagedDirection: r?.pagedDirection ?? '' };
+  });
+  const readerPrefs = () => {
+    const o: Record<string, unknown> = {};
+    if (look.mode) o.mode = look.mode;
+    if (look.spread) o.spread = look.spread === 'true';
+    if (look.pagedDirection) o.pagedDirection = look.pagedDirection;
+    return Object.keys(o).length ? o : null;
+  };
   const [preview, setPreview] = useState<{ series: number; sample: string[] } | null>(null);
   const [busy, setBusy] = useState(false);
   const isLib = editing?.id === 'lib';
@@ -1270,7 +1387,7 @@ function LibraryDialog({ editing, start, libs, onClose, onSaved }: {
     try {
       const ageRating = age === '' ? null : Number(age);
       if (editing) {
-        const body: Record<string, unknown> = { name: name.trim(), ageRating, anilistLookup };
+        const body: Record<string, unknown> = { name: name.trim(), ageRating, anilistLookup, readerPrefs: readerPrefs() };
         if (!isLib && !unchanged) body.paths = folders;
         await api(`/api/admin/libraries/${editing.id}`, { method: 'PATCH', json: body });
         toast(tr('Saved'), 'success');
@@ -1278,7 +1395,7 @@ function LibraryDialog({ editing, start, libs, onClose, onSaved }: {
         // One request. This used to POST the library and then PATCH the rating separately, and skip the
         // PATCH entirely when the rating was null -- so a failed second call created an unrated library
         // under a "Created" toast, which is the one outcome nobody would check for.
-        await api('/api/admin/libraries', { method: 'POST', json: { name: name.trim(), paths: folders, ageRating, anilistLookup } });
+        await api('/api/admin/libraries', { method: 'POST', json: { name: name.trim(), paths: folders, ageRating, anilistLookup, readerPrefs: readerPrefs() } });
         toast(tr('Created'), 'success');
       }
       onSaved();
@@ -1353,6 +1470,29 @@ function LibraryDialog({ editing, start, libs, onClose, onSaved }: {
             className="mt-0.5 size-4 shrink-0 accent-accent" data-library-anilist-lookup />
         </label>
 
+        <div className="mt-3 max-w-md rounded-lg border border-ink-700 bg-ink-900/40 p-3" data-library-reader>
+          <span className="block text-xs font-medium text-fog-200">{tr('Reading defaults')}</span>
+          <span className="mt-1 block text-[11px] leading-relaxed text-fog-500">
+            {tr("Used for every series in this library, unless the series or its source has its own.")}
+          </span>
+          <div className="mt-2 grid grid-cols-2 gap-2">
+            {([
+              ['mode', tr('Reading mode'), [['vertical', tr('Webtoon (scroll)')], ['paged', tr('Paged (swipe)')]]],
+              ['spread', tr('Pages per view'), [['false', tr('Single')], ['true', tr('Double spread')]]],
+              ['pagedDirection', tr('Reading direction'), [['series', tr('Series default')], ['ltr', tr('Left to right')], ['rtl', tr('Right to left')]]],
+            ] as const).map(([k, label, opts]) => (
+              <label key={k} className="block text-[11px] text-fog-400">
+                {label}
+                <select value={look[k]} onChange={(e) => setLook({ ...look, [k]: e.target.value })}
+                  className="field mt-1" data-library-look={k}>
+                  <option value="">{tr('Use user default')}</option>
+                  {opts.map(([v, l]) => <option key={v} value={v}>{l}</option>)}
+                </select>
+              </label>
+            ))}
+          </div>
+        </div>
+
         {preview && (
           <p className="mt-3 text-[11px] leading-relaxed text-fog-500" data-library-preview={preview.series}>
             {previewText(preview.series, preview.sample)}
@@ -1396,7 +1536,10 @@ function LibrariesSection() {
   const anyMembers = (people?.content ?? []).some((u) => u.role !== 'admin');
   // Uchiyomi Desktop keeps libraries and their age rating but not who may open them (lib/desktop.ts).
   const desktopLibs = isDesktop();
-  const refresh = () => { for (const k of [['admin-libraries'], ['admin-users'], ['library'], ['home']]) qc.invalidateQueries({ queryKey: k }); };
+  // ['libraries'] too (v0.60.1, found in Squeaks72's fork): the Library page's library filter and the 18+ toggle read it
+  // (components/AdultToggle.tsx useLibraries), and with a five-minute staleTime they kept a renamed, added or removed
+  // library in this tab until then.
+  const refresh = () => { for (const k of [['admin-libraries'], ['libraries'], ['admin-users'], ['library'], ['home']]) qc.invalidateQueries({ queryKey: k }); };
 
   const openNew = (from = { name: '', paths: [] as string[] }) => { setStart(from); setAdding(true); setEditing(null); };
   const openEdit = (l: LibraryRow) => { setEditing(l); setAdding(false); };
@@ -1741,19 +1884,28 @@ function Health() {
   const [open, setOpen] = useState<string | null>(null);
   // v0.55.0: Fix everything's dialog -- the question, the run, or how the run ended.
   const [fixing, setFixing] = useState(false);
-  const { data, isFetching, refetch } = useQuery({
-    queryKey: ['admin-health'],
-    queryFn: () => api<{ generatedAt: string; checks: HealthCheck[] }>('/api/admin/health'),
-  });
+  // v0.72.0 (#254): one card per check, or one per series. This device's choice, read after mount: the static export
+  // renders without localStorage. The report asks for the series while it is By series (lib/healthBySeries.ts).
+  const [view, setView] = useState<HealthView>('checks');
+  useEffect(() => { setView(healthView()); }, []);
+  const { data, isFetching, refetch } = useQuery(healthQuery);
   const checks = data?.checks || [];
   const bad = checks.filter((c) => c.status !== 'ok').length;
   // After anything on this page changes a finding -- a repair that ENDED, an ignore -- the page is checked
   // again, and the header's mark with it: the refetch stores a new summary, and the header reads that summary.
   const qc = useQueryClient();
   const recheck = () => refetch().then(() => qc.invalidateQueries({ queryKey: ['health-summary'] }));
-  // A Needs-you item's card key, in Fix everything's end: the dialog closes, and that card opens where it is.
+  const pickView = (v: HealthView) => {
+    setHealthView(v);
+    setView(v);
+    // The cards are the same either way; By series needs the grouping, which the report carries only when asked.
+    if (v === 'series' && !data?.bySeries) void refetch();
+  };
+  // A Needs-you item's card key, in Fix everything's end: the dialog closes, and that card opens where it is -- in the
+  // By check view, which is where a card is.
   const showCheck = (id: string) => {
     setFixing(false);
+    if (view !== 'checks') pickView('checks');
     setOpen(id);
     requestAnimationFrame(() => document.querySelector(`[data-health-check="${CSS.escape(id)}"]`)?.scrollIntoView({ block: 'start' }));
   };
@@ -1786,10 +1938,19 @@ function Health() {
           </div>
         </div>
 
+        <LastFixLine />
         <SafeRepairLine checks={checks} />
         <RepairLiveStrip />
 
-        {checks.map((c) => {
+        {/* v0.72.0 (#254): the same findings, one card per check or one per series. */}
+        <div className="full" data-health-view>
+          <Segmented square label={tr('Group the findings')} value={view} onChange={pickView}
+            options={[{ value: 'checks', label: tr('By check') }, { value: 'series', label: tr('By series') }]} />
+        </div>
+        {view === 'series' && (data?.bySeries
+          ? <HealthBySeries rows={data.bySeries} checks={checks} />
+          : <p role="status" className="full py-8 text-center text-sm text-fog-500">{tr('Checking your library…')}</p>)}
+        {view === 'checks' && checks.map((c) => {
           const isOpen = open === c.id;
           // Notes explain important states that are deliberately not findings. A readable partial chapter, for
           // example, is absent from the active failure ledger but this note is the only place Health says where

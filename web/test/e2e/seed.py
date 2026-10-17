@@ -6,6 +6,7 @@ the ones the README actually names -- if a format is added, this file is where i
 browser pass never opened one.
 """
 import os
+import random
 import struct
 import sys
 import zipfile
@@ -167,8 +168,217 @@ def rtl(root: str) -> None:
     print(f'  seeded {manga} and {plain}')
 
 
+def cascade(root: str) -> None:
+    """The #180 walk's library (walk180.mjs): a right-to-left series long enough for appends to chain.
+
+    Only on request (`seed.py <root> --cascade`). Four twelve-page chapters, each page different, whose ComicInfo says
+    `<Manga>YesAndRightToLeft</Manga>`: four pages before the end of one the reader appends the next, and in Safari
+    every append used to carry the reader to the same distance from the new end, which appended the next.
+    """
+    series = os.path.join(root, 'Test Source', 'Cascade Right To Left')
+    os.makedirs(series, exist_ok=True)
+    for ch in (1, 2, 3, 4):
+        with zipfile.ZipFile(os.path.join(series, f'Chapter {ch:03d}.cbz'), 'w') as z:
+            for i in range(1, 13):
+                z.writestr(f'{i:03d}.png', bands(300, 450, 1800 + ch * 100 + i))
+            z.writestr('ComicInfo.xml', '<?xml version="1.0"?><ComicInfo><Series>Cascade Right To Left</Series>'
+                       f'<Number>{ch}</Number><Manga>YesAndRightToLeft</Manga></ComicInfo>')
+    print(f'  seeded {series}')
+
+
+def _rows_png(w: int, h: int, row_for) -> bytes:
+    """A PNG built a row at a time from `row_for(y)` (w * 3 bytes): fast enough for a 20,000-row strip."""
+    raw = bytearray()
+    for y in range(h):
+        raw += b'\x00'
+        raw += row_for(y)
+    return _png_from_raw(w, h, bytes(raw))
+
+
+def _patterns(w: int, seed: int, n: int, lo: int = 40, span: int = 150):
+    """`n` distinct mid-tone rows: no channel near white or near black, so a crop finds no paper in them."""
+    out = []
+    for k in range(n):
+        row = bytearray()
+        for x in range(w):
+            v = lo + (x * 7 + k * 31 + seed * 13) % span
+            row += bytes((v, lo + (v * 3 + k) % span, lo + (v + 2 * k + seed) % span))
+        out.append(bytes(row))
+    return out
+
+
+def strip_png(w: int, h: int, seed: int) -> bytes:
+    """A long strip, art edge to edge: bands of patterned rows, a new band every 250 rows."""
+    pats = _patterns(w, seed, 16)
+    return _rows_png(w, h, lambda y: pats[(y // 250 + seed) % 16])
+
+
+def bordered_png(w: int, h: int, seed: int, border: int = 80, halves: bool = False) -> bytes:
+    """A scanned page: white paper, `border` px of it all round, art inside. `halves`: a double spread whose left
+    half is dark art and right half light art, so a walk can tell which half is on screen."""
+    white = b'\xff' * (w * 3)
+    edge = b'\xff' * (border * 3)
+    inner = w - 2 * border
+    if halves:
+        left = _patterns(w // 2 - border, seed, 12, lo=20, span=90)
+        right = _patterns(w // 2 - border, seed + 50, 12, lo=120, span=90)
+        art = [l + r for l, r in zip(left, right)]
+    else:
+        art = _patterns(inner, seed, 12)
+    return _rows_png(w, h, lambda y: white if y < border or y >= h - border else edge + art[(y // 90 + seed) % 12] + edge)
+
+
+def comfort(root: str) -> None:
+    """The v0.61.0 reader walk's library (v610Walk-reader.mjs): the reader comfort pack.
+
+    Only on request (`seed.py <root> --comfort`). Two series, every page different from every other:
+      - Strip Long (left to right): chapter 1 is two 689 x 20,000 strips, chapter 2 is 120 slices of 720 x 1,000,
+        chapter 3 two strips again -- the window by screens, the append six screens from the end, the zoom that keeps
+        its place mid-strip, the automatic pick's "long strips", and a crop that finds nothing to trim.
+      - Margins Manga (right to left, ComicInfo `YesAndRightToLeft`): two twelve-page chapters of 1,200 x 1,700 pages
+        with 80 px of white paper all round, pages 10 and 12 of each a 2,400 x 1,700 double spread whose halves are
+        told apart by their art (dark left, light right) -- Crop page borders, Wide pages, and the automatic pick's
+        right-to-left.
+    """
+    strip = os.path.join(root, 'Test Source', 'Strip Long')
+    os.makedirs(strip, exist_ok=True)
+    for ch, kind in ((1, 'strips'), (2, 'slices'), (3, 'strips')):
+        with zipfile.ZipFile(os.path.join(strip, f'Chapter {ch:03d}.cbz'), 'w', zipfile.ZIP_STORED) as z:
+            if kind == 'strips':
+                for i in (1, 2):
+                    z.writestr(f'{i:03d}.png', strip_png(689, 20000, ch * 10 + i))
+            else:
+                for i in range(1, 121):
+                    z.writestr(f'{i:03d}.png', strip_png(720, 1000, 1000 + i))
+            z.writestr('ComicInfo.xml', '<?xml version="1.0"?><ComicInfo><Series>Strip Long</Series>'
+                       f'<Number>{ch}</Number><Manga>No</Manga></ComicInfo>')
+    manga = os.path.join(root, 'Test Source', 'Margins Manga')
+    os.makedirs(manga, exist_ok=True)
+    for ch in (1, 2):
+        with zipfile.ZipFile(os.path.join(manga, f'Chapter {ch:03d}.cbz'), 'w', zipfile.ZIP_STORED) as z:
+            for i in range(1, 13):
+                spread = i in (10, 12)
+                z.writestr(f'{i:03d}.png', bordered_png(2400 if spread else 1200, 1700, ch * 100 + i, halves=spread))
+            z.writestr('ComicInfo.xml', '<?xml version="1.0"?><ComicInfo><Series>Margins Manga</Series>'
+                       f'<Number>{ch}</Number><Manga>YesAndRightToLeft</Manga></ComicInfo>')
+    print(f'  seeded {strip} and {manga}')
+
+
+def noise_png(w: int, h: int, seed: int) -> bytes:
+    """A page of noise: nothing in it compresses, so any copy of it made narrower is smaller -- where bordered_png's
+    repeated rows make a PNG so small that no narrower copy of it is (and the server rightly sends the page as it is)."""
+    rnd = random.Random(seed)
+    return _rows_png(w, h, lambda y: rnd.randbytes(w * 3))
+
+
+def readergroup(root: str) -> None:
+    """The reader walk's library (walk263.mjs: #263, #236, #233, #234), every page different from every other.
+
+    Only on request (`seed.py <root> --reader`). Named so that no AniList entry is called that (see rtl()):
+      - Walk Two Six Three Resume (left to right): four twelve-page chapters of 300 x 450 pages -- the address following
+        three crossings and a refresh, a resize; pages narrower than any width Fit pages to my screen asks for.
+      - Walk Two Six Three Gaps: chapters 1, 2, 5, one file holding 6 to 8, and 9, four pages each -- 3 and 4 are missing,
+        6 to 8 are one file's.
+      - Walk Two Six Three Wide (left to right): one twelve-page chapter of 1,200 x 1,700 pages with 2,400 x 1,700 double
+        spreads at pages 5 and 9, their halves told apart by their art -- Wide pages: Split across a turn of the phone,
+        and pages wider than a phone shows them (page 2 noise, so a narrower copy of it is smaller).
+    """
+    resume = os.path.join(root, 'Test Source', 'Walk Two Six Three Resume')
+    os.makedirs(resume, exist_ok=True)
+    for ch in (1, 2, 3, 4):
+        with zipfile.ZipFile(os.path.join(resume, f'Chapter {ch:03d}.cbz'), 'w') as z:
+            for i in range(1, 13):
+                z.writestr(f'{i:03d}.png', bands(300, 450, 2600 + ch * 100 + i))
+            z.writestr('ComicInfo.xml', '<?xml version="1.0"?><ComicInfo><Series>Walk Two Six Three Resume</Series>'
+                       f'<Number>{ch}</Number><Manga>No</Manga></ComicInfo>')
+    gaps = os.path.join(root, 'Test Source', 'Walk Two Six Three Gaps')
+    os.makedirs(gaps, exist_ok=True)
+    for k, name in enumerate(('Chapter 001', 'Chapter 002', 'Chapter 005', 'Chapter 006-008', 'Chapter 009')):
+        with zipfile.ZipFile(os.path.join(gaps, f'{name}.cbz'), 'w') as z:
+            for i in range(1, 5):
+                z.writestr(f'{i:03d}.png', bands(300, 450, 2700 + k * 10 + i))
+    wide = os.path.join(root, 'Test Source', 'Walk Two Six Three Wide')
+    os.makedirs(wide, exist_ok=True)
+    with zipfile.ZipFile(os.path.join(wide, 'Chapter 001.cbz'), 'w', zipfile.ZIP_STORED) as z:
+        for i in range(1, 13):
+            spread = i in (5, 9)
+            # Page 2 is noise: the one a narrower copy of is smaller, which Fit pages to my screen is then sent.
+            z.writestr(f'{i:03d}.png', noise_png(1200, 1700, 2802) if i == 2
+                       else bordered_png(2400 if spread else 1200, 1700, 2800 + i, halves=spread))
+        z.writestr('ComicInfo.xml', '<?xml version="1.0"?><ComicInfo><Series>Walk Two Six Three Wide</Series>'
+                   '<Number>1</Number><Manga>No</Manga></ComicInfo>')
+    print(f'  seeded {resume}, {gaps} and {wide}')
+
+
+def drawn_rows(w: int, h: int, seed: int):
+    """A drawn page as RGB rows: a screentone over the paper and grey bars at many heights, all from `seed`.
+
+    For spread joining (#229, walk229.mjs): the server joins two pages only where one picture runs across the seam -- the
+    same texture both sides, the small steps lining up, and no other page fitting either edge (bff lib/spreadJoin.ts).
+    A flat page, or the gradient bands() draws on every page alike, would fit any other page's edge and never join.
+    """
+    rnd = random.Random(seed)
+    slope = 1 + seed % 3
+    dot = b''.join(bytes((160, 160, 160)) if (x // 4) % 2 else bytes((200, 200, 200)) for x in range(8))
+    tile = dot * (w // 8 + 2)
+    rows = [bytearray(tile[((y * slope) % 8) * 3:((y * slope) % 8 + w) * 3]) for y in range(h)]
+    for _ in range(70):
+        y0, tall = rnd.randrange(h), max(4, h // 60)
+        x0 = rnd.randrange(int(w * 0.6))
+        x1 = min(w, x0 + int(w * 0.3) + rnd.randrange(int(w * 0.6)))
+        g = 30 + rnd.randrange(190)
+        for y in range(y0, min(h, y0 + tall)):
+            rows[y][x0 * 3:x1 * 3] = bytes((g, g, g)) * (x1 - x0)
+    return rows
+
+
+def drawn_png(w: int, h: int, seed: int) -> bytes:
+    return _png_from_raw(w, h, b''.join(b'\x00' + bytes(r) for r in drawn_rows(w, h, seed)))
+
+
+def spread_halves(w: int, h: int, seed: int):
+    """One drawing twice a page wide, cut down the middle: (its left half, its right half) as page-sized PNGs."""
+    rows = drawn_rows(2 * w, h, seed)
+    half = lambda a: _png_from_raw(w, h, b''.join(b'\x00' + bytes(r[a * 3:(a + w) * 3]) for r in rows))
+    return half(0), half(w)
+
+
+def spreads(root: str) -> None:
+    """The spread-joining walk's library (walk229.mjs: #229, #232, #261), right to left, 600 x 900 pages.
+
+    Only on request (`seed.py <root> --spreads`). Named so that no AniList entry is called that (see rtl()):
+      - Walk Two Two Nine Spreads, chapter 1: eight pages, 4 and 5 the right and the left half of one spread (a
+        right-to-left book serves its right half first): the server should join page 4, 'rtl'.
+      - chapter 2: six pages opening on a spread, 1 and 2, the first page of a chapter as half of one.
+    """
+    d = os.path.join(root, 'Test Source', 'Walk Two Two Nine Spreads')
+    os.makedirs(d, exist_ok=True)
+    w, h = 600, 900
+    info = lambda n: ('<?xml version="1.0"?><ComicInfo><Series>Walk Two Two Nine Spreads</Series>'
+                      f'<Number>{n}</Number><Manga>YesAndRightToLeft</Manga></ComicInfo>')
+    left, right = spread_halves(w, h, 22904)
+    with zipfile.ZipFile(os.path.join(d, 'Chapter 001.cbz'), 'w', zipfile.ZIP_STORED) as z:
+        for i in range(1, 9):
+            z.writestr(f'{i:03d}.png', right if i == 4 else left if i == 5 else drawn_png(w, h, 22900 + i))
+        z.writestr('ComicInfo.xml', info(1))
+    left2, right2 = spread_halves(w, h, 22951)
+    with zipfile.ZipFile(os.path.join(d, 'Chapter 002.cbz'), 'w', zipfile.ZIP_STORED) as z:
+        for i in range(1, 7):
+            z.writestr(f'{i:03d}.png', right2 if i == 1 else left2 if i == 2 else drawn_png(w, h, 22950 + i))
+        z.writestr('ComicInfo.xml', info(2))
+    print(f'  seeded {d}')
+
+
 if __name__ == '__main__':
-    if '--rtl' in sys.argv[2:]:
+    if '--spreads' in sys.argv[2:]:
+        spreads(sys.argv[1])
+    elif '--rtl' in sys.argv[2:]:
         rtl(sys.argv[1])
+    elif '--cascade' in sys.argv[2:]:
+        cascade(sys.argv[1])
+    elif '--comfort' in sys.argv[2:]:
+        comfort(sys.argv[1])
+    elif '--reader' in sys.argv[2:]:
+        readergroup(sys.argv[1])
     else:
         main(sys.argv[1])

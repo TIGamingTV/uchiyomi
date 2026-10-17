@@ -9,7 +9,11 @@ import { SourceAdapter, SourceSeries, SourceChapter } from './types';
 import { directionFromLanguage } from '../directionSignals';
 import { canonLang, langLabel, mdLang } from '../lang';
 
-const API = 'https://api.mangadex.org';
+/**
+ * Where MangaDex's API is: MANGADEX_API_URL moves it (v0.56.0), a test knob like ANILIST_API_URL -- the browser walk points it
+ * at a fake, so Discover's name lookups never ask the real MangaDex about a walk's made-up titles. Unset, MangaDex's own.
+ */
+const API = (process.env.MANGADEX_API_URL || 'https://api.mangadex.org').replace(/\/+$/, '');
 const HEADERS = { 'user-agent': 'Uchiyomi/1.0 (self-hosted personal reader)' };
 const RATINGS = ['safe', 'suggestive', 'erotica'].map((r) => `contentRating[]=${r}`).join('&');
 
@@ -169,6 +173,30 @@ export async function mangadexOriginalLanguages(ids: string[]): Promise<Map<stri
   return out;
 }
 
+/** A MangaDex entry as Discover's identity lookup needs it (lib/discoverIdentity.ts): every name, and its AniList link. */
+export interface MangaDexWork { id: string; names: string[]; al: string | null }
+
+/**
+ * The entries a name may be, by MangaDex's title search (which also searches alternative titles): up to five, each with
+ * every name it goes by and the AniList id it links to, for the caller to keep only one that IS the name. Through the
+ * shared limiter like every MangaDex request; a failure throws, so the caller asks again later rather than storing a miss.
+ */
+export async function searchMangaDexWorks(title: string): Promise<MangaDexWork[]> {
+  const s = title.trim();
+  if (!s) return [];
+  const j = await mdGet(`${API}/manga?title=${encodeURIComponent(s)}&limit=5&${RATINGS}&contentRating[]=pornographic`);
+  const out: MangaDexWork[] = [];
+  for (const m of j?.data || []) {
+    if (typeof m?.id !== 'string') continue;
+    const a = m.attributes || {};
+    const names = [...Object.values(a.title || {}), ...((a.altTitles || []) as any[]).flatMap((t) => Object.values(t || {}))]
+      .filter((n): n is string => typeof n === 'string' && !!n.trim());
+    const al = a.links && /^\d+$/.test(String(a.links.al ?? '')) ? String(a.links.al) : null;
+    out.push({ id: m.id.toLowerCase(), names, al });
+  }
+  return out;
+}
+
 /**
  * Every name of many titles at once -- each language's title and every alternative title -- for the recheck of a
  * cover the art backfill took from a MangaDex search before the title check existed (v0.55.7, lib/matchCheck.ts).
@@ -192,16 +220,6 @@ export async function mangadexTitles(ids: string[]): Promise<Map<string, string[
   return out;
 }
 
-
-/**
- * Languages tried, in order, when a title has no English chapters (the English adapter only).
- *
- * Deliberately short. Each miss is a request, and a title with chapters in NONE of these is one that was
- * already unusable -- so the list buys the common cases (the Spanish- and Portuguese-language scanlation
- * scene is by far the largest after English) without turning a genuinely empty title into a dozen calls on
- * every updater sweep.
- */
-const CHAPTER_LANGS = ['en', 'es-la', 'es', 'pt-br', 'fr', 'ru', 'id'] as const;
 
 /** The groups credited on one feed row, in the order MangaDex lists them. Empty when none is attached. */
 function groupsOn(c: any): string[] {
@@ -269,11 +287,11 @@ export function mangadexId(code: string): string {
 /**
  * MangaDex in one language, an app code from lib/lang.ts MANGADEX_LANGS ("es-419", "pt-BR", "zh-Hant").
  *
- * English is the `mangadex` adapter and is exactly what it was before v0.52.0, but for Newest: its search is
- * unfiltered and its chapter list falls back through Spanish, Portuguese and the rest when a title has no English.
- * Any other language is that language only: search and Popular find titles with chapters in it, Newest is its
- * newest chapters, and the chapter list is its chapters with no fallback -- a Spanish source that answered in
- * English would mix the languages it exists to keep apart. Throws for a code MangaDex is not offered in.
+ * Every adapter is its language only, English included (v0.62.0): search and Popular find titles with chapters in
+ * it, Newest is its newest chapters, and the chapter list is its chapters with no fallback. English used to fall
+ * back through Spanish, Portuguese and the rest when a title had no English chapters, which was how a server set to
+ * English only downloaded a Spanish series; since v0.52.0 that title belongs to MangaDex (ES-419), an adapter of its
+ * own. Throws for a code MangaDex is not offered in.
  */
 export function makeMangadex(code: string): SourceAdapter {
   const app = canonLang(code);
@@ -294,10 +312,9 @@ export function makeMangadex(code: string): SourceAdapter {
     preferredOrder: 10,
 
     async search(query) {
-      // English searches every title, as it always has (its chapter list falls back to other languages). Another
-      // language finds only titles that have chapters in it: a hit it cannot serve is a dead end.
-      const only = english ? '' : `&availableTranslatedLanguage[]=${md}`;
-      const j = await mdGet(`${API}/manga?title=${encodeURIComponent(query)}&limit=12&${RATINGS}&includes[]=cover_art&includes[]=author&order[relevance]=desc${only}`);
+      // Only titles with chapters in this language, English included (v0.62.0): a hit it cannot serve is a dead end,
+      // and English no longer falls back to another language to fill one.
+      const j = await mdGet(`${API}/manga?title=${encodeURIComponent(query)}&limit=12&${RATINGS}&includes[]=cover_art&includes[]=author&order[relevance]=desc&availableTranslatedLanguage[]=${md}`);
       return (j.data || []).map(series);
     },
 
@@ -344,26 +361,11 @@ export function makeMangadex(code: string): SourceAdapter {
     },
 
     async listChapters(seriesId) {
-      if (!english) return feedFor(seriesId, md);
-      // English first, then a fallback order -- ONE LANGUAGE AT A TIME, never all at once.
-      //
-      // The bug: this asked only for `translatedLanguage[]=en`, so a title whose chapters are all Spanish or
-      // Portuguese came back with zero chapters and could not be added at all. It looked like a dead series.
-      //
-      // Why not simply drop the filter, which is what the obvious fix does: chapter numbers repeat across
-      // languages, and the chooser in lib/releases.ts picks one copy per number by group, hosting and date --
-      // it has no notion of a preferred language. Pulling every language at once therefore produces a chapter
-      // list whose language is decided arbitrarily, per chapter. Asking one language at a time and stopping at
-      // the first that answers keeps the result single-language, so the chooser never has to arbitrate that.
-      //
-      // It also protects the reason this adapter declares `lang: 'en'` at all (see the comment on `lang`):
-      // reporting no language made it join every language group, and picking Japanese in the UI then filled a
-      // third of the wall with English MangaDex rows.
-      for (const lang of CHAPTER_LANGS) {
-        const found = await feedFor(seriesId, lang);
-        if (found.length) return found;
-      }
-      return [];
+      // This language's chapters and nothing else, English included (v0.62.0). English used to fall back one
+      // language at a time when a title had none, so a server set to English only downloaded Spanish or Portuguese
+      // chapters with nothing on screen to say why. Since v0.52.0 each language is an adapter of its own, so a title
+      // that exists only in Spanish is added from MangaDex (ES-419) instead.
+      return feedFor(seriesId, md);
     },
 
     async getPageUrls(chapterId) {

@@ -231,8 +231,11 @@ function configOf(x: string, target: string): { attrs: string; value: string } |
  * Before it, an Unraid user had to find, pin and configure a Suwayomi container by hand, and the one shipped
  * uncapped in every layout until v0.46.0 took a quarter of the host's memory (discussion #72).
  *
- * Reintroduce by deleting `--memory=1536m` from ExtraParams: the uncapped JVM is back on Unraid. Or write `--`
+ * Reintroduce by deleting `--memory=2048m` from ExtraParams: the uncapped JVM is back on Unraid. Or write `--`
  * into its header comment: dockerMan cannot parse the file (PR #50), and the helper above names it.
+ *
+ * #275: Unraid has no swap by default, so the ceiling is a hard wall there, and 1536m killed engines that needed
+ * 1.4 GB (630 MB of it heap). Reintroduce by putting `1536m` back, raising -Xmx alone, or deleting MALLOC_ARENA_MAX.
  */
 test('the Unraid engine template is the bundled engine', () => {
   const file = 'templates/uchiyomi-suwayomi.xml';
@@ -241,6 +244,14 @@ test('the Unraid engine template is the bundled engine', () => {
   assert.match(x, /<Repository>ghcr\.io\/suwayomi\/suwayomi-server:v[\d.]+<\/Repository>/, 'the engine image is not pinned (enginePins.test.ts holds the version)');
   assert.match(x, /<ExtraParams>[^<]*--memory=\d+[mg]\b[^<]*<\/ExtraParams>/, 'no memory ceiling: a JVM sizes its heap from the whole server');
   assert.match(configOf(x, 'JAVA_TOOL_OPTIONS')?.value ?? '', /-Xmx\d+[mMgG]/, "the engine's heap is not capped");
+  const ceiling = x.match(/<ExtraParams>[^<]*--memory=(\d+)([mg])\b/);
+  const heap = (configOf(x, 'JAVA_TOOL_OPTIONS')?.value ?? '').match(/-Xmx(\d+)([mMgG])/);
+  const mib = (n: string, unit: string) => Number(n) * (/^[gG]$/.test(unit) ? 1024 : 1);
+  assert.ok(ceiling && heap && mib(ceiling[1], ceiling[2]) - mib(heap[1], heap[2]) >= 1280,
+    "the ceiling leaves less than 1.25 GB above the heap: with no swap the kernel kills the engine there (#275)");
+  const arenas = configOf(x, 'MALLOC_ARENA_MAX');
+  assert.equal(arenas?.value, '2', 'glibc may keep freed memory in up to eight arenas per CPU (#275)');
+  assert.match(arenas!.attrs, /Default="2"/, "MALLOC_ARENA_MAX's default is not 2");
   const data = configOf(x, '/home/suwayomi/.local/share/Tachidesk');
   assert.ok(data && /Type="Path"/.test(data.attrs), "no Path for the engine's data: every install would lose its extensions and series links on update");
   assert.match(data!.value, /^\/mnt\/user\/appdata\/uchiyomi-suwayomi$/, 'the engine data is not in its own appdata folder');
@@ -252,11 +263,22 @@ test('the Unraid engine template is the bundled engine', () => {
   }
   assert.ok(configOf(x, 'FLARESOLVERR_URL'), 'no FLARESOLVERR_URL to point the engine at a solver');
   assert.match(configOf(x, 'AUTH_PASSWORD')?.attrs ?? '', /Mask="true"/, "the engine's password is shown in clear");
+  // v0.73.0: the port is published on the bridge network, so a new install signs in. Reintroduce the empty AUTH_MODE
+  // (or a password Unraid lets you leave blank): a new engine starts with no password, and these fail.
+  // An install from before keeps its own values: the three variables have been here since the template's first version.
+  const auth = configOf(x, 'AUTH_MODE');
+  assert.equal(auth?.value, 'basic_auth', 'a new Unraid engine starts with its sign-in off');
+  assert.match(auth!.attrs, /Default="basic_auth"/, "AUTH_MODE's default is not basic_auth");
+  assert.match(configOf(x, 'AUTH_PASSWORD')!.attrs, /Required="true"/, 'the engine can be installed without a password');
+  assert.equal(configOf(x, 'AUTH_PASSWORD')!.value, '', 'the template ships a password everyone knows');
   assert.match(x, /<TemplateURL>https:\/\/raw\.githubusercontent\.com\/AngeloSha\/uchiyomi\/main\/templates\/uchiyomi-suwayomi\.xml<\/TemplateURL>/, 'TemplateURL does not point at this file');
   // The way in: the main template's help names the engine template, and it can pass the engine's credentials.
   const main = read('templates/uchiyomi.xml');
   assert.match(configOf(main, 'SUWAYOMI_URL')?.attrs ?? '', /Description="[^"]*uchiyomi-suwayomi[^"]*:4567/, "the main template's SUWAYOMI_URL help does not point at the engine template");
   assert.ok(configOf(main, 'SUWAYOMI_USERNAME'), 'the main template cannot pass the engine user name');
+  // The two user names match out of the box, so a new install types the password twice and nothing else.
+  assert.equal(configOf(main, 'SUWAYOMI_USERNAME')!.value, configOf(x, 'AUTH_USERNAME')?.value, 'the two templates name different engine users');
+  assert.ok(configOf(x, 'AUTH_USERNAME')?.value, 'the engine has no user name');
   assert.match(configOf(main, 'SUWAYOMI_PASSWORD')?.attrs ?? '', /Mask="true"/, "the main template shows the engine's password in clear");
 });
 
@@ -277,6 +299,13 @@ test('the Umbrel package is the one under review: proxy block, PUID, digest pin,
   // OPDS readers and API-token scripts cannot carry the Umbrel cookie; first-run setup must stay behind it.
   assert.match(String(c.services.app_proxy.environment.PROXY_AUTH_WHITELIST), /\/opds\/\*.*\/img\/\*.*\/api\/\*/);
   assert.match(String(c.services.app_proxy.environment.PROXY_AUTH_BLACKLIST), /\/api\/setup/, 'first-run setup is reachable without Umbrel login');
+  // The Mihon/Tachiyomi extension (AngeloSha/uchiyomi-extension, probeServer/probeToken) tests a server address on
+  // GET /healthz and a token on GET /auth/me before it browses /api and /img. Behind the Umbrel login both answer
+  // with Umbrel's sign-in page, and the extension reports "No Uchiyomi at ..." for a server that works. Exact paths:
+  // the rest of /auth (sign-in, registration) stays behind Umbrel, like first-run setup.
+  const whitelisted = String(c.services.app_proxy.environment.PROXY_AUTH_WHITELIST).split(',');
+  for (const p of ['/healthz', '/auth/me']) assert.ok(whitelisted.includes(p), `${p} is behind the Umbrel login: the Mihon extension's connection check fails there`);
+  assert.deepEqual(whitelisted.filter((p) => p.startsWith('/auth')), ['/auth/me'], 'more of /auth than /auth/me is outside the Umbrel login');
   const s = c.services.server;
   // PUID/PGID, not user:: the image has a permission-fixing root entrypoint (the store guide's own rule).
   assert.equal(s.user, undefined, 'user: forces a uid on an image whose entrypoint must start as root');
@@ -286,19 +315,47 @@ test('the Umbrel package is the one under review: proxy block, PUID, digest pin,
   assert.ok(!('DATABASE_URL' in (s.environment ?? {})), 'DATABASE_URL set: the embedded database is off and there is no other');
   assert.ok(s.volumes.some((v: string) => v.startsWith('${APP_DATA_DIR}/data/db:') && v.endsWith(':/data')), 'the database must live under app-data');
   assert.ok(s.volumes.some((v: string) => v.includes('/data/storage/downloads/') && v.endsWith(':/library')), 'the library must come from Umbrel Downloads');
+  // umbrelOS 2.0 (2026-09-22). `storage` lets a user move the app's data to an external drive (ext4 only), and a
+  // version without it cannot start an install whose data was moved -- so once declared it is never removed. It moves
+  // `${APP_DATA_DIR}/data` and nothing else, which is why every app-data mount must come from under data/.
+  assert.deepEqual(m.storage, { dataRoot: 'data' }, 'storage was removed: installs whose data was moved cannot start');
+  for (const v of s.volumes.filter((v: string) => v.startsWith('${APP_DATA_DIR}'))) assert.match(v, /^\$\{APP_DATA_DIR\}\/data\/[a-z]+:/, `${v} is outside data/, which umbrelOS moves with the app`);
+  // The library's folder setting. umbrelOS makes one from the Downloads mount on its own, with the id
+  // `umbrel-downloads:<folder>` (umbreld apps/app.ts); this entry gives it a name and a note. A different id, service
+  // or target would be a second, empty setting, and changing the id later drops every user's chosen folder.
+  const lib = (m.folderAccess ?? []).find((x: any) => x.id === 'umbrel-downloads:manga');
+  assert.ok(lib && lib.name && lib.note, 'the library has no named folder setting (folderAccess umbrel-downloads:manga)');
+  assert.deepEqual(lib.mounts, [{ service: 'server', targetPath: '/library' }]);
+  assert.ok(s.volumes.includes('${UMBREL_ROOT}/data/storage/downloads/manga:/library'), 'the folder setting no longer names the compose mount');
   assert.match(String(s.stop_grace_period), /40s/);
   assert.ok(s.image.includes(`:v${m.version}@`), `manifest version ${m.version} does not match the pinned image ${s.image}`);
   assert.match(String(s.environment.JWT_SECRET), /APP_UCHIYOMI_JWT_SECRET/, 'the session secret should come from exports.sh');
   // v0.49.0 (#72): Admin → Extensions opens its engine setup steps on the platform this hint names (bff
   // lib/platform.ts), and Umbrel's say that an Umbrel app cannot add the optional engine. Nothing else gives an
   // Umbrel install away -- no HOST_OS, no EXTENSION_ENGINE -- so without the line it reads as 'unknown' and opens on
-  // steps it cannot follow. Carried into the store package with its next version bump (the store PR holds v0.40.0).
-  // Reintroduce by deleting the line from the compose file: this assertion names it.
+  // steps it cannot follow. Reintroduce by deleting the line from the compose file: this assertion names it.
   assert.equal(s.environment.UCHIYOMI_PLATFORM, 'umbrel', 'the Umbrel compose does not tell the app it runs on Umbrel (UCHIYOMI_PLATFORM: umbrel)');
   assert.match(read('deploy/umbrel/uchiyomi/exports.sh'), /derive_entropy/, 'exports.sh does not derive the secret');
   for (const d of ['db', 'config', 'cache', 'downloads', 'backups']) assert.ok(existsSync(join(REPO, `deploy/umbrel/uchiyomi/data/${d}/.gitkeep`)), `data/${d} is not committed; Umbrel would mount an empty root-owned path`);
   const f = c.services.flaresolverr;
-  assert.ok(f && /@sha256:[0-9a-f]{64}$/.test(f.image), 'the solver sidecar is not pinned by digest');
+  assert.match(f?.image ?? '', /^ghcr\.io\/flaresolverr\/flaresolverr:v\d+\.\d+\.\d+@sha256:[0-9a-f]{64}$/, 'the solver sidecar is not pinned by release tag and digest');
+});
+
+test('the Umbrel package is never more than one release behind', () => {
+  // deploy/umbrel pins the image by digest, and a digest exists only once a tag's release run has published it, so
+  // the release PR itself can never carry its own version here. Nothing asked for the follow-up either, and from
+  // v0.40.0 to v0.61.2 nobody did it, while docs/INSTALL.md told Umbrel users this package was current. The rule:
+  // it pins the version in package.json or the release before it. A release PR goes red until the package pins the
+  // release that is already out; the merge job of release.yml prints that digest, and so does
+  //   docker buildx imagetools inspect ghcr.io/angelosha/uchiyomi:v<version>
+  // Reintroduce by leaving the pin behind at a release: this test fails on that release's PR.
+  const now = JSON.parse(read('bff/package.json')).version as string;
+  const released = [...read('CHANGELOG.md').matchAll(/^## v(\d+\.\d+\.\d+) /gm)].map((x) => x[1]);
+  const before = released.find((v) => v !== now);
+  assert.ok(before, 'CHANGELOG.md names no earlier release');
+  const pinned = String(parseYaml(read('deploy/umbrel/uchiyomi/umbrel-app.yml')).version);
+  assert.ok([now, before].includes(pinned),
+    `deploy/umbrel pins v${pinned}, more than one release behind v${now}: pin v${now} if its images are published, else v${before} -- the version in umbrel-app.yml, the image tag and digest in docker-compose.yml`);
 });
 
 test('an Unraid or Umbrel user can still get from the README to their manifest', () => {
@@ -685,4 +742,39 @@ test('pin-engine pins what the release actually serves, and only from a prerelea
     srv.close();
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test('the engine canary only reads, unless the owner switches its reporting on -- and then never touches main, a tag or a PR', () => {
+  // .github/workflows/engine-canary.yml tests every new Suwayomi-Server every week (the engine upgrade). It runs on a
+  // schedule with the repository's token, so its shape is pinned: scheduled and dispatched only (never on a push or a
+  // pull request, where a fork's code would run with it), read-only at the top, the write permissions on the report
+  // job alone and that job behind the ENGINE_CANARY_POST switch, no secret but GITHUB_TOKEN, a timeout on every job,
+  // and the one push it makes is the engine-bump/<tag> branch. Reintroduce `contents: write` at the top, a
+  // `secrets.SOMETHING`, `pull_request:` in `on`, a report job without the switch, or a `git push origin HEAD:main` in
+  // scripts/engine/report.mjs: each names itself below.
+  const y = read('.github/workflows/engine-canary.yml');
+  const wf = parseYaml(y);
+  assert.deepEqual(Object.keys(wf.on).sort(), ['schedule', 'workflow_dispatch'], 'the canary runs on something other than its schedule and a dispatch');
+  assert.equal(wf.on.schedule[0].cron, '23 5 * * 1');
+  assert.deepEqual(Object.keys(wf.on.workflow_dispatch.inputs).sort(), ['preview', 'version']);
+  assert.equal(wf.on.workflow_dispatch.inputs.preview.default, true);
+  assert.deepEqual(wf.permissions, { contents: 'read' }, 'the canary has write permissions outside its report job');
+  assert.ok(wf.concurrency?.group, 'two canaries could run at once');
+  for (const [name, job] of Object.entries<any>(wf.jobs)) {
+    assert.ok(job['timeout-minutes'], `engine-canary.yml job "${name}" has no timeout`);
+    const writes = Object.entries(job.permissions ?? {}).filter(([, v]) => v === 'write').map(([k]) => k);
+    if (name === 'report') assert.deepEqual(writes.sort(), ['contents', 'issues']);
+    else assert.deepEqual(writes, [], `job "${name}" may write`);
+  }
+  assert.match(String(wf.jobs.report.if), /vars\.ENGINE_CANARY_POST == 'on'/, 'the report job posts without the owner\'s switch');
+  const secrets = [...code(y).matchAll(/secrets\.([A-Za-z_]+)/g)].map((m) => m[1]);
+  assert.deepEqual([...new Set(secrets)], ['GITHUB_TOKEN'], 'the canary reads a secret other than its own token');
+  // The pushes: the workflow makes none itself, and report.mjs makes exactly one, to the bump branch.
+  assert.ok(!/git push|gh pr create|refs\/tags/.test(code(y)), 'the workflow pushes or opens a pull request itself');
+  const report = read('scripts/engine/report.mjs');
+  const pushes = [...report.matchAll(/git\('push'[^\n]*/g)].map((m) => m[0]);
+  assert.equal(pushes.length, 1, 'report.mjs pushes in more than one place');
+  assert.match(pushes[0], /`HEAD:refs\/heads\/\$\{branch\}`/);
+  assert.match(report, /const branch = `engine-bump\/\$\{r\.tag\}`;/, 'the branch report.mjs pushes is not engine-bump/<tag>');
+  assert.ok(!/refs\/tags|\/pulls|'main'|"main"/.test(report.replace(/^\s*\/\/.*$/gm, '')), 'report.mjs touches a tag, main or a pull request');
 });

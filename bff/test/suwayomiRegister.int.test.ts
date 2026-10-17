@@ -88,6 +88,29 @@ test('extension source registration', { skip: DSN ? false : 'set TEST_DATABASE_U
     assert.equal(adapter!.lang, 'en', 'the language must reach the adapter too, or it joins every group');
   });
 
+  await t.test('a MIXED source, as the engine lists it, is remembered adult and registers adult', async () => {
+    // The engine upgrade: the adult flag comes from `contentWarning` (SAFE | MIXED | NSFW), and a legacy store's 18+
+    // extension is MIXED. Reintroduce `contentWarning === 'NSFW'` in sources.ts adultOf: the row is stored clean and a
+    // capped account reaches the adapter. Through listRemoteSources itself, as registration calls it.
+    reset();
+    await q('DELETE FROM suwayomi_sources');
+    const { listRemoteSources } = await import('../src/lib/sources/suwayomi/sources');
+    const { sourceAllowedFor } = await import('../src/lib/visibility');
+    const nodes = [
+      { id: '20', name: 'Mixed', lang: 'en', contentWarning: 'MIXED' }, { id: '21', name: 'Safe', lang: 'en', contentWarning: 'SAFE' },
+      { id: '22', name: 'Unsaid', lang: 'en' },
+    ];
+    const list = () => listRemoteSources((async () => ({ sources: { nodes } })) as never);
+    await reg.loadSuwayomiSources(list);
+    const rows = await q<{ source_id: string; nsfw: boolean }>(`SELECT source_id, nsfw FROM suwayomi_sources ORDER BY source_id`);
+    assert.deepEqual(rows.map((r) => [r.source_id, r.nsfw]), [['20', true], ['21', false], ['22', true]], 'only SAFE is stored clean');
+    await q(`UPDATE suwayomi_sources SET enabled = true`);
+    await reg.loadSuwayomiSources(list);
+    assert.equal(sourceAllowedFor(loader.getSource('sw:20'), 13), false, 'a capped account reaches a MIXED source');
+    assert.equal(sourceAllowedFor(loader.getSource('sw:21'), 13), true);
+    await q('DELETE FROM suwayomi_sources');
+  });
+
   await t.test('which extension a source came out of is remembered, refreshed, and tolerated when missing', async () => {
     // One package can expose dozens of sources (3Hentai: twenty-nine language variants) and `pkgName` is
     // the only thing they share that is not a guess; the Providers page folds them into one card by it.
@@ -196,6 +219,48 @@ test('extension source registration', { skip: DSN ? false : 'set TEST_DATABASE_U
       (env as { SUWAYOMI_MAX_SOURCES: number }).SUWAYOMI_MAX_SOURCES = original;
       await q('DELETE FROM series_sources WHERE series_id = ANY($1)', [SERIES]);
       await q('DELETE FROM lib_series WHERE id = ANY($1)', [SERIES]);
+    }
+  });
+
+  await t.test("a switched-off source never takes a working one's slot", async () => {
+    // v0.59.0: used first, then the rest -- and a source switched off in Health, which nothing asks, held its slot like
+    // any other: on the owner's install 16 of the 40 went to switched-off sources while Atsumaru, which works, was over
+    // the limit. Reintroduce the two-part order (drop `isOff` from load()): sources 0 and 1, first in the engine's list
+    // and one of them used, are the two registered. Reintroduce counting them in wouldFit: it reads no room for one more.
+    reset();
+    const { env } = await import('../src/env');
+    const original = env.SUWAYOMI_MAX_SOURCES;
+    (env as { SUWAYOMI_MAX_SOURCES: number }).SUWAYOMI_MAX_SOURCES = 2;
+    const SERIES = ['s_reg_offused'];
+    const OFF = ['sw:0', 'sw:1'];
+    try {
+      await q('DELETE FROM lib_series WHERE id = ANY($1)', [SERIES]);
+      await q('DELETE FROM source_health WHERE source_id = ANY($1::text[])', [OFF]);
+      await q('DELETE FROM suwayomi_sources');
+      await reg.loadSuwayomiSources(async () => remote(4));
+      await q('UPDATE suwayomi_sources SET enabled = true');
+      await q(`INSERT INTO source_health (source_id, disabled) VALUES ('sw:0', true), ('sw:1', true)`);
+      await q(`INSERT INTO lib_series (id, source, title, folder, source_id, source_series_id)
+               VALUES ('s_reg_offused','t','s_reg_offused','s_reg_offused','sw:0','1')`);
+      const r = await reg.loadSuwayomiSources(async () => remote(4));
+      assert.deepEqual([r.registered, r.skipped], [2, 2]);
+      assert.deepEqual(loader.sourceIds().sort(), ['sw:2', 'sw:3'],
+        'the working sources, though the engine lists the switched-off ones first and a series reads through one');
+      assert.ok(reg.leftOutByLimit('sw:0') && reg.leftOutByLimit('sw:1'), 'the switched-off ones are what the limit left out');
+
+      // With room, a switched-off source still registers, after the working ones: Health shows it, and switching it back
+      // on needs no load.
+      reset();
+      (env as { SUWAYOMI_MAX_SOURCES: number }).SUWAYOMI_MAX_SOURCES = 3;
+      await reg.loadSuwayomiSources(async () => remote(4));
+      assert.deepEqual(loader.sourceIds().sort(), ['sw:0', 'sw:2', 'sw:3']);
+      // wouldFit counts as the load does: two working sources under a limit of three leave room for one, four switched on or not.
+      assert.equal(await reg.wouldFit(['new']), true, 'a switched-off source takes no room from a new one');
+      assert.equal(await reg.wouldFit(['new', 'new2']), false, 'PREMISE: the working ones still count');
+    } finally {
+      (env as { SUWAYOMI_MAX_SOURCES: number }).SUWAYOMI_MAX_SOURCES = original;
+      await q('DELETE FROM lib_series WHERE id = ANY($1)', [SERIES]);
+      await q('DELETE FROM source_health WHERE source_id = ANY($1::text[])', [OFF]);
     }
   });
 

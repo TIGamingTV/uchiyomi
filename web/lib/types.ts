@@ -4,9 +4,51 @@ import type { Said } from './said';
 
 export interface UchiyomiFlags {
   favorite: boolean;
+  /** The viewer's own stars, 1–5, or null when they have not rated it. */
   rating: number | null;
   unread?: number;
   newCount?: number;
+  /**
+   * v0.58.0: what AniList says of the series, beside the viewer's own stars -- `score` its average score, 0–100 (shown
+   * "84%"), and `popularity` how many AniList users have it on a list (shown compact, "312K"); each null when AniList has
+   * none. Null when the series has no checked AniList link or nothing was fetched yet, absent from an older server.
+   */
+  anilist?: AniListNumbers | null;
+  /** v0.58.0: when this viewer last read a chapter of it (ISO); null for never, absent from an older server. */
+  lastReadAt?: string | null;
+  /**
+   * v0.61.0: the release radar -- the server's estimate of when the next chapter comes (bff lib/releaseRadar.ts). Null
+   * while nothing dates the series or it has no source; absent from an older server. lib/radar.ts says it in words.
+   */
+  radar?: SeriesRadar | null;
+}
+
+/**
+ * The release radar (v0.61.0, `yomi.radar`), ISO times. `nextAt`/`dueUntil` bound the estimate, null when the rhythm is
+ * too uneven or too short or the series ended or is on hiatus; from `quietAfter` on the series is quiet. `every` is the
+ * median gap in days, `steady` whether it keeps one weekday. Always shown as an estimate ("~Friday", "usually Fridays").
+ */
+export interface SeriesRadar {
+  nextAt: string | null;
+  dueUntil: string | null;
+  quietAfter: string | null;
+  lastAt: string | null;
+  every: number | null;
+  kind: CadenceKind;
+  steady: boolean;
+  ended: boolean;
+  basis: 'source' | 'arrival' | null;
+}
+
+/** AniList's average score (0–100) and popularity for a series (v0.58.0, `yomi.anilist`). */
+export interface AniListNumbers {
+  /**
+   * v0.60.0: the AniList entry's id -- the series page's AniList tile links to `https://anilist.co/manga/<id>`. Absent
+   * from an older server, and the tile is then not a link.
+   */
+  id?: string | null;
+  score: number | null;
+  popularity: number | null;
 }
 
 export interface SeriesMetadata {
@@ -63,6 +105,10 @@ export interface TrackerStatus {
   expiringSoon: boolean;
   lastSyncAt: string | null;
   lastError: string | null;
+  /** Only a new token mends it (#246, bff lib/trackers.ts needsReconnect); a rate limit or an outage never sets it. */
+  needsReconnect?: boolean;
+  /** v0.73.0: the service asked us to wait (a rate limit), so pushes go slowly; never an error. */
+  slowedDown?: boolean;
 }
 
 /**
@@ -133,6 +179,10 @@ export interface SeriesEdition {
 }
 
 export interface Series {
+  /** Admins only: the library it is in. */
+  library?: { id: string; name: string };
+  /** The reading defaults of the library the series is in (#235): the content's look, never a theme; null when it has none. */
+  libraryReader?: { mode?: 'vertical' | 'paged'; spread?: boolean; pagedDirection?: 'ltr' | 'rtl' | 'series' } | null;
   /** Whether the scheduled updater fetches new chapters for this series. */
   autoUpdate?: boolean;
   /** The folder on disk, relative to the library root. Only sent to admins, for the rename control. */
@@ -206,7 +256,10 @@ export interface Series {
   borrowNames?: boolean | null;
   /** Admins only: whether names are borrowed for this series once the server setting is applied. */
   borrowNamesEffective?: boolean;
-  /** Admins only: the type the notice-chapter switches go by -- the override, else the evidence's, else unknown. */
+  /**
+   * The type the notice-chapter switches go by -- the override, else the evidence's, else unknown. Every viewer since
+   * v0.61.0 (the reader's automatic mode reads it); admins only before, so an older server sends members nothing.
+   */
   seriesType?: SeriesType;
   /** Admins only: what the evidence alone says the series is, and which evidence. null when nothing has said. */
   detectedType?: { type: Exclude<SeriesType, 'unknown'>; from: 'genre' | 'source' | 'anilist' | 'webtoon' | null } | null;
@@ -216,6 +269,8 @@ export interface Series {
   hideNoticesEffective?: boolean;
   /** Admins only: how many of its chapters that hides right now. */
   hiddenNotices?: number;
+  /** Admins only (#240): how many chapter numbers an admin hid from it, for More's Show hidden chapters. */
+  hiddenChapters?: number;
   /**
    * Admins only (v0.55.3, #147): the rule the notice switches hide by -- true, chapters numbered like 12.5 with 3 pages
    * or fewer; false, every chapter numbered like 12.5. Settings' "Only hide short ones".
@@ -245,6 +300,8 @@ export interface Book {
   id: string;
   /** where this book was last read, when that was another device (see /api/home) */
   lastDevice?: { id: string; name: string | null; at: string } | null;
+  /** v0.61.0, Home's Pick back up: when the reader last read in the series (see /api/home `pickUp`). */
+  stoppedAt?: string | null;
   seriesId: string;
   seriesTitle: string;
   name: string;
@@ -421,10 +478,30 @@ export interface VersionCopy {
   onDisk: boolean;
   /** The copy's own title (v0.49.0): posts that share a number are told apart by it (lib/versions.ts). */
   title?: string | null;
+  /**
+   * v0.62.0: the copy's language when it is known to be another than the series' -- a copy the server never takes.
+   * Absent from an older server.
+   */
+  otherLanguage?: string | null;
+}
+
+/**
+ * v0.62.0: the chapters on the server known to be in another language than the series', each of which a copy in the
+ * series' language can replace -- the notice above the chapter list (components/LanguageNotice.tsx).
+ */
+export interface OtherLanguage {
+  /** The series' language: the one they are fetched again in. */
+  series: string;
+  /** The languages they are in, most chapters first. */
+  langs: string[];
+  /** The chapters, for Fetch again (POST /api/admin/series/:id/chapters/refetch). */
+  bookIds: string[];
 }
 
 export interface Versions {
   checkedAt: string | null;
+  /** v0.62.0; absent from an older server. */
+  otherLanguage?: OtherLanguage | null;
   content: { number: number; copies: VersionCopy[] }[];
 }
 
@@ -456,6 +533,11 @@ export interface PageInfo {
    * explanation over it rather than letting a blank page read as a broken image.
    */
   missing?: true;
+  /**
+   * #229, with ?spreads=1 only: this page and the next are one double-page spread a source served as two files, and which
+   * side of the spread the next page is on (bff lib/spreadJoin.ts joinDirection).
+   */
+  join?: 'rtl' | 'ltr';
   fileName: string;
   mediaType: string;
   width?: number;
@@ -498,10 +580,13 @@ export type HealthAction =
   | 'replace_source'
   // v0.55.0: a frozen series whose source is over the extension engine's source limit. Opens Admin → Sources on that
   // source, where one nothing uses can be switched off to make room (no server action).
-  | 'free_slot';
+  | 'free_slot'
+  // v0.72.0, Chapter files: Fetch again for the row's `bookIds` (POST /api/admin/series/:id/chapters/refetch), the
+  // series page's own route: each old file is kept until its new copy lands.
+  | 'refetch';
 
 /** One step of the nightly repair (`bff/src/lib/repair.ts`), as `POST /api/admin/tasks/repair/run` takes it. */
-export type RepairStep = 'solver' | 'count' | 'failures' | 'short' | 'gaps' | 'groups' | 'names' | 'directions';
+export type RepairStep = 'solver' | 'count' | 'failures' | 'short' | 'gaps' | 'groups' | 'names' | 'directions' | 'details';
 
 export interface HealthItem {
   seriesId?: string;
@@ -527,8 +612,17 @@ export interface HealthItem {
   number?: number;
   numbers?: number[];
   sourceId?: string;
-  /** The duplicate pair's suggested survivor: the id inside `seriesIds` a merge should keep. */
+  /**
+   * The duplicate pair's suggested survivor: the id inside `seriesIds` a merge should keep. Since v0.57.0 the copy whose
+   * main source still works (`usable` or `cooling`), then the one with more chapters.
+   */
   keep?: string;
+  /**
+   * v0.57.0, on a duplicates row: what each of `seriesIds` holds, in the same order -- its chapters, and its main source
+   * with whether updates can use it (`null`: no main source, files only). The merge confirmations say it under each
+   * title. Absent from an older server: the titles alone.
+   */
+  copies?: DuplicateCopy[];
   /** v0.52.0, on a duplicates row: the language of each of `seriesIds`, for Link as editions' confirmation. */
   langs?: string[];
   /** Which chips this item offers. Absent or empty means the item is a statement, not a task. */
@@ -583,6 +677,15 @@ export interface HealthItem {
   slowed?: boolean;
 }
 
+/** v0.57.0: one copy of a duplicate pair (HealthItem.copies), as the merge confirmations show it. */
+export interface DuplicateCopy {
+  /** The series, one of the row's `seriesIds`. */
+  id: string;
+  chapters: number;
+  /** Its main source and that source's standing (bff lib/sourceStanding.ts); `null` for a series with none. */
+  source: { id: string; name: string; standing: NonNullable<SeriesSource['standing']> } | null;
+}
+
 /** v0.53.0: the Source health card's groups, in the server's order. */
 export type SourceGroup = 'affected' | 'unused' | 'quiet' | 'off';
 /** v0.53.0: a source row's one state (bff lib/health.ts SourceState). */
@@ -626,12 +729,42 @@ export interface HealthCheck {
   testMs?: number;
 }
 
+/**
+ * v0.72.0, Health's By series view (GET /api/admin/health?view=series, bff lib/health.ts groupBySeries): one series and
+ * every finding about it, each with its card's id, grouped on the server from each card's whole list.
+ */
+export interface SeriesFindings {
+  seriesId: string;
+  title: string;
+  /** Its worst card's. */
+  status: 'warn' | 'problem';
+  findings: Array<{ check: string; item: HealthItem }>;
+}
+
+export interface HealthReport {
+  generatedAt: string;
+  checks: HealthCheck[];
+  /** Only with `?view=series`. */
+  bySeries?: SeriesFindings[];
+}
+
 export interface HomePayload {
   onDeck: Book[];
   updated: Series[];
   new: Series[];
   favorites: Series[];
   updatesCount?: number;
+  /**
+   * v0.58.0: up to 20 of the viewer's series that have an AniList popularity, most popular first -- Home's "Most popular
+   * in your library". Absent from an older server, and then the rail is not drawn.
+   */
+  popular?: Series[];
+  /**
+   * v0.61.0: Pick back up -- the chapter to resume each series put down 90 days to two years ago, with `stoppedAt` --
+   * and Hidden gems -- well-rated series nobody on the server has read. Absent from an older server: no rail.
+   */
+  pickUp?: Book[];
+  gems?: Series[];
 }
 
 export interface DownloadManifest {
@@ -646,7 +779,7 @@ export interface DownloadManifest {
   coverUrl: string;
   totalBytes: number;
   /** `missing` rides along like `junk`: the placeholder bytes download like any page, and the caption is drawn offline too. */
-  pages: { number: number; url: string; width: number | null; height: number | null; bytes: number | null; junk?: boolean; missing?: true }[];
+  pages: { number: number; url: string; width: number | null; height: number | null; bytes: number | null; junk?: boolean; missing?: true; join?: 'rtl' | 'ltr' }[];
 }
 
 export function isWebtoon(dir?: string): boolean {

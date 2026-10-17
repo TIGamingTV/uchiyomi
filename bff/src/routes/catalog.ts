@@ -1,12 +1,14 @@
 import type { FastifyInstance, FastifyRequest } from 'fastify';
 import { z } from 'zod';
 import { q, one } from '../lib/db';
+import { cleanLibraryReader } from '../lib/libraryReader';
 import { junkPagesFor, setPageOverride } from '../lib/junkPages';
+import { spreadsFor } from '../lib/spreadMeasure';
 import { komgaImage } from '../lib/komga';
 import { content as komga, NATIVE_PROGRESS, OWNED } from '../lib/backend';
 import { UnsupportedFilter, owned } from '../lib/ownedCatalog';
 import { cleanDescription } from '../lib/htmlText';
-import { viewCtxFor, SYSTEM_CTX, type ViewCtx, hideAdult, browsableIds, browsable, Params, adultFilterConfigured } from '../lib/visibility';
+import { viewCtxFor, SYSTEM_CTX, type ViewCtx, hideAdult, browsableIds, browsable, Params, adultFilterConfigured, seriesVisible } from '../lib/visibility';
 
 /** The viewer attached by the preHandler above. */
 const vc = (req: FastifyRequest): ViewCtx => (req as any).viewCtx as ViewCtx;
@@ -17,6 +19,7 @@ import { sourceLabel } from '../lib/health';
 import { authenticate, roleOf, userIdOf } from '../lib/auth';
 import { warmHeroBackdrops } from './images';
 import { writeProgress, reachedEnd } from '../lib/progress';
+import { onDeckPicks, type DeckPick } from '../lib/onDeck';
 import { enrichSeries, newSinceSeen, seenCounts, seriesSeen } from '../lib/enrich';
 import { seriesSourcesFor } from '../lib/seriesSources';
 import { readSeriesPrefs, effectivePrefsFor } from '../lib/scanlatorPrefs';
@@ -33,10 +36,14 @@ import { groupsOf, normGroup } from '../lib/releases';
 import { getSource } from '../lib/sources';
 import { cleanSourceOrder } from '../lib/sourcePrefs';
 import { editionInfo } from '../lib/editions';
-import { effectiveLang } from '../lib/seriesLang';
+import { effectiveLang, seriesLanguage } from '../lib/seriesLang';
+import { copyLang, languageRulesFor, type LanguageRules } from '../lib/copyLanguage';
+import { chapterFileRel } from '../lib/downloader';
 import { DL_ROOT, LIBRARY_ROOT, lastScanFailure, lastScanReport, scanProgress, scanRunning } from '../lib/library';
 import { noticeBook, noticeListed, noticesShortOnly } from '../lib/noticeChapters';
 import { noticeTypes, hiddenCount } from '../lib/noticeSettings';
+import { heldRecs, relatedFor } from '../lib/anilistRelated';
+import { seriesGaps } from '../lib/seriesGaps';
 import { join } from 'node:path';
 
 
@@ -100,6 +107,9 @@ const progressBody = z.object({
   // the fact, and without this the server cannot tell a queued page-12 from a live one and lets it overwrite
   // a position the reader has since moved well past. Absent means "now", which is every live ping.
   at: z.coerce.number().int().positive().optional(),
+  // v0.61.0: read under Incognito reading. The account's switch is the server's own to read (lib/progress.ts); this is
+  // for a chapter read while it was on and sent after it went off -- the offline outbox, a retried page turn.
+  incognito: z.boolean().optional(),
 });
 
 const forYouCache = new Map<string, { ts: number; pool: any[] }>();
@@ -111,7 +121,14 @@ async function tasteRecs(req: FastifyRequest): Promise<any[]> {
   // while 18+ was revealed would otherwise be handed straight back after it was hidden again.
   const key = `${uid}:${vc(req).hideAdultLibraries ? 'safe' : 'all'}`;
   const cached = forYouCache.get(key);
-  if (cached && Date.now() - cached.ts < 10 * 60 * 1000) return cached.pool;
+  if (cached && Date.now() - cached.ts < 10 * 60 * 1000) {
+    // Re-judged for THIS request: the pool was built under the grants and age cap the member had then, and an admin
+    // may have narrowed them since (or moved or re-rated a series). Without this For you and Featured kept listing a
+    // series the member had just lost, name and summary included, for up to ten minutes. Reintroduce by returning
+    // cached.pool: "For you drops a series the member just lost" in visibilityGaps.int.test.ts still lists it.
+    const ok = new Set(await browsableIds(cached.pool.map((s: any) => s.id), vc(req)));
+    return cached.pool.filter((s: any) => ok.has(s.id));
+  }
   const favIds = (await q<{ series_id: string }>('SELECT series_id FROM favorites WHERE user_id = $1', [uid])).map((r) => r.series_id);
   const doneIds = (await q<{ series_id: string }>('SELECT DISTINCT series_id FROM read_progress WHERE user_id = $1 AND completed = true', [uid])).map((r) => r.series_id);
   const sourceIds = Array.from(new Set([...favIds, ...doneIds])).slice(0, 30);
@@ -134,6 +151,8 @@ async function tasteRecs(req: FastifyRequest): Promise<any[]> {
 
 // How many series the Continue Reading rail carries. 20 hid 33 of the heaviest user's 53 in progress.
 const ON_DECK_LIMIT = 60;
+/** v0.61.0: how many series Pick back up offers; a rail of things you put down should not be a backlog. */
+const PICK_UP_LIMIT = 20;
 
 /**
  * How long POST /api/refresh waits for the library scan before it answers that the scan is still running (v0.55.6):
@@ -320,76 +339,40 @@ export default async function catalogRoutes(app: FastifyInstance) {
   app.get('/api/home', async (req) => {
     const uid = userIdOf(req);
     const admin = NATIVE_PROGRESS && roleOf(req) === 'admin';
+    // The part-way-through pick is a read_progress row, which survives a prune by design, so the resolved book is checked
+    // as well: Continue Reading must never hand someone a chapter with no pages.
+    const resolvePicks = async (picks: DeckPick[]): Promise<any[]> => {
+      const books = (await Promise.all(picks.map((r) => komga.book(vc(req), r.bookId).catch(() => null))))
+        .filter((b) => b && !b.pruned) as any[];
+      return overlay(books, await userProgress(uid, books.map((b) => b.id)));
+    };
 
     let onDeckP: Promise<any[]>;
     if (admin) {
       onDeckP = komga.booksOnDeck(vc(req), 0, 20).then((r: any) => r.content).catch(() => []);
     } else {
-      onDeckP = (async () => {
-        // One row per series you have been reading lately: the chapter you are part-way through, or -- if you
-        // finished it -- the next one you have not read.
-        //
-        // It used to be only `completed = false`, so finishing a chapter dropped the series out of Continue
-        // Reading entirely and nothing put the next one in front of you. You had to remember what you were
-        // reading and go find it, which is precisely the job this rail exists to do.
-        //
-        // Scoped to series touched in the last 90 days so the list stays short, ordered by when you last read.
-        // The 18+ filter is applied HERE rather than after the fact, for the same reason the LIMIT is: this
-        // resolves each pick through komga.book(), which is a by-id read and deliberately does not filter,
-        // so a series hidden from browsing would otherwise stay in Continue Reading. Params is used rather
-        // than hand-written $1/$2 because `browsable()` pushes its own for a restricted viewer.
-        const p = new Params();
-        const uidP = p.add(uid);
-        const rows = await q<{ book_id: string }>(
-          `WITH recent AS (
-             SELECT series_id, max(updated_at) AS last_read
-               FROM read_progress rp
-              WHERE rp.user_id = ${uidP} AND rp.updated_at > now() - interval '90 days'
-                AND EXISTS (SELECT 1 FROM lib_series s WHERE s.id = rp.series_id AND ${browsable('s', vc(req), p)})
-              GROUP BY series_id
-           ),
-           pick AS (
-             SELECT r.series_id, r.last_read,
-                    COALESCE(
-                      -- the chapter you are part-way through wins
-                      (SELECT p.book_id FROM read_progress p
-                         WHERE p.user_id = ${uidP} AND p.series_id = r.series_id AND p.completed = false
-                           -- not a notice chapter the admin hides (lib/noticeChapters.ts): it is no chapter to resume
-                           AND NOT ${noticeBook('p.book_id')}
-                         ORDER BY p.updated_at DESC LIMIT 1),
-                      -- otherwise the lowest-numbered chapter you have not finished
-                      (SELECT b.id FROM lib_books b
-                         LEFT JOIN book_overrides bo ON bo.book_id = b.id
-                         WHERE b.series_id = r.series_id
-                           -- never offer a chapter whose pages were deleted (a tombstone, lib/chapterCleanup.ts)
-                           AND b.pruned_at IS NULL
-                           AND NOT ${noticeBook('b.id')}
-                           AND NOT EXISTS (
-                             SELECT 1 FROM read_progress p2
-                              WHERE p2.user_id = ${uidP} AND p2.book_id = b.id AND p2.completed
-                           )
-                         ORDER BY COALESCE(bo.number, b.number) ASC, b.file ASC LIMIT 1)
-                    ) AS book_id
-               FROM recent r
-           )
-           SELECT book_id FROM pick
-            WHERE book_id IS NOT NULL      -- a series you have finished entirely drops out, correctly
-            ORDER BY last_read DESC
-            LIMIT ${p.add(ON_DECK_LIMIT)}`,
-          p.values as any[],
-        );
-        // The part-way-through pick above is a read_progress row, which survives a prune by design, so the
-        // resolved book is checked as well: Continue Reading must never hand someone a chapter with no pages.
-        const books = (await Promise.all(rows.map((r) => komga.book(vc(req), r.book_id).catch(() => null))))
-          .filter((b) => b && !b.pruned) as any[];
-        return overlay(books, await userProgress(uid, books.map((b) => b.id)));
-      })();
+      // The pick itself is lib/onDeck.ts (v0.61.0: shared with Pick back up and the OPDS Keep reading shelf).
+      onDeckP = onDeckPicks(uid, vc(req), { window: 'recent', limit: ON_DECK_LIMIT }).then(resolvePicks);
     }
 
-    const [onDeck, updated, fresh] = await Promise.all([
+    // v0.61.0, Pick back up: the same pick over series put down three months to two years ago, each saying when
+    // (`stoppedAt`). Kept apart from Keep reading by construction (lib/onDeck.ts): no series is on both.
+    const pickUpP = onDeckPicks(uid, vc(req), { window: 'stale', limit: PICK_UP_LIMIT })
+      .then(async (picks) => {
+        const at = new Map(picks.map((r) => [r.bookId, r.lastRead]));
+        return (await resolvePicks(picks)).map((b) => ({ ...b, stoppedAt: at.get(b.id) ?? null }));
+      })
+      .catch(() => []);
+
+    const [onDeck, updated, fresh, popular, pickUp, gems] = await Promise.all([
       onDeckP,
       komga.seriesUpdated(vc(req), 0, 20).catch(() => ({ content: [] })),
       komga.seriesNew(vc(req), 0, 20).catch(() => ({ content: [] })),
+      // v0.58.0: Most popular in your library (lib/anilistScores.ts).
+      komga.seriesPopular(vc(req), 0, 20).catch(() => ({ content: [] })),
+      pickUpP,
+      // v0.61.0, Hidden gems (lib/ownedCatalog.ts seriesGems).
+      komga.seriesGems(vc(req), 0, 20).catch(() => ({ content: [] })),
     ]);
 
     // Which device each in-progress book was last read on. Reading progress is already shared across devices;
@@ -442,6 +425,10 @@ export default async function catalogRoutes(app: FastifyInstance) {
       updated: await enrichSeries(req, (updated as any).content ?? []),
       new: await enrichSeries(req, (fresh as any).content ?? []),
       favorites: await enrichSeries(req, favorites),
+      popular: await enrichSeries(req, (popular as any).content ?? []),
+      // v0.61.0: Home draws each only when it has something in it.
+      pickUp,
+      gems: await enrichSeries(req, (gems as any).content ?? []),
       updatesCount,
     };
   });
@@ -507,6 +494,19 @@ export default async function catalogRoutes(app: FastifyInstance) {
     // Where the chapters come from: the primary source first, then any followed ones. Every viewer gets
     // this -- it is what the "Sources" line under the title shows, and nothing in it names the host.
     out.sources = await seriesSourcesFor(id).catch(() => []);
+    // The reading defaults of the library it sits in (lib/libraryReader.ts); null when it has none. Every viewer gets
+    // them: they are layered under the source's and the series' own in the reader.
+    const lr = await one<{ p: unknown; lid: string | null; lname: string | null }>(
+      `SELECT l.id AS lid, l.name AS lname, l.reader_prefs AS p
+         FROM lib_series s LEFT JOIN libraries l ON l.id = s.library_id WHERE s.id = $1`, [id]);
+    out.libraryReader = cleanLibraryReader(lr?.p);
+    // Admins only: which library it is in, for the reader's "use these settings for the library" key.
+    if (roleOf(req) === 'admin' && lr?.lid) out.library = { id: lr.lid, name: lr.lname };
+    // v0.61.0: what kind of comic it is -- the admin's override, else what the evidence learned, else unknown -- for EVERY
+    // viewer: the reader's "Pick the mode for each series" opens a manhwa as a webtoon and a manga page by page. The
+    // evidence behind it (`detectedType`) stays an admin's, below. Additive: the admin block sets the same value.
+    const typeRow = await one<{ series_type: string | null }>('SELECT series_type FROM lib_series WHERE id = $1', [id]).catch(() => null);
+    out.seriesType = ov?.series_type ?? typeRow?.series_type ?? 'unknown';
     // v0.52.0 (#72): the other language editions of this work this viewer may open, for the series page's switcher
     // and the reader's; null for a series on its own. `lang` (the DTO's) is the language it is in.
     out.edition = await editionInfo(id, vc(req), userIdOf(req)).catch(() => null);
@@ -519,9 +519,11 @@ export default async function catalogRoutes(app: FastifyInstance) {
     if (roleOf(req) === 'admin') {
       const f = await one<{ folder: string; source_prefs: { priority?: unknown } | null; borrow_names: boolean | null; server_borrow: boolean | null;
                             reading_direction: string | null; reading_direction_from: string | null; lang: string | null; source_id: string | null; roots: string[] | null;
-                            series_type: string | null; series_type_from: string | null; type_override: string | null; hide_notices: boolean | null }>(
+                            series_type: string | null; series_type_from: string | null; type_override: string | null; hide_notices: boolean | null;
+                            hidden_count: number }>(
         `SELECT folder, source_prefs, borrow_names, (SELECT borrow_names FROM server_settings WHERE id = 1) AS server_borrow,
                 reading_direction, reading_direction_from, lang, source_id, series_type, series_type_from, hide_notices,
+                COALESCE(cardinality(hidden_numbers), 0) AS hidden_count,
                 (SELECT o.series_type FROM series_overrides o WHERE o.series_id = lib_series.id) AS type_override,
                 ARRAY(SELECT DISTINCT b.root FROM lib_books b WHERE b.series_id = lib_series.id AND b.root IS NOT NULL ORDER BY b.root) AS roots
            FROM lib_series WHERE id = $1`, [id]);
@@ -554,6 +556,8 @@ export default async function catalogRoutes(app: FastifyInstance) {
       out.hiddenNotices = out.hideNoticesEffective ? await hiddenCount(id) : 0;
       // v0.55.3 (#147): the rule the switches hide by -- short ones only, or every fraction -- so the sheet says which.
       out.hideNoticeShortOnly = noticesShortOnly();
+      // #240: how many chapter numbers an admin hid from it (lib/hiddenChapters.ts), for More's Show hidden chapters.
+      out.hiddenChapters = Number(f?.hidden_count ?? 0);
     }
     return out;
   });
@@ -609,9 +613,43 @@ export default async function catalogRoutes(app: FastifyInstance) {
     return { ok: true };
   });
 
+  /**
+   * v0.61.0, Expected this week (the Updates page, under the new chapters): the series this reader follows -- a
+   * favourite, or one they read in the last 90 days -- whose next chapter the release radar (lib/releaseRadar.ts) puts
+   * within the next seven days, due or running late but not yet quiet; monitored series only, soonest first, at most
+   * 30. Every series as a listing shows it to THIS viewer (browsable(): their libraries, age cap and 18+ switch), and
+   * only their own favourites and reading choose it. `{content: Series[]}`, enriched, so each carries yomi.radar.
+   * Reintroduce another member's reading (drop the user from the events test), or list without browsable(): "Expected
+   * this week: this reader's series due within seven days, in the libraries they may see" in releaseRadar.int.test.ts
+   * lists their series, or the 18+ favourite a listing leaves out while the 18+ switch is off (the by-id resolve below
+   * keeps libraries and age caps, and knows no 18+ switch).
+   */
+  app.get('/api/updates/expected', async (req) => {
+    const p = new Params();
+    const uid = p.add(userIdOf(req));
+    const rows = await q<{ id: string }>(
+      `SELECT s.id FROM lib_series s JOIN series_radar r ON r.series_id = s.id
+        WHERE (EXISTS (SELECT 1 FROM favorites f WHERE f.user_id = ${uid} AND f.series_id = s.id)
+               OR EXISTS (SELECT 1 FROM reading_events e WHERE e.user_id = ${uid} AND e.series_id = s.id
+                             AND e.created_at > now() - interval '90 days'))
+          AND s.auto_update AND r.next_at IS NOT NULL AND r.next_at < now() + interval '7 days' AND r.quiet_after > now()
+          AND ${browsable('s', vc(req), p)}
+        ORDER BY r.next_at, s.id
+        LIMIT 30`,
+      p.values as any[],
+    );
+    const series = (await Promise.all(rows.map((r) => komga.series(vc(req), r.id).catch(() => null)))).filter(Boolean) as any[];
+    return { content: await enrichSeries(req, series) };
+  });
+
   // Ambient cover color (computed + cached on demand).
   app.get('/api/series/:id/color', async (req) => {
     const { id } = req.params as { id: string };
+    // Only for a series this viewer may open, answered as for an unknown id so the route says nothing either way. Every
+    // sibling by-id route was gated; this one answered the colour of hidden, deleted, merged and over-cap series. Komga
+    // mode has no per-viewer model, so the gate is the owned backend's. Reintroduce by removing it:
+    // visibilityGaps.int.test.ts reads the colour of a series in an ungranted library.
+    if (OWNED && !(await seriesVisible(id, vc(req)))) return { color: null };
     const row = await one<{ color: string }>('SELECT color FROM series_colors WHERE series_id = $1', [id]);
     if (row?.color) return { color: row.color };
     if (NATIVE_PROGRESS) try {
@@ -630,17 +668,57 @@ export default async function catalogRoutes(app: FastifyInstance) {
     return { color: null };
   });
 
-  // "More like this" — series sharing genres with this one.
+  // "More like this" — series sharing genres with this one. Since v0.61.0 led by the library series AniList's readers
+  // recommend after this one (lib/anilistRelated.ts heldRecs, read from the table, never from AniList), then the genre
+  // matches, each series once, eighteen in all. Home's "Because you read" and the reader's "Because you finished this"
+  // read it too. Reintroduce the genre matches alone: "More like this leads with the held recommendations" in
+  // anilistRelated.int.test.ts finds a genre match first.
   app.get('/api/series/:id/similar', async (req) => {
     const { id } = req.params as { id: string };
     const s = (await komga.series(vc(req), id).catch(() => null)) as any;
+    if (!s) return { content: [] };
+    // A read that fails leaves the genre matches: the rail they made before v0.61.0.
+    const recIds = OWNED ? await heldRecs(id, vc(req)).catch(() => [] as string[]) : [];
+    const recs = (await Promise.all(recIds.map((x) => komga.series(vc(req), x).catch(() => null)))).filter(Boolean) as any[];
     const genres = (s?.metadata?.genres ?? []).slice(0, 3);
-    if (!genres.length) return { content: [] };
-    const res = await komga.searchSeries(vc(req), { condition: { anyOf: genres.map((g: string) => ({ genre: { operator: 'is', value: g } })) } }, 0, 24);
+    const res = genres.length
+      ? await komga.searchSeries(vc(req), { condition: { anyOf: genres.map((g: string) => ({ genre: { operator: 'is', value: g } })) } }, 0, 24)
+      : { content: [] as any[] };
     // Another edition of this work is not "more like this" (v0.52.0): it is this, in another language, and the
     // switcher under the title already offers it.
-    const content = res.content.filter((x: any) => x.id !== id && !(s?.workId && x.workId === s.workId)).slice(0, 18);
+    const seen = new Set<string>([id]);
+    const content: any[] = [];
+    for (const x of [...recs, ...res.content]) {
+      if (content.length >= 18) break;
+      if (seen.has(x.id) || (s?.workId && x.workId === s.workId)) continue;
+      seen.add(x.id);
+      content.push(x);
+    }
     return { content: await enrichSeries(req, content) };
+  });
+
+  /**
+   * What AniList relates this series to (v0.61.0, lib/anilistRelated.ts relatedFor): its sequels, prequels, main story,
+   * side stories, spin-offs and alternative versions. A held one is the library's series, enriched like every rail, when
+   * this viewer may list it -- and left out, never named, when they may not; one the server does not hold is AniList's
+   * cover and words (`outside`), unless it is 18+ for the viewer. `lookups: false` and nothing else for a series whose
+   * library does not look things up on AniList, or with no checked link. Reads the table only: a page open never asks
+   * AniList. Resolved through the series' own visibility first, so a series this viewer may not open is a 404.
+   */
+  app.get('/api/series/:id/related', async (req) => {
+    const { id } = req.params as { id: string };
+    await komga.series(vc(req), id);
+    if (!OWNED) return { lookups: false, content: [] };
+    const r = await relatedFor(id, vc(req));
+    const heldIds = r.content.flatMap((e) => ('seriesId' in e ? [e.seriesId] : []));
+    const found = (await Promise.all(heldIds.map((x) => komga.series(vc(req), x).catch(() => null)))).filter(Boolean) as any[];
+    const byId = new Map((await enrichSeries(req, found)).map((x: any) => [x.id, x]));
+    const content: Array<{ relation: string; series?: any; outside?: unknown }> = [];
+    for (const e of r.content) {
+      if (!('seriesId' in e)) content.push({ relation: e.relation, outside: e.outside });
+      else if (byId.has(e.seriesId)) content.push({ relation: e.relation, series: byId.get(e.seriesId) });
+    }
+    return { lookups: r.lookups, content };
   });
 
   app.get('/api/series/:id/books', async (req) => {
@@ -686,6 +764,17 @@ export default async function catalogRoutes(app: FastifyInstance) {
       deletedAsGhostsOn(),
     ]);
     return { ...listing, numbering, archive, deletedAsGhosts };
+  });
+
+  /**
+   * The runs of chapter numbers the series is missing (#236), for the reader's "Chapters 44–99 are missing here" as it
+   * moves on to the next chapter: the Health card's own rule, less the runs an admin ignored there (lib/seriesGaps.ts).
+   * Behind the series' own gate, like the listing: `komga.series` answers 404 for a series this viewer cannot open.
+   */
+  app.get('/api/series/:id/gaps', async (req) => {
+    const { id } = req.params as { id: string };
+    await komga.series(vc(req), id);
+    return { gaps: await seriesGaps(id) };
   });
 
   /**
@@ -786,6 +875,13 @@ export default async function catalogRoutes(app: FastifyInstance) {
    *
    * `chosen` is what the rules would take, so a `blocked` number -- every copy dropped, the first kept in
    * `chosen` only for display (lib/seriesListing.ts) -- has no chosen copy at all: the rules took nothing.
+   *
+   * v0.62.0, chapters in the series' language (lib/copyLanguage.ts): a copy's `otherLanguage` is its language when it
+   * is known to be another than the series' -- a copy the rules never take, labelled so the sheet can say why -- and
+   * the answer's `otherLanguage` lists the chapters HERE in another language that a copy in the series' language can
+   * replace: the notice above the chapter list, whose Fetch them again (POST /api/admin/series/:id/chapters/refetch)
+   * replaces each file in place. Only a file that route can replace (the downloader's own path in the download root),
+   * only a number with such a copy, and nothing at all for a series whose language no source serves (languageRules).
    */
   app.get('/api/series/:id/versions', async (req) => {
     const { id } = req.params as { id: string };
@@ -794,8 +890,10 @@ export default async function catalogRoutes(app: FastifyInstance) {
     const rows = await q<{ number: number; title: string | null; source_id: string; status: string; chosen: { sourceId?: string } | null; copies: ListingCopy[] }>(
       `SELECT l.number, l.title, l.source_id, l.status, l.chosen, l.copies FROM series_listing l
         WHERE l.series_id = $1 AND NOT ${noticeListed('l')} ORDER BY l.number`, [id]);
-    const books = await q<{ number: number; source_id: string | null; scanlator: string | null; source_chapter_id: string | null; chapter_name: string | null }>(
-      'SELECT number, source_id, scanlator, source_chapter_id, chapter_name FROM lib_books WHERE series_id = $1 AND pruned_at IS NULL', [id]);
+    const books = await q<{ id: string; number: number; source_id: string | null; scanlator: string | null; source_chapter_id: string | null;
+                             chapter_name: string | null; lang: string | null; root: string | null; file: string; number_end: number | null }>(
+      `SELECT id, number, source_id, scanlator, source_chapter_id, chapter_name, lang, root, file, number_end
+         FROM lib_books WHERE series_id = $1 AND pruned_at IS NULL`, [id]);
     const booksOf = new Map<number, typeof books>();
     for (const b of books) {
       const n = Number(b.number);
@@ -811,8 +909,39 @@ export default async function catalogRoutes(app: FastifyInstance) {
       if (n === undefined) { n = getSource(sid)?.name ?? sid; names.set(sid, n); }
       return n;
     };
+    const series = await one<{ folder: string; source_id: string | null }>('SELECT folder, source_id FROM lib_series WHERE id = $1', [id]);
+    const followed = [
+      ...(series?.source_id ? [series.source_id] : []),
+      ...(await q<{ source_id: string }>('SELECT source_id FROM series_sources WHERE series_id = $1', [id])).map((f) => f.source_id),
+    ];
+    const { inLanguage } = await languageRulesFor(id, followed).catch((): LanguageRules => ({}));
+    /** A copy's language when it is known to be another than the series'; null when it is the series' or unknown. */
+    const otherLanguageOf = (c: { lang?: string | null; source?: string | null }) =>
+      inLanguage && !inLanguage(c) ? copyLang(c) : null;
+    let otherLanguage: { series: string; langs: string[]; bookIds: string[] } | null = null;
+    if (inLanguage && series) {
+      const replaceable = new Set(rows.filter((r) => r.copies?.some((c) => inLanguage(c))).map((r) => Number(r.number)));
+      const tally = new Map<string, number>();
+      const bookIds: string[] = [];
+      for (const b of books) {
+        const number = Number(b.number);
+        if (b.number_end != null || b.root !== DL_ROOT || b.file !== chapterFileRel(series.folder, number) || !replaceable.has(number)) continue;
+        const lang = otherLanguageOf({ lang: b.lang, source: b.source_id });
+        if (!lang) continue;
+        bookIds.push(b.id);
+        tally.set(lang, (tally.get(lang) ?? 0) + 1);
+      }
+      if (bookIds.length) {
+        otherLanguage = {
+          series: (await seriesLanguage(id)).lang,
+          langs: [...tally].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0])).map(([l]) => l),
+          bookIds,
+        };
+      }
+    }
     return {
       checkedAt: await checkedAtOf(id),
+      otherLanguage,
       content: rows.map((r) => {
         const number = Number(r.number);
         const here = booksOf.get(number) ?? [];
@@ -846,6 +975,7 @@ export default async function catalogRoutes(app: FastifyInstance) {
               groups: c.groups ?? [],
               scanlator: c.scanlator ?? null,
               lang: c.lang ?? null,
+              otherLanguage: otherLanguageOf(c),
               pages: c.pages ?? null,
               publishedAt: c.publishedAt ?? null,
               chosen,
@@ -877,17 +1007,24 @@ export default async function catalogRoutes(app: FastifyInstance) {
     return (await booksForUser(req, [b]))[0];
   });
 
-  app.get('/api/books/:id/pages', async (req) => {
+  app.get('/api/books/:id/pages', async (req, reply) => {
     const { id } = req.params as { id: string };
     const pages = await komga.bookPages(vc(req), id);
     // `junk` rides along on the page list rather than being its own request, so the reader and the offline
     // download manifest -- which both read this route -- get it without either knowing the feature exists.
     // A chapter whose pages have not been hashed yet simply comes back with nothing flagged.
     const junk = await junkPagesFor(id).catch(() => new Set<number>());
-    if (!junk.size) return pages;
-    return Array.isArray(pages)
+    const listed = junk.size && Array.isArray(pages)
       ? pages.map((p: any) => (junk.has(p.number) ? { ...p, junk: true } : p))
       : pages;
+    // #229, opt-in: a reader who turned Join split double pages on asks with ?spreads=1, and the pages a source cut from
+    // one spread come back with `join` (which side the next page is on). Only READ here: a chapter not measured yet is
+    // queued for the background measure (lib/spreadMeasure.ts) and answered as it is, and `x-spreads: pending` tells the
+    // reader to ask again shortly. Without the parameter the list is exactly what it was, and nothing is measured.
+    if ((req.query as Record<string, string>).spreads !== '1' || !Array.isArray(listed)) return listed;
+    const s = await spreadsFor(id, listed.length);
+    reply.header('x-spreads', s.state);
+    return s.joins.size ? listed.map((p: any) => (s.joins.has(p.number) ? { ...p, join: s.joins.get(p.number) } : p)) : listed;
   });
 
   // Mark or un-mark one page by hand. A person's call outranks the heuristic in both directions.
@@ -948,7 +1085,7 @@ export default async function catalogRoutes(app: FastifyInstance) {
   app.put('/api/books/:id/progress', async (req, reply) => {
     const uid = userIdOf(req);
     const { id } = req.params as { id: string };
-    const { page, completed, seriesId, deviceId, silent, at } = progressBody.parse(req.body ?? {});
+    const { page, completed, seriesId, deviceId, silent, at, incognito } = progressBody.parse(req.body ?? {});
 
     let sid: string | undefined;
     let done = completed;
@@ -981,7 +1118,7 @@ export default async function catalogRoutes(app: FastifyInstance) {
     // -- and a 500 is a retry forever, where a 404 lets it drop the entry.
     if (!sid) return reply.code(404).send({ error: 'not_found' });
 
-    await writeProgress({ userId: uid, bookId: id, seriesId: sid, page, completed: done, silent, deviceId, at });
+    await writeProgress({ userId: uid, bookId: id, seriesId: sid, page, completed: done, silent, deviceId, at, incognito });
 
     if (NATIVE_PROGRESS && roleOf(req) === 'admin') komga.setReadProgress(vc(req), id, page, done).catch(() => {});
     return reply.send({ ok: true });

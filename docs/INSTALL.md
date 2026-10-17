@@ -1,5 +1,7 @@
 # Installing Uchiyomi
 
+> 🌐 The same install as a guided walk-through, with the compose file explained line by line: [uchiyomi.com/manga-server](https://uchiyomi.com/manga-server).
+
 The two-command quick start lives in the [README](../README.md). This page is everything else: the one-click
 app stores, what each container is for, keeping it up to date, and putting it behind a domain.
 
@@ -91,9 +93,11 @@ actually open (the manifest defaults to `http://localhost:8080`) or logins will 
 install it like anything else. One container, database included; set PUID/PGID to the owner of your library
 so renames work. For Mihon/Tachiyomi extensions, install **uchiyomi-suwayomi** from Apps as well
 ([`templates/uchiyomi-suwayomi.xml`](../templates/uchiyomi-suwayomi.xml): the extension engine, pinned and
-memory-capped), create its folder first (`mkdir -p /mnt/user/appdata/uchiyomi-suwayomi && chown 1000:1000
-/mnt/user/appdata/uchiyomi-suwayomi` in the Unraid terminal), then set Uchiyomi's advanced *SUWAYOMI_URL* to
-`http://YOUR-SERVER-IP:4567`. Admin → Sources walks through the same steps.
+memory-capped), choose the password it asks for, create its folder first (`mkdir -p /mnt/user/appdata/uchiyomi-suwayomi
+&& chown 1000:1000 /mnt/user/appdata/uchiyomi-suwayomi` in the Unraid terminal), then set Uchiyomi's advanced
+*SUWAYOMI_URL* to `http://YOUR-SERVER-IP:4567` and *SUWAYOMI_USERNAME* / *SUWAYOMI_PASSWORD* to the engine's user name
+(`uchiyomi` unless you changed it) and password. Admin → Sources walks through the same steps. An engine installed
+before v0.73.0 has no password; [A password on the engine](extensions.md#a-password-on-the-engine) adds one.
 
 The template behind that listing is [`templates/uchiyomi.xml`](../templates/uchiyomi.xml) in this
 repository, which is laid out as a Community Applications template repository (`templates/` plus the
@@ -109,10 +113,10 @@ keep working; it points here.
 
 **On Umbrel?** Uchiyomi is [submitted to the Umbrel App Store](https://github.com/getumbrel/umbrel-apps/pull/6055)
 and the submission is still open. Until it is listed, install the package at
-[`deploy/umbrel/uchiyomi`](../deploy/umbrel/uchiyomi) yourself — it is kept pinned to the current release by
-digest, so it may be a version ahead of the one in the pull request. It runs the database inside
-the container, reads your library from *Downloads/manga*, and includes the Cloudflare solver; the Mihon
-extension engine is not part of it.
+[`deploy/umbrel/uchiyomi`](../deploy/umbrel/uchiyomi) yourself — it is pinned by digest to the current release or
+the one before it, so it may be ahead of the one in the pull request. It runs the database inside the container,
+reads your library from *Downloads/manga* (on umbrelOS 2.0 you can pick another folder in the app's settings), and
+includes the Cloudflare solver; the Mihon extension engine is not part of it.
 
 ## What each container is for
 
@@ -150,6 +154,11 @@ you first installed, indefinitely, with nothing to tell you. Watch
 Upgrading in place is safe: accounts, reading progress, downloads and settings live in named volumes, and the
 database migrates itself on boot.
 
+The extension engine (`uchiyomi-suwayomi`) is the exception: its image is pinned to the version a release was tested
+with, so `pull` fetches the same one again. When a release moves it (its notes say so, and so does **Admin → Health**),
+change that one `image:` line yourself, after backing up the engine's data:
+[Updating the engine](extensions.md#updating-the-engine).
+
 > The two upgrade warnings that used to sit here — empty backups on v0.9.0/v0.9.1, and volume ownership
 > before v0.5.1 — are long past. They are in the [changelog](../CHANGELOG.md) with the same detail, which is
 > where release history belongs.
@@ -185,3 +194,32 @@ proxy's own password prompt (HTTP Basic Auth) does not, yet.
 
 > Using the development stack from a clone instead? Its services are named `yomi-*`, with networks
 > `yomi_app` and `yomi_internal`.
+
+## Single sign-on
+
+Uchiyomi signs people in through any OpenID Connect provider (Authentik, Authelia, Keycloak, Pocket ID…), beside its
+own accounts or, for a server on the internet, instead of them. With Authentik:
+
+1. **Applications → Providers → Create → OAuth2/OpenID Provider**: client type *Confidential*, redirect URI
+   `https://manga.example.com/auth/oidc/callback` (your `PUBLIC_ORIGIN` followed by `/auth/oidc/callback`), and the
+   default scopes `openid`, `profile` and `email` (`profile` carries the `groups` claim).
+2. **Applications → Create**, with that provider, slug `uchiyomi`. Under its **Policy / Group / User Bindings**, bind
+   the group whose members may read here: Authentik then turns everyone else away before Uchiyomi sees them.
+3. In `.env`:
+
+```dotenv
+OIDC_ISSUER=https://auth.example.com/application/o/uchiyomi/
+OIDC_CLIENT_ID=…
+OIDC_CLIENT_SECRET=…
+OIDC_NAME=Authentik
+OIDC_ADMIN_GROUP=uchiyomi-admins   # members of this group are admins here
+OIDC_ALLOW_SIGNUP=true              # a person the provider lets in gets an account at their first sign-in
+```
+
+An account made this way starts with the new-member defaults in **Admin → Members**: which libraries it can open, an
+age limit and downloads. Set them before you let people in; until then a new account opens every library.
+
+**SSO-only.** Add `AUTH_MODE=oidc-only` and the server stops offering passwords at all: no setup form, no password
+sign-in, no sign-up. A new server's first admin is the first person in `OIDC_ADMIN_GROUP` to sign in, or the subject
+`OIDC_BOOTSTRAP_ADMIN_SUB` names. Accounts that already exist need linking first (*Link to Authentik* in **Profile → Account**), and `AUTH_RESCUE_ADMIN` is the way back in if the provider is ever down. The whole reference, with every
+setting: [Single sign-on (OIDC)](api.md#single-sign-on-oidc).

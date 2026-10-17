@@ -119,6 +119,12 @@ export interface SourceAdapter {
   // ---- optional, plugin-declared capabilities (the core consults these instead of hardcoding ids) ----
   /** page/cover images sit behind Cloudflare → fetch them with FlareSolverr session cookies. */
   requiresCloudflare?: boolean;
+  /**
+   * This adapter's page images are on a private address by design, so the downloader's public-host rule does not apply
+   * to their first hop. Only the end-to-end fake source sets it, and that adapter exists only when FAKE_SOURCE_URLS is
+   * set (sources/fake.ts). A site's pages never get it: a URL a site names is exactly what the rule is for.
+   */
+  localImages?: boolean;
   /** Referer to send when fetching page/cover images (string, or derived from the chapter url). */
   imageReferer?: string | ((chapterUrl: string) => string);
   /** Extra headers for page/cover image fetches — e.g. auth for a source that proxies its own images. */
@@ -181,7 +187,8 @@ export interface SourceAdapter {
   /**
    * BCP-47-ish language this source publishes in, when it only publishes in one. Suwayomi reports it per
    * source; a built-in declares it only when its own requests pin a language (each MangaDex adapter asks for
-   * its one language and nothing else). Absent means "no single language", which the language grouping reads
+   * its one language and nothing else); a site added by address when its pages or its sheet say one (v0.62.0,
+   * customSites.ts Site.lang). Absent means "no single language", which the language grouping reads
    * as "belongs to every group" -- so declaring it wrongly is worse than leaving it off.
    */
   lang?: string;

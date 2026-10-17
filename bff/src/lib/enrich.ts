@@ -19,7 +19,8 @@ import { roleOf, userIdOf } from './auth';
 import { autoHeroFor } from './autoHero';
 import { effectiveLang } from './seriesLang';
 import { browsable, Params, type ViewCtx } from './visibility';
-import { noticeBook, noticeHidden, noticesActive } from './noticeChapters';
+import { hidingActive, noticeBook, noticeHidden } from './noticeChapters';
+import { radarsFor } from './releaseRadar';
 
 export async function seriesColors(ids: string[]): Promise<Map<string, string>> {
   if (!ids.length) return new Map();
@@ -32,8 +33,8 @@ export async function seriesColors(ids: string[]): Promise<Map<string, string>> 
 
 /**
  * The chapter count "new since you last looked" is kept in (series_seen.seen_books_count): every chapter row,
- * lib_series.books_count, the notice chapters an admin hides included (lib/noticeChapters.ts) -- where `booksCount`
- * leaves those out. booksCount moves when a switch flips or a notice's pages get counted, and nobody read anything
+ * lib_series.books_count, the notice chapters an admin hides included (lib/noticeChapters.ts), and the numbers an
+ * admin hid by hand (#240) -- where `booksCount` leaves those out. Hiding a chapter is not reading one either. booksCount moves when a switch flips or a notice's pages get counted, and nobody read anything
  * new: kept in it, a hide switched on swallowed the next real chapters of every favourite (the seen count stood
  * above the count left), and one switched off announced every old notice as new. The same as booksCount while
  * nothing hides, so nothing is asked then. Either way the count is what each series' row says when there is none.
@@ -42,7 +43,7 @@ export async function seriesColors(ids: string[]): Promise<Map<string, string>> 
  */
 export async function seenCounts(list: Array<{ id: string; booksCount?: number }>): Promise<Map<string, number>> {
   const out = new Map(list.map((s) => [s.id, s.booksCount ?? 0]));
-  if (!noticesActive() || !list.length) return out;
+  if (!hidingActive() || !list.length) return out;
   const rows = await q<{ id: string; n: number }>('SELECT id, books_count AS n FROM lib_series WHERE id = ANY($1)', [list.map((s) => s.id)]);
   for (const r of rows) out.set(r.id, Number(r.n));
   return out;
@@ -68,7 +69,7 @@ export async function newSinceSeen(seen: Map<string, number>, counts: Map<string
     out.set(id, fresh);
     if (fresh > 0) due.push([id, fresh]);
   }
-  if (!noticesActive() || !due.length) return out;
+  if (!hidingActive() || !due.length) return out;
   const rows = await q<{ id: string; n: number }>(
     `SELECT k.id, count(*) FILTER (WHERE NOT t.hidden)::int AS n
        FROM unnest($1::text[], $2::int[]) AS k(id, fresh)
@@ -101,12 +102,14 @@ export async function seriesSeen(userId: string, ids: string[]): Promise<Map<str
  * One grouped query rather than two: `read_progress` holds a row per opened chapter with a `completed` flag,
  * so both numbers come from the same scan.
  */
-async function seriesProgress(userId: string, seriesIds: string[]): Promise<Map<string, { done: number; started: number }>> {
+async function seriesProgress(userId: string, seriesIds: string[]): Promise<Map<string, { done: number; started: number; lastAt: string | null }>> {
   if (!seriesIds.length) return new Map();
-  const rows = await q<{ series_id: string; done: number; started: number }>(
+  const rows = await q<{ series_id: string; done: number; started: number; last_at: Date | null }>(
     `SELECT series_id,
             count(*) FILTER (WHERE completed)::int      AS done,
-            count(*) FILTER (WHERE NOT completed)::int  AS started
+            count(*) FILTER (WHERE NOT completed)::int  AS started,
+            -- v0.58.0: when this viewer last read in it, for the Library's Recently read (the same max the sort reads).
+            max(updated_at)                             AS last_at
        FROM read_progress
       WHERE user_id = $1 AND series_id = ANY($2)
         -- A hidden notice chapter (lib/noticeChapters.ts) is out of the total these are laid against, so out of
@@ -115,7 +118,30 @@ async function seriesProgress(userId: string, seriesIds: string[]): Promise<Map<
       GROUP BY series_id`,
     [userId, seriesIds],
   );
-  return new Map(rows.map((r) => [r.series_id, { done: r.done, started: r.started }]));
+  return new Map(rows.map((r) => [r.series_id, { done: r.done, started: r.started, lastAt: r.last_at ? new Date(r.last_at).toISOString() : null }]));
+}
+
+/**
+ * v0.58.0: each series' outside rating, from the AniList entry it is linked to (lib/anilistScores.ts) -- the checked
+ * link only, as the sorts read it. Absent: no checked link, or no score fetched yet, or AniList answered nothing.
+ * v0.60.0: and the entry's id, so the series page's AniList tile opens that entry on anilist.co. Reintroduce without
+ * it: "every series says its outside rating" in anilistScores.int.test.ts reads no id.
+ */
+export interface OutsideRating { id: string; score: number | null; popularity: number | null }
+async function anilistScores(seriesIds: string[]): Promise<Map<string, OutsideRating>> {
+  if (!seriesIds.length) return new Map();
+  const rows = await q<{ series_id: string; anilist_id: string; score: number | null; popularity: number | null }>(
+    `SELECT t.series_id, t.external_id AS anilist_id, a.score, a.popularity
+       FROM series_trackers t JOIN anilist_scores a ON a.anilist_id = t.external_id
+      WHERE t.series_id = ANY($1) AND t.provider = 'anilist' AND (t.linked_by IS NOT NULL OR t.checked_at IS NOT NULL)
+        AND (a.score IS NOT NULL OR a.popularity IS NOT NULL)`,
+    [seriesIds],
+  ).catch(() => [] as Array<{ series_id: string; anilist_id: string; score: number | null; popularity: number | null }>);
+  return new Map(rows.map((r) => [r.series_id, {
+    id: String(r.anilist_id),
+    score: r.score == null ? null : Number(r.score),
+    popularity: r.popularity == null ? null : Number(r.popularity),
+  }]));
 }
 
 /**
@@ -164,6 +190,8 @@ export async function enrichSeries(req: FastifyRequest, list: any[]): Promise<an
   const seen = await seriesSeen(userId, list.map((s) => s.id));
   const fresh = await newSinceSeen(seen, await seenCounts(list));
   const heroes = await autoHeroFor(list.map((s) => s.id));
+  const outside = await anilistScores(list.map((s) => s.id));
+  const radars = await radarsFor(list.map((s) => s.id));
   const editions = await editionLangs(list, (req as any).viewCtx as ViewCtx | undefined);
   return list.map((s) => {
     const p = progress?.get(s.id);
@@ -188,6 +216,15 @@ export async function enrichSeries(req: FastifyRequest, list: any[]): Promise<an
         // would break any client reading it for nothing.
         unread,
         newCount: fresh.get(s.id) ?? 0,
+        // v0.58.0: the outside rating (AniList's score out of 100 and how many people list it), beside the viewer's
+        // own `rating`; and when this viewer last read in it. The Library's new sorts order by these.
+        anilist: outside.get(s.id) ?? null,
+        lastReadAt: p?.lastAt ?? null,
+        // v0.61.0: the release radar (lib/releaseRadar.ts) -- when its next chapter is likely, as an estimate: `{nextAt,
+        // dueUntil, quietAfter, lastAt, every, kind, steady, ended, basis}`, null while nothing dates it. The same for every
+        // viewer; the series page, the reader's end card, Releasing soon and Expected this week read it. Reintroduce
+        // without it: "the series page carries its radar" in releaseRadar.int.test.ts reads undefined.
+        radar: radars.get(s.id) ?? null,
       },
     };
   });

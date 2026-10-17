@@ -123,6 +123,12 @@ export function taskResult(r: any): string {
       const n = r.directions.learned ?? 0;
       bits.push(n === 1 ? tr('1 reading direction learned') : tr('{n} reading directions learned', { n }));
     }
+    // Missing details (v0.73.0, bff lib/autoDetails.ts) are off unless switched on, so like the group upgrades the clause
+    // is never "off"; with the switch on it says how many series got something, when one did or when it ran alone.
+    if (ran('details') && r.details && !r.details.off && (r.details.filled || (only?.length === 1))) {
+      const n = r.details.filled ?? 0;
+      bits.push(n === 1 ? tr('missing details filled in for 1 series') : tr('missing details filled in for {n} series', { n }));
+    }
     if (ran('failures')) {
       const n = r.failures?.reset ?? 0;
       bits.push(n === 1 ? tr('1 failure reset') : tr('{n} failures reset', { n }));
@@ -238,7 +244,10 @@ export function taskResult(r: any): string {
     // A sweep an admin cancelled from the download pill (#82) is not a quiet night either. One key per count: the
     // `{count}` key read "+1 chapters", and its placeholder hid it from the pairing check.
     const added = r.added === 1 ? tr('+1 chapter') : tr('+{n} chapters', { n: r.added });
-    const base = ` \u00b7 ${added}${r.stopped === 'cancelled' ? ` \u00b7 ${tr('cancelled')}` : ''}`;
+    // v0.61.0: the series the smart update checks left for a later sweep (bff lib/releaseRadar.ts isDue) -- said, so a
+    // sweep that visited 40 of 224 series reads as resting the rest, not as missing them.
+    const rested = r.rested > 0 ? ` \u00b7 ${r.rested === 1 ? tr('1 quiet series not due') : tr('{n} quiet series not due', { n: r.rested })}` : '';
+    const base = ` \u00b7 ${added}${r.stopped === 'cancelled' ? ` \u00b7 ${tr('cancelled')}` : ''}${rested}`;
     if (r.healthy === false) {
       const bits: string[] = [];
       if (r.failed) bits.push(r.failed === 1 ? tr('1 series did not answer') : tr('{n} series did not answer', { n: r.failed }));

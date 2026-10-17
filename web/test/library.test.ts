@@ -109,12 +109,17 @@ test('no sort the grid cannot page through', () => {
   // random()`, the grid pages with LIMIT/OFFSET, and useInfiniteQuery APPENDS -- so page 2 re-rolls the
   // shuffle, redrawing series already scrolled past and silently omitting others. You would have to count
   // to notice. "Surprise me" is the honest version: one series, one request, no pagination.
-  // Reintroduce by adding { key: 'random', label: 'Shuffle', sort: 'random,desc' } to SORTS.
-  const sorts = [...read('components/LibraryFilters.tsx').matchAll(/sort: '([^']+)'/g)].map((m) => m[1]);
-  assert.ok(sorts.length >= 4, `the SORTS scan found ${sorts.length} entries — it is not reading the array`);
+  // Reintroduce by adding { key: 'random', label: 'Shuffle', sort: 'random,desc', … } to SORTS.
+  // v0.60.0: the orders live in lib/librarySort.ts, the toolbar's Sort menu reads them there, and every one can run the
+  // other way -- which keeps the field, so a random field stays the only way to get a random order.
+  const sorts = [...read('lib/librarySort.ts').matchAll(/sort: '([^']+)'/g)].map((m) => m[1]);
+  assert.ok(sorts.length >= 9, `the SORTS scan found ${sorts.length} entries — it is not reading the array`);
   for (const s of sorts) {
     assert.doesNotMatch(s, /random/i, `"${s}": a random order cannot be paginated, and the grid paginates`);
   }
+  // Nothing else on the page names an order of its own.
+  assert.doesNotMatch(code(read('components/LibraryFilters.tsx')), /sort: '/, 'the filter panel has orders of its own again');
+  assert.doesNotMatch(code(read('components/LibraryToolbar.tsx')), /random/i, 'the toolbar offers a random order');
 });
 
 test('the genre list comes from the counted endpoint, not the flat one', () => {
@@ -169,8 +174,13 @@ test('every label the panel renders reaches the translation extractor', () => {
   // English, in all eight languages, forever, with nothing in the suite noticing.
   // Reintroduce by going back to that expression, or by dropping a key from the locale files.
   const src = read('components/LibraryFilters.tsx');
-  for (const arr of ['SORT_LABELS', 'READ_LABELS', 'STATUS_LABELS']) {
+  for (const arr of ['READ_LABELS', 'STATUS_LABELS']) {
     assert.match(src, new RegExp(`const ${arr} = keys\\(`), `${arr} is not registered with keys()`);
+  }
+  // The orders, their groups and their directions moved to the toolbar's menu (v0.60.0), from one file.
+  const sorts = read('lib/librarySort.ts');
+  for (const arr of ['SORT_LABELS', 'GROUP_LABELS', 'DIR_LABELS']) {
+    assert.match(sorts, new RegExp(`const ${arr} = keys\\(`), `${arr} is not registered with keys()`);
   }
   assert.doesNotMatch(code(src), /charAt\(0\) \+ /, 'a label is being title-cased in JS instead of translated');
 
@@ -234,9 +244,11 @@ test('the library filter state is still the URL, with one writer', () => {
   // key -- changing one refetches from page 0 rather than appending to a stale list. The panel is a pure
   // component over props for the same reason: two writers would race.
   // Reintroduce by giving LibraryFilters its own useSearchParams/useRouter: the sidebar and the sheet then
-  // disagree about what is selected the moment one of them navigates.
+  // disagree about what is selected the moment one of them navigates. v0.60.0: the toolbar too -- its search, order and
+  // direction go through the page's setParam, never a router of its own.
   const panel = read('components/LibraryFilters.tsx');
   assert.doesNotMatch(panel, /useSearchParams|useRouter/, 'the filter panel writes the URL itself');
+  assert.doesNotMatch(read('components/LibraryToolbar.tsx'), /useSearchParams|useRouter|next\/navigation/, 'the toolbar writes the URL itself');
   const page = read('app/library/page.tsx');
   assert.equal((page.match(/router\.replace\(/g) ?? []).length, 2,
     'expected exactly two URL writers in the library: setParam and clearAll');
@@ -395,15 +407,19 @@ test('the select bar fits two rows on a phone and one at 1024 px: the admin acti
   // took 940 of 992. So the three are rows of More at every width, and More stays for admins from lg up (735 px in
   // English, 822 in German, which took two rows before). Reintroduce any of them as a key in the bar: "an admin action
   // is a key in the bar" fails; drop the admin's More from lg up: "the admin actions cannot be reached from lg up".
+  // v0.60.0: keys, not chips -- the bar's buttons are actions, and the owner's "no more pills" keeps the capsule for the
+  // filter chips. Same 12 px words, same 12 px padding: the rows above hold. Reintroduce a chip: "a chip in the select
+  // bar" fails, and noPills.test.ts scans the bar for any capsule.
   const src = read('app/library/page.tsx');
   const bar = /bottom-\[calc\(5\.75rem\+env\(safe-area-inset-bottom\)\)\][\s\S]*?<\/div>\s*<\/div>\s*\)\}/.exec(src)?.[0] ?? '';
   assert.ok(bar.length > 200, 'could not find the select bar');
-  const chips = [...bar.matchAll(/className=\{?[`"]chip[^`"]*[`"]\}?/g)].map((m) => m[0]);
-  const phoneOnly = chips.filter((c) => /\blg:hidden\b/.test(c));
-  assert.equal(phoneOnly.length, 1, 'expected exactly one phone-only More chip');
-  assert.ok(chips.length <= 6, `${chips.length} chips reach the phone bar; more than six wraps to a third row at 390 px`);
+  assert.doesNotMatch(code(bar), /className=\{?[`"]chip\b/, 'a chip in the select bar');
+  const phone = [...bar.matchAll(/className=\{?[`"](btn-key\b[^`"]*)[`"]\}?/g)].map((m) => m[1]).filter((c) => !/\bhidden lg:inline-flex\b/.test(c));
+  const phoneOnly = phone.filter((c) => /\blg:hidden\b/.test(c));
+  assert.equal(phoneOnly.length, 1, 'expected exactly one phone-only More key');
+  assert.ok(phone.length <= 6, `${phone.length} keys reach the phone bar; more than six wraps to a third row at 390 px`);
   assert.doesNotMatch(code(bar), /setMoving\(true\)|setRemoving\(true\)|findSelected/, 'an admin action is a key in the bar');
-  assert.match(bar, /onClick=\{\(\) => setMore\(true\)\} className=\{`chip text-xs disabled:opacity-50 \$\{isAdmin \? '' : 'lg:hidden'\}`\}/,
+  assert.match(bar, /onClick=\{\(\) => setMore\(true\)\} className=\{`btn-key \$\{isAdmin \? '' : 'lg:hidden'\}`\}/,
     'the admin actions cannot be reached from lg up');
   // From lg up, every chip and key an admin sees there: at most the seven that measured one row at 1024 px.
   const keys = [...bar.matchAll(/className=\{?[`"]((?:chip|btn-key)\b[^`"]*)[`"]\}?/g)].map((m) => m[1]);
@@ -440,7 +456,7 @@ test('Archive slowly: a key from lg up, a row of More on a phone, for anyone who
   assert.match(src, /\{canDownload\(user\) && <button disabled=\{acting\} onClick=\{archiveSelected\} className="btn-key hidden lg:inline-flex">\{tr\('Archive slowly'\)\}<\/button>\}/,
     'the archive key reaches the phone bar');
   // More is a member's on a phone only (from lg up Archive slowly is a key), and an admin's at every width (v0.49.1).
-  assert.match(src, /\{\(isAdmin \|\| canDownload\(user\)\) && <button disabled=\{acting\} onClick=\{\(\) => setMore\(true\)\} className=\{`chip text-xs disabled:opacity-50 \$\{isAdmin \? '' : 'lg:hidden'\}`\}/,
+  assert.match(src, /\{\(isAdmin \|\| canDownload\(user\)\) && <button disabled=\{acting\} onClick=\{\(\) => setMore\(true\)\} className=\{`btn-key \$\{isAdmin \? '' : 'lg:hidden'\}`\}/,
     'a member who may download has no way to archive on a phone');
   const sheet = src.slice(src.indexOf('<Sheet title={selectedText(picked.size)}'), src.indexOf('</Sheet>', src.indexOf('<Sheet title={selectedText(picked.size)}')));
   assert.match(sheet, /\{canDownload\(user\) && \(\s*<button onClick=\{\(\) => \{ setMore\(false\); void archiveSelected\(\); \}\}/, 'More has no Archive slowly, or keeps the sheet open under the notice');
@@ -503,8 +519,11 @@ test('src is the main source and anysrc any source, from the URL to the search, 
   // queryKey: "the grid's key does not carry the source filters" fails, and a change of source filter would append
   // its pages to the list the old filter fetched.
   const page = code(read('app/library/page.tsx'));
-  const fn = /function conditionFrom\(([^)]*)\) \{([\s\S]*?)\n\}/.exec(page);
+  // v0.61.0: conditionFrom moved to lib/libraryQuery.ts, where Save as list and the server's port of it (bff
+  // lib/smartLists.ts) read it too; the page imports it. Read from there deliberately, the same pins kept.
+  const fn = /function conditionFrom\(([^)]*)\) \{([\s\S]*?)\n\}/.exec(code(read('lib/libraryQuery.ts')));
   assert.ok(fn, 'could not find conditionFrom');
+  assert.match(page, /import \{ conditionFrom[^}]*\} from '@\/lib\/libraryQuery';/, 'the page builds its condition somewhere else');
   const params = fn![1].split(',').map((p) => p.trim().split(/[\s:=]/)[0]);
   assert.deepEqual(params.slice(4), ['src', 'anysrc'], 'conditionFrom takes the source filters in another order');
   // Which parameter guards each condition, and which one it carries.
@@ -515,7 +534,7 @@ test('src is the main source and anysrc any source, from the URL to the search, 
   assert.match(page, /const src = params\.get\('src'\) \|\| '';\s*const anysrc = params\.get\('anysrc'\) \|\| '';/, 'the URL params are read into the wrong names');
   assert.match(page, /useMemo\(\(\) => conditionFrom\(read, status, genres, lib, src, anysrc\), \[read, status, genres\.join\(','\), lib, src, anysrc\]\)/,
     'the condition memo does not carry both source filters, in order');
-  assert.match(page, /queryKey: \['library', active\.key, read, status, genres\.join\(','\), lib, src, anysrc\],/, "the grid's key does not carry the source filters");
+  assert.match(page, /queryKey: \['library', active\.key, dir, read, status, genres\.join\(','\), lib, src, anysrc, q\],/, "the grid's key does not carry the source filters");
   assert.match(page, /const activeCount = [^;]*\+ \(src \? 1 : 0\) \+ \(anysrc \? 1 : 0\);/, 'the badge does not count the source filters');
   // The writing side: Main source's chips set `src` and count `main`, Any source's set `anysrc` and count `any`, and
   // both placements of the panel are handed both values; each active chip clears its own param.
@@ -541,7 +560,8 @@ test('Main source offers "No source" (#149): its own condition, a sentinel no so
   assert.ok(sentinel, 'could not find the No source sentinel');
   // Not a site added by address (letters and digits), an extension's source (sw:…), MangaDex (mangadex…), nor nothing.
   for (const id of [/^[a-z0-9]+$/, /^sw:/, /^mangadex/, /^$/]) assert.doesNotMatch(sentinel!, id, `No source's sentinel could be a source id: ${sentinel}`);
-  const fn = /function conditionFrom\(([^)]*)\) \{([\s\S]*?)\n\}/.exec(page)![2];
+  // v0.61.0: conditionFrom lives in lib/libraryQuery.ts (see the test above).
+  const fn = /function conditionFrom\(([^)]*)\) \{([\s\S]*?)\n\}/.exec(code(read('lib/libraryQuery.ts')))![2];
   assert.match(fn, /if \(src === NO_SOURCE\) all\.push\(\{ hasMainSource: \{ operator: 'isFalse' \} \}\);\s*else if \(src\) all\.push\(\{ mainSource: \{ operator: 'is', value: src \} \}\);/,
     'No source is sent as a source id');
   // The section: Main source with one source and series that have none; Any source still with two. Evaluated.
@@ -558,11 +578,12 @@ test('Main source offers "No source" (#149): its own condition, a sentinel no so
   assert.match(panel, /<SourceSection title=\{tr\('Main source'\)\}[\s\S]{0,120}?rows=\{sources\} none=\{none\} count=\{\(s\) => s\.main\} value=\{mainSrc\} onPick=\{\(id\) => onSet\('src', id\)\} \/>/,
     'Main source is not handed the No source count');
   assert.match(panel, /<SourceSection title=\{tr\('Any source'\)\}[\s\S]{0,140}?rows=\{sources\} count=\{\(s\) => s\.any\}/, 'Any source has a No source of its own');
-  // The chip: single choice in `src`, a tap on the chosen one clears it, its count beside it as a source's is.
-  const section = panel.slice(panel.indexOf('function SourceSection('), panel.indexOf('function Eyebrow('));
+  // The row (a chip until v0.60.0): single choice in `src`, a tap on the chosen one clears it, its count beside it as a
+  // source's is.
+  const section = panel.slice(panel.indexOf('function SourceSection('), panel.indexOf('function GenreRow('));
   assert.match(section, /const noneShown = none !== undefined && \(none > 0 \|\| value === NO_SOURCE\);/, 'No source is offered with nothing in it, or not while chosen');
-  assert.match(section, /<button type="button" onClick=\{\(\) => onPick\(value === NO_SOURCE \? '' : NO_SOURCE\)\} aria-pressed=\{value === NO_SOURCE\}[\s\S]*?\{tr\('No source'\)\}<span className="ms-1 tabular-nums text-fog-600">\{none\}<\/span>/,
-    'the No source chip does not write the sentinel into src, or has no count');
+  assert.match(section, /<FilterOption on=\{value === NO_SOURCE\} onPick=\{\(\) => onPick\(value === NO_SOURCE \? '' : NO_SOURCE\)\}[\s\S]*?label=\{tr\('No source'\)\} count=\{none\}/,
+    'the No source row does not write the sentinel into src, or has no count');
   // The active chip says it in words, never the sentinel; the count comes from the same query as the sources.
   assert.match(page, /const sourceName = \(id: string\) => \(id === NO_SOURCE \? tr\('No source'\) : libSources\?\.sources\.find/, 'the active chip reads the sentinel');
   assert.match(panel, /\.then\(\(r\) => \(\{ sources: r\.content \?\? \[\], none: r\.none \?\? 0 \}\)\)/, 'the count is not read, or an older server\'s missing one is not 0');
@@ -583,23 +604,48 @@ test('in Japanese and Chinese the source filters use those files\' full-width br
   assert.ok(ja['Any source'].startsWith(ja['Any: {name}'].split('：')[0]), 'ja: Any source and its active chip say any in two different words');
 });
 
-test('a chosen source chip is drawn chosen, even for a source that is not loaded', () => {
+test('a chosen source row is drawn chosen, even for a source that is not loaded', () => {
   // `.chip-active` is in @layer components and `text-fog-500` is a utility, so where a chip carried both the
   // utility won: the chosen chip of a source that is not loaded (its extension gone, the engine down) kept the
-  // grey of an unchosen one and lost its accent. The class list is evaluated here for all four cases. Reintroduce
-  // `${value === s.id ? 'chip-active' : ''} ${s.installed ? '' : 'text-fog-500'}`: "a chosen chip for a source
-  // that is not loaded is drawn unchosen" fails.
+  // grey of an unchosen one and lost its accent. Since v0.60.0 the choices are rows (FilterOption), and the row's
+  // class list is evaluated here for all four cases. Reintroduce `${on ? 'text-accent' : ''} ${muted ? 'text-fog-500' : ''}`:
+  // "a chosen row for a source that is not loaded is drawn unchosen" fails.
   const panel = code(read('components/LibraryFilters.tsx'));
-  const section = panel.slice(panel.indexOf('function SourceSection('), panel.indexOf('function Eyebrow('));
-  const tpl = /<button key=\{s\.id\}[\s\S]*?className=\{`([^`]*)`\}/.exec(section)?.[1];
-  assert.ok(tpl, 'could not find the source chip');
-  const classes = (value: string, installed: boolean): string[] =>
-    (new Function('value', 's', `return \`${tpl}\`;`)(value, { id: 'x', installed }) as string).split(/\s+/).filter(Boolean);
-  assert.ok(classes('x', false).includes('chip-active') && !classes('x', false).includes('text-fog-500'),
-    'a chosen chip for a source that is not loaded is drawn unchosen');
-  assert.ok(classes('', false).includes('text-fog-500'), 'a source that is not loaded no longer looks it');
-  assert.ok(classes('x', true).includes('chip-active'));
-  assert.deepEqual(classes('', true), ['chip', 'text-xs']);
+  const option = panel.slice(panel.indexOf('function FilterOption('), panel.indexOf('function Glyph('));
+  const tpl = /<button type="button" onClick=\{onPick\}[\s\S]*?className=\{`([^`]*)`\}/.exec(option)?.[1];
+  assert.ok(tpl, 'could not find the filter row');
+  const classes = (on: boolean, muted: boolean): string[] =>
+    (new Function('on', 'muted', `return \`${tpl}\`;`)(on, muted) as string).split(/\s+/).filter(Boolean);
+  assert.ok(classes(true, true).includes('text-accent') && !classes(true, true).includes('text-fog-500'),
+    'a chosen row for a source that is not loaded is drawn unchosen');
+  assert.ok(classes(false, true).includes('text-fog-500'), 'a source that is not loaded no longer looks it');
+  assert.ok(classes(true, false).includes('text-accent'));
+  assert.ok(!classes(false, false).includes('text-accent') && !classes(false, false).includes('text-fog-500'));
+  // And Main source hands its rows the source's own state.
+  const section = panel.slice(panel.indexOf('function SourceSection('), panel.indexOf('function GenreRow('));
+  assert.match(section, /<FilterOption key=\{s\.id\} on=\{value === s\.id\}[\s\S]{0,120}?muted=\{!s\.installed\}/, 'the source rows are not muted for a source that is not loaded');
+});
+
+test('the filters are rows that fold, and a folded section still says what it filters by (v0.60.0)', () => {
+  // The owner: "it's so full of pills". Every choice is a FilterOption row in a FilterSection; nothing in the panel is a
+  // chip any more. A folded section names its pick beside its title, so a filter is never on out of sight. Reintroduce a
+  // chip: "the panel draws chips again" fails; drop `picked` from the folded header: "a folded section hides its filter".
+  const panel = code(read('components/LibraryFilters.tsx'));
+  assert.doesNotMatch(panel, /className=\{`?['"]?chip\b|\bchip-active\b/, 'the panel draws chips again');
+  for (const id of ['read', 'status', 'format', 'genres']) assert.match(panel, new RegExp(`<FilterSection id="${id}"`), `${id} is not a folding section`);
+  assert.match(panel, /<SourceSection title=\{tr\('Main source'\)\}[^>]*id="src"/, 'Main source does not fold');
+  assert.match(panel, /<SourceSection title=\{tr\('Any source'\)\}[^>]*id="anysrc"/, 'Any source does not fold');
+  const section = panel.slice(panel.indexOf('function FilterSection('), panel.indexOf('function FilterOption('));
+  assert.match(section, /\{!open && picked && <span[^>]*>\{picked\}<\/span>\}/, 'a folded section hides its filter');
+  assert.match(section, /aria-expanded=\{open\}/, 'the fold key does not say whether it is open');
+  // Per device, read after mount (the static export renders without storage), Any source folded until told otherwise.
+  assert.match(panel, /const FOLD_KEY = 'uchiyomi\.libraryFilterFold';/);
+  assert.match(panel, /const FOLD_DEFAULT = \['anysrc'\];/);
+  assert.match(panel, /useEffect\(\(\) => \{\s*try \{\s*const saved = JSON\.parse\(localStorage\.getItem\(FOLD_KEY\)/, 'the fold is read during render, not after mount');
+  // The walks' handles survive: every choice is still an aria-pressed button, and No source keeps its hook.
+  const option = panel.slice(panel.indexOf('function FilterOption('), panel.indexOf('function Glyph('));
+  assert.match(option, /<button type="button" onClick=\{onPick\} aria-pressed=\{on\}/);
+  assert.match(panel, /attrs=\{\{ 'data-source-none': '' \}\}/, 'No source lost its hook');
 });
 
 test('the Library asks for one card per work, and the card names the work\'s languages (v0.52.0)', () => {
@@ -608,24 +654,29 @@ test('the Library asks for one card per work, and the card names the work\'s lan
   // `collapseEditions: true` from the grid's search: "the Library asks for one card per work" fails, and Blue Lock
   // sits on the shelf twice.
   const page = code(read('app/library/page.tsx'));
-  assert.match(page, /api<Page<Series>>\('\/api\/series\/search', \{ json: \{ page: pageParam, size: 40, sort: active\.sort, condition, collapseEditions: true \} \}\)/,
+  assert.match(page, /api<Page<Series>>\('\/api\/series\/search', \{ json: \{ page: pageParam, size: 40, sort: sortBy, condition, query: q \|\| undefined, collapseEditions: true \} \}\)/,
     'the Library asks for one card per work');
   const cards = code(read('components/cards.tsx'));
   assert.match(cards, /\{!!series\.edition\?\.langs && series\.edition\.langs\.length > 1 && \(/, 'the card does not name its languages');
   assert.match(cards, /libraryCaption\(series\.edition\.langs, series\.lang\)/, 'the shown edition is not the one marked');
 });
 
-test('a capped count reads "99+" in Arabic too: every "99+" sits in a left-to-right box', () => {
+test('a count reads the same in Arabic: the unread tag and the nav ring\'s "99+" sit in a left-to-right box', () => {
   // v0.55.7 integration (lane C's report): the Library tile's unread badge read "+99" in Arabic -- "99+" is a number and
-  // a sign, and the sign took the right-to-left paragraph's side. The tiles' badges and the nav ring's count say it.
-  // Reintroduce by dropping a `dir="ltr"`: the element that renders that "99+" is named.
-  for (const f of ['components/cards.tsx', 'components/ProgressRing.tsx']) {
-    const src = code(read(f));
-    // Each element that renders a capped count -- `'99+'` inline, or ringCount's -- opens with dir="ltr".
-    const opens = [...src.matchAll(/<span\b[^>]*>\s*\{(?:unread > 99 \? '99\+' : unread|n)\}/g)].map((m) => m[0]);
-    assert.ok(opens.length > 0, `${f}: no capped count found -- the scan no longer sees the badge`);
-    for (const o of opens) assert.match(o, /\bdir="ltr"/, `${f}: a capped count is not left-to-right: ${o.replace(/\s+/g, ' ').slice(0, 140)}`);
-  }
-  // ringCount is where the nav ring's count is capped, and the one place it is.
+  // a sign, and the sign took the right-to-left paragraph's side. Since v0.61.2 (#202) the tiles say the whole count
+  // ("1,150", one grouped run) through UnreadCount; the nav ring's count is still capped. Reintroduce by dropping a
+  // `dir="ltr"`: the element is named.
+  const cards = code(read('components/cards.tsx'));
+  const tag = /function UnreadCount\([^)]*\) \{[\s\S]*?return (<span\b[^>]*>)\{numberText\(n\)\}<\/span>;/.exec(cards);
+  assert.ok(tag, 'cards.tsx: UnreadCount no longer renders the count -- the scan no longer sees the tag');
+  assert.match(tag![1], /\bdir="ltr"/, `cards.tsx: the unread count is not left-to-right: ${tag![1]}`);
+  assert.equal((cards.match(/<UnreadCount n=\{unread\} \/>/g) ?? []).length, 3, 'every unread tag (card, tile, row) goes through UnreadCount');
+  assert.doesNotMatch(cards, /'99\+'/, 'cards.tsx caps a count again');
+  const ring = code(read('components/ProgressRing.tsx'));
+  const opens = [...ring.matchAll(/<span\b[^>]*>\s*\{n\}/g)].map((m) => m[0]);
+  assert.ok(opens.length > 0, 'ProgressRing.tsx: no ring count found -- the scan no longer sees it');
+  for (const o of opens) assert.match(o, /\bdir="ltr"/, `ProgressRing.tsx: the ring count is not left-to-right: ${o.replace(/\s+/g, ' ').slice(0, 140)}`);
+  // ringCount is where the nav ring's count is capped, and the one place it is: three characters, so the tag on an icon
+  // keeps its shape.
   assert.match(read('lib/ring.ts'), /return n > 99 \? '99\+' : String\(Math\.floor\(n\)\);/);
 });

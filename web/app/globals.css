@@ -69,6 +69,14 @@
 
   --radius-4xl: 2rem;
 
+  /* The two small sizes the app reaches for most (UI refresh), as tokens rather than the hundreds of text-[11px] /
+     text-[10px] it writes by hand. For new and redesigned code; the arbitrary sizes elsewhere are left alone, and
+     several tests read them. */
+  --text-2xs: 0.6875rem;
+  --text-2xs--line-height: 1rem;
+  --text-3xs: 0.625rem;
+  --text-3xs--line-height: 0.875rem;
+
   /* Reads --tile when a card sets one, so a cover's own colour lifts off the page on hover, and falls back
      to the accent everywhere else -- which is every surface that does not set it. */
   --shadow-glow: 0 0 0 1px rgb(var(--tile, var(--accent)) / 0.4), 0 8px 40px -8px rgb(var(--tile, var(--accent)) / 0.5);
@@ -90,6 +98,12 @@
      is not drawn at all and the clock runs the same. */
   --animate-notice-countdown: notice-countdown 1s linear forwards;
 
+  /* The Library's "the shelf is changing" line (v0.60.0): a third of the grid's width sliding along its top edge while a
+     new order, filter or search loads over the covers it replaces. Applied only when motion is welcome -- under reduced
+     motion or Reduce effects the line stands still (app/library/page.tsx), because the reduced-motion rule below shortens
+     an infinite animation to a jitter rather than stopping it, as it would the ring's. */
+  --animate-indeterminate: indeterminate 1.1s cubic-bezier(0.45, 0, 0.55, 1) infinite;
+
   @keyframes fade-up {
     0% { opacity: 0; transform: translateY(12px); }
     100% { opacity: 1; transform: translateY(0); }
@@ -109,6 +123,10 @@
     from { transform: scaleX(1); }
     to { transform: scaleX(0); }
   }
+  @keyframes indeterminate {
+    from { transform: translateX(-100%); }
+    to { transform: translateX(300%); }
+  }
 }
 
 :root {
@@ -125,10 +143,15 @@
      and a scrim lighting the wrong corner in Arabic makes the label unreadable rather than merely odd. */
   --start: 0%;
 
+  /* The desktop sidebar's width and the top bar's height (UI refresh). Both are 0 below lg, where the phone has its
+     bottom bar and no rail, so every calc() below that adds them is the old geometry on a phone. The top bar is the
+     40 px keys plus py-3 and its 1 px border: 65 px, the figure the Library's sticky toolbar already used. */
+  --rail-w: 0px;
+  --topbar-h: 0px;
 }
 [dir='rtl'] { --start: 100%; }
 @media (min-width: 640px)  { :root { --gutter: 1.25rem; } }
-@media (min-width: 1024px) { :root { --gutter: 2rem; } }
+@media (min-width: 1024px) { :root { --gutter: 2rem; --rail-w: 4.5rem; --topbar-h: 65px; } }
 
 @layer base {
   html {
@@ -169,13 +192,38 @@
     width: 100%;
     margin-inline: auto;
   }
-  @media (min-width: 1024px) { .shell { padding-inline: 2rem; } }
+  /* At lg the start edge also clears the sidebar (components/Sidebar.tsx), which is fixed over the page. */
+  @media (min-width: 1024px) { .shell { padding-inline: 2rem; padding-inline-start: calc(2rem + var(--rail-w)); } }
 
   /* The one escape hatch, for art that has to reach the edges. Logical margins, so it still reaches the
      right edges under dir="rtl" instead of tearing the layout open on one side.
      Contract: valid only on a child of a page root carrying `px-4 lg:px-0`. */
   .bleed { margin-inline: -1rem; width: calc(100% + 2rem); }
-  @media (min-width: 1024px) { .bleed { margin-inline: -2rem; width: calc(100% + 4rem); } }
+  /* At lg it reaches under the sidebar too: art runs to the window's edge and the rail floats over it. Text laid
+     inside a bleed puts itself back on the content edge with .bleed-pad. */
+  @media (min-width: 1024px) {
+    .bleed {
+      margin-inline-start: calc(-2rem - var(--rail-w)); margin-inline-end: -2rem;
+      width: calc(100% + 4rem + var(--rail-w));
+    }
+  }
+  /* The same reach at lg only, for a page root that has no phone gutter to undo (Home's hero, the series banner). */
+  @media (min-width: 1024px) {
+    .bleed-lg {
+      margin-inline-start: calc(-2rem - var(--rail-w)); margin-inline-end: -2rem;
+      width: calc(100% + 4rem + var(--rail-w));
+    }
+  }
+  /* Text inside a bleed, on the content edge: the phone gutter, and at lg the shell's own padding, rail included. */
+  .bleed-pad { padding-inline: 1rem; }
+  @media (min-width: 1024px) { .bleed-pad { padding-inline-start: calc(2rem + var(--rail-w)); padding-inline-end: 2rem; } }
+  /* Art that starts at the top of the window, under the (then transparent) top bar: lib/overArt.ts. */
+  @media (min-width: 1024px) { .under-topbar { margin-top: calc(-1 * var(--topbar-h)); } }
+  /* The same on a phone, under Home's own sticky header (app/page.tsx), which has no background of its own: its
+     height is safe-top's padding, the 40 px keys and its pb-3. */
+  @media (max-width: 1023.98px) {
+    .under-phone-header { margin-top: calc(-1 * (max(0.9rem, calc(env(safe-area-inset-top) + 0.55rem)) + 2.5rem + 0.75rem)); }
+  }
   /* One field style. It was copy-pasted as a local `fld` const in three files, which is how two of them
      drifted. max-w-md never binds inside a card and binds hard in a full-width one, which is what keeps a
      text input from stretching to two thousand pixels on a wide display. */
@@ -221,15 +269,21 @@
   /* Status-bar / notch safe clearance for top bars. Lives in the components layer so a plain
      `pt-*` utility no longer silently overrides it; pair with `lg:pt-*` to override on desktop. */
   .safe-top { padding-top: max(0.9rem, calc(env(safe-area-inset-top) + 0.55rem)); }
+  /* The lines above the top bar stack as one column (AppShell's banner stack: offline, Incognito reading, 18+, Health,
+     a tracker to reconnect), and only the FIRST meets an installed app's status bar. A `safe-top` line under another
+     one keeps an ordinary line's padding: Health's under Incognito's, or the tracker's under Health's (#246), left a
+     phone a notch's worth of empty band between two lines. */
+  .banner-stack > .safe-top:not(:first-child) { padding-top: 0.5rem; }
   .safe-bottom { padding-bottom: max(0.8rem, calc(env(safe-area-inset-bottom) + 0.4rem)); }
 
+  /* UI refresh: squared like every other action key (noPills.test.ts). The names stay, so no page changes. */
   .btn-accent {
-    @apply inline-flex items-center justify-center gap-2 rounded-full bg-accent px-5 py-3
+    @apply inline-flex items-center justify-center gap-2 rounded-xl bg-accent px-5 py-3
            font-semibold text-black transition active:scale-[0.97];
     box-shadow: 0 8px 30px -10px rgb(var(--accent) / 0.7);
   }
   .btn-ghost {
-    @apply inline-flex items-center justify-center gap-2 rounded-full border border-ink-600
+    @apply inline-flex items-center justify-center gap-2 rounded-xl border border-ink-600
            bg-ink-800/60 px-5 py-3 font-medium text-fog-100 backdrop-blur
            transition hover:border-ink-500 active:scale-[0.97];
   }
@@ -264,11 +318,32 @@
     @apply border-accent/35 bg-accent-soft text-accent hover:border-accent/70 hover:text-accent
            disabled:hover:border-accent/35 disabled:hover:text-accent;
   }
+  /* The series page's reading button (v0.60.0): the accent key, lit by the series' own cover colour -- `--cover`, which
+     lib/theme.ts applyCover sets while a series is open, else the accent. After `.btn-accent` in this layer, so its
+     plain accent shadow gives way to this one; Reduce effects puts the plain one back (below, unlayered). A still
+     shadow: nothing here animates but the hover, which the reduced-motion rule already cuts short. */
+  .cta-glow {
+    box-shadow: 0 10px 34px -12px rgb(var(--cover, var(--accent)) / 0.85), 0 0 26px -8px rgb(var(--cover, var(--accent)) / 0.5),
+      0 0 0 1px rgb(var(--cover, var(--accent)) / 0.3);
+  }
+  .cta-glow:hover {
+    box-shadow: 0 12px 40px -10px rgb(var(--cover, var(--accent)) / 0.95), 0 0 34px -6px rgb(var(--cover, var(--accent)) / 0.6),
+      0 0 0 1px rgb(var(--cover, var(--accent)) / 0.45);
+  }
   .card {
     @apply rounded-3xl border border-ink-700/70 bg-ink-850/70 backdrop-blur;
   }
+  /* `content-visibility: auto`: a placeholder well off the screen is skipped, and its shimmer with it. A grid renders one
+     for every cover that has not loaded, and lazy covers below the fold wait: the 200-cover Library kept 158 shimmers
+     running where nobody could see them, and every frame of theirs was main-thread work for the whole page -- restyle,
+     pre-paint, re-layering (idle at 4x CPU: 325 ms of re-layering in every 2.5 s; Home on a phone: half its idle main
+     thread). What shows is the same: a skipped placeholder is still its grey box, and its shimmer starts as it comes
+     within about half a screen -- so a row scrolled to sweeps in step with its own row rather than with the first
+     screenful, as every later page of covers already did. Every placeholder takes its size from its classes, never its
+     content, so skipping one moves nothing. Pinned in web/test/idleWork.test.ts. */
   .skeleton {
     @apply relative overflow-hidden bg-ink-800;
+    content-visibility: auto;
   }
   .skeleton::after {
     content: '';
@@ -293,7 +368,16 @@
   opacity: 0.05; mix-blend-mode: overlay;
   background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='160' height='160'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='2' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
   background-size: 180px 180px;
+  transition: opacity 0.3s ease-out;
 }
+/* The grain steps aside while the page moves (v0.67.3, the owner's call: "pause it while scrolling"). Its overlay blend has
+   the GPU redraw everything under it into a layer of its own and blend the two, on every frame the content moves: on a
+   fast scroll it was the whole difference between 39-55 fps and a steady 60, on Home and the Library alike. Lenis marks
+   the page `lenis-scrolling` while it moves (wheel, keys, touch, a scrollbar), and the grain is out of the page then --
+   at opacity 0 the blend was still prepared, and the Library stayed at 48 -- and fades back in over 0.3 s once it stops
+   (and on its first paint). At rest it is exactly as before. Pinned in web/test/effects.test.ts. */
+html.lenis-scrolling .fx-grain { display: none; }
+@starting-style { .fx-grain { opacity: 0; } }
 .fx-vignette {
   position: fixed; inset: 0; z-index: 2; pointer-events: none;
   background: radial-gradient(125% 100% at 50% 0%, transparent 52%, rgba(0,0,0,0.5) 100%);
@@ -340,9 +424,75 @@
   -webkit-mask-composite: xor; mask-composite: exclude; pointer-events: none;
 }
 
+/* The phone hero cover's slow drift (components/PhoneHeroCover.tsx, v0.67.0's design): closer and back, 24 s each way.
+   CSS, not framer keyframes: a page loaded directly mounts inside the page transition's AnimatePresence, whose
+   initial={false} has framer start every motion component in it at its last keyframe and play nothing -- the drift never
+   ran from v0.67.0 to v0.74.0. The compositor runs this. The component leaves the class off while Reduce effects or the
+   system's reduced motion is on; the two rules below stop it there too, as .fx-mesh is stopped, rather than leave the
+   0.001 ms of the reduced-motion rule flickering an infinite animation. */
+@keyframes hero-drift { from { transform: scale(1); } to { transform: scale(1.07); } }
+.hero-drift { animation: hero-drift 24s ease-in-out infinite alternate; }
+
+/* The badge emblems' sheen and Legend's halo (components/BadgeEmblem.tsx, v0.75.0, the owner's approved design): a band of
+   light across an earned medal every 6.5 s, and Legend's aurora turning once in 14 s. The emblem leaves both classes off
+   while Reduce effects or the system's reduced motion is on; the rules below stop them there too, as the drift's are. */
+@keyframes badge-sheen { 0% { transform: translateX(0); } 28%, 100% { transform: translateX(210px); } }
+.badge-sheen { animation: badge-sheen 6.5s cubic-bezier(.45, 0, .2, 1) infinite; }
+@keyframes badge-halo { to { transform: rotate(360deg); } }
+.badge-halo { animation: badge-halo 14s linear infinite; }
+
 @media (prefers-reduced-motion: reduce) {
   .fx-mesh { animation: none; }
+  .hero-drift { animation: none; }
+  .badge-sheen, .badge-halo { animation: none; }
   *, *::before, *::after { animation-duration: 0.001ms !important; transition-duration: 0.001ms !important; }
+}
+
+/* ============ Background tones (Look settings) ============
+   OLED black is the app's look and the default: the @theme block's --color-ink-* scale, with no attribute and no rule
+   here. Graphite and Midnight are lib/tone.ts's other two, put on <html data-tone> by the code that applies the accent,
+   and each is the whole ink scale again. Every bg-, border- and from-/via-/to-ink utility reads these variables -- with
+   an opacity too, through color-mix() -- so the page, its cards, its borders and the fades of art into the page all move
+   together, and no component needs to know a tone exists.
+   ⚠️ lib/tone.ts restates three shades of each for the theme-color meta and the swatches; test/tokens.test.ts holds the
+   two together, wants every shade of the scale in every tone, and checks each tone's text contrast and the order of its
+   surfaces.
+   ⚠️ BEFORE the Reduce effects block below: its solid glass must still beat a tone's tinted one, at the same
+   specificity, so it has to come later. */
+html[data-tone='graphite'] {
+  --color-ink-950: #131316;
+  --color-ink-900: #18181c;
+  --color-ink-850: #1d1d22;
+  --color-ink-800: #232329;
+  --color-ink-700: #2d2d35;
+  --color-ink-600: #3a3a44;
+  --color-ink-500: #4e4e5a;
+}
+html[data-tone='midnight'] {
+  --color-ink-950: #090d18;
+  --color-ink-900: #0d1220;
+  --color-ink-850: #111727;
+  --color-ink-800: #161d30;
+  --color-ink-700: #1e2740;
+  --color-ink-600: #2a3452;
+  --color-ink-500: #3e4a6e;
+}
+/* What paints the page colour by hand rather than through a token follows a tone too: the canvas behind the body (an
+   overscroll, the notch), the scrollbars, the glass, and the collapsed sidebar's scrim -- black on true black is
+   invisible except over art, and on a tone it would be a dark band down the start of every page. These restate OLED's
+   own rules in the tone's ink; the rules themselves are untouched, so OLED renders exactly what it did. */
+html[data-tone] { background: var(--color-ink-950); }
+html[data-tone] * { scrollbar-color: var(--color-ink-600) transparent; }
+html[data-tone] *::-webkit-scrollbar-thumb { background: var(--color-ink-600); }
+html[data-tone] .glass { background: color-mix(in srgb, var(--color-ink-850) 55%, transparent); }
+html[data-tone] .glass-strong { background: color-mix(in srgb, var(--color-ink-900) 78%, transparent); }
+html[data-tone] .rail-scrim {
+  background-image: linear-gradient(to right, color-mix(in srgb, var(--color-ink-950) 82%, transparent),
+    color-mix(in srgb, var(--color-ink-950) 55%, transparent) 55%, transparent);
+}
+html[data-tone][dir='rtl'] .rail-scrim {
+  background-image: linear-gradient(to left, color-mix(in srgb, var(--color-ink-950) 82%, transparent),
+    color-mix(in srgb, var(--color-ink-950) 55%, transparent) 55%, transparent);
 }
 
 /* ============ Reduce effects (#71) ============
@@ -376,11 +526,17 @@ html.reduce-effects *::after { -webkit-backdrop-filter: none; backdrop-filter: n
 html.reduce-effects .glass,
 html.reduce-effects .glass-strong { background: var(--color-ink-900); }
 html.reduce-effects .skeleton::after { animation: none; display: none; }
+html.reduce-effects .hero-drift { animation: none; }
+html.reduce-effects .badge-sheen,
+html.reduce-effects .badge-halo { animation: none; }
 /* The accent hairline is a two-layer mask with `mask-composite: exclude`, on every tile in the grid. Chrome
    barely notices it; Firefox does: with everything above already off, the 200-tile library at 1440 still
    scrolled at 32 fps in headless Firefox, and at 59.5 with only these rings gone. Every element wearing one
    keeps its own plain border underneath, so nothing loses its edge -- only the accent glint on it. */
 html.reduce-effects .grad-border::before { display: none; }
+/* The reading button's cover-coloured glow (v0.60.0) goes back to the plain accent shadow every `.btn-accent` wears. */
+html.reduce-effects .cta-glow,
+html.reduce-effects .cta-glow:hover { box-shadow: 0 8px 30px -10px rgb(var(--accent) / 0.7); }
 
 /* Lenis momentum scroll */
 html.lenis, html.lenis body { height: auto; }
@@ -401,4 +557,20 @@ html.lenis, html.lenis body { height: auto; }
 
 [dir='rtl'] .scrim-soft {
   background-image: linear-gradient(to left, rgb(0 0 0 / 0.65), rgb(0 0 0 / 0.20) 45%, transparent 72%);
+}
+
+/* Home's hero: the current slide's segment filling while it shows (components/HeroCarousel.tsx). Plain CSS, not an
+   @theme token: the hero sets it inline, with the slide's own duration, and only when motion is welcome. */
+@keyframes hero-progress {
+  from { transform: scaleX(0); }
+  to { transform: scaleX(1); }
+}
+
+/* The collapsed sidebar over art (components/Sidebar.tsx): dark at the window's start edge, gone by its own end, so
+   the icons read on a bright page and the art still runs under them. The same dir= twin as the scrims above. */
+.rail-scrim {
+  background-image: linear-gradient(to right, rgb(0 0 0 / 0.82), rgb(0 0 0 / 0.55) 55%, rgb(0 0 0 / 0));
+}
+[dir='rtl'] .rail-scrim {
+  background-image: linear-gradient(to left, rgb(0 0 0 / 0.82), rgb(0 0 0 / 0.55) 55%, rgb(0 0 0 / 0));
 }

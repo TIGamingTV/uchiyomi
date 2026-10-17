@@ -6,7 +6,7 @@
 openapi: 3.1.0
 info:
   title: Uchiyomi API
-  version: 0.55.8
+  version: 0.77.1
   description: "Everything the web app does, it does over this API. Session JWTs are for the browser; scripts
     use a personal API token (Profile -> Connections -> API tokens), sent as `Authorization: Bearer uy_...`.
     Scopes: read (every token; GET plus the library search POST, which is a query), write (anything that changes data), admin (the /api/admin surface, which also
@@ -136,13 +136,14 @@ components:
         their 18+ switch hides one of the series it names (`params.seriesIds`, since v0.55.1, judged on the series as it
         stands, a merged-away one included), and `current.title` the same way by `current.seriesIds`; a line written
         before v0.55.1, with no ids, is left out whatever it names.
-      required: [id, status, startedAt, by, phase, phaseIndex]
+      required: [id, status, startedAt, by, origin, phase, phaseIndex]
       properties:
         id: { type: string }
         status: { type: string, enum: [running, done, stopped, failed, interrupted] }
         startedAt: { type: string, format: date-time }
         finishedAt: { type: string, format: date-time }
         by: { type: string, nullable: true }
+        origin: { type: string, enum: [nightly, manual], description: 'How the run began (since v0.70.0): nightly for the scheduled one.' }
         phase:
           type: string
           nullable: true
@@ -190,6 +191,29 @@ components:
                   said: { $ref: '#/components/schemas/AutofixSaid' }
                   action: { type: object, additionalProperties: true }
         log: { type: array, items: { $ref: '#/components/schemas/AutofixSaid' } }
+    SeriesRadar:
+      type: object
+      description: >-
+        Since v0.61.0, `yomi.radar` on every enriched series: the release radar's estimate of its next chapter, from
+        the dates its sources list (`basis: source`) or, when they date too little, from when its chapters arrived on
+        this server (`arrival`); null while nothing dates the series or it has no source. Times are ISO. `nextAt` and
+        `dueUntil` are null unless the rhythm is clear -- four releases or more, mostly evenly spaced, shipping daily,
+        weekly or monthly -- and the series is not ended or on hiatus; from `nextAt` to `dueUntil` it is "due any
+        day", after that "running late", and from `quietAfter` on quiet. `every` is the median gap in days, `kind`
+        the cadence (daily | weekly | monthly | irregular | unknown), `steady` whether its releases keep one weekday
+        (the estimate is moved onto it), `ended` whether its status says it is finished. An estimate, always: the
+        web says "~Friday" and "usually Fridays".
+      required: [nextAt, dueUntil, quietAfter, lastAt, every, kind, steady, ended, basis]
+      properties:
+        nextAt: { type: [string, "null"], format: date-time }
+        dueUntil: { type: [string, "null"], format: date-time }
+        quietAfter: { type: [string, "null"], format: date-time }
+        lastAt: { type: [string, "null"], format: date-time }
+        every: { type: [number, "null"] }
+        kind: { type: string, enum: [daily, weekly, monthly, irregular, unknown] }
+        steady: { type: boolean }
+        ended: { type: boolean }
+        basis: { type: [string, "null"], enum: [source, arrival, null] }
     AccountSettings:
       type: object
       additionalProperties: true
@@ -199,23 +223,46 @@ components:
       properties:
         librarySort:
           type: string
-          enum: [updated, new, az, unread]
+          enum: [updated, new, az, unread, popular, score, rating, chapters, read, soon]
           description: >-
-            The Library's saved default sort. A valid `sort` in the Library URL wins for that visit; opening a
-            shared URL does not change this setting.
+            The Library's saved default sort (since v0.58.0 also Most popular, Top rated, My rating, Most chapters
+            and Recently read; since v0.61.0 Releasing soon, `soon`). A valid `sort` in the Library URL wins for that visit; opening a shared URL does not
+            change this setting.
+        librarySortDir:
+          type: string
+          nullable: true
+          enum: [asc, desc]
+          description: >-
+            Since v0.60.0: the Library's saved sort order, High to low (`desc`) or Low to high (`asc`); null goes back
+            to the sort's own direction. A valid `dir` in the Library URL wins for that visit.
         homeCollections:
           type: array
           maxItems: 3
           uniqueItems: true
           items: { type: string, minLength: 1, maxLength: 64 }
           description: >-
-            Ordered ids of up to three Lists owned by this account. Missing preserves the legacy first-three-
-            nonempty Home rails; an explicit empty array means no List rails. Empty selected Lists retain their
-            slot. Already-stored stale or unowned ids are ignored by Home and omitted on the next edit;
-            a request that tries to add one is refused.
+            Ordered ids of up to three Lists owned by this account -- or, since v0.61.0, shared with the household by
+            another member. Missing preserves the legacy first-three-nonempty Home rails; an explicit empty array means
+            no List rails. Empty selected Lists retain their slot. Already-stored stale or unreadable ids are ignored by
+            Home and omitted on the next edit; a request that tries to add one (another member's private List, a
+            malformed id) is refused.
         showAllChapters:
           type: boolean
           description: Show one unpaged chapter list, including all grey rows and unfolded older runs.
+        incognito:
+          type: boolean
+          description: >-
+            Since v0.61.0, Incognito reading, for the whole account and enforced by the server: progress is still
+            written (Keep reading and resuming work), but no reading event is recorded (history, streaks, Wrapped, the
+            leaderboard, the household's Top 10, member activity) and nothing is pushed to a tracker automatically --
+            whatever client wrote the progress. The next push once it is off sends the series' real highest chapter.
+        trackerPlanOnAdd:
+          type: boolean
+          description: >-
+            Since v0.68.0 (#223), off unless exactly true: a series this account adds to the library goes on each
+            connected tracker it is linked to as Plan to Read (AniList PLANNING, MyAnimeList plan_to_read, Kitsu
+            planned), only where the account's list has no entry for it yet -- an existing entry is never changed --
+            and never under Incognito reading.
         reader:
           type: object
           additionalProperties: true
@@ -226,6 +273,24 @@ components:
             type: string
             enum: [az, za, read, unread, latest]
           description: Per-List display sorts; absence for a List means its own order.
+    SmartListQuery:
+      type: object
+      additionalProperties: false
+      required: [v, sort]
+      description: >-
+        Since v0.61.0, a smart list's saved Library search, in the Library URL's own words. Answered with the Library's
+        own search for whoever opens the list.
+      properties:
+        v: { type: integer, enum: [1] }
+        q: { type: string, minLength: 1, maxLength: 200, description: Title search. }
+        read: { type: string, enum: [UNREAD, IN_PROGRESS, READ] }
+        status: { type: string, minLength: 1, maxLength: 40 }
+        genres: { type: array, maxItems: 20, items: { type: string, minLength: 1, maxLength: 60 } }
+        lib: { type: string, minLength: 1, maxLength: 120, description: Library id. }
+        src: { type: string, minLength: 1, maxLength: 120, description: "Main source id; '-' is No source." }
+        anysrc: { type: string, minLength: 1, maxLength: 120, description: Any source id. }
+        sort: { type: string, enum: [updated, read, new, soon, popular, score, rating, chapters, unread, az] }
+        dir: { type: string, enum: [asc, desc] }
     AdminBulkDeleteResult:
       type: object
       required: [id, outcome, chapters, bytes, kept, paused, chapterSkips]
@@ -534,6 +599,36 @@ components:
           maxItems: 100
           items: { type: string, minLength: 1, maxLength: 120 }
           description: Source ids, best first. Sources not named here rank below every named one, in the series' follow order.
+    NewMemberDefaults:
+      type: object
+      description: >-
+        What a member the server makes by itself starts with (#208): a sign-up (POST /auth/register), or a first sign-in
+        through the OIDC provider with OIDC_ALLOW_SIGNUP, in SSO-only mode too. A member's own fields from PATCH
+        /api/admin/users/{id}, with their meanings. The account is made with them in one transaction. Never applied to the
+        first admin (POST /api/setup, or SSO-only mode's first sign-in), to an account made by POST /api/admin/users, or to
+        the desktop app's own; an account the provider makes an admin (OIDC_ADMIN_GROUP) carries them too, unrestricted
+        while it is one. Saving them changes no account that exists. GET always answers all three; PATCH takes any of them,
+        an absent one left as it is.
+      properties:
+        libraries:
+          type: [array, "null"]
+          maxItems: 1000
+          items: { type: string, maxLength: 100 }
+          description: >-
+            null, the default: every library, including ones added later. A list: exactly these library ids. [] (or a
+            list whose libraries are all gone): none, never every library. An id no library has is dropped, and a
+            library removed later leaves the list.
+        maxAgeRating:
+          type: [integer, "null"]
+          minimum: 0
+          maximum: 18
+          description: The highest age rating a new member may see; null, the default, is no limit.
+        perms:
+          type: object
+          properties:
+            canDownload:
+              type: boolean
+              description: false denies downloads. Absent, or true, allows them (stored as {}), the default.
     ScanlatorPrefs:
       type: object
       description: >-
@@ -719,10 +814,12 @@ components:
         number: { type: number }
         reason:
           type: string
-          enum: [not_listed, blocked_group, already_here, source_unavailable, cooldown, duplicate]
+          enum: [not_listed, blocked_group, other_language, already_here, source_unavailable, cooldown, duplicate, hidden]
           description: >-
             `duplicate` is a second pick for a number already picked in the same body: the first pick was
-            handled, this one was not.
+            handled, this one was not. `other_language` (since v0.62.0): every copy of the number is in another
+            language than the series' -- a pick takes one anyway. `hidden` (since v0.76.0): an admin hid the number
+            from the series (POST /api/admin/series/{id}/chapters/hide), and nothing fetches it, a pick included.
         source: { type: string, description: Present when the skipped entry was a pick, naming the copy asked for. }
         sourceId: { type: string, description: Present when the skipped entry was a pick. }
     Pick:
@@ -812,7 +909,7 @@ components:
     Copy:
       type: object
       description: One version of a listed chapter number, as the sources list it.
-      required: [key, source, sourceName, groups, scanlator, lang, pages, publishedAt, chosen, blocked, onDisk]
+      required: [key, source, sourceName, groups, scanlator, lang, otherLanguage, pages, publishedAt, chosen, blocked, onDisk]
       properties:
         key: { type: string, description: "`<source>:<sourceId>`, unique within the number." }
         source: { type: string, description: The adapter id; with `sourceId` this is what a Pick names. }
@@ -820,6 +917,7 @@ components:
         groups: { type: array, items: { type: string } }
         scanlator: { type: [string, "null"], description: The group string as the source shows it (a joint release reads "A & B"). }
         lang: { type: [string, "null"] }
+        otherLanguage: { type: [string, "null"], description: "Since v0.62.0: the copy's language when it is known to be another than the series' (its own, else its source's), a copy the release rules never take; null otherwise." }
         pages: { type: [integer, "null"], description: 0 is an external link (not downloadable); null when the source does not say. }
         publishedAt: { type: [string, "null"], format: date-time }
         chosen: { type: boolean, description: The copy the release rules chose at the last check. }
@@ -1096,73 +1194,9 @@ paths:
         - auth
       summary: Create the first admin account (only while no account exists).
       operationId: postApiSetup
-      requestBody:
-        required: false
-        content:
-          application/json:
-            schema:
-              type: object
-              properties:
-                username:
-                  type: string
-                password:
-                  type: string
-                displayName:
-                  type: string
-      security: []
-      responses:
-        "200":
-          description: OK
-        "400":
-          description: Malformed body or parameter
-        "409":
-          description: "Conflict: already exists, already running, or duplicate"
-  /auth/config:
-    get:
-      tags:
-        - auth
-      summary: Login options the client should offer (registration open, OIDC configured).
-      operationId: getAuthConfig
-      security: []
-      responses:
-        "200":
-          description: OK
-  /auth/login:
-    post:
-      tags:
-        - auth
-      summary: Log in with username and password (and a TOTP code when enabled); returns a short-lived JWT and sets
-        the refresh cookie.
-      operationId: postAuthLogin
-      requestBody:
-        required: false
-        content:
-          application/json:
-            schema:
-              type: object
-              properties:
-                username:
-                  type: string
-                password:
-                  type: string
-                totp:
-                  type: string
-      security: []
-      responses:
-        "200":
-          description: OK
-        "400":
-          description: Malformed body or parameter
-        "401":
-          description: Not authenticated
-        "429":
-          description: Too many attempts
-  /auth/register:
-    post:
-      tags:
-        - auth
-      summary: Create an account, when registration is open.
-      operationId: postAuthRegister
+      description: >-
+        Not registered in SSO-only mode (AUTH_MODE=oidc-only, since v0.63.0): a new server's first admin is made by
+        their first sign-in through the provider instead (OIDC_BOOTSTRAP_ADMIN_SUB, else OIDC_ADMIN_GROUP).
       requestBody:
         required: false
         content:
@@ -1183,9 +1217,110 @@ paths:
         "400":
           description: Malformed body or parameter
         "403":
-          description: "Forbidden: token scope, account permission or age limit"
+          description: "`already_configured`: the server has an account. Two setups at once make one admin (since v0.77.1)."
+  /auth/config:
+    get:
+      tags:
+        - auth
+      summary: Login options the client should offer (registration open, OIDC configured).
+      operationId: getAuthConfig
+      description: >-
+        Since v0.63.0 `mode` is `local` or `oidc-only` (AUTH_MODE): in SSO-only mode the provider is the only way in,
+        and `rescue: true` says password sign-in is open for one admin while AUTH_RESCUE_ADMIN names one.
+        `allowRegistration` is always false in SSO-only mode.
+      security: []
+      responses:
+        "200":
+          description: OK
+  /auth/login:
+    post:
+      tags:
+        - auth
+      summary: Log in with username and password (and a TOTP code when enabled); returns a short-lived JWT and sets
+        the refresh cookie.
+      operationId: postAuthLogin
+      description: >-
+        Not registered in SSO-only mode (AUTH_MODE=oidc-only, since v0.63.0), nor are /auth/register, /auth/password
+        and /auth/totp/*. While AUTH_RESCUE_ADMIN names an admin it is registered again for that one account: any other
+        name is refused as a wrong password is, and a rescue sign-in is logged and written down as `login.rescue`.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                username:
+                  type: string
+                password:
+                  type: string
+                code:
+                  type: string
+                  maxLength: 32
+                  description: A code from the authenticator app, or a recovery code (xxxxx-xxxxx-xxxxx-xxxxx, dashes optional).
+      security: []
+      responses:
+        "200":
+          description: OK
+        "400":
+          description: Malformed body or parameter
+        "401":
+          description: Not authenticated
+        "423":
+          description: "`locked`: five failures in a row, a wrong password or a wrong code, lock the account for 15 minutes"
+        "429":
+          description: Too many attempts
+  /auth/register:
+    post:
+      tags:
+        - auth
+      summary: Create an account, when registration is open.
+      operationId: postAuthRegister
+      description: >-
+        Only while Admin → Settings → Open registration is on (`allowRegistration` in GET /auth/config; never on
+        Uchiyomi Desktop). Makes a member (role `user`) and signs them in exactly as POST /auth/login does: the same
+        body and the same refresh and image cookies. Since v0.61.0 the web sign-in screen has a form for it, the
+        device names itself as at sign-in (`deviceId`, `deviceName`, shown in the sessions list), and a name that
+        differs from an existing one only in case is taken. Five per address per ten minutes.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [username, password]
+              properties:
+                username:
+                  type: string
+                  minLength: 2
+                  maxLength: 64
+                  pattern: "^[a-zA-Z0-9._-]+$"
+                password:
+                  type: string
+                  minLength: 8
+                displayName:
+                  type: string
+                  maxLength: 64
+                deviceId:
+                  type: string
+                  maxLength: 128
+                  description: Since v0.61.0. The device's own id, as POST /auth/login takes it.
+                deviceName:
+                  type: string
+                  maxLength: 128
+                  description: Since v0.61.0. Shown for this session in GET /auth/sessions.
+      security: []
+      responses:
+        "200":
+          description: Signed in as the new account, as from POST /auth/login.
+        "400":
+          description: "`bad_request` (a name outside the rules, or a malformed body) or `weak_password`"
+        "403":
+          description: "`registration_disabled`: Open registration is off"
         "409":
-          description: "Conflict: already exists, already running, or duplicate"
+          description: "`username_taken`: the name, or one that differs from it only in case, is taken"
+        "429":
+          description: More than five sign-ups in ten minutes from this address
   /auth/refresh:
     post:
       tags:
@@ -1283,7 +1418,11 @@ paths:
         "400":
           description: Malformed body or parameter
         "401":
-          description: Not authenticated
+          description: Not authenticated, or `wrong_password` (counts toward the account lock since v0.77.1)
+        "423":
+          description: "`locked`: the account is locked"
+        "429":
+          description: Too many attempts
   /auth/sessions:
     get:
       tags:
@@ -1342,26 +1481,34 @@ paths:
     post:
       tags:
         - auth
-      summary: Confirm two-factor with a first code; returns recovery codes once.
+      summary: Confirm two-factor with a first code and the account password; returns recovery codes once.
       operationId: postAuthTotpEnable
       requestBody:
-        required: false
+        required: true
         content:
           application/json:
             schema:
               type: object
+              required: [code, password]
               properties:
                 code:
                   type: string
+                password:
+                  type: string
+                  description: The account's current password (since v0.77.1).
       security:
         - bearer: []
       responses:
         "200":
           description: OK
         "400":
-          description: Malformed body or parameter
+          description: Malformed body or parameter, or `totp_invalid`
         "401":
-          description: Not authenticated
+          description: Not authenticated, or `wrong_password` (counts toward the account lock)
+        "423":
+          description: "`locked`: the account is locked"
+        "429":
+          description: Too many attempts
   /auth/totp/disable:
     post:
       tags:
@@ -1386,7 +1533,11 @@ paths:
         "400":
           description: Malformed body or parameter
         "401":
-          description: Not authenticated, or `wrong_password`
+          description: Not authenticated, or `wrong_password` (counts toward the account lock since v0.77.1)
+        "423":
+          description: "`locked`: the account is locked"
+        "429":
+          description: Too many attempts
   /auth/oidc/start:
     get:
       tags:
@@ -1397,12 +1548,33 @@ paths:
       responses:
         "302":
           description: Redirect
+  /auth/oidc/link:
+    get:
+      tags:
+        - auth
+      summary: "Link the account signed in on this browser to an identity at the provider (since v0.63.0)."
+      operationId: getAuthOidcLink
+      description: >-
+        A top-level navigation from Profile → Account: the account is the one whose session cookie comes with the
+        request, never one the request names. Redirects to the provider; its answer lands on the callback, which links
+        the identity and redirects to `/profile/?tab=Account&sso_link=ok|taken|failed` without signing anyone in
+        (`taken`: the identity is already another account's). With no session, redirects to the sign-in screen.
+      security: []
+      responses:
+        "302":
+          description: Redirect
+        "404":
+          description: Single sign-on is not configured
   /auth/oidc/callback:
     get:
       tags:
         - auth
       summary: "Single sign-on return leg: finishes login and redirects into the app."
       operationId: getAuthOidcCallback
+      description: >-
+        Since v0.63.0, in SSO-only mode, a new server's first sign-in makes its admin: the subject OIDC_BOOTSTRAP_ADMIN_SUB
+        names, else anyone in OIDC_ADMIN_GROUP. Anyone else first is sent back with `sso_error=not_set_up`. Group mapping
+        never takes away the last admin's role.
       security: []
       responses:
         "302":
@@ -1647,6 +1819,16 @@ paths:
       tags:
         - library
       summary: "Everything the home screen is built from: on-deck books with progress, rails, updates."
+      description: >-
+        `onDeck`, `updated`, `new`, `favorites`, `updatesCount` and, since v0.58.0, `popular`: up to 20 series of the
+        caller's library that have an outside popularity (AniList, through the series' checked AniList link), the
+        most listed first -- Home's "Most popular in your library". Every series carries `yomi.anilist {id, score,
+        popularity}` (or null; `id`, the AniList entry's id, since v0.60.0) beside the caller's own `yomi.rating`, and
+        `yomi.lastReadAt`. Since v0.61.0 also `pickUp`, up to 20 books shaped like `onDeck`, each with `stoppedAt`
+        (when the caller last read in the series): the chapter to pick a series back up at, for series last read 90
+        days to two years ago in which the caller finished at least one chapter (never a series `onDeck` holds); and
+        `gems`, up to 20 series with an AniList score of at least 75 that nobody on the server has read in any
+        language edition, one per work, best score first (empty on a Komga backend).
       operationId: getApiHome
       parameters:
         - name: adult
@@ -1699,8 +1881,15 @@ paths:
                   description: >-
                     `field,dir`. Fields: `updated` (last chapter added), `added` (series created), `title`,
                     `author`, `unread` (your unread count), `favorites` (your starred series first, then by
-                    unread -- what "popular" means for a personal library), `random`. The per-user ones need
-                    a signed-in caller and fall back to title order without one.
+                    unread -- what "popular" means for a personal library), `random`; since v0.58.0
+                    `popularity` and `score` (how many AniList users list the series and its AniList score, through
+                    its checked AniList link; a series with none comes after every series with one, either
+                    direction), `rating` (your own stars, unrated after rated), `chapters` (the chapters the series
+                    shows) and `lastRead` (when you last read in it). The per-user ones (`unread`, `favorites`,
+                    `rating`, `lastRead`) need a signed-in caller and fall back to title order without one. Since
+                    v0.61.0 `releasing`: the release radar's estimate of the next chapter (`yomi.radar.nextAt`),
+                    soonest first in `asc`; a series without one in force -- no estimate, gone quiet, or not
+                    monitored -- comes after every dated series in either direction, then by title.
                   type: string
                 condition:
                   type: object
@@ -1759,6 +1948,18 @@ paths:
                         properties:
                           seed: { type: integer }
                       - type: "null"
+                  yomi:
+                    type: object
+                    additionalProperties: true
+                    description: >-
+                      The caller's own state over the series (favourite, rating, unread, newCount, anilist,
+                      lastReadAt), and since v0.61.0 `radar`, the release radar's estimate (the same on every
+                      enriched series: the Library, Home's rails, Updates).
+                    properties:
+                      radar:
+                        oneOf:
+                          - $ref: "#/components/schemas/SeriesRadar"
+                          - type: "null"
                   sources:
                     type: array
                     description: Where the chapters come from, primary first, then followed sources in the order they were added. Present for every viewer.
@@ -1794,6 +1995,16 @@ paths:
                                 current: { type: boolean }
                                 lastRead: { type: [number, "null"] }
                       - type: "null"
+                  library:
+                    description: Admins only. The library the series is in, for the reader's key that saves the current look as that library's reading defaults.
+                    type: object
+                    properties:
+                      id: { type: string }
+                      name: { type: string }
+                  libraryReader:
+                    description: The reading defaults of the library the series is in (`mode`, `spread`, `pagedDirection`), or null when it has none.
+                    type: [object, "null"]
+                    additionalProperties: true
                   langStated:
                     description: Admins only (since v0.52.0). Whether `lang` is the series' own (stated) rather than inferred.
                     type: boolean
@@ -1847,8 +2058,10 @@ paths:
                       - type: "null"
                   seriesType:
                     description: >-
-                      Admins only. What kind of comic the series is, as the notice-chapter switches read it: the
-                      admin's override (`overrides.seriesType`), else `detectedType`, else `unknown`.
+                      What kind of comic the series is, as the notice-chapter switches read it: the admin's override
+                      (`overrides.seriesType`), else what the evidence learned (`detectedType`), else `unknown`. Every
+                      viewer since v0.61.0, for the reader's automatic mode (admins only before); the evidence itself,
+                      `detectedType`, is still admins only.
                     type: string
                     enum: [manga, manhwa, manhua, webtoon, comic, unknown]
                   detectedType:
@@ -1916,6 +2129,41 @@ paths:
           description: OK
         "401":
           description: Not authenticated
+  /api/updates/expected:
+    get:
+      tags:
+        - library
+      summary: Expected this week -- the caller's series whose next chapter is likely within seven days.
+      operationId: getApiUpdatesExpected
+      description: >-
+        Since v0.61.0. The series the caller follows -- a favourite, or one they read in the last 90 days -- whose
+        release radar (`yomi.radar`, see SeriesRadar) puts the next chapter before seven days from now, due or running
+        late but not yet quiet; monitored series only, soonest first, at most 30. Only what this caller may list:
+        their libraries, age cap and 18+ switch. Each series is enriched, so it carries `yomi.radar`. An estimate,
+        never a promise: the web says so under the heading.
+      parameters:
+        - name: adult
+          in: query
+          required: false
+          schema:
+            type: string
+      security:
+        - bearer: []
+      responses:
+        "200":
+          description: "`{content: Series[]}`"
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  content:
+                    type: array
+                    items:
+                      type: object
+                      additionalProperties: true
+        "401":
+          description: Not authenticated
   /api/series/{id}/color:
     get:
       tags:
@@ -1943,6 +2191,40 @@ paths:
         - library
       summary: Series like this one.
       operationId: getApiSeriesIdSimilar
+      description: >-
+        `{content: Series[]}`, at most 18, each once and never another edition of this work. Since v0.61.0 the library
+        series AniList's readers recommend after this one come first (read from the server's stored copy, never from
+        AniList, and only those this account may list), then the series sharing its genres. Empty for a series this
+        account may not open.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      security:
+        - bearer: []
+      responses:
+        "200":
+          description: OK
+        "401":
+          description: Not authenticated
+        "404":
+          description: Not found, or not visible to this account
+  /api/series/{id}/related:
+    get:
+      tags:
+        - library
+      summary: What AniList relates this series to -- sequels, prequels, side stories and more (v0.61.0).
+      operationId: getApiSeriesIdRelated
+      description: >-
+        `{lookups, content: [{relation, series?, outside?}]}`. `relation` is AniList's: `SEQUEL`, `PREQUEL`, `PARENT`
+        (the main story), `SIDE_STORY`, `SPIN_OFF` or `ALTERNATIVE`, in that order. A related work the server holds is
+        `series`, enriched like every rail, when this account may list it, and left out -- never named -- when it may
+        not; one the server does not hold is `outside: {anilistId, title, cover, format, status, score}`, unless it is
+        18+ for this account (an age limit under 18, or Show 18+ off: AniList's adult flag and the admin's adult
+        genres). `lookups` is false, with nothing else, for a series in a library whose AniList lookups are off or with
+        no checked AniList link. Read from the copy the server refreshes in the background; a request never asks AniList.
       parameters:
         - name: id
           in: path
@@ -2045,6 +2327,49 @@ paths:
                       The admin's "Show deleted chapters as ghosts" (PATCH /api/admin/settings `deletedAsGhosts`), to
                       every viewer: the series page draws a chapter whose file was deleted on purpose as a ghost row.
                       The chapter itself is still in /api/series/{id}/books, `pruned`, with its `prunedReason`.
+        "401":
+          description: Not authenticated
+        "404":
+          description: Not found, or not visible to this account
+  /api/series/{id}/gaps:
+    get:
+      tags:
+        - library
+      summary: The runs of chapter numbers the series is missing, as the reader warns of them.
+      operationId: getApiSeriesIdGaps
+      description: >-
+        Since v0.74.0 (#236). `{gaps: [{lo, hi}]}`, lowest first: the whole numbers between the chapters the series holds,
+        by the Health page's Chapter gaps rule -- a range file holds every number in it, a chapter deleted on purpose (the
+        cleanup, Delete files) and a post its source deleted under posting-order numbering are held, an impossible number
+        is left out -- less the runs an admin ignored on that card. Holes below a Latest-N start are included. The reader
+        names the runs between the chapter it leaves and the next one. 404 for a series this account may not open.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      security:
+        - bearer: []
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [gaps]
+                properties:
+                  gaps:
+                    type: array
+                    items:
+                      type: object
+                      required: [lo, hi]
+                      properties:
+                        lo:
+                          type: number
+                        hi:
+                          type: number
         "401":
           description: Not authenticated
         "404":
@@ -2203,7 +2528,9 @@ paths:
         `blocked` and `onDisk`. A `source` and
         `sourceId` from here make a Pick for POST /api/sources/fetch or the admin refetch. A number listed
         before v0.33.0 has an empty `copies` until its next check. Any account that can open the series may
-        read it.
+        read it. Since v0.62.0 `otherLanguage` lists the chapters on the server known to be in another language
+        than the series' that a listed copy in its language can replace -- `{series, langs, bookIds}`, the ids for
+        the admin refetch -- and is null when there are none.
       parameters:
         - name: id
           in: path
@@ -2219,11 +2546,18 @@ paths:
             application/json:
               schema:
                 type: object
-                required: [checkedAt, content]
+                required: [checkedAt, otherLanguage, content]
                 properties:
                   checkedAt:
                     type: [string, "null"]
                     format: date-time
+                  otherLanguage:
+                    type: [object, "null"]
+                    required: [series, langs, bookIds]
+                    properties:
+                      series: { type: string, description: The series' language. }
+                      langs: { type: array, items: { type: string }, description: "The languages they are in, most chapters first." }
+                      bookIds: { type: array, items: { type: string } }
                   content:
                     type: array
                     items:
@@ -2391,6 +2725,16 @@ paths:
           required: true
           schema:
             type: string
+        - name: spreads
+          in: query
+          required: false
+          description: >-
+            `1` (v0.77.0, #229, Join split double pages): add `join` to pages that are, with the next, one double-page
+            spread the source served as two files. Only reads the chapter's stored answer; one not found yet is queued
+            for the background measure, and `x-spreads` says so.
+          schema:
+            type: string
+            enum: ["1"]
       security:
         - bearer: []
       responses:
@@ -2398,6 +2742,14 @@ paths:
           description: >-
             Pages stay at their original one-based positions. A repair placeholder carries `missing: true`;
             it may also carry `junk`, but clients must not hide a missing page.
+          headers:
+            x-spreads:
+              description: >-
+                With `spreads=1` only: `done` (looked at; joins on the pages), `pending` (queued now, ask again
+                shortly) or `none` (nothing to look at).
+              schema:
+                type: string
+                enum: [done, pending, none]
           content:
             application/json:
               schema:
@@ -2414,6 +2766,12 @@ paths:
                     sizeBytes: { type: [integer, "null"] }
                     junk: { type: boolean }
                     missing: { type: boolean, description: True only for a repair placeholder in a partial chapter. }
+                    join:
+                      type: string
+                      enum: [rtl, ltr]
+                      description: >-
+                        With `spreads=1`: this page and the next are one spread cut in two; which side the next page
+                        sits on (`rtl` on its left).
         "401":
           description: Not authenticated
         "404":
@@ -2519,6 +2877,15 @@ paths:
                   type: boolean
                 silent:
                   type: boolean
+                at:
+                  type: integer
+                  description: When the page was read, in client ms (the offline outbox's replay time); absent means now.
+                incognito:
+                  type: boolean
+                  description: >-
+                    Since v0.61.0: read under Incognito reading. The account's own `incognito` setting is read by the
+                    server anyway; this covers a chapter read while it was on and sent after it went off. Either way
+                    the progress is written, and no reading event or tracker push follows.
       security:
         - bearer: []
       responses:
@@ -2944,6 +3311,15 @@ paths:
             fan-out within the sources the caller may be shown, never past them: an id outside that set
             (an adult source without `adult=1`, one above the account's age limit, an unknown id) asks
             nobody and answers the empty shape. Absent means every source.
+        - name: sources
+          in: query
+          required: false
+          schema:
+            type: string
+          description: >-
+            Ask only these source ids, comma-separated (at most 200). Narrows the fan-out exactly as `source`
+            does: within the sources the caller may be shown, never past them. Combines with `source` (both must
+            match). Absent or empty means every source.
         - name: groupBy
           in: query
           required: false
@@ -3496,8 +3872,93 @@ paths:
         - sources
       summary: Trending titles from AniList for the Discover page.
       operationId: getApiDiscoverTrending
+      description: >-
+        `{content: [{id, title, cover, banner, description, genres, score, chapters, status}]}`, up to 36, never one
+        the server already holds, never 18+ on AniList and never a light novel. Since v0.61.0 by `country` of origin,
+        each cached six hours; while Show 18+ is off, a title carrying a genre the admin named as adult is left out of
+        the answer.
+      parameters:
+        - name: country
+          in: query
+          required: false
+          description: "`KR` (manhwa, the default), `JP` (manga) or `CN` (manhua)."
+          schema:
+            type: string
+            enum: [KR, JP, CN]
       security:
         - bearer: []
+      responses:
+        "200":
+          description: OK
+        "400":
+          description: "`country` is not one of KR, JP, CN"
+        "401":
+          description: Not authenticated
+        "403":
+          description: This account may not add series
+  /api/discover/because:
+    get:
+      tags:
+        - sources
+      summary: Discover's "Because you read" -- AniList's recommendations after a series the caller read (v0.61.0).
+      operationId: getApiDiscoverBecause
+      description: >-
+        `{seed: {id, title} | null, content}`: `content` in the trending shape, at most 20. The seed is the caller's most
+        recently read series with a finished chapter, that they may list, in a library whose AniList lookups are on and
+        with a checked AniList link -- the first of five that leaves at least four recommendations once what the server
+        holds (by AniList entry or any name) and what is 18+ for the caller are left out. `seed` null and nothing to show
+        otherwise. Read from the server's stored copy; a request never asks AniList.
+      security:
+        - bearer: []
+      responses:
+        "200":
+          description: OK
+        "401":
+          description: Not authenticated
+        "403":
+          description: This account may not add series
+  /api/discover/recommendations:
+    get:
+      tags:
+        - sources
+      summary: Titles the connected AniList and MyAnimeList readers suggest after what this account rated highest.
+      operationId: getApiDiscoverRecommendations
+      description: >-
+        Returns `{content, sources, pending}`. `content` is ranked, at most 40, each with `title`, `altTitles`,
+        `cover`, `score` and `sources` -- the services that suggested it and, for each, the series of the
+        account's own it came from (`because`). Titles on any of the account's connected lists, held by the
+        library, light novels, and what is 18+ for the caller (an adults-only title past the age cap; while 18+ is hidden,
+        one in a genre the admin named adult; a title no service rated, for a caller hiding 18+ or capped below it) are
+        left out. Behind Discover's canDownload rule. Answered from caches: the account's list is read at most every 12
+        hours and each seed title's suggestions once per server per 14 days, so calling this repeatedly costs the
+        trackers nothing. `pending: true` means a first refresh is still running (the answer waits up to 8 seconds
+        for it); ask again in a few seconds. An account with no tracker connected gets an empty `content`. The series
+        named in `because` are judged for the caller as the suggestions are, and a series of the library counts only when
+        the caller may browse it, in a library with AniList lookups on, through a checked link.
+      security:
+        - bearer: []
+      responses:
+        "200":
+          description: OK
+        "401":
+          description: Not authenticated
+        "403":
+          description: This account may not add series
+  /api/discover/works:
+    get:
+      tags:
+        - sources
+      summary: What Discover's work keys are now, while names are being looked up (v0.56.0).
+      operationId: getApiDiscoverWorks
+      security:
+        - bearer: []
+      parameters:
+        - name: keys
+          in: query
+          required: false
+          description: Up to 200 work keys, comma-separated.
+          schema:
+            type: string
       responses:
         "200":
           description: OK
@@ -4494,7 +4955,16 @@ paths:
     get:
       tags:
         - personal
-      summary: The caller's collections.
+      summary: The caller's collections (Lists); with scope=all, smart and shared ones too.
+      description: >-
+        Without `scope`: the caller's own hand-picked lists, `{id, name, accent, sort_order, item_count}` with the
+        stored count, as before v0.61.0 (the series page's "Add to collection" sheet offers these). `scope=all`
+        (v0.61.0): the caller's own lists of both kinds, then those other members share with the household, each
+        `{id, name, accent, sort_order, item_count, kind: manual|smart, shared, mine, owner?: {id, name, avatar},
+        query?}` -- `item_count` is how many series it shows THIS caller (their libraries, age cap and 18+ switch),
+        `owner` names whoever made someone else's list, and `query`, a smart list's saved search, goes to its owner
+        alone. A shared list that shows the caller nothing is left out. `preview` (UI refresh): the ids of its first
+        series THIS caller may see, at most four, in the list's own order -- the covers its card shows.
       operationId: getApiCollections
       parameters:
         - name: adult
@@ -4502,6 +4972,12 @@ paths:
           required: false
           schema:
             type: string
+        - name: scope
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [all]
       security:
         - bearer: []
       responses:
@@ -4512,7 +4988,13 @@ paths:
     post:
       tags:
         - personal
-      summary: Create a collection.
+      summary: Create a collection (a List), hand-picked or smart, private or shared.
+      description: >-
+        Since v0.61.0 `query` makes a smart list -- a saved Library search, the Library's own URL words
+        `{v: 1, q?, read?: UNREAD|IN_PROGRESS|READ, status?, genres?, lib?, src? ('-' is No source), anysrc?, sort, dir?:
+        asc|desc}`, `sort` one of updated, read, new, soon, popular, score, rating, chapters, unread, az -- answered afresh for
+        whoever opens it; a list's kind is fixed when it is made. `shared: true` lets the rest of the household read it
+        (never change it). An unknown or oversized query key is 400.
       operationId: postApiCollections
       requestBody:
         required: false
@@ -4523,6 +5005,12 @@ paths:
               properties:
                 name:
                   type: string
+                accent:
+                  type: string
+                query:
+                  $ref: '#/components/schemas/SmartListQuery'
+                shared:
+                  type: boolean
       security:
         - bearer: []
       responses:
@@ -4536,7 +5024,10 @@ paths:
     patch:
       tags:
         - personal
-      summary: Rename a collection.
+      summary: Rename a collection, change a smart list's search, or share it.
+      description: >-
+        The owner's only: someone else's list, shared or not, is 404. Since v0.61.0 `query` replaces a smart list's
+        search (400 `not_smart` on a hand-picked list) and `shared` shares the list with the household or stops it.
       operationId: patchApiCollectionsId
       parameters:
         - name: id
@@ -4553,13 +5044,21 @@ paths:
               properties:
                 name:
                   type: string
+                accent:
+                  type: string
+                sortOrder:
+                  type: integer
+                query:
+                  $ref: '#/components/schemas/SmartListQuery'
+                shared:
+                  type: boolean
       security:
         - bearer: []
       responses:
         "200":
           description: OK
         "400":
-          description: Malformed body or parameter
+          description: Malformed body or parameter, or `not_smart`
         "401":
           description: Not authenticated
         "404":
@@ -4592,7 +5091,11 @@ paths:
         `{id, name, accent, sort_order, items}`: the series in the list's own order, enriched like every listing
         (`yomi.unread` is the unread badge), a series hidden by the 18+ switch or an age cap left out. Since v0.55.7 (#164)
         each item also carries `lastReadAt` (when the caller last read in it, their own progress only; null if never)
-        and `latestChapterAt` (when its newest chapter arrived; null without one), for the list's sorts.
+        and `latestChapterAt` (when its newest chapter arrived; null without one), for the list's sorts. Since v0.61.0
+        also a list shared with the household by another member (404 for anyone else's private list, and for a
+        malformed id), with `kind`, `shared`, `mine`, `owner` (someone else's list), `query` (the owner's own smart
+        list) and `total`, how many series it shows this caller in all: a smart list is answered for the caller, in
+        its saved order, and capped at `limit` items (200 without one).
       operationId: getApiCollectionsId
       parameters:
         - name: id
@@ -4605,6 +5108,13 @@ paths:
           required: false
           schema:
             type: string
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 200
       security:
         - bearer: []
       responses:
@@ -4619,7 +5129,10 @@ paths:
       tags:
         - personal
       summary: Add a series to a collection.
-      description: At the end of the list's own order (since v0.55.7; before, at position 0), as the bulk add puts them.
+      description: >-
+        At the end of the list's own order (since v0.55.7; before, at position 0), as the bulk add puts them. The
+        owner's hand-picked lists only: since v0.61.0 someone else's list is 404 (it answered `{ok: false}`), and a
+        smart list is 409 `smart_list` -- it holds what its search finds. The same for the other item routes.
       operationId: postApiCollectionsIdItems
       parameters:
         - name: id
@@ -4647,6 +5160,8 @@ paths:
           description: Not authenticated
         "404":
           description: Not found, or not visible to this account
+        "409":
+          description: "`smart_list`: a smart list holds what its search finds (v0.61.0)"
     put:
       tags:
         - personal
@@ -4680,6 +5195,8 @@ paths:
           description: Not authenticated
         "404":
           description: Not found, or not visible to this account
+        "409":
+          description: "`smart_list`: a smart list holds what its search finds (v0.61.0)"
   /api/collections/{id}/items/{seriesId}:
     delete:
       tags:
@@ -4706,6 +5223,8 @@ paths:
           description: Not authenticated
         "404":
           description: Not found, or not visible to this account
+        "409":
+          description: "`smart_list`: a smart list holds what its search finds (v0.61.0)"
   /api/ratings/{seriesId}:
     put:
       tags:
@@ -4985,15 +5504,25 @@ paths:
         - personal
       summary: "Reading statistics: streaks, chapters, time."
       operationId: getApiStats
+      description: >-
+        Finished chapters count once (since v0.70.0, #264): `chapters_completed`, `weekChapters`, each `byDay` entry
+        (per UTC day) and `windowChapters` (new: the `days` window's chapters, each once) count distinct chapters, as
+        /api/leaderboard does. A chapter read again on another day counts on that day too, as the streak does.
       parameters:
         - name: days
           in: query
           required: false
-          description: Size of the daily window, clamped to 7-400. Defaults to 90.
+          description: >-
+            Size of the daily window, clamped to 7-400. Defaults to 90. `all` (since v0.75.0, #265) is every UTC day
+            from the caller's first read to today, at least 7 and at most 3660 (about ten years); `days` in the answer
+            says how many that was.
           schema:
-            type: integer
-            minimum: 7
-            maximum: 400
+            oneOf:
+              - type: integer
+                minimum: 7
+                maximum: 400
+              - type: string
+                enum: [all]
       security:
         - bearer: []
       responses:
@@ -5001,18 +5530,174 @@ paths:
           description: OK
         "401":
           description: Not authenticated
+  /api/stats/insights:
+    get:
+      tags:
+        - personal
+      summary: "Profile → Insights: the best day and week, and one row per series the caller has read in."
+      operationId: getApiStatsInsights
+      description: >-
+        Since v0.75.0 (from #249). The caller's own reading only, from reading_events, so an Incognito read is in none of
+        it, and each finished chapter counts once within its window (#264). `bestDay` is the UTC day with the most
+        chapters finished and `bestWeek` the Monday-to-Sunday UTC week (`start` is its Monday), each null before any
+        chapter is finished. `series` has one row per series the caller has a recorded read in, listed by the rule every
+        rail follows (18+ follows the Show 18+ switch, `adult=1`; a series the caller may not open is absent): `total`
+        chapters (hidden notice chapters left out), how many of them the caller has finished (`read`), `lastReadAt` (from
+        events) and the chapters of it finished in the last 28 days (`recent`), this UTC month and the month before.
+      security:
+        - bearer: []
+      responses:
+        "200":
+          description: "`{now, bestDay, bestWeek, series}`"
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  now: { type: string }
+                  bestDay:
+                    type: [object, "null"]
+                    properties:
+                      day: { type: string }
+                      chapters: { type: integer }
+                  bestWeek:
+                    type: [object, "null"]
+                    properties:
+                      start: { type: string }
+                      chapters: { type: integer }
+                  series:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id: { type: string }
+                        title: { type: string }
+                        source: { type: string }
+                        genres: { type: array, items: { type: string } }
+                        total: { type: integer }
+                        read: { type: integer }
+                        lastReadAt: { type: [string, "null"] }
+                        recent: { type: integer }
+                        thisMonth: { type: integer }
+                        prevMonth: { type: integer }
+        "401":
+          description: Not authenticated
+  /api/stats/time:
+    get:
+      tags:
+        - personal
+      summary: Reading time from the caller's own page turns -- the week, the month, the year and the Studio's window.
+      operationId: getApiStatsTime
+      description: >-
+        Since v0.61.0. Worked out from the caller's reading_events, every device merged into one timeline: the gap
+        between one page turn and the next counts in full when it is within the page's allowance (five minutes, more for
+        a tall strip by its height-to-width ratio, at most thirty), a longer gap is a break and counts nothing, and each
+        sitting adds one typical page (the window's median counted gap, 5-90 s) for the page it opened on, which the
+        reader never reports. `week` and `month` are the rolling 7 and 30 days; `year` is the UTC calendar year
+        /api/wrapped counts; `window` is the last `days` days with `perChapterMs` (the median time of the chapters
+        finished in it, null under three), `byHour` (24 numbers, ms, in `tz`) and `byDevice` ({name, ms}, most first,
+        named by the caller's own sessions; null for an unnamed device). `chapters` counts finished chapters as
+        /api/stats does. Times are ms. No user parameter: a member reads only their own time.
+      parameters:
+        - name: days
+          in: query
+          required: false
+          description: The window, clamped to 7-400. Defaults to 90.
+          schema:
+            type: integer
+            minimum: 7
+            maximum: 400
+        - name: tz
+          in: query
+          required: false
+          description: An IANA timezone for the hours of the day (Asia/Kolkata); anything else is UTC, and `tz` says so.
+          schema:
+            type: string
+      security:
+        - bearer: []
+      responses:
+        "200":
+          description: "`{tz, days, week: {ms, chapters}, month: {ms, chapters}, year: {year, ms, chapters}, window: {ms, chapters, perChapterMs, byHour, byDevice}}`"
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  tz: { type: string }
+                  days: { type: integer }
+                  week: { type: object, properties: { ms: { type: integer }, chapters: { type: integer } } }
+                  month: { type: object, properties: { ms: { type: integer }, chapters: { type: integer } } }
+                  year: { type: object, properties: { year: { type: integer }, ms: { type: integer }, chapters: { type: integer } } }
+                  window:
+                    type: object
+                    properties:
+                      ms: { type: integer }
+                      chapters: { type: integer }
+                      perChapterMs: { type: [integer, "null"] }
+                      byHour: { type: array, items: { type: integer }, minItems: 24, maxItems: 24 }
+                      byDevice:
+                        type: array
+                        items:
+                          type: object
+                          properties:
+                            name: { type: [string, "null"] }
+                            ms: { type: integer }
+        "401":
+          description: Not authenticated
+  /api/series/{id}/reading-pace:
+    get:
+      tags:
+        - personal
+      summary: The caller's pace through a series, for "Catch up in ~2 h".
+      operationId: getApiSeriesIdReadingPace
+      description: >-
+        Since v0.61.0. `{perChapterMs, from}`: the median time of the chapters of this series the caller finished in the
+        last 365 days when there are three or more (`from: series`), else their median over every series in the last 90
+        days (`all`), else `{perChapterMs: null, from: null}`. Reading time as GET /api/stats/time works it out. 404 for
+        a series the caller may not open.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      security:
+        - bearer: []
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  perChapterMs: { type: [integer, "null"] }
+                  from: { type: [string, "null"], enum: [series, all, null] }
+        "401":
+          description: Not authenticated
+        "404":
+          description: Not found, or not visible to this account
   /api/wrapped:
     get:
       tags:
         - personal
       summary: The year in reading.
       operationId: getApiWrapped
+      description: >-
+        Since v0.61.0 also `tz` (as asked, UTC when it is not a timezone), `ms` (the year's reading time, as GET
+        /api/stats/time's `year` works it out -- the same figure), `perChapterMs` and `byHour` (24 numbers, ms, in `tz`).
+        Chapters are still counted in UTC.
       parameters:
         - name: year
           in: query
           required: false
           schema:
             type: integer
+        - name: tz
+          in: query
+          required: false
+          schema:
+            type: string
         - name: adult
           in: query
           required: false
@@ -5111,6 +5796,8 @@ paths:
           description: Not authenticated
         "404":
           description: Not found, or not visible to this account
+        "409":
+          description: "`smart_list`: a smart list holds what its search finds (v0.61.0)"
   /api/library/bulk/newest:
     post:
       tags:
@@ -5234,74 +5921,180 @@ paths:
         The caller's own connections, every provider listed connected or not. Unchanged by the tracker
         import (v0.36.0): POST /api/admin/import/batches with `origin: 'tracker'` reads the requesting
         admin's list through the very connection shown here, and links what it imports so this listing's
-        linked series grow with it.
+        linked series grow with it. Since v0.61.0 a provider with a page that SHOWS a token to copy carries
+        `authorizeUrl`: AniList's, for the project's public client (client id 53603, implicit grant, redirect to
+        AniList's pin page) -- open it, approve, paste the token it shows into POST /api/trackers/{provider}/connect.
+        No secret is involved. `tokenHelp` stays the English fallback.
       security:
         - bearer: []
       responses:
         "200":
-          description: OK
+          description: Every provider, in a `content` array.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [content]
+                properties:
+                  content:
+                    type: array
+                    items:
+                      type: object
+                      required: [provider, label, tokenHelp, connected, accountName, expiresAt, expiringSoon, lastSyncAt, lastError, needsReconnect, slowedDown]
+                      properties:
+                        provider: { type: string, enum: [anilist, myanimelist, kitsu, mangaupdates] }
+                        label: { type: string }
+                        tokenHelp: { type: string, description: "Where a token comes from, in English." }
+                        authorizeUrl:
+                          type: string
+                          description: >-
+                            Since v0.61.0, only for a provider with a page that shows a token (AniList):
+                            https://anilist.co/api/v2/oauth/authorize?client_id=53603&response_type=token
+                        connected: { type: boolean, description: "False for a connection a rejected token disabled." }
+                        accountName: { type: [string, "null"] }
+                        expiresAt: { type: [string, "null"], format: date-time }
+                        expiringSoon: { type: boolean }
+                        lastSyncAt: { type: [string, "null"], format: date-time }
+                        lastError: { type: [string, "null"] }
+                        needsReconnect:
+                          type: boolean
+                          description: >-
+                            Since v0.71.0 (#246): only a new token mends this connection -- its token was rejected (the
+                            connection is off), has lapsed, or can no longer be read. A rate limit, an outage or a refused
+                            lower number also leave `lastError`, but never set this.
+                        slowedDown:
+                          type: boolean
+                          description: >-
+                            Since v0.73.0: the service asked us to wait (a 429 that outlasted the retries), so pushes go
+                            slowly for now. A pace, not an error: `lastError` is null for it, and the next push that lands
+                            clears it. AniList's pushes share the server's one AniList quota with every other AniList
+                            request, spaced by the limit AniList states, and a 429 is waited out and the push made again.
         "401":
           description: Not authenticated
   /api/trackers/anilist:
     post:
       tags:
         - personal
-      summary: Connect AniList with an OAuth code.
+      summary: Connect AniList with a pasted access token (the older path of POST /api/trackers/anilist/connect).
       operationId: postApiTrackersAnilist
+      description: >-
+        Kept for the clients and docs that already call it; answers exactly as POST /api/trackers/{provider}/connect
+        does for `anilist`, including the 502s since v0.61.0.
       requestBody:
-        required: false
+        required: true
         content:
           application/json:
             schema:
               type: object
+              required: [token]
               properties:
-                code:
+                token:
                   type: string
+                  minLength: 10
+                  maxLength: 4000
       security:
         - bearer: []
       responses:
         "200":
-          description: OK
+          description: "`{ok: true, account}`: verified and saved."
         "400":
-          description: Malformed body or parameter
+          description: "`bad_request` (no token) or `rejected` (AniList's verdict on the token)"
         "401":
           description: Not authenticated
+        "502":
+          description: "`tracker_unreachable`, or `tracker_refused` with the service's `status`: not about the token"
   /api/trackers/{provider}/connect:
     post:
       tags:
         - personal
-      summary: Connect a tracker (AniList, MyAnimeList, Kitsu) with the provider's credential.
+      summary: Connect a tracker (AniList, MyAnimeList, Kitsu, MangaUpdates) with a pasted access token.
       operationId: postApiTrackersProviderConnect
+      description: >-
+        The token is checked against the service (who it belongs to) before it is stored, encrypted. Since v0.61.0
+        only the service's verdict on the token is a 400 `rejected`: no answer at all (a timeout, DNS, a refused
+        connection) is a 502 `tracker_unreachable`, and an answer that refused the request for another reason
+        (Cloudflare's 403 in front of AniList, a 429, a 5xx, an AniList 400 that is not "Invalid token") is a 502
+        `tracker_refused` carrying the service's `status` when there was one. Neither 502 means the token is bad.
       parameters:
         - name: provider
           in: path
           required: true
           schema:
             type: string
+            enum: [anilist, myanimelist, kitsu, mangaupdates]
       requestBody:
-        required: false
+        required: true
         content:
           application/json:
             schema:
               type: object
+              required: [token]
               properties:
-                code:
+                token:
                   type: string
-                username:
-                  type: string
-                password:
-                  type: string
+                  minLength: 10
+                  maxLength: 4000
+                  description: >-
+                    The access token itself (AniList's pin page shows it; MyAnimeList and Kitsu hand it out as
+                    `access_token` from their token endpoints).
       security:
         - bearer: []
       responses:
         "200":
-          description: OK
+          description: "`{ok: true, account}`: verified and saved."
         "400":
-          description: Malformed body or parameter
+          description: "`bad_request` (no token, or one under 10 characters) or `rejected` (the service's verdict on the token)"
         "401":
           description: Not authenticated
         "404":
-          description: Not found, or not visible to this account
+          description: "`unknown_provider`"
+        "502":
+          description: >-
+            `tracker_unreachable` `{error, message}`, or `tracker_refused` `{error, status?, message}`: the service
+            could not be asked, or refused the request for a reason that is not the token.
+  /api/trackers/{provider}/test:
+    post:
+      tags:
+        - personal
+      summary: Test a saved tracker connection -- does the token still work? Changes nothing.
+      operationId: postApiTrackersProviderTest
+      description: >-
+        Since v0.61.0. Makes the one call a Connect proves a token with (who it belongs to) using the caller's
+        saved token, and says what came back. Always a 200 for a known provider, whatever the verdict; nothing
+        is written -- not `enabled`, not `lastError`, not the account name. `expired` and `not_connected` are said
+        without asking the service (`not_connected`: no connection, one a rejected token disabled, or a saved
+        token this server can no longer decrypt). Six per minute per account (keyed on the account, not the
+        address). Not audited: it changes nothing.
+      parameters:
+        - name: provider
+          in: path
+          required: true
+          schema:
+            type: string
+            enum: [anilist, myanimelist, kitsu, mangaupdates]
+      security:
+        - bearer: []
+      responses:
+        "200":
+          description: What the service said about the saved token.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok, verdict]
+                properties:
+                  ok: { type: boolean, description: "True only for `connected`." }
+                  verdict:
+                    type: string
+                    enum: [connected, rejected, unreachable, refused, expired, not_connected]
+                  account: { type: string, description: "The account the token belongs to, with `connected`." }
+                  status: { type: integer, description: "The HTTP status the service answered, with `refused` when there was one." }
+        "401":
+          description: Not authenticated
+        "404":
+          description: "`unknown_provider`"
+        "429":
+          description: More than six tests in a minute from this account
   /api/trackers/{provider}:
     delete:
       tags:
@@ -5345,10 +6138,12 @@ paths:
       description: >-
         The one deliberate way down. Progress is otherwise monotonic per series (a tracker takes a lower
         number and rewrites the entry with no undo): this deletes the caller's `tracker_progress` floor for
-        the series on THAT provider only -- `anilist`, `myanimelist` or `kitsu`; any other name is 404
-        `unknown_provider` -- and pushes the current local count at once, lower or not. The other providers'
-        floors are untouched. No web control calls it; a floor the tracker has since corrected is taken by
-        reading the list again (POST /api/admin/import/batches with `origin: tracker` replaces the floor).
+        the series on THAT provider only -- `anilist`, `myanimelist`, `kitsu` or `mangaupdates`; any other name is 404
+        `unknown_provider` -- and pushes the current local count at once, lower or not, even below what the
+        service's own entry holds (since v0.61.2 every other push reads the entry first and leaves one at or past
+        the chapter alone). The other providers' floors are untouched. No web control calls it; a floor the
+        tracker has since corrected is taken by reading the list again (POST /api/admin/import/batches with
+        `origin: tracker` replaces the floor).
       parameters:
         - name: provider
           in: path
@@ -5394,7 +6189,10 @@ paths:
         `reader` (the reader's defaults; since v0.55.7 with `coverEdges`, default true, the cover's colour at the
         reader's edges) and, since v0.55.7, `listSorts` (list id to `az`, `za`, `read`, `unread` or `latest`: the order
         each list is shown in; a list's own order is not stored). Since v0.55.8 the validated keys are `librarySort`,
-        `homeCollections` and `showAllChapters`. Unknown keys remain accepted and retained for compatibility.
+        `homeCollections` and `showAllChapters` (since v0.60.0 also `librarySortDir`, since v0.61.0 `incognito`, a
+        boolean, and since v0.68.0 `trackerPlanOnAdd`, a boolean). Unknown keys remain accepted and retained for compatibility -- since v0.66.0 the web app's `homeRails`
+        (`{order, hidden}`, Home's rails as the reader arranged them; null is the default order) and `tone` (`oled`,
+        `graphite` or `midnight`, the background) among them.
       operationId: putApiSettings
       requestBody:
         required: false
@@ -5600,6 +6398,15 @@ paths:
           required: false
           schema:
             type: integer
+        - name: fit
+          in: query
+          required: false
+          description: >-
+            Since v0.74.0 (#234): the width (64-2000) a screen shows the page at -- the reader's Fit pages to my screen.
+            The page comes at most that wide at quality 85 (WebP, or JPEG for a strip too tall for WebP), or exactly as
+            it is when it is already that narrow, animated, unreadable, or no smaller re-encoded. Ignored beside `w`.
+          schema:
+            type: integer
       security:
         - imgCookie: []
         - bearer: []
@@ -5761,7 +6568,7 @@ paths:
     get:
       tags:
         - images
-      summary: Owned-library page bytes (1-based); ?w resizes.
+      summary: Owned-library page bytes (1-based); ?w resizes, ?fit fits the page to a screen.
       operationId: getImgLibBooksIdPageN
       parameters:
         - name: id
@@ -5777,6 +6584,15 @@ paths:
         - name: w
           in: query
           required: false
+          schema:
+            type: integer
+        - name: fit
+          in: query
+          required: false
+          description: >-
+            Since v0.74.0 (#234): the width (64-2000) a screen shows the page at -- the reader's Fit pages to my screen.
+            The page comes at most that wide at quality 85 (WebP, or JPEG for a strip too tall for WebP), or exactly as
+            it is when it is already that narrow, animated, unreadable, or no smaller re-encoded. Ignored beside `w`.
           schema:
             type: integer
       security:
@@ -5875,6 +6691,40 @@ paths:
           description: OK
         "401":
           description: Not authenticated
+  /img/series/{id}/copy-page:
+    get:
+      tags:
+        - images
+      summary: One page of one named copy of a chapter of a library series, for the compare view.
+      operationId: getImgSeriesIdCopyPage
+      description: >-
+        Admin only, by the API's rule: the account is an admin, and the credential is a signed-in session or an API
+        token carrying the admin scope -- never an OPDS reader's token, nor an admin's read token (403). The copy is
+        named by its source and the source's own chapter id, and must be one this series' listing holds (the `copies`
+        of GET /api/series/{id}/versions) -- never a free-form id -- of a series the admin may see (a hidden or merged
+        one is 404). Fetched through the same guard as /img/sources/preview and served as the original bytes with
+        `cache-control: private, no-store`.
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+        - { name: source, in: query, required: true, schema: { type: string } }
+        - { name: chapter, in: query, required: true, description: The source's chapter id for the copy., schema: { type: string } }
+        - { name: i, in: query, required: true, description: The page index, from 0., schema: { type: integer, minimum: 0 } }
+      security:
+        - imgCookie: []
+        - bearer: []
+      responses:
+        "200":
+          description: The page's bytes.
+        "401":
+          description: Not authenticated
+        "403":
+          description: Not an admin, or the source is disabled
+        "404":
+          description: The copy is not in the series' listing, or no such page
+        "429":
+          description: The source is in a cooldown
+        "502":
+          description: The page could not be fetched, or was not an image
   /img/sources/preview:
     get:
       tags:
@@ -5916,6 +6766,9 @@ paths:
       tags:
         - opds
       summary: Root navigation feed.
+      description: >-
+        Per reader since v0.61.0: Keep reading, the three series feeds, Favourites, then one entry per List the reader
+        may read -- their own, and those shared with the household that show them a series ("List · Owner").
       operationId: getOpds
       security:
         - opdsBasic: []
@@ -6025,6 +6878,69 @@ paths:
           description: OK
         "401":
           description: Not authenticated
+  /opds/continue:
+    get:
+      tags:
+        - opds
+      summary: "Keep reading: the chapter Home offers for each series this reader is reading, newest read first."
+      description: Since v0.61.0. Chapters, each with its CBZ link and an OPDS-PSE stream link carrying `pse:lastRead`.
+      operationId: getOpdsContinue
+      security:
+        - opdsBasic: []
+      responses:
+        "200":
+          description: OK
+        "401":
+          description: Not authenticated
+  /opds/favorites:
+    get:
+      tags:
+        - opds
+      summary: This reader's favourites, newest first, paged sixty at a time.
+      description: Since v0.61.0. Series entries; 18+ titles only when the token's 18+ switch allows them.
+      operationId: getOpdsFavorites
+      parameters:
+        - name: page
+          in: query
+          required: false
+          schema:
+            type: integer
+      security:
+        - opdsBasic: []
+      responses:
+        "200":
+          description: OK
+        "401":
+          description: Not authenticated
+  /opds/lists/{id}:
+    get:
+      tags:
+        - opds
+      summary: One List's series as this reader may see them, paged sixty at a time.
+      description: >-
+        Since v0.61.0. The reader's own List or one shared with the household (a smart list answered for this reader);
+        anything else, a malformed id included, is 404.
+      operationId: getOpdsListsId
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: page
+          in: query
+          required: false
+          schema:
+            type: integer
+      security:
+        - opdsBasic: []
+      responses:
+        "200":
+          description: OK
+        "401":
+          description: Not authenticated
+        "404":
+          description: Not found, or not visible to this account
   /opds/series/{id}:
     get:
       tags:
@@ -6170,7 +7086,10 @@ paths:
         - admin
       summary: All accounts with their permissions.
       operationId: getApiAdminUsers
-      description: Requires an admin account and a token carrying the admin scope. Scopes only ever restrict.
+      description: >-
+        Requires an admin account and a token carrying the admin scope. Scopes only ever restrict. Since v0.63.0 the
+        answer carries `auth: {mode, sso, signup}` -- the sign-in mode, the provider's name (null without one) and
+        whether OIDC_ALLOW_SIGNUP makes accounts -- and each account `sso`, whether it is linked to the provider.
       security:
         - bearer: []
       responses:
@@ -6185,7 +7104,9 @@ paths:
         - admin
       summary: Create an account.
       operationId: postApiAdminUsers
-      description: Requires an admin account and a token carrying the admin scope. Scopes only ever restrict.
+      description: >-
+        Requires an admin account and a token carrying the admin scope. Scopes only ever restrict. Refused with 403
+        `sso_only` in SSO-only mode (since v0.63.0): accounts come from the sign-on provider.
       requestBody:
         required: false
         content:
@@ -6242,7 +7163,10 @@ paths:
         includes scanlator_prefs, the server-wide release preferences (ScanlatorPrefs; the default is no
         priority, nothing blocked, two days of patience), backup_hour, the local hour (0-23) of the nightly
         backup, and auto_follow_on_failure, the on-by-default bounded source hunt after an ordinary scheduled
-        chapter failure. The hunt never runs for interactive Add/Fetch or after a 403/429 refusal.
+        chapter failure. The hunt never runs for interactive Add/Fetch or after a 403/429 refusal. Since v0.61.0
+        update_smart, the smart update checks (off by default; see updateSmart on PATCH). Since v0.61.1
+        backup_enabled and backup_keep, the nightly backup's switch and how many runs it keeps. newMemberDefaults
+        (#208), what a member who signs up starts with.
       security:
         - bearer: []
       responses:
@@ -6264,6 +7188,8 @@ paths:
                   hideNoticeShortOnly:
                     type: boolean
                     description: Since v0.55.3 (#147), the notice switches' rule (PATCH hideNoticeShortOnly); true unless set off.
+                  newMemberDefaults:
+                    $ref: "#/components/schemas/NewMemberDefaults"
                   cleanup_read:
                     type: boolean
                     description: Whether the opt-in read-chapter cleanup is on. Off by default.
@@ -6290,6 +7216,18 @@ paths:
                     minimum: 0
                     maximum: 23
                     description: Local hour of the nightly backup. Default 3.
+                  backup_enabled:
+                    type: boolean
+                    description: >-
+                      Since v0.61.1, whether the nightly backup runs. On by default. Off skips the nightly run only;
+                      Run now under Tasks still backs up.
+                  backup_keep:
+                    type: integer
+                    minimum: 1
+                    maximum: 365
+                    description: >-
+                      Since v0.61.1, how many backup runs are kept: the saved number, or BACKUP_KEEP (14 unless set)
+                      while none has been saved. The oldest beyond it are deleted after each backup.
                   auto_follow_on_failure:
                     type: boolean
                     description: >-
@@ -6310,7 +7248,7 @@ paths:
                     type: array
                     items:
                       type: string
-                    description: The source ids the 18+ filter treats as adult. See adultSources on PATCH.
+                    description: The source ids rated Adult only, lowercased. See adultSources on PATCH.
                   source_prefs:
                     $ref: "#/components/schemas/SourceOrder"
                   group_upgrade:
@@ -6319,6 +7257,9 @@ paths:
                   borrow_names:
                     type: boolean
                     description: Whether the nightly repair borrows chapter names from another source. See borrowNames on PATCH.
+                  fill_details:
+                    type: boolean
+                    description: Whether the nightly repair fills in missing descriptions, genres, authors and covers. See fillDetails on PATCH.
                   archive_paused: { type: boolean, description: "The slow archive (#117) is paused server-wide. See archivePaused on PATCH." }
                   archive_per_hour: { type: integer, minimum: 1, maximum: 30 }
                   archive_window_from: { type: [integer, "null"], minimum: 0, maximum: 23 }
@@ -6356,8 +7297,8 @@ paths:
         - admin
       summary: "Change server settings: name, open registration, update interval, backup hour, extension check
         interval and its kill switch, the update check, the opt-in install count, the opt-in read-chapter
-        cleanup, the bounded failed-chapter source hunt, the server-wide scanlation-group preferences, and what
-        the 18+ switch hides besides 18+ libraries."
+        cleanup, the bounded failed-chapter source hunt, the server-wide scanlation-group preferences, what
+        the 18+ switch hides besides 18+ libraries, and what a new member starts with."
       operationId: patchApiAdminSettings
       description: >-
         Requires an admin account and a token carrying the admin scope. Scopes only ever restrict. Answers
@@ -6381,6 +7322,15 @@ paths:
                   type: boolean
                 updateCheck:
                   description: Ask GitHub whether a newer release exists. Sends nothing about this install.
+                  type: boolean
+                updateSmart:
+                  description: >-
+                    Since v0.61.0, Smart update checks (off by default): the SCHEDULED sweep asks a series that has
+                    been quiet a long time less often -- a seventh of its silence, never less than every three days
+                    (or the update interval, when that is longer) -- and every series at the usual interval while its
+                    next chapter is due or its sources list chapters this server lacks. Run now, Check now, Fetch
+                    newest, the repair, Fix everything and the slow archive always ask at once. The sweep's result
+                    gains `rested`, the series left for a later sweep.
                   type: boolean
                 installPing:
                   description: >-
@@ -6420,6 +7370,18 @@ paths:
                   description: >-
                     Local hour of the nightly backup. The pending timer is re-armed at once, so the change
                     applies to the next run rather than the one after.
+                backupEnabled:
+                  type: boolean
+                  description: >-
+                    Since v0.61.1 (#199), the nightly backup's switch. Off skips the nightly run (the Tasks row says
+                    `switched off · on demand`); Run now still backs up.
+                backupKeep:
+                  type: integer
+                  minimum: 1
+                  maximum: 365
+                  description: >-
+                    Since v0.61.1 (#199), how many backup runs to keep. Saving deletes nothing; the oldest beyond
+                    it go after the next backup.
                 autoFollowOnFailure:
                   type: boolean
                   description: >-
@@ -6477,10 +7439,14 @@ paths:
                     maxLength: 60
                 adultSources:
                   description: >-
-                    Source ids to treat as adult on top of the ones whose extension declares itself NSFW,
-                    replaced whole. While a request does not carry adult=1 they drop out of the routes that
-                    list sources or fan out over them (GET /api/sources, search-all, latest, popular). By-id
-                    routes are unaffected. Same normalisation as adultGenres. Empty by default.
+                    The source ids rated Adult only, on top of the ones whose extension declares itself NSFW,
+                    replaced whole (PUT /api/admin/sources/{id}/age-rating rates one at a time). Since v0.73.0 a
+                    permission: an account limited below 18 is refused these sources everywhere, by-id routes
+                    included (latest, popular, detail, add, preview), as it is refused a self-declared adult
+                    one. And while a request does not carry adult=1 they drop out of the routes that list
+                    sources or fan out over them (GET /api/sources, search-all, latest, popular). Ids are
+                    lowercased and trimmed; anything outside letters, digits and _ . : - is dropped. Empty by
+                    default.
                   type: array
                   maxItems: 200
                   items:
@@ -6517,6 +7483,19 @@ paths:
                     donor, so the chapter's own source replaces it the moment it supplies one. Switching
                     this off clears exactly the names it wrote for every series that follows this setting
                     (a series switched on for itself keeps its own).
+                  type: boolean
+                fillDetails:
+                  description: >-
+                    Fill in missing details (since v0.73.0), the nightly repair's ninth step. Off by default.
+                    A series with no description, genres or author of its own is given them from AniList (in one
+                    batched request by id, for series linked there with a checked link, in libraries whose
+                    AniList lookups are on, and in English only), else from its own source or one it follows in
+                    its language -- only sources that are not off, failing or cooling down, for at most
+                    REPAIR_DETAILS_MAX (15) series a night that are kept updated; a series with no chapters yet is
+                    given a cover too. What it fills in is kept in a layer of its own below the scan: a series'
+                    own details always win, an admin's edit wins over both, and the 18+ filter judges the genres
+                    a series shows. A series asked is asked again after 30 days. A manual follow asks at once.
+                    Switching this off deletes everything it filled in, and puts back any cover it set.
                   type: boolean
                 archivePaused:
                   type: boolean
@@ -6599,6 +7578,11 @@ paths:
                     a site split into parts (12.1, 12.2) included, whatever their pages, and the sweep then downloads no
                     fractional chapter of a series that hides them. A file holding a range of chapters is never a
                     notice either way. Applies on the next request. Read back as `hideNoticeShortOnly`.
+                newMemberDefaults:
+                  description: >-
+                    #208: what a member the server makes by itself starts with (Admin → Members → When someone signs
+                    up), each field on its own. Read back as `newMemberDefaults`.
+                  $ref: "#/components/schemas/NewMemberDefaults"
       security:
         - bearer: []
       responses:
@@ -6651,6 +7635,8 @@ paths:
         /api/admin/tasks/rescan/apply), persisted in server_settings.rescan_last_run / rescan_last_result.
         The `fingerprint` entry's `lastResult` is this process's last pass, {done, failed, young, ms} -- `young`
         (since v0.55.7) the files a pass the server started left for a later one, written in the last minute.
+        Since v0.61.0 the `update` entry's `lastResult` carries `rested`: monitored series the smart update checks
+        (server_settings.update_smart) left for a later sweep, 0 when the switch is off or the sweep was Run now.
       security:
         - bearer: []
       responses:
@@ -6683,7 +7669,7 @@ paths:
         any kind -- how a page that pressed a one-row fix learns that ITS run (the id the run route answered)
         ended, even one that took 5 ms; `recent` the five newest finished runs {id, finishedAt, status, kind,
         target}; `lastFull` {id, at, ms, origin, result} the newest full run. `limits` is every bound the
-        running process uses (env overrides applied): shortMax, gapsMax, groupsMax, namesMax, countMax,
+        running process uses (env overrides applied): shortMax, gapsMax, groupsMax, namesMax, detailsMax, countMax,
         directionsMax, huntBudget, shortHuntMax, gapChapters, retrySeries, shortCopies, failuresMax, retryCap,
         paceMs, pageListMs, listingRefreshMs, listTimeoutMs, huntWallMs, huntMaxSources, solverBudgetMs,
         expiredBlockHours, repairHours. `estimates` maps a run kind to {typicalMs (median of its last five
@@ -6931,7 +7917,7 @@ paths:
         schedule. Audit: `task.run` {task: 'verify'} at the press and `library.verify` {checked, missing,
         readLibraryMissing, unmounted, ms} when the walk ends.
         `repair` (since v0.41.0) is the only task that takes a body, and it is also detached. With no body it
-        runs all eight steps over the whole library; `only` narrows it to named steps, and the three targets
+        runs all nine steps over the whole library; `only` narrows it to named steps, and the three targets
         each belong to exactly one step -- `seriesId` to `gaps` ("Fill now" on one series), `bookId` to
         `short` ("Fix" on one chapter), `sourceId` to `failures` ("Retry now" on one source) -- so a target
         sent without `only: ["<its step>"]` is refused with 400 rather than quietly widened into a full run.
@@ -6982,16 +7968,18 @@ paths:
                 only:
                   type: array
                   minItems: 1
-                  maxItems: 8
+                  maxItems: 9
                   description: >-
-                    Which steps to run, each at most once. Omitted means all eight, in this order. `groups`
-                    and `names` (since v0.47.0) do nothing unless group upgrades, or chapter-name borrowing,
-                    are switched on (groupUpgrade and borrowNames on PATCH /api/admin/settings).
+                    Which steps to run, each at most once. Omitted means all nine, in this order. `groups`,
+                    `names` (since v0.47.0) and `details` (since v0.73.0) do nothing unless group upgrades,
+                    chapter-name borrowing or Fill in missing details are switched on (groupUpgrade,
+                    borrowNames and fillDetails on PATCH /api/admin/settings) -- `details` then reports
+                    `details: {asked, filled}`, and `details: {off: true, asked: 0, filled: 0}` while it is off.
                     `directions` (since v0.48.0) asks MangaDex and AniList which way series with no known
                     reading direction read, at most REPAIR_DIRECTIONS_MAX (500) series per service.
                   items:
                     type: string
-                    enum: [solver, count, failures, short, gaps, groups, names, directions]
+                    enum: [solver, count, failures, short, gaps, groups, names, directions, details]
                 seriesId:
                   type: string
                   description: >-
@@ -7084,7 +8072,11 @@ paths:
         - admin
       summary: Add a whole site by URL (engine auto-detected).
       operationId: postApiAdminSourcesCustom
-      description: Requires an admin account and a token carrying the admin scope. Scopes only ever restrict.
+      description: >-
+        Requires an admin account and a token carrying the admin scope. Scopes only ever restrict. Since v0.62.0 the
+        homepage's language (`<html lang>`, else `og:locale`) is stored as the site's language and answered as `lang`,
+        except English, which WordPress writes for any site left at its default: null, and the site is in the unstated
+        language. A picked engine reads the page for the language for up to 15 s.
       requestBody:
         required: false
         content:
@@ -7113,9 +8105,12 @@ paths:
     patch:
       tags:
         - admin
-      summary: Change a custom site's base address, and nothing else, so its series follow it.
+      summary: Change a custom site's base address or its language, and nothing else, so its series follow it.
       operationId: patchApiAdminSourcesCustomId
-      description: Requires an admin account and a token carrying the admin scope. Scopes only ever restrict.
+      description: >-
+        Requires an admin account and a token carrying the admin scope. Scopes only ever restrict. Give `base`, `lang`
+        or both. A new `base` clears the site's block and is tested again (`smoke`). A new `lang` (since v0.62.0)
+        re-picks the chapters of every series that uses the site; `smoke` is null when only the language changed.
       parameters:
         - name: id
           in: path
@@ -7131,13 +8126,16 @@ paths:
               properties:
                 base:
                   type: string
+                lang:
+                  type: string
+                  description: "The site's language, one code (since v0.62.0): `es`, `es-419`, `pt-BR`, `zh-Hant`."
       security:
         - bearer: []
       responses:
         "200":
           description: OK
         "400":
-          description: Malformed body or parameter
+          description: "Malformed body or parameter; `unknown_language` for a `lang` that is not one language"
         "401":
           description: Not authenticated
         "403":
@@ -7820,6 +8818,81 @@ paths:
             source_unavailable (main.unavailable: not loaded, switched off, or beyond the admin's age reach);
             moved (main.moved: the main source changed meanwhile); language_differs (the follow route's refusal:
             follow.languageDiffers or follow.languageDiffersEdition, with `edition: {of, lang, existing?}`).
+  /api/admin/series/{id}/attach-source:
+    post:
+      tags:
+        - admin
+      summary: Attach a source a person picked by hand, with no chapter-overlap gate.
+      operationId: postApiAdminSeriesIdAttachSource
+      description: >-
+        Requires an admin account and a token carrying the admin scope. Scopes only ever restrict. For a series too short
+        to be judged by chapter numbers (fewer than 3, or none): the person has searched and chosen, so the fill scan's
+        and Find's overlap gates do not apply. The pair is still checked with the source: it is asked for the title, and
+        its own title must be the series' title or one of its other names, else `title_differs` (with `theirTitle`) until
+        the request says `force: true`; what the source calls it is what is stored. `as: follower` adds the source as a
+        follower (refused `cap` at the follower cap); `as: main` makes it the main source, past the cap, with `old`
+        deciding the old main (default `drop`). A series with no main source takes the pick as its main whichever is
+        asked. Still refused: the source not loaded, switched off, in a cooldown (`cooling`) or beyond the age reach, a
+        source that does not say what the title is (`unreachable`), another language (`language_differs` + `edition`),
+        posting-order numbering, a pending renumber, a run inside the series. Audited as `series.attach_source`. Starts a
+        listing refresh.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [source, sourceSeriesId, as]
+              additionalProperties: false
+              properties:
+                source: { type: string }
+                sourceSeriesId: { type: string }
+                as: { type: string, enum: [follower, main] }
+                old: { type: string, enum: [auto, keep, drop] }
+                force:
+                  type: boolean
+                  description: Attach it although the source calls it something else (the answer to `title_differs`).
+      security:
+        - bearer: []
+      responses:
+        "200":
+          description: Attached. The series' full source list.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok, as, theirTitle, sources]
+                properties:
+                  ok: { type: boolean }
+                  as: { type: string, enum: [follower, main] }
+                  from: { type: [string, "null"] }
+                  old: { type: string, enum: [kept, dropped] }
+                  theirTitle:
+                    type: string
+                    description: What the source calls the pick, as stored.
+                  sources:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/SeriesSource"
+        "400":
+          description: bad_request
+        "401":
+          description: Not authenticated
+        "403":
+          description: "Forbidden: token scope, account permission or age limit"
+        "404":
+          description: not_found -- not a series this admin may see.
+        "409":
+          description: >-
+            Refused, with `error`, `message` and `messageSaid` (lib/said.ts): is_main, posting_order, renumber_pending,
+            busy, source_unavailable, cooling, unreachable, cap, moved, title_differs (with `theirTitle`),
+            language_differs (with `edition`).
   /api/admin/series/{id}/sources/{sourceId}:
     delete:
       tags:
@@ -7829,8 +8902,10 @@ paths:
       description: >-
         Requires an admin account and a token carrying the admin scope. Scopes only ever restrict. Chapters
         already downloaded from it stay; the listing rows it carried are dropped at once, so nothing can be
-        fetched through it before the next check. The primary cannot be removed this way; it is not a
-        followed source.
+        fetched through it before the next check. The main source can be detached the same way: a follower takes
+        over (the old main dropped), or the series is left with no source when it has none. A series numbered by
+        posting order refuses (nothing could attach a new main to it afterwards); a refusal is 409 with `error`,
+        `message` and `messageSaid`, as the attach route answers.
       parameters:
         - name: id
           in: path
@@ -8194,9 +9269,8 @@ paths:
       operationId: postApiAdminSeriesIdMerge
       description: >-
         Requires an admin account and a token carrying the admin scope. Scopes only ever restrict. Merges
-        {id} INTO the series named by `into`: every chapter and progress row moves to the survivor, nothing is
-        de-duplicated and no chapter row is deleted, so no reading progress can be lost; the absorbed row
-        stays, pointed at the survivor, and a merge is one-way (400 `merged` for a source or target that is
+        {id} INTO the series named by `into`: every chapter and progress row moves to the survivor; the absorbed
+        row stays, pointed at the survivor, and a merge is one-way (400 `merged` for a source or target that is
         itself merged, 400 `deleted` for a hidden one, 400 `same_series` for itself). Since v0.37.0 merging is
         transitive: anything the absorbed series had itself absorbed earlier is re-pointed at the new
         survivor in the same transaction, so a title folded in two merges ago still files its folder's
@@ -8206,7 +9280,17 @@ paths:
         a work left with one edition dissolves. Since v0.55.0 the absorbed series' main source becomes a source the
         survivor follows when it still works (usable, or only cooling down), is in the survivor's language, is not
         the survivor's own main source, and fits under the follower cap (two), unless the survivor is numbered by
-        posting order; the answer's `carried` names it, or is null.
+        posting order; the answer's `carried` names it, or is null. Since v0.57.0 a chapter both series had is
+        kept ONCE: for every number the survivor held exactly one live copy of and {id} exactly one (a number
+        either held twice -- an extra, a chapter's parts -- is left alone, as is a series numbered by posting
+        order or being renumbered), the survivor's copy stays (the other's when the survivor's has placeholder
+        pages and the other is whole, or its file is gone), what was read of the other copy moves onto it
+        (completed stays completed; the page is carried over in proportion to the two copies' page counts),
+        its reading history and notes follow, and the other copy leaves the list -- its row is deleted, not
+        tombstoned, and its file is deleted when it is in the download folder, else left on disk and set aside so
+        the scan does not list it again. A copy someone bookmarked stays, as does a pair whose folder is not
+        reachable. `duplicates` counts the copies removed and `keptBoth` the numbers still held twice; audited
+        `series.extra_copies`.
       parameters:
         - name: id
           in: path
@@ -8229,6 +9313,20 @@ paths:
       responses:
         "200":
           description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok, moved, favorites, ratings, collections, carried, duplicates, keptBoth]
+                properties:
+                  ok: { type: boolean, enum: [true] }
+                  moved: { type: integer, description: Chapter rows moved to the survivor. }
+                  favorites: { type: integer }
+                  ratings: { type: integer }
+                  collections: { type: integer }
+                  carried: { type: [string, "null"], description: The absorbed series' main source, now followed by the survivor (v0.55.0). }
+                  duplicates: { type: integer, description: "v0.57.0: copies of a chapter both had that were taken off the list." }
+                  keptBoth: { type: integer, description: "v0.57.0: numbers still held twice (a bookmark in the other copy, a folder not reachable)." }
         "400":
           description: Malformed body or parameter
         "401":
@@ -8685,6 +9783,254 @@ paths:
           description: Not found, or not visible to this account
         "409":
           description: "`refused`: the download directory is not writable; `message` and `fix` say what to do"
+  /api/admin/series/{id}/chapters/hide:
+    post:
+      tags:
+        - admin
+      summary: Hide chapter numbers from a series, for everyone. Nothing is deleted.
+      operationId: postApiAdminSeriesIdChaptersHide
+      description: >-
+        Requires an admin account and a token carrying the admin scope. Scopes only ever restrict. Since v0.76.0 (#240,
+        rebuilt to hide only): for a chapter a source lists that is not part of the work. A hidden number, by its
+        effective number (an admin's override when there is one), is left out of every surface for every viewer -- the
+        chapter list and its missing-chapter rows, next and previous, Continue reading, the unread counts, Updates,
+        history, OPDS, the Komga-compatible API and what the trackers are told -- is neither held nor missing for
+        Health, the repair and Find missing chapters, and is never downloaded: not by the sweep, Check for new
+        chapters, Fetch newest, the slow archive or POST /api/sources/fetch (`hidden`), and a download already queued
+        stops before it asks the source. Nothing is deleted: no file, no chapter row and no reading progress is touched,
+        and the read-chapter cleanup and Fix everything leave such a chapter's file alone. A file holding a range of
+        chapters is never hidden by one number. The number's failure-ledger rows are dropped. Restore with
+        /chapters/unhide. A merge carries the absorbed series' hidden numbers to the survivor, and a renumber moves
+        each with its post. Answers the numbers this call hid; one hidden already is not hidden twice. Audit line
+        `series.chapters_hide`.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [numbers]
+              properties:
+                numbers:
+                  type: array
+                  minItems: 1
+                  maxItems: 500
+                  items:
+                    type: number
+                    minimum: 0
+                    maximum: 1000000
+      security:
+        - bearer: []
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok, hidden]
+                properties:
+                  ok:
+                    type: boolean
+                  hidden:
+                    type: array
+                    description: The numbers this call hid, lowest first.
+                    items:
+                      type: number
+        "400":
+          description: Malformed body or parameter
+        "401":
+          description: Not authenticated
+        "403":
+          description: "Forbidden: token scope, account permission or age limit"
+        "404":
+          description: Not found, or not visible to this account
+        "409":
+          description: "`merged`: the series was merged into another, whose chapters and hidden numbers they are now"
+  /api/admin/series/{id}/chapters/hidden:
+    get:
+      tags:
+        - admin
+      summary: The chapter numbers hidden from a series, with what each one is.
+      operationId: getApiAdminSeriesIdChaptersHidden
+      description: >-
+        Requires an admin account and a token carrying the admin scope. Scopes only ever restrict. Since v0.76.0 (#240):
+        what the series page's Show hidden chapters lists, lowest first. `onServer` counts the chapter rows the server
+        keeps at the number (a file, or a deleted one's row; a range file is never one), `listed` says a source the
+        series follows lists it, `title` is the source's name for it, else the file's.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      security:
+        - bearer: []
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [content]
+                properties:
+                  content:
+                    type: array
+                    items:
+                      type: object
+                      required: [number, onServer, listed, title]
+                      properties:
+                        number:
+                          type: number
+                        onServer:
+                          type: integer
+                        listed:
+                          type: boolean
+                        title:
+                          type: string
+                          nullable: true
+        "401":
+          description: Not authenticated
+        "403":
+          description: "Forbidden: token scope, account permission or age limit"
+        "404":
+          description: Not found, or not visible to this account
+  /api/admin/series/{id}/chapters/unhide:
+    post:
+      tags:
+        - admin
+      summary: Show hidden chapter numbers again.
+      operationId: postApiAdminSeriesIdChaptersUnhide
+      description: >-
+        Requires an admin account and a token carrying the admin scope. Scopes only ever restrict. Since v0.76.0 (#240):
+        the numbers named, or every one with `all: true` -- exactly one of the two. Nothing was deleted, so every
+        surface shows the chapters again on the next request, their missing-chapter rows included, and the next sweep
+        fetches one that is missing. Answers the numbers that were hidden. Audit line `series.chapters_unhide`.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                numbers:
+                  type: array
+                  minItems: 1
+                  maxItems: 500
+                  items:
+                    type: number
+                    minimum: 0
+                    maximum: 1000000
+                all:
+                  type: boolean
+                  enum: [true]
+      security:
+        - bearer: []
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok, restored]
+                properties:
+                  ok:
+                    type: boolean
+                  restored:
+                    type: array
+                    description: The numbers shown again, lowest first.
+                    items:
+                      type: number
+        "400":
+          description: Malformed body or parameter
+        "401":
+          description: Not authenticated
+        "403":
+          description: "Forbidden: token scope, account permission or age limit"
+        "404":
+          description: Not found, or not visible to this account
+  /api/admin/series/{id}/cover-candidates:
+    get:
+      tags:
+        - admin
+      summary: The covers the sources this series follows have for it.
+      operationId: getApiAdminSeriesIdCoverCandidates
+      description: >-
+        Requires an admin account and a token carrying the admin scope. Scopes only ever restrict. One entry per
+        source the series uses that answered with a picture (`sourceId`, `name`, `primary`, `coverUrl`); show it through
+        /img/sources/cover and apply it with PUT /api/admin/series/{id}/art `{ kind: cover, mode: source, source }`. Only
+        a usable source is asked (not one switched off, not loaded, cooling down or failing), each under its own time
+        budget, all at once.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      security:
+        - bearer: []
+      responses:
+        "200":
+          description: OK
+        "401":
+          description: Not authenticated
+        "403":
+          description: "Forbidden: token scope, account permission or age limit"
+        "404":
+          description: Not found, or not visible to this account
+  /api/admin/series/{id}/copy-pages:
+    get:
+      tags:
+        - admin
+      summary: How many pages one copy of a chapter has on its source.
+      operationId: getApiAdminSeriesIdCopyPages
+      description: >-
+        Requires an admin account and a token carrying the admin scope. Scopes only ever restrict. The copy is named
+        by `source` and `chapter` (the source's chapter id) and must be one the series' listing holds. The pages
+        are GET /img/series/{id}/copy-page.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+        - { name: source, in: query, required: true, schema: { type: string } }
+        - { name: chapter, in: query, required: true, schema: { type: string } }
+      security:
+        - bearer: []
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  count: { type: integer }
+        "401":
+          description: Not authenticated
+        "403":
+          description: "Forbidden: token scope, account permission, or a disabled source"
+        "404":
+          description: The copy is not in the series' listing
+        "429":
+          description: The source is in a cooldown
+        "502":
+          description: The source would not list the pages
   /api/admin/series/{id}/chapters/refetch:
     post:
       tags:
@@ -8762,7 +10108,7 @@ paths:
                           type: string
                         reason:
                           type: string
-                          enum: [not_found, not_owned, not_ours, not_listed, blocked_group, source_unavailable, cooldown, duplicate]
+                          enum: [not_found, not_owned, not_ours, not_listed, blocked_group, other_language, source_unavailable, cooldown, duplicate]
                         source:
                           type: string
                           description: "On a `duplicate` entry: the adapter of the pick that was ignored."
@@ -8963,6 +10309,13 @@ paths:
                   type: boolean
                   default: true
                   description: Permit automatic AniList enrichment for series currently in this library.
+                readerPrefs:
+                  description: Reading defaults for the library's series (mode, spread, pagedDirection); null clears them. Layered under a source's and a series' own. No theme, which stays each reader's own; an unknown key is dropped.
+                  type: [object, "null"]
+                  properties:
+                    mode: { type: string, enum: [vertical, paged] }
+                    spread: { type: boolean }
+                    pagedDirection: { type: string, enum: [ltr, rtl, series] }
       security:
         - bearer: []
       responses:
@@ -9105,6 +10458,13 @@ paths:
                 anilistLookup:
                   type: boolean
                   description: Permit automatic AniList enrichment for series currently in this library.
+                readerPrefs:
+                  description: Reading defaults for the library's series (mode, spread, pagedDirection); null clears them. Layered under a source's and a series' own. No theme, which stays each reader's own; an unknown key is dropped.
+                  type: [object, "null"]
+                  properties:
+                    mode: { type: string, enum: [vertical, paged] }
+                    spread: { type: boolean }
+                    pagedDirection: { type: string, enum: [ltr, rtl, series] }
                 members:
                   type: array
                   items: { type: string }
@@ -9212,6 +10572,8 @@ paths:
         `reset` hands the art back to the automatic source. `first_page` (v0.55.7, the cover only; a banner is a 400)
         makes the series' own first page its cover for good: `overrides.cover` on the series reads `first_page`, and
         nothing found online is shown or looked up for it -- its banner is made from its pages unless an admin set one.
+        `source` (the cover only) takes the cover a followed source has for the series: only the source's id is sent, the
+        picture's address is read from the source's own record of the series, and the server keeps its own copy.
         Automatic art is kept from an online entry only when it is named as the series is (v0.55.7).
       parameters:
         - name: id
@@ -9232,7 +10594,10 @@ paths:
                   enum: [cover, banner]
                 mode:
                   type: string
-                  enum: [url, upload, reset, first_page]
+                  enum: [url, upload, reset, first_page, source]
+                source:
+                  type: string
+                  description: For `source` (the cover only), the id of a source this series follows; see GET /api/admin/series/{id}/cover-candidates.
                 url:
                   type: string
                   format: uri
@@ -9344,7 +10709,11 @@ paths:
         the engine, this call's own look included, and whether it answered), `linkedSeries` (series added through an
         extension) and, when the engine answers, `solver` ({supported, enabled, wiring: ok | off | localhost |
         other | unsupported, connectable, url}; `url` is never sent on desktop). When the engine answers but the
-        last registration missed it, this call registers its sources before replying."
+        last registration missed it, this call registers its sources before replying. Since the engine upgrade:
+        `buildType` (Stable or Preview), `tested` and `oldest` (the engine version this Uchiyomi was tested with, and
+        the oldest it works with), `standing` (same | older | tooOld | newer | unknown: the engine's version against
+        them) and `refused` ([{op, message, at}]: the operations the engine refused, by name and in its own words).
+        An engine that refuses Uchiyomi's queries answers, so it is `reachable` -- and not compatible."
 
       security:
         - bearer: []
@@ -9963,11 +11332,37 @@ paths:
         lies before its start is an `info` row with no actions and the detail `gaps.belowFloor` {n, start, ranges}
         (`start` is the first chapter it was started from), counted in the summary by `gaps.beforeStart` {n}: nothing
         fetches below the start unasked, so neither the repair's gap step nor Fill now works on those holes.
+        Since v0.72.0 three more checks (after @Squeaks72's #253 and #252). `disk` ("Disk space and folders"): the
+        downloads disk's free space -- `problem` under the downloader's own floor (MIN_FREE_GB: new downloads stop),
+        `warn` under the slow archive's floor while the archive has a series queued (it waits), otherwise one `info`
+        row -- and a library or download folder that cannot be opened, or that is empty while the library records
+        chapters in it (`problem`; only its first entry is read). Keys `space:downloads`, `folder:library`,
+        `folder:downloads`; an ignore records the level, so an ignored warning does not silence a later problem.
+        `trackers` ("Tracker sync"): every member's tracker connection the tracker refused, whose last sync failed, or
+        whose sign-in ended or ends within 14 days (within 30 days: `info`), titled by the tracker and the member's
+        username; key `PROVIDER:USERID`. `files` ("Chapter files"): one row per series with chapter files the nightly
+        repair's page count opened and found no page in (`pages` 0 with `pages_checked_at` set; a file whose mtime
+        moves is counted again), with `bookIds` and `numbers` (at most 20) of the files Uchiyomi downloaded itself and
+        the action `refetch` -- POST /api/admin/series/{id}/chapters/refetch with those `bookIds`, which keeps each old
+        file until its new copy lands; key `series:ID`. Nothing is deleted by any of them.
+        `view=series` adds `bySeries`: every series with a finding on a card about one series at a time (duplicates
+        aside), grouped from each card's full list rather than the 50 rows a card carries -- [{seriesId, title,
+        status: 'warn'|'problem' (its worst card's), findings: [{check, item}]}], worst first, then most findings,
+        then by title. `view=checks` (or none) leaves it out.
+      parameters:
+        - name: view
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [checks, series]
       security:
         - bearer: []
       responses:
         "200":
           description: OK
+        "400":
+          description: "Bad request: `view` is neither checks nor series"
         "401":
           description: Not authenticated
         "403":
@@ -10006,7 +11401,7 @@ paths:
       description: >-
         Requires an admin account and a token carrying the admin scope. Scopes only ever restrict.
         Body {check, key, ignored}: `check` is one of chapter-gaps, chapter-failures, sources, frozen-series,
-        duplicates, outliers, downloads-missing, and `key` is the finding's `key` as GET /api/admin/health reports
+        duplicates, outliers, downloads-missing, and since v0.72.0 disk, trackers and files, and `key` is the finding's `key` as GET /api/admin/health reports
         it. The server looks the finding up again and records everything it is about (every missing number of a
         gap, not only the hundred the report carries); it then reports it greyed with `ignored` and an `unignore`
         action, and stays quiet while what it is about is part of that. A finding gone for a week forgets its
@@ -10023,7 +11418,7 @@ paths:
               properties:
                 check:
                   type: string
-                  enum: [chapter-gaps, chapter-failures, sources, frozen-series, duplicates, outliers, downloads-missing]
+                  enum: [chapter-gaps, chapter-failures, sources, frozen-series, duplicates, outliers, downloads-missing, disk, trackers, files]
                 key:
                   type: string
                 ignored:
@@ -10296,7 +11691,7 @@ paths:
         batches in every state, newest first, as `{content: [{id, origin, tracker, state, total, resolved,
         added, already, failed, skippedNovels, truncated, created_at, updated_at, stale}]}` — `origin` is
         `backup`, `mangadex`, `paste` or `tracker`, and `tracker` names the service (`anilist`, `myanimelist`,
-        `kitsu`) for a tracker batch, null otherwise; `skippedNovels` (integer: the novels a tracker read
+        `kitsu`, `mangaupdates`) for a tracker batch, null otherwise; `skippedNovels` (integer: the novels a tracker read
         dropped, 0 for the other origins) and `truncated` (boolean: the intake kept the first 500 titles not
         already in the library and more remained -- since v0.51.0 the titles already owned ride along as
         skipped rows and do not count -- or the tracker read hit its cap) are the intake's own answer kept on
@@ -10392,7 +11787,7 @@ paths:
                   description: Names the tracker intake; `tracker` says which service.
                 tracker:
                   type: string
-                  enum: [anilist, myanimelist, kitsu]
+                  enum: [anilist, myanimelist, kitsu, mangaupdates]
                   description: Which connected tracker to read the requesting admin's own list from.
                 statuses:
                   type: array
@@ -11124,6 +12519,8 @@ paths:
                         followed: { type: integer, minimum: 0 }
                         withBackup: { type: integer, minimum: 0 }
                         lastTestedAt: { type: [string, "null"], format: date-time, description: The last deliberate live check (Test or the daily check). }
+                        ageRating: { type: [integer, "null"], enum: [18, null], description: "Since v0.73.0: 18 when the admin rated the whole source Adult only (PUT /api/admin/sources/{id}/age-rating), else null." }
+                        defaultAgeRating: { type: [integer, "null"], enum: [18, null], description: "What the source is held to without that rating: 18 for an extension that declares itself adult, else null. Either 18 refuses the source to an account limited below 18." }
                         icon: { type: boolean, description: "GET /img/sources/icon/{id} serves an extension's logo." }
                         address: { type: string, description: A site added by address only. }
                         overLimit:
@@ -11243,6 +12640,57 @@ paths:
           description: "Forbidden: token scope, account permission or age limit"
         "404":
           description: Not found, or not visible to this account
+  /api/admin/sources/{id}/age-rating:
+    put:
+      tags:
+        - admin
+      summary: Rate a whole source Adult only, or take the rating off.
+      operationId: putApiAdminSourcesIdAgeRating
+      description: >-
+        Since v0.73.0. Requires an admin account and a token carrying the admin scope. `ageRating` 18 rates the
+        source Adult only: an account limited below 18 is refused it everywhere -- the by-id routes included
+        (latest, popular, detail, add, preview) -- as it is refused a source whose extension declares itself adult,
+        and while a request does not carry adult=1 it leaves Discover, search and the latest and popular lists.
+        `null` takes the rating off, so the extension's own flag decides again. Nothing rates a source below its
+        extension's flag. Stored in the settings' adultSources, so the two are one list. The id need not be loaded
+        now (an extension's source is registered only while the engine is up). Audited as `source.age_rating`
+        {source, ageRating}.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [ageRating]
+              properties:
+                ageRating: { type: [integer, "null"], enum: [18, null], description: "18 = Adult only; null = the source's default." }
+      security:
+        - bearer: []
+      responses:
+        "200":
+          description: Saved.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok, ageRating]
+                properties:
+                  ok: { type: boolean }
+                  ageRating: { type: [integer, "null"] }
+        "400":
+          description: "`bad_request`: not 18 or null, or an id that is not a source id"
+        "401":
+          description: Not authenticated
+        "403":
+          description: "Forbidden: token scope, account permission or age limit"
+        "409":
+          description: "`too_many`: 200 sources are rated Adult only already. With `message` and `messageSaid` (`rating.tooMany`)."
   /api/admin/sources/{id}/{action}:
     post:
       tags:
@@ -11336,6 +12784,11 @@ paths:
                 properties:
                   libraries: { type: array, items: { type: object, properties: { name: { type: string } } } }
                   seriesTotal: { type: integer }
+                  booksTotal:
+                    type: integer
+                    description: >-
+                      Since v0.61.2 (#204), every chapter in the series seriesTotal counts, as each series' booksCount
+                      counts them (a notice chapter the admin hides left out).
                   cacheBytes: { type: integer }
                   lastScan: { type: [integer, "null"], description: When the last scan started, in ms since the epoch. }
                   members: { type: integer }
@@ -11359,7 +12812,9 @@ paths:
         - admin
       summary: "Change an account: role, permissions, library access, age limit, downloads."
       operationId: patchApiAdminUsersId
-      description: Requires an admin account and a token carrying the admin scope. Scopes only ever restrict.
+      description: >-
+        Requires an admin account and a token carrying the admin scope. Scopes only ever restrict. A body with a
+        `password` is refused whole with 403 `sso_only` in SSO-only mode (since v0.63.0).
       parameters:
         - name: id
           in: path
@@ -11644,12 +13099,20 @@ paths:
     get:
       tags:
         - komga
-      summary: "The extension's Books search type. Always an empty page: this library has no chapter-level search."
+      summary: Every chapter the credential may list, a page at a time (since v0.61.2; an empty page before).
+      description: >-
+        The extension's Books type, and the chapter count a Komga client reads from `totalElements` (Homepage's Komga
+        widget shows it as its Books tile, #204). Listed as the series list lists series -- soft delete, merge, the grants,
+        the age cap and the token's 18+ hide -- and as each series lists its chapters (overrides; a notice chapter the
+        admin hides left out), by series title then number. `search` matches a chapter's or its series' name.
       operationId: getApiV1Books
       parameters:
         - { name: search, in: query, required: false, schema: { type: string } }
         - { name: page, in: query, required: false, schema: { type: integer, minimum: 0 } }
         - { name: size, in: query, required: false, schema: { type: integer, minimum: 1, maximum: 500 } }
+        - { name: sort, in: query, required: false, schema: { type: string }, description: "`…,desc` reverses the order." }
+        - { name: library_id, in: query, required: false, schema: { type: string }, description: Only these libraries (repeatable). }
+        - { name: media_status, in: query, required: false, schema: { type: string }, description: "`READY` leaves out the read chapters the cleanup pruned." }
       security:
         - komgaApiKey: []
         - komgaBearer: []
@@ -11657,7 +13120,7 @@ paths:
         - komgaSession: []
       responses:
         "200":
-          description: An empty KomgaPage (content [], last true).
+          description: A KomgaPage of KomgaBooks; `totalElements` is the whole count.
         "401":
           description: Not authenticated
         "429":

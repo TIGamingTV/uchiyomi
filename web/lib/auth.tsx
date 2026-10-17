@@ -1,10 +1,12 @@
 'use client';
 import { createContext, useContext, useEffect, useRef, useState, ReactNode } from 'react';
-import { api, refreshSession, setAccessToken, setCurrentUser } from './api';
+import { QueryClientContext } from '@tanstack/react-query';
+import { api, ApiError, refreshSession, setAccessToken, setCurrentUser } from './api';
 import { readOfflineIdentity, writeOfflineIdentity, clearOfflineIdentity, OfflineIdentity } from './offlineIdentity';
 import { deviceId, deviceName } from './device';
 import { clearShownOnce } from './shownOnce';
 import { applyReduceEffects, restoreReduceEffects } from './effects';
+import { applyTone, restoreTone } from './tone';
 import { isDesktop, serverReachableHint, untilReachable } from './desktop';
 import { t as tr } from './i18n';
 
@@ -15,6 +17,8 @@ interface User {
   displayName: string;
   role: string;
   totpEnabled?: boolean;
+  /** Linked to an identity at the OIDC provider (v0.63.0): Profile → Account offers Link to … until it is. */
+  sso?: boolean;
   perms?: Record<string, boolean>;
   avatar?: Avatar;
   settings: Record<string, any>;
@@ -40,6 +44,8 @@ interface AuthCtx {
   isAdmin: boolean;
   login: (username: string, password: string, code?: string) => Promise<{ ok: boolean; totp?: boolean; error?: string }>;
   firstRunSetup: (username: string, password: string) => Promise<{ ok: boolean; error?: string }>;
+  /** Sign up while Open registration is on (v0.61.0). `closed`: it was switched off meanwhile. */
+  register: (username: string, password: string) => Promise<{ ok: boolean; closed?: boolean; error?: string }>;
   logout: () => Promise<void>;
   setSettings: (partial: Record<string, any>) => void;
   setAvatar: (avatar: Avatar) => void;
@@ -116,9 +122,23 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const [status, setStatus] = useState<Status>('loading');
   const [user, setUser] = useState<User | null>(null);
   const timer = useRef<any>(null);
+  // Read from the context rather than with useQueryClient, which throws without a provider: tests mount AuthProvider
+  // alone, and a provider-less AuthProvider simply has no query cache to clear.
+  const qc = useContext(QueryClientContext);
 
   /**
-   * The server has confirmed who we are. One function, because four paths reach this state (boot, login,
+   * Everything this tab holds for the account that was signed in: the service worker's caches, and the in-memory query
+   * cache. The query cache outlives a sign-out (no reload, staleTime 30 s, kept 5 min unused), so the next person on a
+   * shared device was shown the last one's Wrapped, history, stats and picks -- 18+ titles to an age-capped account
+   * included -- until each query refetched. Run at sign-out and at every sign-in, whoever signed in before.
+   */
+  const forgetAccountData = async () => {
+    qc?.clear();
+    await purgeAccountCaches();
+  };
+
+  /**
+   * The server has confirmed who we are. One function, because five paths reach this state (boot, login, sign-up,
    * first-run setup, reconnect) and a field added to one of them would otherwise be missing from the others.
    *
    * `setCurrentUser` comes FIRST, before `setUser` and before anything renders: the reader consults the
@@ -134,6 +154,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     // arrived one commit later would let the mesh, grain and vignette paint a frame on every reload with
     // Reduce effects on (#71). Both directions, so the next account on a shared device gets its own setting.
     applyReduceEffects(u.settings?.reduceEffects === true);
+    // The background tone (lib/tone.ts), for the same reason: the shell's first frame is already in it.
+    applyTone(u.settings?.tone);
     setStatus('authed');
   };
 
@@ -153,6 +175,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     // No server to ask, so the device's copy, which the last online sign-in of this same account wrote (the
     // mirror is cleared with the saved identity on sign-out). Before setStatus for the same reason as above.
     restoreReduceEffects();
+    restoreTone();
     setStatus('offline');
   };
 
@@ -176,13 +199,15 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     // sign-in screen reduced for whoever's session happened to lapse. The account still holds the setting and
     // the next sign-in applies it, both ways.
     applyReduceEffects(false);
+    // The tone likewise: the sign-in screen is OLED, and the next person's offline launch does not inherit this one's.
+    applyTone(null);
     setUser(null);
     setStatus('anon');
     // Secrets the server only ever sends once are held outside React so a remount cannot destroy them.
     // That store has to end with the session, or a shared machine hands the next person a live token.
     clearShownOnce();
     void tellWorkerUser(null);
-    await purgeAccountCaches();
+    await forgetAccountData();
   };
 
   useEffect(() => {
@@ -245,7 +270,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       const res = await api<{ accessToken: string; user: User; refreshExpiresAt?: number }>('/auth/login', {
         json: { username, password, code, deviceId: deviceId(), deviceName: deviceName() },
       });
-      await purgeAccountCaches(); // whoever used this device last does not get to answer this account's requests
+      await forgetAccountData(); // whoever used this device last does not get to answer this account's requests
       setAccessToken(res.accessToken);
       // After the purge, never before: the identity write must not be the thing the purge sweeps away.
       adoptAuthed(res.user, res.refreshExpiresAt);
@@ -285,6 +310,42 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     }
   };
 
+  /**
+   * Sign up (v0.61.0): Admin → Settings → Open registration has a form on the sign-in screen at last. A sign-in like
+   * `login`, step for step -- the caches of whoever used this device last are purged first, the session is adopted, and
+   * the device names itself so the new session reads as this phone in the sessions list.
+   *
+   * The refusal by its code first, in the reader's words (the server's sentences are English): a name that is taken --
+   * in any case, the server says -- the password and name rules setup already words, registration switched off since
+   * the screen was drawn (`closed`: the screen goes back to signing in and drops its link), and the five-in-ten-minutes
+   * limit, whose 429 carries no code of ours. Reintroduce `body.message ||` ahead of the codes: "a sign-up refusal is
+   * said by its code first" in web/test/signUp.test.ts fails.
+   */
+  const register = async (username: string, password: string): Promise<{ ok: boolean; closed?: boolean; error?: string }> => {
+    try {
+      const res = await api<{ accessToken: string; user: User; refreshExpiresAt?: number }>('/auth/register', {
+        json: { username, password, deviceId: deviceId(), deviceName: deviceName() },
+      });
+      await forgetAccountData();
+      setAccessToken(res.accessToken);
+      adoptAuthed(res.user, res.refreshExpiresAt);
+      return { ok: true };
+    } catch (e: any) {
+      let body: any = {};
+      try { body = JSON.parse(e?.body || '{}'); } catch {}
+      const status = e instanceof ApiError ? e.status : 0;
+      if (body.error === 'registration_disabled') {
+        return { ok: false, closed: true, error: tr('Sign-up is turned off on this server. Ask whoever runs it for an account.') };
+      }
+      const error = body.error === 'username_taken' || status === 409 ? tr('That username is taken.')
+        : body.error === 'weak_password' ? tr('Password must be at least 8 characters.')
+        : body.error === 'bad_request' ? tr('Username: letters, numbers, . _ - (2–64 characters).')
+        : status === 429 ? tr('Too many attempts. Wait a few minutes and try again.')
+        : body.message || tr('Could not create account');
+      return { ok: false, error };
+    }
+  };
+
   const logout = async () => {
     try {
       await api('/auth/logout', { method: 'POST' });
@@ -303,6 +364,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     applyAccent({ ...(user?.settings || {}), ...partial });
     // The Appearance switch applies the moment it is flipped, and again (reverted) if the save is refused.
     if ('reduceEffects' in partial) applyReduceEffects(partial.reduceEffects === true);
+    if ('tone' in partial) applyTone(partial.tone);
   };
 
   const setAvatar = (avatar: Avatar) => setUser((u) => (u ? { ...u, avatar } : u));
@@ -322,7 +384,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   };
 
   return (
-    <Ctx.Provider value={{ status, user, isAdmin: user?.role === 'admin', login, firstRunSetup, logout, setSettings, setAvatar, setTotpEnabled, desktop: isDesktop(), reconnect }}>
+    <Ctx.Provider value={{ status, user, isAdmin: user?.role === 'admin', login, firstRunSetup, register, logout, setSettings, setAvatar, setTotpEnabled, desktop: isDesktop(), reconnect }}>
       {children}
     </Ctx.Provider>
   );

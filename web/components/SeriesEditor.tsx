@@ -25,6 +25,8 @@ import { numLabel } from '@/lib/numbering';
 import { useLayer } from '@/lib/layers';
 import { useReduceEffects } from '@/lib/effects';
 import { keys, t as tr } from '@/lib/i18n';
+import { bustCover } from '@/lib/coverBust';
+import { ART_MAX_BYTES, ART_MAX_MB, dataUrlOf } from '@/lib/artUpload';
 import { metaSaver, seedMeta, type SeriesMeta } from '@/lib/seriesMeta';
 import { SERIES_TYPES, seriesTypeKey } from '@/lib/seriesTypes';
 import { useToast } from './Toast';
@@ -34,6 +36,7 @@ import { ProgressRing } from './ProgressRing';
 import { useContextMenu } from './ContextMenu';
 import { useCheckNow } from './SourcesSheet';
 import { IcX } from './icons';
+import { GenreTagInput } from './GenreTagInput';
 import { LinkRow, Row, SaveScope, SaveState, Segmented, SwitchRow, TextRow, useAutosave, useSaveScope } from './settings';
 
 /**
@@ -106,13 +109,6 @@ const ages = (current: string): number[] => {
   return current !== '' && Number.isInteger(n) && !AGES.includes(n) ? [...AGES, n].sort((a, b) => a - b) : AGES;
 };
 
-/**
- * The largest picture an upload takes. ⚠️ The route's body limit is sized from it (bff routes/admin.ts ART_BODY_LIMIT):
- * the picture travels base64 in JSON, a third larger, and the 12 MB limit it had refused everything between 9 and
- * 11 MB that this dialog had just said it would take.
- */
-const ART_MAX_MB = 11;
-const ART_MAX_BYTES = ART_MAX_MB * 1024 * 1024;
 type ArtKind = 'cover' | 'banner';
 
 /** Tab through the dialog and round again, never out of it: the page under a modal is not there to the keyboard. */
@@ -253,7 +249,7 @@ export function SeriesEditor({ id, series, tab: opening = 'details', onClose, on
           {/* Text tabs with an accent underline, the Library's Series | Downloads. A row too long for a phone scrolls
               inside itself, never the page; the underline sits on the row's own inset line, which a scroller would
               clip if it hung over a border below it. */}
-          <div role="tablist" aria-label={tr('Edit details')} data-lenis-prevent
+          <div role="tablist" aria-label={tr('Edit details')} data-lenis-prevent-horizontal
             className="hide-scrollbar mt-3 flex shrink-0 items-end gap-5 overflow-x-auto px-4 shadow-[inset_0_-1px_0_var(--color-ink-800)] md:gap-6 md:px-6">
             {TABS.map((t, i) => {
               const on = t === tab;
@@ -422,37 +418,10 @@ function StatusRow({ value, onSave }: { value: string; onSave: (v: string) => Pr
 function GenresRow({ genres, onSave }: { genres: string[]; onSave: (g: string[]) => Promise<void> }) {
   const { run } = useAutosave();
   const fid = useId();
-  const [draft, setDraft] = useState('');
-  const save = (next: string[]) => { void run(() => onSave(next)); };
-  const add = (raw: string) => {
-    const t = raw.trim().replace(/,$/, '').trim();
-    setDraft('');
-    if (!t || genres.some((g) => g.toLowerCase() === t.toLowerCase())) return;
-    save([...genres, t]);
-  };
   return (
     <Row label={tr('Genres')} htmlFor={fid} stacked
       help={tr('Genres drive the Library’s genre filters and the recommendation rails. Clearing them all means this series genuinely has none.')}>
-      <div className="flex w-full flex-wrap gap-1.5 rounded-xl border border-ink-700 bg-ink-850 p-1.5 transition-colors focus-within:border-accent">
-        {genres.map((g) => (
-          <span key={g} className="inline-flex min-w-0 items-center gap-0.5 rounded-md bg-ink-700/80 py-0.5 pe-0.5 ps-2 text-xs text-fog-100">
-            <bdi dir="auto" className="truncate">{g}</bdi>
-            <button type="button" onClick={() => save(genres.filter((x) => x !== g))} aria-label={tr('Remove {name}', { name: g })}
-              className="grid h-6 w-6 shrink-0 place-items-center rounded text-fog-500 transition-colors hover:text-rose-300">
-              <IcX width={12} height={12} />
-            </button>
-          </span>
-        ))}
-        <input id={fid} value={draft} dir="auto" maxLength={60} placeholder={tr('Add a genre…')}
-          className="min-w-[8rem] flex-1 bg-transparent px-1.5 py-1 text-sm text-fog-50 outline-hidden placeholder:text-fog-500"
-          onChange={(e) => (e.target.value.endsWith(',') ? add(e.target.value) : setDraft(e.target.value))}
-          onBlur={() => add(draft)}
-          onKeyDown={(e) => {
-            if (e.key === 'Enter') { e.preventDefault(); add(draft); }
-            else if (e.key === 'Backspace' && !draft && genres.length) save(genres.slice(0, -1));
-            else if (e.key === 'Escape' && draft) { e.preventDefault(); setDraft(''); }
-          }} />
-      </div>
+      <GenreTagInput id={fid} genres={genres} onChange={(next) => { void run(() => onSave(next)); }} />
     </Row>
   );
 }
@@ -692,12 +661,6 @@ function LibraryRow({ id, series, onSaved }: { id: string; series: Series; onSav
 
 /** Whether a dropped thing carries files (a dragged link or text does not, and is left to the browser). */
 const carriesFiles = (e: DragEvent) => [...(e.dataTransfer?.types ?? [])].includes('Files');
-const dataUrlOf = (f: File) => new Promise<string>((res, rej) => {
-  const r = new FileReader();
-  r.onload = () => res(String(r.result));
-  r.onerror = () => rej(new Error('read'));
-  r.readAsDataURL(f);
-});
 const webLink = (s: string): boolean => {
   try { const u = new URL(s); return u.protocol === 'http:' || u.protocol === 'https:'; } catch { return false; }
 };
@@ -770,6 +733,7 @@ function ArtPanel({ id, series, onSaved, onNewBanner }: { id: string; series: Se
     setBusy(kind);
     try {
       await api(`/api/admin/series/${id}/art`, { method: 'PUT', json: { kind, ...body } });
+      if (kind === 'cover') bustCover(id);
       // The pictures follow the series' art version, which the refetch brings: the preview stays covered until it
       // has, rather than showing the old art as if the change had not taken.
       onSaved();

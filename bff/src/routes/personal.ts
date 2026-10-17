@@ -1,4 +1,5 @@
 import type { FastifyInstance } from 'fastify';
+import rateLimit from '@fastify/rate-limit';
 import { z } from 'zod';
 import { q, one } from '../lib/db';
 // backend-agnostic content client: the owned library in owned mode, Komga otherwise. The old direct
@@ -10,14 +11,25 @@ import { startBulkNewest, bulkNewestState } from '../lib/bulkNewest';
 // The download strip's "is a job running for this folder" lives with the strip, in routes/sources.ts, and
 // routes/admin.ts imports it from there too.
 import { jobBusy } from './sources';
-import { authenticate, userIdOf, roleOf, issueOpdsToken, issueApiToken, listApiTokens, revokeApiToken, API_SCOPES, revokeOpdsToken, opdsTokenStatus, setOpdsShowAdult, OPDS_TOKEN_DAYS } from '../lib/auth';
+import { BlockedAddress } from '../lib/ssrfGuard';
+import { authenticate, userIdOf, roleOf, actsAsAdmin, issueOpdsToken, issueApiToken, listApiTokens, revokeApiToken, API_SCOPES, revokeOpdsToken, opdsTokenStatus, setOpdsShowAdult, OPDS_TOKEN_DAYS } from '../lib/auth';
 import { enrichSeries, seenCounts } from '../lib/enrich';
 import { env } from '../env';
 import { pushEnabled, vapidPublicKey, saveSubscription, removeSubscription } from '../lib/push';
-import { statusFor, saveConnection, disconnect, whoAmI, pushSeriesProgress, pushSeriesProgressAsync, clearTrackerFloor } from '../lib/trackers';
-import { ADAPTERS, isProvider, type Provider } from '../lib/trackerProviders';
+import { statusFor, saveConnection, disconnect, whoAmI, pushSeriesProgress, pushSeriesProgressAsync, clearTrackerFloor, testConnection } from '../lib/trackers';
+import { ADAPTERS, isProvider, verdictOf, type Provider } from '../lib/trackerProviders';
 import { logAudit } from '../lib/audit';
 import { noticeBook } from '../lib/noticeChapters';
+import { devicesOf, hourIn, lastDays, loadTimeline, summarize, validTz, yearRange } from '../lib/readingTime';
+import { listFor, ownListFor, listsFor, listItems, kindOf, ownerOf, type ListRow } from '../lib/lists';
+import { smartQuery, parseQuery } from '../lib/smartLists';
+import { insightsFor } from '../lib/readingInsights';
+
+/** A colour a member stores that other members' browsers paint (avatar, list accent): hex only (v0.69.1). */
+const HEX_COLOR = /^#(?:[0-9a-f]{3,4}|[0-9a-f]{6}|[0-9a-f]{8})$/i;
+
+/** The most days `/api/stats?days=all` answers: about ten years, the "All time" heatmap's longest strip (#265). */
+const ALL_TIME_MAX_DAYS = 3660;
 
 function computeStreaks(days: string[]): { current: number; longest: number } {
   if (!days.length) return { current: 0, longest: 0 };
@@ -64,7 +76,25 @@ async function listDates(userId: string, ids: string[]): Promise<{ read: Map<str
   };
 }
 
+/**
+ * A list as the Lists routes describe it (v0.61.0): its kind and sharing, whether it is the caller's own, and -- for its
+ * owner alone -- a smart list's search, which Edit filters opens. Someone else never receives the search: it may name a
+ * library or a source they do not have.
+ */
+function listOut(l: ListRow, uid: string) {
+  const mine = l.user_id === uid;
+  const query = mine && kindOf(l) === 'smart' ? parseQuery(l.query) : null;
+  return {
+    id: l.id, name: l.name, accent: l.accent, sort_order: l.sort_order,
+    kind: kindOf(l), shared: l.shared === true, mine,
+    ...(query ? { query } : {}),
+  };
+}
+
 export default async function personalRoutes(app: FastifyInstance) {
+  // server.ts registers the limiter at the root; a test or a tool that mounts this plugin bare gets it here instead,
+  // so Test connection is never unlimited by accident (v0.61.0, the notify.ts and komgaCompat.ts precedent).
+  if (!app.hasDecorator('createRateLimit')) await app.register(rateLimit, { global: false });
   app.addHook('preHandler', authenticate);
   app.addHook('preHandler', async (req) => {
     (req as any).viewCtx = await viewCtxFor(userIdOf(req), roleOf(req), { hideAdult: hideAdult(req) });
@@ -114,9 +144,11 @@ export default async function personalRoutes(app: FastifyInstance) {
       .safeParse(req.body);
     if (!b.success) return reply.code(400).send({ error: 'bad_request', message: 'Give the token a name and at least one scope.' });
 
-    // Only an admin may mint an admin-scoped token; otherwise any user could self-promote their automation.
+    // Only admin authority may mint an admin-scoped token: an admin session, or a token that already carries the
+    // admin scope. Otherwise any user could self-promote their automation, and an admin's read+write sync token
+    // (which requireAdmin refuses) could mint its way onto the admin API in one request.
     const scopes = b.data.scopes;
-    if (scopes.includes('admin') && roleOf(req) !== 'admin') {
+    if (scopes.includes('admin') && !actsAsAdmin(req)) {
       return reply.code(403).send({ error: 'forbidden', message: 'Only an admin can create an admin token.' });
     }
     // 'write' and 'admin' both imply being able to read
@@ -141,7 +173,13 @@ export default async function personalRoutes(app: FastifyInstance) {
   app.post('/api/push/subscribe', async (req, reply) => {
     const b = z.object({ endpoint: z.string().url(), keys: z.object({ p256dh: z.string(), auth: z.string() }), deviceId: z.string().optional() }).safeParse(req.body);
     if (!b.success) return reply.code(400).send({ error: 'bad_request' });
-    await saveSubscription(userIdOf(req), { endpoint: b.data.endpoint, keys: b.data.keys }, b.data.deviceId);
+    try {
+      await saveSubscription(userIdOf(req), { endpoint: b.data.endpoint, keys: b.data.keys }, b.data.deviceId);
+    } catch (e) {
+      // not https, or not a public host (lib/push.ts assertPushEndpoint): a refusal, answered as a 400 rather than a 500
+      if (e instanceof BlockedAddress) return reply.code(400).send({ error: 'bad_request', message: 'A push endpoint must be a public https URL.' });
+      throw e;
+    }
     return { ok: true };
   });
   app.post('/api/push/unsubscribe', async (req, reply) => {
@@ -192,103 +230,147 @@ export default async function personalRoutes(app: FastifyInstance) {
     return { ok: true, favorite: false };
   });
 
-  // ---- collections ----
+  // ---- collections (the app's Lists) ----
+  //
+  // v0.61.0: smart and shared lists (lib/lists.ts, lib/smartLists.ts). Reading a list -- GET of one, or the ?scope=all
+  // listing -- answers for any list the caller may read: their own, or one shared with the household. Changing one --
+  // PATCH, DELETE and the item routes -- only for its owner: a shared list is read-only for everyone else (the owner's
+  // ruling), and someone else's list answers 404, never 403, so an id says nothing about whether it exists. Reintroduce
+  // by reading through listFor in a write: "a shared list is read-only for everyone but its owner" in lists.int.test.ts
+  // sees 200.
+  const listName = z.string().min(1).max(120);
+
+  /** The caller's own hand-picked list for the item routes, or the answer that refuses it (already sent). */
+  const pickedList = async (req: any, reply: any): Promise<ListRow | null> => {
+    const list = await ownListFor(userIdOf(req), (req.params as { id: string }).id);
+    if (!list) { reply.code(404).send({ error: 'not_found' }); return null; }
+    // A smart list holds what its search finds; there is nothing to add by hand, remove or reorder.
+    if (kindOf(list) === 'smart') {
+      reply.code(409).send({ error: 'smart_list', message: 'A smart list holds what its filters find. Change its filters instead.' });
+      return null;
+    }
+    return list;
+  };
+
+  // No `scope`: the caller's own hand-picked lists with the stored count, as before v0.61.0 -- the series page's "Add to
+  // collection" sheet offers these, and an older client reads them. `scope=all`: theirs of both kinds and the
+  // household's shared ones, counted for this viewer (lib/lists.ts listsFor).
   app.get('/api/collections', async (req) => {
-    const uid = userIdOf(req);
-    return {
-      content: await q(
-        `SELECT c.id, c.name, c.accent, c.sort_order,
-                (SELECT count(*) FROM collection_items ci WHERE ci.collection_id = c.id) AS item_count
-         FROM collections c WHERE c.user_id = $1 ORDER BY c.sort_order, c.created_at`,
-        [uid],
-      ),
-    };
+    const { scope } = req.query as { scope?: string };
+    return { content: await listsFor(userIdOf(req), vc(req), scope === 'all' ? 'all' : 'manual') };
   });
 
-  app.post('/api/collections', async (req) => {
+  app.post('/api/collections', async (req, reply) => {
     const uid = userIdOf(req);
-    const { name, accent } = z.object({ name: z.string().min(1).max(120), accent: z.string().max(32).optional() }).parse(req.body);
-    return one('INSERT INTO collections (user_id, name, accent) VALUES ($1, $2, $3) RETURNING id, name, accent, sort_order', [uid, name, accent ?? null]);
+    const b = z.object({
+      name: listName,
+      accent: z.string().regex(HEX_COLOR).optional(),
+      // v0.61.0: a smart list's saved Library search, and whether the household may read the list.
+      query: smartQuery.optional(),
+      shared: z.boolean().optional(),
+    }).safeParse(req.body);
+    if (!b.success) return reply.code(400).send({ error: 'bad_request', message: 'Give the list a name; a smart list needs a valid search.' });
+    const row = await one<ListRow>(
+      `INSERT INTO collections (user_id, name, accent, query, shared) VALUES ($1, $2, $3, $4::jsonb, $5)
+       RETURNING id, user_id, name, accent, sort_order, query, shared`,
+      [uid, b.data.name, b.data.accent ?? null, b.data.query ? JSON.stringify(b.data.query) : null, b.data.shared === true],
+    );
+    return listOut(row!, uid);
   });
 
-  app.patch('/api/collections/:id', async (req) => {
+  app.patch('/api/collections/:id', async (req, reply) => {
     const uid = userIdOf(req);
-    const { id } = req.params as { id: string };
-    const body = z.object({ name: z.string().min(1).max(120).optional(), accent: z.string().max(32).nullable().optional(), sortOrder: z.number().int().optional() }).parse(req.body);
-    return one(
+    const b = z.object({
+      name: listName.optional(),
+      accent: z.string().regex(HEX_COLOR).nullable().optional(),
+      sortOrder: z.number().int().optional(),
+      query: smartQuery.optional(),
+      shared: z.boolean().optional(),
+    }).safeParse(req.body ?? {});
+    if (!b.success) return reply.code(400).send({ error: 'bad_request' });
+    const list = await ownListFor(uid, (req.params as { id: string }).id);
+    if (!list) return reply.code(404).send({ error: 'not_found' });
+    // A list's kind is fixed when it is made: a hand-picked list has no search to change, and a smart one cannot be
+    // turned into a hand-picked list by sending no search.
+    if (b.data.query && kindOf(list) !== 'smart') return reply.code(400).send({ error: 'not_smart', message: 'Only a smart list has filters to change.' });
+    const row = await one<ListRow>(
       `UPDATE collections SET
          name = COALESCE($3, name),
          accent = COALESCE($4, accent),
-         sort_order = COALESCE($5, sort_order)
-       WHERE id = $1 AND user_id = $2 RETURNING id, name, accent, sort_order`,
-      [id, uid, body.name ?? null, body.accent ?? null, body.sortOrder ?? null],
+         sort_order = COALESCE($5, sort_order),
+         query = COALESCE($6::jsonb, query),
+         shared = COALESCE($7, shared)
+       WHERE id = $1 AND user_id = $2 RETURNING id, user_id, name, accent, sort_order, query, shared`,
+      [list.id, uid, b.data.name ?? null, b.data.accent ?? null, b.data.sortOrder ?? null,
+        b.data.query ? JSON.stringify(b.data.query) : null, b.data.shared ?? null],
     );
+    return listOut(row!, uid);
   });
 
-  app.delete('/api/collections/:id', async (req) => {
+  app.delete('/api/collections/:id', async (req, reply) => {
     const uid = userIdOf(req);
-    const { id } = req.params as { id: string };
-    await q('DELETE FROM collections WHERE id = $1 AND user_id = $2', [id, uid]);
+    const list = await ownListFor(uid, (req.params as { id: string }).id);
+    if (!list) return reply.code(404).send({ error: 'not_found' });
+    await q('DELETE FROM collections WHERE id = $1 AND user_id = $2', [list.id, uid]);
     return { ok: true };
   });
 
+  // One list and its series, for its owner or -- shared -- for anyone in the household. `limit` (1-200) caps the items, a
+  // Home rail asking for twelve; a smart list is capped at 200 without it, a hand-picked one is whole as it always was.
+  // `total` is how many there are in all for this viewer, so a capped smart list can say so.
   app.get('/api/collections/:id', async (req, reply) => {
     const uid = userIdOf(req);
     const { id } = req.params as { id: string };
-    const col = await one('SELECT id, name, accent, sort_order FROM collections WHERE id = $1 AND user_id = $2', [id, uid]);
-    if (!col) return reply.code(404).send({ error: 'not_found' });
-    const ids = (
-      await q<{ series_id: string }>('SELECT series_id FROM collection_items WHERE collection_id = $1 ORDER BY position', [id])
-    ).map((r) => r.series_id);
-    // A collection is a listing like any other, so a title in an 18+ library stays out of it while hidden.
-    // Nothing is removed from the collection itself -- reordering and membership are untouched.
-    const shown = await browsableIds(ids, vc(req));
-    const series = (await Promise.all(ids.filter((sid) => shown.has(sid)).map((sid) => komga.series(vc(req), sid).catch(() => null)))).filter(Boolean);
-    const items = await enrichSeries(req, series);
+    const raw = (req.query as { limit?: string }).limit;
+    const limit = raw === undefined ? undefined : Math.max(1, Math.min(200, Math.floor(Number(raw)) || 200));
+    const list = await listFor(uid, id);
+    if (!list) return reply.code(404).send({ error: 'not_found' });
+    const kind = kindOf(list);
+    const { items: found, total } = await listItems(list, vc(req), 0, kind === 'smart' ? (limit ?? 200) : limit);
+    // Someone else's shared list exists for a member only while it shows them something, as the listing has it.
+    if (list.user_id !== uid && total === 0) return reply.code(404).send({ error: 'not_found' });
+    const items = await enrichSeries(req, found);
     // The list's sorts (#164) order by two dates no series payload carries; they ride on these items alone. The items
     // stay in the list's own order: the web sorts them, a list being one request and never paged.
     const dates = await listDates(uid, items.map((s: any) => s.id));
     return {
-      ...col,
+      ...listOut(list, uid),
+      ...(list.user_id === uid ? {} : { owner: await ownerOf(list) }),
+      total,
       items: items.map((s: any) => ({ ...s, lastReadAt: dates.read.get(s.id) ?? null, latestChapterAt: dates.latest.get(s.id) ?? null })),
     };
   });
 
-  app.post('/api/collections/:id/items', async (req) => {
-    const uid = userIdOf(req);
-    const { id } = req.params as { id: string };
+  app.post('/api/collections/:id/items', async (req, reply) => {
     const { seriesId } = z.object({ seriesId: z.string().min(1) }).parse(req.body);
-    const owns = await one('SELECT id FROM collections WHERE id = $1 AND user_id = $2', [id, uid]);
-    if (!owns) return { ok: false };
+    const list = await pickedList(req, reply);
+    if (!list) return reply;
     // At the end of the list's own order, where the bulk add puts them. The column's default, 0, tied a series added
     // to a list someone had ordered by hand with its first entry -- and the list's own order is its default sort.
     await q(
       `INSERT INTO collection_items (collection_id, series_id, position)
        VALUES ($1, $2, COALESCE((SELECT max(position) + 1 FROM collection_items WHERE collection_id = $1), 0))
        ON CONFLICT DO NOTHING`,
-      [id, seriesId],
+      [list.id, seriesId],
     );
     return { ok: true };
   });
 
-  app.delete('/api/collections/:id/items/:seriesId', async (req) => {
-    const uid = userIdOf(req);
-    const { id, seriesId } = req.params as { id: string; seriesId: string };
-    const owns = await one('SELECT id FROM collections WHERE id = $1 AND user_id = $2', [id, uid]);
-    if (!owns) return { ok: false };
-    await q('DELETE FROM collection_items WHERE collection_id = $1 AND series_id = $2', [id, seriesId]);
+  app.delete('/api/collections/:id/items/:seriesId', async (req, reply) => {
+    const { seriesId } = req.params as { id: string; seriesId: string };
+    const list = await pickedList(req, reply);
+    if (!list) return reply;
+    await q('DELETE FROM collection_items WHERE collection_id = $1 AND series_id = $2', [list.id, seriesId]);
     return { ok: true };
   });
 
   // Reorder a collection: the full series-id list in its new order rewrites the positions.
-  app.put('/api/collections/:id/items', async (req) => {
-    const uid = userIdOf(req);
-    const { id } = req.params as { id: string };
+  app.put('/api/collections/:id/items', async (req, reply) => {
     const { seriesIds } = z.object({ seriesIds: z.array(z.string().min(1)).max(500) }).parse(req.body);
-    const owns = await one('SELECT id FROM collections WHERE id = $1 AND user_id = $2', [id, uid]);
-    if (!owns) return { ok: false };
+    const list = await pickedList(req, reply);
+    if (!list) return reply;
     for (let i = 0; i < seriesIds.length; i++)
-      await q('UPDATE collection_items SET position = $3 WHERE collection_id = $1 AND series_id = $2', [id, seriesIds[i], i]);
+      await q('UPDATE collection_items SET position = $3 WHERE collection_id = $1 AND series_id = $2', [list.id, seriesIds[i], i]);
     return { ok: true };
   });
 
@@ -496,10 +578,27 @@ export default async function personalRoutes(app: FastifyInstance) {
 
   app.get('/api/stats', async (req) => {
     const uid = userIdOf(req);
+    // When reading started, so a year picker can offer the years that exist rather than guessing a range.
+    // Null for an account that has never read anything, which is different from "started this year". `span` is the
+    // UTC days from that first day to today, both counted: what "All time" draws.
+    const first = await one<{ at: string | null; span: number | null }>(
+      `SELECT min(created_at) AS at,
+              ((now() AT TIME ZONE 'UTC')::date - (min(created_at) AT TIME ZONE 'UTC')::date + 1)::int AS span
+         FROM reading_events WHERE user_id = $1`,
+      [uid],
+    );
+    const firstRead = first?.at ?? null;
     // Clamped, not trusted: `days` sizes a generate_series, so an unbounded value is a way to ask the
     // database to materialise a few million rows. 400 covers "a year, plus the run-up" -- the widest thing
     // the heatmap draws -- and 7 is the narrowest window in which a week's shape is visible at all.
-    const windowDays = Math.max(7, Math.min(400, Math.floor(Number((req.query as Record<string, string>).days) || 90)));
+    // `days=all` (#265, CheetahDoesStuff: the Reading studio's "All time") is every day from the first read to today,
+    // dense like the others, within ALL_TIME_MAX_DAYS: ten years is still a bounded series, and the heatmap is all
+    // the Studio draws for it. Reintroduce the plain clamp ("all" reads as NaN, so 90): "All time" in
+    // statsShape.int.test.ts gets 90 days back.
+    const asked = (req.query as Record<string, string>).days;
+    const windowDays = asked === 'all'
+      ? Math.max(7, Math.min(ALL_TIME_MAX_DAYS, first?.span ?? 7))
+      : Math.max(7, Math.min(400, Math.floor(Number(asked) || 90)));
     const summary = (await one('SELECT chapters_completed, series_touched, total_events, last_read_at FROM reading_stats WHERE user_id = $1', [uid])) ?? {
       chapters_completed: 0,
       series_touched: 0,
@@ -526,8 +625,11 @@ export default async function personalRoutes(app: FastifyInstance) {
                 (now() AT TIME ZONE 'UTC')::date,
                 interval '1 day') AS d
          LEFT JOIN (
+           -- A chapter finished twice in a day is one chapter that day (#264): one read-through writes two completed
+           -- events (the page before the last already counts as the end, lib/progressRules.ts reachedEnd, and the last
+           -- page sends its own). A chapter read again on ANOTHER day lights that day too, as it does the streak below.
            SELECT date_trunc('day', created_at AT TIME ZONE 'UTC')::date AS day,
-                  count(*) FILTER (WHERE completed) AS chapters
+                  count(DISTINCT book_id) FILTER (WHERE completed) AS chapters
              FROM reading_events
             WHERE user_id = $1 AND created_at > now() - make_interval(days => $2)
             GROUP BY 1
@@ -542,12 +644,86 @@ export default async function personalRoutes(app: FastifyInstance) {
       )
     ).map((r) => r.d);
     const streaks = computeStreaks(days);
-    const weekChapters = (await one<{ c: number }>(`SELECT count(*)::int AS c FROM reading_events WHERE user_id = $1 AND completed = true AND created_at > now() - interval '7 days'`, [uid]))?.c ?? 0;
+    // The week's chapters (the weekly goal) and the window's (the Studio's count over its heatmap): each finished chapter
+    // once, as the household board counts its week (#264). The window's is not the sum of byDay, where a chapter read
+    // again on another day counts on both days. Reintroduce count(*): "a read-through counts once" in
+    // finishedOnce.int.test.ts finds five.
+    const counts = await one<{ week: number; in_window: number }>(
+      `SELECT count(DISTINCT book_id) FILTER (WHERE created_at > now() - interval '7 days')::int AS week,
+              count(DISTINCT book_id)::int AS in_window
+         FROM reading_events
+        WHERE user_id = $1 AND completed = true AND created_at > now() - make_interval(days => $2)`,
+      [uid, windowDays],
+    );
+    const weekChapters = counts?.week ?? 0;
     const settings = ((await one<{ data: any }>('SELECT data FROM app_settings WHERE user_id = $1', [uid]))?.data) ?? {};
-    // When reading started, so a year picker can offer the years that exist rather than guessing a range.
-    // Null for an account that has never read anything, which is different from "started this year".
-    const firstRead = (await one<{ at: string | null }>('SELECT min(created_at) AS at FROM reading_events WHERE user_id = $1', [uid]))?.at ?? null;
-    return { ...summary, days: windowDays, byDay, first_read_at: firstRead, currentStreak: streaks.current, longestStreak: streaks.longest, weekChapters, weeklyGoal: settings.weeklyGoal ?? 0 };
+    return { ...summary, days: windowDays, byDay, windowChapters: counts?.in_window ?? 0, first_read_at: firstRead, currentStreak: streaks.current, longestStreak: streaks.longest, weekChapters, weeklyGoal: settings.weeklyGoal ?? 0 };
+  });
+
+  /**
+   * v0.61.0, Reading time (lib/readingTime.ts): how long the signed-in reader has read, from their own page turns -- the
+   * last 7 and 30 days, this UTC year (the one /api/wrapped counts), and over the Reading Studio's window (`days`,
+   * 7-400, as /api/stats) the median time per finished chapter, the hours of the day in `tz` (an IANA name; UTC when it
+   * is not one) and the devices, by the names their own sessions gave. No user parameter: nobody reads another
+   * member's time, and the household leaderboard and the admin's member stats stay counts of chapters.
+   * Reintroduce another member's events: "the Studio's time: the reader's own, by window, hour and device" in
+   * readingTime.int.test.ts adds the other member's forty turns.
+   */
+  app.get('/api/stats/time', async (req) => {
+    const uid = userIdOf(req);
+    const qs = req.query as Record<string, string>;
+    const days = Math.max(7, Math.min(400, Math.floor(Number(qs.days) || 90)));
+    const tz = validTz(qs.tz);
+    const now = Date.now();
+    const year = new Date(now).getUTCFullYear();
+    const [ys, ye] = yearRange(year);
+    const win = lastDays(days, now);
+    const week = lastDays(7, now);
+    const month = lastDays(30, now);
+    const tl = await loadTimeline(uid, Math.min(win[0], month[0], ys), now + 1);
+    const hourOf = hourIn(tz);
+    const w = summarize(tl, win[0], win[1], hourOf);
+    const wk = summarize(tl, week[0], week[1], hourOf);
+    const mo = summarize(tl, month[0], month[1], hourOf);
+    const yr = summarize(tl, ys, ye, hourOf);
+    return {
+      tz, days,
+      week: { ms: wk.ms, chapters: wk.chapters },
+      month: { ms: mo.ms, chapters: mo.chapters },
+      year: { year, ms: yr.ms, chapters: yr.chapters },
+      window: { ms: w.ms, chapters: w.chapters, perChapterMs: w.perChapterMs, byHour: w.byHour, byDevice: await devicesOf(uid, w.byDevice) },
+    };
+  });
+
+  /**
+   * Profile → Insights (lib/readingInsights.ts, from @Squeaks72's #249): the best day and week, and one row per browsable
+   * series the reader has a recorded read in -- its chapters, how many they have finished, when they last read it and
+   * what they finished of it lately. Own reading only, each chapter once; 18+ series follow the request's Show 18+ switch;
+   * incognito reads are not in reading_events, so they are in none of it. Reintroduce `WHERE true` for browsable():
+   * "a hidden 18+ series never appears" in readingInsights.int.test.ts lists it.
+   */
+  app.get('/api/stats/insights', async (req) => insightsFor(userIdOf(req), vc(req)));
+
+  /**
+   * v0.61.0: this reader's pace through a series, for its page's "Catch up in ~2 hr" -- the median time of the chapters
+   * of it they finished in the last year when there are three or more (`from: 'series'`), else their median over every
+   * series in the last 90 days (`'all'`), else none. A series they may not open is not found, as its page is not.
+   * Reintroduce the lookup by id alone: "the reading pace of a series: its own, else the reader's overall, else none;
+   * 404 where it may not be seen" in readingTime.int.test.ts answers 200 for a library this account was not given.
+   */
+  app.get('/api/series/:id/reading-pace', async (req, reply) => {
+    const { id } = req.params as { id: string };
+    const seen = await komga.series(vc(req), id).catch(() => null);
+    if (!seen) return reply.code(404).send({ error: 'not_found' });
+    const now = Date.now();
+    const year = lastDays(365, now);
+    const quarter = lastDays(90, now);
+    const tl = await loadTimeline(userIdOf(req), year[0], now + 1);
+    const noHours = () => 0;
+    const own = summarize(tl, year[0], year[1], noHours, id).perChapterMs;
+    if (own != null) return { perChapterMs: own, from: 'series' as const };
+    const all = summarize(tl, quarter[0], quarter[1], noHours).perChapterMs;
+    return all != null ? { perChapterMs: all, from: 'all' as const } : { perChapterMs: null, from: null };
   });
 
   app.get('/api/wrapped', async (req) => {
@@ -564,12 +740,19 @@ export default async function personalRoutes(app: FastifyInstance) {
     //
     // A half-open range rather than a function on the column, so the index on (user_id, created_at) is
     // usable; `extract(...)` was not sargable and scanned every event the account ever had.
+    //
+    // Each chapter once, on the day it was first finished that year (#264): one read-through writes two completed
+    // events (the page before the last already counts as the end, lib/progressRules.ts reachedEnd), and a re-read or
+    // an outbox replay writes more, so "69 chapters" was 40. The months, weekdays, days and top series below are
+    // built from these rows, so they add up to `chapters`. Reintroduce the plain SELECT: "a read-through counts once"
+    // in finishedOnce.int.test.ts finds five.
     const rows = await q<{ series_id: string; created_at: string }>(
-      `SELECT series_id, created_at
+      `SELECT DISTINCT ON (book_id) series_id, created_at
          FROM reading_events
         WHERE user_id = $1 AND completed = true
           AND created_at >= make_timestamptz($2, 1, 1, 0, 0, 0, 'UTC')
-          AND created_at <  make_timestamptz($3, 1, 1, 0, 0, 0, 'UTC')`,
+          AND created_at <  make_timestamptz($3, 1, 1, 0, 0, 0, 'UTC')
+        ORDER BY book_id, created_at, id`,
       [uid, year, year + 1],
     );
     const seriesCounts: Record<string, number> = {};
@@ -617,8 +800,19 @@ export default async function personalRoutes(app: FastifyInstance) {
     const genreCounts: Record<string, number> = {};
     for (const s of pool) for (const g of s.genres) genreCounts[g] = (genreCounts[g] ?? 0) + (seriesCounts[s.id] ?? 0);
     const rankedGenres = Object.entries(genreCounts).sort((a, b) => b[1] - a[1]).slice(0, 5);
+    // v0.61.0: the year's reading time from page turns (lib/readingTime.ts), its pace per chapter and its hours of the
+    // day in the reader's `tz` -- the same timeline and the same year the Reading Studio's year tile reads, so the two
+    // never disagree. Reintroduce a different year (say the last 365 days): "the Studio's year is Wrapped's, to the
+    // millisecond" in readingTime.int.test.ts finds two figures.
+    const tz = validTz((req.query as Record<string, string>).tz);
+    const [ys, ye] = yearRange(year);
+    const time = summarize(await loadTimeline(uid, ys, ye), ys, ye, hourIn(tz));
     return {
       year,
+      tz,
+      ms: time.ms,
+      perChapterMs: time.perChapterMs,
+      byHour: time.byHour,
       chapters: rows.length,
       series: Object.keys(seriesCounts).length,
       topSeries: topSeries.map((s) => ({ id: s.id, title: s.title, count: s.count })),
@@ -715,12 +909,12 @@ export default async function personalRoutes(app: FastifyInstance) {
   });
 
   app.post('/api/collections/:id/items/bulk', async (req, reply) => {
-    const { id } = req.params as { id: string };
     const b = bulkBody.safeParse(req.body);
     if (!b.success) return reply.code(400).send({ error: 'bad_request' });
-    const uid = userIdOf(req);
-    const owns = await one('SELECT id FROM collections WHERE id = $1 AND user_id = $2', [id, uid]);
-    if (!owns) return reply.code(404).send({ error: 'not_found' });
+    // The owner's hand-picked list only (v0.61.0): 404 for anyone else's, 409 for a smart list.
+    const list = await pickedList(req, reply);
+    if (!list) return reply;
+    const id = list.id;
     const live = await liveSeries(b.data.seriesIds, vc(req));
     await q(
       `INSERT INTO collection_items (collection_id, series_id, position)
@@ -781,10 +975,19 @@ export default async function personalRoutes(app: FastifyInstance) {
 
   // Connect by pasting a token, for any provider. This is the honest, dependency-free path: a full OAuth
   // dance would make every self-hoster register an application with each service and keep its secret in
-  // their compose file, which is a worse trade for a household app than copying a token once.
+  // their compose file, which is a worse trade for a household app than copying a token once. Since v0.61.0
+  // AniList's token comes from the project's own public client, whose page shows it to copy -- still a paste,
+  // with no secret anywhere (trackerProviders.ts ANILIST_CLIENT_ID).
   //
   // The token is verified against the service before it is stored, so a typo fails here with the service's
   // own answer rather than silently at 3am when the first chapter tries to sync.
+  //
+  // Only the service's verdict on the token is a 400 `rejected` (v0.61.0, #190). Every failure used to be, so a DNS
+  // failure, Cloudflare's 403 in front of AniList or an outage all read "AniList did not accept that token" and sent
+  // the person back for a new one. No answer at all is a 502 `tracker_unreachable`; an answer that refused the request
+  // for another reason is a 502 `tracker_refused` with the service's `status` (lib/trackerProviders.ts verdictOf).
+  // Reintroduce by answering 400 `rejected` in the catch again: "connect: a network throw is 502 tracker_unreachable"
+  // in trackerVerdicts.int.test.ts fails.
   const connectTracker = async (provider: Provider, req: any, reply: any) => {
     const b = z.object({ token: z.string().min(10).max(4000) }).safeParse(req.body);
     const adapter = ADAPTERS[provider];
@@ -792,7 +995,18 @@ export default async function personalRoutes(app: FastifyInstance) {
     let who;
     try {
       who = await whoAmI(b.data.token.trim(), provider);
-    } catch {
+    } catch (e) {
+      const v = verdictOf(e);
+      if (v.verdict !== 'rejected') req.log.warn({ provider, verdict: v.verdict, status: v.status, err: (e as Error)?.message }, 'tracker connect: the token could not be checked');
+      if (v.verdict === 'unreachable') {
+        return reply.code(502).send({ error: 'tracker_unreachable', message: `Could not reach ${adapter.label}. Try again in a moment.` });
+      }
+      if (v.verdict === 'refused') {
+        return reply.code(502).send({
+          error: 'tracker_refused', ...(v.status ? { status: v.status } : {}),
+          message: `${adapter.label} refused the request${v.status ? ` (HTTP ${v.status})` : ''}. That is not about the token; try again later.`,
+        });
+      }
       return reply.code(400).send({ error: 'rejected', message: `${adapter.label} did not accept that token.` });
     }
     if (!who) return reply.code(400).send({ error: 'rejected', message: `${adapter.label} did not accept that token.` });
@@ -810,6 +1024,27 @@ export default async function personalRoutes(app: FastifyInstance) {
     const { provider } = req.params as { provider: string };
     if (!isProvider(provider)) return reply.code(404).send({ error: 'unknown_provider' });
     return connectTracker(provider, req, reply);
+  });
+
+  // Test connection (v0.61.0, #190): does the saved token still work? One call to the service (lib/trackers.ts
+  // testConnection), always a 200 that says which -- `connected` with the account, or `rejected`, `unreachable`,
+  // `refused` (+ `status`), `expired`, `not_connected` -- and nothing is written. Six a minute per account: each one is
+  // a request to someone else's service. `hook: 'preHandler'` puts the limiter after authenticate, so the key is the
+  // account (the notify-target Test's pattern). Reintroduce by dropping the rateLimit config: "the seventh test in a
+  // minute is a 429" in trackerVerdicts.int.test.ts sees a 200.
+  app.post('/api/trackers/:provider/test', {
+    config: {
+      rateLimit: {
+        max: 6,
+        timeWindow: '1 minute',
+        hook: 'preHandler',
+        keyGenerator: (req) => `tracker-test:${userIdOf(req)}`,
+      },
+    },
+  }, async (req, reply) => {
+    const { provider } = req.params as { provider: string };
+    if (!isProvider(provider)) return reply.code(404).send({ error: 'unknown_provider' });
+    return testConnection(userIdOf(req), provider);
   });
 
   app.delete('/api/trackers/:provider', async (req) => {
@@ -848,7 +1083,9 @@ export default async function personalRoutes(app: FastifyInstance) {
     if (!isProvider(provider)) return reply.code(404).send({ error: 'unknown_provider' });
     const uid = userIdOf(req);
     await clearTrackerFloor(uid, seriesId, provider);
-    await pushSeriesProgress(uid, seriesId).catch(() => {});
+    // `lower`: since v0.61.2 a push sends nothing to a service already at or past this chapter (pushStatus), and this
+    // route is the one place a lower number is the point. Only for the provider asked about.
+    await pushSeriesProgress(uid, seriesId, { lower: provider }).catch(() => {});
     return { ok: true };
   });
 
@@ -869,12 +1106,46 @@ export default async function personalRoutes(app: FastifyInstance) {
     // Without this boundary an arbitrary sort leaks into the catalogue query, and a forged collection id can
     // make Home disclose whether another account owns it.
     if ('librarySort' in data) {
-      const sort = z.enum(['updated', 'new', 'az', 'unread']).safeParse(data.librarySort);
+      // v0.58.0: Most popular, Top rated, My rating, Most chapters and Recently read (web/components/LibraryFilters.tsx).
+      // v0.61.0: Releasing soon (`soon`, the release radar's estimate; web/lib/librarySort.ts).
+      const sort = z.enum(['updated', 'new', 'az', 'unread', 'popular', 'score', 'rating', 'chapters', 'read', 'soon']).safeParse(data.librarySort);
       if (!sort.success) return reply.code(400).send({ error: 'bad_settings', message: 'Choose a valid Library sort.' });
       data.librarySort = sort.data;
     }
+    // v0.60.0: the Library's sort order, High to low or Low to high (web/components/LibraryToolbar.tsx); null goes back to
+    // the sort's own direction. It reaches the catalogue query as `field,asc|desc`, so only these. Reintroduce by
+    // accepting anything: "a sort order other than asc or desc" in settingsV558.int.test.ts saves it.
+    if ('librarySortDir' in data && data.librarySortDir !== null) {
+      const dir = z.enum(['asc', 'desc']).safeParse(data.librarySortDir);
+      if (!dir.success) return reply.code(400).send({ error: 'bad_settings', message: 'Choose High to low or Low to high.' });
+      data.librarySortDir = dir.data;
+    }
+    // v0.69.1: the avatar is painted for other members (web/components/Avatar.tsx), its colour into an inline background,
+    // where a stored `url(https://…)` made every viewer's browser fetch a URL the member chose. A hex colour and a short
+    // emoji, or nothing. Reintroduce by accepting any object: "an avatar colour must be a hex colour" in
+    // settingsV558.int.test.ts saves a url().
+    if ('avatar' in data && data.avatar !== null) {
+      const av = z.object({ emoji: z.string().max(16).optional(), color: z.string().regex(HEX_COLOR).optional() }).safeParse(data.avatar); // unknown keys are dropped
+      if (!av.success) return reply.code(400).send({ error: 'bad_settings', message: 'An avatar is an emoji and a colour.' });
+      data.avatar = av.data;
+    }
+    if ('accent' in data && data.accent !== null && !(typeof data.accent === 'string' && HEX_COLOR.test(data.accent))) {
+      return reply.code(400).send({ error: 'bad_settings', message: 'Choose a colour.' });
+    }
     if ('showAllChapters' in data && typeof data.showAllChapters !== 'boolean') {
       return reply.code(400).send({ error: 'bad_settings', message: 'Show all chapters must be on or off.' });
+    }
+    // v0.61.0, Incognito reading (lib/incognito.ts): the whole account's, read by the server on every progress write and
+    // tracker push, so only a real boolean. Reintroduce by accepting anything: "Incognito must be on or off" in
+    // incognito.int.test.ts saves "yes".
+    if ('incognito' in data && typeof data.incognito !== 'boolean') {
+      return reply.code(400).send({ error: 'bad_settings', message: 'Incognito reading must be on or off.' });
+    }
+    // v0.68.0, #223: whether a series this account adds goes on its trackers as Plan to Read (lib/trackers.ts
+    // planSeriesOnAdd), read by the server at every add, so only a real boolean. Reintroduce by accepting anything:
+    // "Plan to read on add must be on or off" in planOnAdd.int.test.ts saves "yes".
+    if ('trackerPlanOnAdd' in data && typeof data.trackerPlanOnAdd !== 'boolean') {
+      return reply.code(400).send({ error: 'bad_settings', message: 'Plan to read on add must be on or off.' });
     }
     if ('homeCollections' in data) {
       const parsed = z.array(z.string().min(1).max(64)).max(30).safeParse(data.homeCollections);
@@ -882,8 +1153,15 @@ export default async function personalRoutes(app: FastifyInstance) {
       const ids = [...new Set(parsed.data)];
       if (ids.length > 3) return reply.code(400).send({ error: 'bad_settings', message: 'Choose up to three lists for Home.' });
       if (ids.length) {
-        const owned = await q<{ id: string }>('SELECT id FROM collections WHERE user_id = $1 AND id = ANY($2)', [uid, ids]);
-        if (owned.length !== ids.length) {
+        // The caller's own lists, or one shared with the household (v0.61.0) -- never another member's private list,
+        // which would let Home say whether an id exists. A malformed id is no list, not a uuid cast error. Reintroduce by
+        // dropping `user_id = $1 OR`: "Home's lists take a shared list and refuse another member's private one" in
+        // lists.int.test.ts saves the private id.
+        const uuids = ids.filter((id) => /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id));
+        const readable = uuids.length === ids.length
+          ? await q<{ id: string }>('SELECT id FROM collections WHERE (user_id = $1 OR shared) AND id = ANY($2::uuid[])', [uid, ids])
+          : [];
+        if (readable.length !== ids.length) {
           return reply.code(400).send({ error: 'bad_settings', message: 'One of those lists is no longer available.' });
         }
       }

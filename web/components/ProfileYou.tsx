@@ -1,5 +1,6 @@
 'use client';
 import { useState } from 'react';
+import { useReducedMotion } from 'framer-motion';
 import Link from 'next/link';
 import { useQuery } from '@tanstack/react-query';
 import { api } from '@/lib/api';
@@ -7,8 +8,14 @@ import { IcChevronRight } from '@/components/icons';
 import { Heatmap } from '@/components/charts/Heatmap';
 import { Pace } from '@/components/charts/Pace';
 import { Bars } from '@/components/charts/Bars';
+import { Columns } from '@/components/charts/Columns';
 import { t as tr, keys } from '@/lib/i18n';
-import { bookCountText } from '@/lib/format';
+import { bookCountText, dayText } from '@/lib/format';
+import { hoursText, perChapterText, readerTz } from '@/lib/readingTime';
+import { shownDeviceName } from '@/lib/device';
+import { BADGES, badgeCaption, badgeEarned, badgeHave, lockedBadges } from '@/lib/badges';
+import { useReduceEffects } from '@/lib/effects';
+import { BadgeEmblem } from '@/components/BadgeEmblem';
 
 /**
  * The You tab of the profile: what you have earned, what you have read, and your lists.
@@ -29,6 +36,8 @@ export interface Stats {
   series_touched: number;
   last_read_at: string | null;
   byDay: { day: string; chapters: number }[];
+  /** The window's finished chapters, each once (#264): not the sum of byDay, where a chapter read again on another day counts twice. */
+  windowChapters?: number;
   currentStreak: number;
   longestStreak: number;
   weekChapters: number;
@@ -36,16 +45,28 @@ export interface Stats {
 }
 interface CollectionRow { id: string; name: string; item_count: number }
 
-// Rendered as `tr(b.label)`, so the labels are declared. See lib/i18n.ts.
-const BADGE_LABELS = keys('Reader', 'Bookworm', 'On a roll', 'Centurion', 'Devoted', 'Legend');
-export const BADGES = [
-  { emoji: '📖', label: BADGE_LABELS[0], test: (s: Stats) => s.chapters_completed >= 10 },
-  { emoji: '🐛', label: BADGE_LABELS[1], test: (s: Stats) => s.chapters_completed >= 50 },
-  { emoji: '🔥', label: BADGE_LABELS[2], test: (s: Stats) => s.longestStreak >= 7 },
-  { emoji: '💯', label: BADGE_LABELS[3], test: (s: Stats) => s.chapters_completed >= 100 },
-  { emoji: '🌙', label: BADGE_LABELS[4], test: (s: Stats) => s.longestStreak >= 30 },
-  { emoji: '👑', label: BADGE_LABELS[5], test: (s: Stats) => s.chapters_completed >= 500 },
-];
+/** GET /api/stats/time (v0.61.0): reading time from page turns, the reader's own (bff lib/readingTime.ts). */
+export interface ReadingTime {
+  tz: string;
+  days: number;
+  week: { ms: number; chapters: number };
+  month: { ms: number; chapters: number };
+  year: { year: number; ms: number; chapters: number };
+  window: { ms: number; chapters: number; perChapterMs: number | null; byHour: number[]; byDevice: { name: string | null; ms: number }[] };
+}
+
+/**
+ * The devices' rows: each name as the session list says it, unnamed ones as "Device" -- one row per name shown, since
+ * two devices the server could not name read the same and a list of two "Device" rows says nothing.
+ */
+export function deviceRows(list: ReadingTime['window']['byDevice']): { label: string; value: number; hint: string }[] {
+  const by = new Map<string, number>();
+  for (const d of list) {
+    const label = shownDeviceName(d.name, { device: true }) || tr('Device');
+    by.set(label, (by.get(label) ?? 0) + d.ms);
+  }
+  return [...by].sort((a, b) => b[1] - a[1]).map(([label, ms]) => ({ label, value: ms, hint: hoursText(ms) }));
+}
 
 /* ================================== You ================================== */
 
@@ -53,33 +74,69 @@ export const BADGES = [
  * What you have earned, plus the single next thing.
  *
  * It used to render all six at once with five of them greyed out, which is a wall of things you have not
- * done sitting on your own profile.
+ * done sitting on your own profile. The rest stay behind Show locked (#267), off until asked for, nearest first.
+ *
+ * Every badge is a key that says what it takes (#267): hover, focus or a tap puts its caption in the line under the
+ * row, which otherwise says what the next badge takes -- a phone has no hover, so a tooltip alone would tell it nothing.
+ * Squared, as the badges are statuses, not filters (web/test/noPills.test.ts). Since v0.75.0 each key is the badge's
+ * drawn emblem (components/BadgeEmblem.tsx, the owner's approved design) at 56 px over its name, and its progress while
+ * it is locked; the emblems' sheen and Legend's halo move only while both motion switches allow it.
  */
 export function BadgesCard({ stats, span = '' }: { stats?: Stats; span?: string }) {
+  const [showLocked, setShowLocked] = useState(false);
+  // The badge whose caption shows: the one hovered, else the one tapped or focused, else the next.
+  const [hovered, setHovered] = useState<string | null>(null);
+  const [picked, setPicked] = useState<string | null>(null);
+  // Both of the app's motion gates, read here and handed to every emblem: Reduce effects, and the system's reduced motion.
+  const still = useReduceEffects() || !!useReducedMotion();
   if (!stats) return <div className={`card skeleton h-32 ${span}`} />;
-  const earned = BADGES.filter((b) => b.test(stats));
-  const next = BADGES.find((b) => !b.test(stats));
+  const earned = BADGES.filter((b) => badgeEarned(b, stats));
+  const locked = lockedBadges(stats);
+  const next = locked[0];
+  const shown = showLocked ? [...earned, ...locked] : next ? [...earned, next] : earned;
+  const about = shown.find((b) => b.label === (hovered ?? picked)) ?? null;
+  const caption = about
+    ? `${tr(about.label)} · ${badgeCaption(about, stats)}`
+    : next ? `${tr('Next: {badge}', { badge: tr(next.label) })} · ${badgeCaption(next, stats)}` : tr('Every badge earned');
   return (
     <div id="badges" className={`${CARD} scroll-mt-4 lg:scroll-mt-20 ${span}`}>
-      <h2 className="mb-3 font-display text-base font-semibold">{tr('Badges')}</h2>
-      <div className="flex flex-wrap gap-2">
-        {earned.map((b) => (
-          <span key={b.label} className="inline-flex items-center gap-1.5 rounded-full border border-accent/40 bg-accent-soft px-3 py-1.5 text-xs text-fog-100">
-            <span>{b.emoji}</span>{tr(b.label)}
-          </span>
-        ))}
-        {next && (
-          <span key={next.label} className="inline-flex items-center gap-1.5 rounded-full border border-ink-700 px-3 py-1.5 text-xs text-ink-500 opacity-60">
-            <span>{next.emoji}</span>{tr(next.label)}
-          </span>
+      <div className="mb-3 flex items-center justify-between gap-2">
+        <h2 className="font-display text-base font-semibold">{tr('Badges')}</h2>
+        {locked.length > 1 && (
+          <button type="button" onClick={() => setShowLocked((v) => !v)} aria-pressed={showLocked} data-badges-locked
+            className={`btn-key h-7 px-2.5 text-[11px] ${showLocked ? 'btn-key-accent' : 'text-fog-400'}`}>
+            {tr('Show locked')}
+          </button>
         )}
       </div>
+      <div className="flex flex-wrap gap-x-2.5 gap-y-3.5"
+        onBlur={(e) => { if (!e.currentTarget.contains(e.relatedTarget as Node | null)) setPicked(null); }}>
+        {shown.map((b, i) => {
+          const got = badgeEarned(b, stats);
+          // The badge the caption is about is lit: its key takes the ink a hover gives it.
+          const on = about === b;
+          return (
+            <button key={b.label} type="button" data-badge={b.label} data-earned={got ? '' : undefined}
+              title={badgeCaption(b, stats)}
+              onClick={() => setPicked(b.label)} onFocus={() => setPicked(b.label)}
+              onMouseEnter={() => setHovered(b.label)} onMouseLeave={() => setHovered(null)}
+              className={`grid w-[76px] justify-items-center gap-1.5 rounded-[14px] border px-1 pb-1.5 pt-2 transition ${
+                on ? 'border-ink-700 bg-ink-800' : 'border-transparent hover:border-ink-700 hover:bg-ink-800'}`}>
+              <BadgeEmblem badge={b} earned={got} have={badgeHave(b, stats)} size={56} still={still} delay={2 + i * 0.9} />
+              <span className={`text-center text-[11px] leading-tight ${got ? 'text-fog-100' : 'text-fog-400'}`}>{tr(b.label)}</span>
+              {!got && <span className="-mt-1 text-[10px] tabular-nums text-fog-500">{badgeHave(b, stats)}/{b.goal}</span>}
+            </button>
+          );
+        })}
+      </div>
+      <p data-badge-caption className="mt-3.5 text-xs text-fog-400">{caption}</p>
     </div>
   );
 }
 
 export function ListsCard({ span = '' }: { span?: string }) {
-  const { data } = useQuery({ queryKey: ['collections'], queryFn: () => api<{ content: CollectionRow[] }>('/api/collections'), staleTime: 300_000 });
+  // v0.61.0: every list this reader may read, smart and shared ones too, each counted for them (lib/lists.ts).
+  const { data } = useQuery({ queryKey: ['lists-all'], queryFn: () => api<{ content: CollectionRow[] }>('/api/collections?scope=all'), staleTime: 60_000 });
   const rows = data?.content ?? [];
   return (
     <div className={`${CARD} ${span}`}>
@@ -95,7 +152,7 @@ export function ListsCard({ span = '' }: { span?: string }) {
           ))}
         </div>
       ) : (
-        <p className="text-xs text-fog-500">{tr('No collections yet')}</p>
+        <p className="text-xs text-fog-500">{tr('No lists yet')}</p>
       )}
       <Link href="/collections/" className="chip mt-3 text-xs">{tr('See all')}<IcChevronRight width={14} height={14} aria-hidden className="rtl:-scale-x-100" /></Link>
     </div>
@@ -110,11 +167,23 @@ export function ListsCard({ span = '' }: { span?: string }) {
  * dense daily series and simply had nowhere to be drawn at more than 90 days.
  */
 export function StudioCard({ span = '' }: { span?: string }) {
-  const [days, setDays] = useState(90);
+  // #265 (CheetahDoesStuff): "All time" is every day since the first read -- the heatmap alone, in a strip that scrolls
+  // sideways and opens on the newest weeks. The other panels are built around 7-400 days (medians, a pace line, hours
+  // over the window), so it asks /api/stats for the strip and nothing else.
+  const [days, setDays] = useState<number | 'all'>(90);
+  const all = days === 'all';
   const { data, isLoading } = useQuery({
     queryKey: ['stats', days],
     queryFn: () => api<Stats>(`/api/stats?days=${days}`),
   });
+  // v0.61.0: reading time over the same window, plus the week, the month and the year (bff lib/readingTime.ts).
+  const tz = readerTz();
+  const { data: time } = useQuery({
+    queryKey: ['stats-time', days, tz],
+    queryFn: () => api<ReadingTime>(`/api/stats/time?days=${days}&tz=${encodeURIComponent(tz)}`),
+    enabled: !all,
+  });
+  const devices = deviceRows(time?.window.byDevice ?? []);
 
   const series = data?.byDay ?? [];
   const counts = series.map((d) => d.chapters);
@@ -136,11 +205,11 @@ export function StudioCard({ span = '' }: { span?: string }) {
     <div id="reading-studio" className={`${CARD} scroll-mt-4 lg:scroll-mt-20 ${span}`}>
       <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
         <h2 className="font-display text-base font-semibold">{tr('Reading studio')}</h2>
-        <div className="flex gap-1.5">
-          {[90, 180, 365].map((d) => (
-            <button key={d} onClick={() => setDays(d)} aria-pressed={days === d}
+        <div className="flex flex-wrap gap-1.5">
+          {([90, 180, 365, 'all'] as const).map((d) => (
+            <button key={d} onClick={() => setDays(d)} aria-pressed={days === d} data-studio-range={d}
               className={`chip text-[11px] ${days === d ? 'border-accent/50 text-accent' : 'text-fog-400'}`}>
-              {tr('{n} days', { n: d })}
+              {d === 'all' ? tr('All time') : tr('{n} days', { n: d })}
             </button>
           ))}
         </div>
@@ -148,11 +217,43 @@ export function StudioCard({ span = '' }: { span?: string }) {
 
       {total === 0 ? (
         <p className="py-6 text-center text-sm text-fog-500">{tr('Nothing read in this window yet.')}</p>
+      ) : all ? (
+        <div data-studio-all>
+          <p className="mb-1.5 text-[11px] uppercase tracking-widest text-fog-500">
+            {bookCountText(data?.windowChapters ?? total)}
+            {/* The first read, or where a strip of more than ten years begins (it is cut there). */}
+            {data?.first_read_at && series.length > 0
+              && ` · ${tr('since {date}', { date: dayText(Math.max(Date.parse(data.first_read_at), Date.parse(series[0].day)), true) })}`}
+          </p>
+          {series.length > 0 && <Heatmap values={counts} start={series[0].day} scroll />}
+        </div>
       ) : (
         <div className="space-y-5">
+          {/* v0.61.0: how long, in three squared tiles -- the last week, the last month and the year (Wrapped's) -- then
+              the pace per chapter and what the figures are built on. Static: nothing counts up. */}
+          {time && (
+            <div data-studio-time>
+              <p className="mb-1.5 text-[11px] uppercase tracking-widest text-fog-500">{tr('Reading time')}</p>
+              <div className="grid grid-cols-3 gap-2">
+                {[
+                  { label: tr('Last 7 days'), ...time.week },
+                  { label: tr('Last 30 days'), ...time.month },
+                  { label: String(time.year.year), ...time.year },
+                ].map((tile) => (
+                  <div key={tile.label} className="min-w-0 rounded-xl border border-ink-700/70 bg-ink-850/50 px-2.5 py-2">
+                    <p className="truncate text-[10px] text-fog-500">{tile.label}</p>
+                    <p className="truncate font-display text-base font-semibold tabular-nums text-fog-100">{hoursText(tile.ms)}</p>
+                    <p className="truncate text-[10px] text-fog-500">{bookCountText(tile.chapters)}</p>
+                  </div>
+                ))}
+              </div>
+              {perChapterText(time.window.perChapterMs) && <p className="mt-2 text-xs text-fog-300">{perChapterText(time.window.perChapterMs)}</p>}
+              <p className="mt-0.5 text-[11px] text-fog-500">{tr('Counted from page turns; long pauses are left out.')}</p>
+            </div>
+          )}
           <div>
             <p className="mb-1.5 text-[11px] uppercase tracking-widest text-fog-500">
-              {bookCountText(total)}
+              {bookCountText(data?.windowChapters ?? total)}
             </p>
             {series.length > 0 && <Heatmap values={counts} start={series[0].day} />}
           </div>
@@ -164,6 +265,19 @@ export function StudioCard({ span = '' }: { span?: string }) {
             <p className="mb-2 text-[11px] uppercase tracking-widest text-fog-500">{tr('By weekday')}</p>
             <Bars items={dow.map((v, i) => ({ label: tr(DOW[i]), value: v }))} />
           </div>
+          {/* v0.61.0: when in the day, in the reader's own hours, and on which devices. */}
+          {!!time?.window.byHour.some((v) => v > 0) && (
+            <div data-studio-hours>
+              <p className="mb-2 text-[11px] uppercase tracking-widest text-fog-500">{tr('By hour')}</p>
+              <Columns values={time.window.byHour} />
+            </div>
+          )}
+          {devices.length > 0 && (
+            <div data-studio-devices>
+              <p className="mb-2 text-[11px] uppercase tracking-widest text-fog-500">{tr('Devices')}</p>
+              <Bars items={devices} wideHint />
+            </div>
+          )}
         </div>
       )}
     </div>

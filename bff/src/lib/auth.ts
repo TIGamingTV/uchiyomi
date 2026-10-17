@@ -1,5 +1,5 @@
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
-import type { FastifyReply, FastifyRequest } from 'fastify';
+import type { FastifyReply, FastifyRequest, FastifyServerOptions } from 'fastify';
 import { q, one } from './db';
 import { env } from '../env';
 import { isDesktop } from './desktop';
@@ -382,11 +382,22 @@ export function passwordError(pw: string): string | null {
   return !pw || pw.length < PASSWORD_MIN ? `Password must be at least ${PASSWORD_MIN} characters.` : null;
 }
 
-/** Bump the failed-login counter; lock the account once it crosses the threshold. Returns whether now locked. */
+/**
+ * Bump the failed-login counter; lock the account once it crosses the threshold. Returns whether now locked.
+ *
+ * A lock that has run out ends its count too (v0.77.1): the first failure after it counts as one, not as the sixth, so
+ * the account locks again only after MAX_FAILED more. Every column below reads the row as it was before this update, in
+ * one statement, so failures racing each other still each count. Reintroduce by dropping the `locked_until <= now()`
+ * cases: "a failure after a lock has run out counts from one" in accountLock.int.test.ts is locked again at once.
+ */
 export async function recordFailedLogin(userId: string): Promise<boolean> {
   const row = await one<{ failed_logins: number }>(
-    `UPDATE users SET failed_logins = failed_logins + 1,
-       locked_until = CASE WHEN failed_logins + 1 >= $2 THEN now() + make_interval(mins => $3) ELSE locked_until END
+    `UPDATE users SET
+       failed_logins = CASE WHEN locked_until <= now() THEN 1 ELSE failed_logins + 1 END,
+       locked_until = CASE
+         WHEN (CASE WHEN locked_until <= now() THEN 1 ELSE failed_logins + 1 END) >= $2 THEN now() + make_interval(mins => $3)
+         WHEN locked_until <= now() THEN NULL
+         ELSE locked_until END
      WHERE id = $1 RETURNING failed_logins`,
     [userId, MAX_FAILED, LOCK_MINUTES],
   );
@@ -394,6 +405,18 @@ export async function recordFailedLogin(userId: string): Promise<boolean> {
 }
 export const resetFailedLogins = (userId: string) =>
   q('UPDATE users SET failed_logins = 0, locked_until = NULL WHERE id = $1', [userId]);
+
+/**
+ * Spend a two-factor code's step (lib/totp.ts totpStep): true when it is later than the last step this account used,
+ * which it then becomes, in the one statement, so two sign-ins racing with one code get one session. A code is good
+ * once (RFC 6238 section 5.2); the ±1 step drift window had made each one good for about a minute and a half.
+ * Reintroduce by accepting any matching step: "a code signs in once" in totpReplay.int.test.ts signs in twice.
+ */
+export const spendTotpStep = async (userId: string, step: number): Promise<boolean> =>
+  !!(await one(
+    'UPDATE users SET totp_last_step = $2 WHERE id = $1 AND (totp_last_step IS NULL OR totp_last_step < $2) RETURNING id',
+    [userId, step],
+  ));
 
 /** Returns the unlock time if the account is currently locked, else null. */
 export function lockedUntil(user: { locked_until?: string | Date | null }): Date | null {
@@ -415,14 +438,22 @@ export const revokeAllSessions = (userId: string, exceptId?: string) =>
     exceptId ? [userId, exceptId] : [userId]);
 
 /**
- * Client IP from the proxy chain.
+ * Client IP, as Fastify resolved it under `trustProxy` (server.ts, env.TRUST_PROXY).
  *
- * ⚠️ This reads X-Forwarded-For whatever `trustProxy` is set to. On the desktop app nothing sits in front of the
- * server, so a forwarded-for header there is only ever one a local process invented, and it is ignored.
+ * This used to read the first X-Forwarded-For entry whatever `trustProxy` said, and the first entry is the one a
+ * client writes itself -- a proxy appends to the header, it does not replace it. `req.ip` walks the chain from the
+ * socket back through the trusted proxies only, so it is the address the nearest untrusted hop connected from.
  */
 export function clientIp(req: FastifyRequest): string | null {
-  const xff = isDesktop() ? '' : (req.headers['x-forwarded-for'] as string) || '';
-  return (xff.split(',')[0].trim() || req.ip || '').slice(0, 64) || null;
+  return (req.ip || '').slice(0, 64) || null;
+}
+
+/** env.TRUST_PROXY as Fastify's `trustProxy` option: true, false, or the address list as written. */
+export function trustProxySetting(raw: string): FastifyServerOptions['trustProxy'] {
+  const v = raw.trim().toLowerCase();
+  if (v === 'true') return true;
+  if (v === 'false' || v === '') return false;
+  return raw.trim();
 }
 
 /**
@@ -460,6 +491,28 @@ export function userIdOf(request: FastifyRequest): string {
 
 export function roleOf(request: FastifyRequest): string {
   return (request.user as { role?: string }).role || 'user';
+}
+
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * True for an existing, enabled account. For the credentials that are verified by signature alone and outlive a
+ * disable or delete (the week-long yomi_img cookie); API and OPDS tokens already join users in SQL.
+ */
+export async function accountActive(userId: string | null | undefined): Promise<boolean> {
+  if (!userId || !UUID.test(userId)) return false;
+  const r = await one<{ ok: boolean }>('SELECT NOT disabled AS ok FROM users WHERE id = $1', [userId]);
+  return r?.ok === true;
+}
+
+/**
+ * Whether this request carries admin authority: an admin account, and for an API token the admin scope too
+ * (requireAdmin's rule). roleOf alone is the account's role, which an admin's read+write automation token has.
+ */
+export function actsAsAdmin(request: FastifyRequest): boolean {
+  if (roleOf(request) !== 'admin') return false;
+  const scopes = (request.user as { tokenScopes?: string[] }).tokenScopes;
+  return !scopes || scopes.includes('admin');
 }
 
 /** Route guard: 403 unless the verified user is an admin. Run after `authenticate`. */

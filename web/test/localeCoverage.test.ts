@@ -236,6 +236,11 @@ const IRREGULAR_PAIRS: Record<string, string> = {
   'left out 1 folder or file it could not read': 'left out {n} folders or files it could not read',
   // v0.55.1, Health's chapters waiting for a site's pause (lib/said.ts failures.waiting): three words agree.
   '1 chapter waits for a site that asked for a pause, and is tried again by itself': '{n} chapters wait for a site that asked for a pause, and are tried again by themselves',
+  // v0.72.0, Health's Disk space and Chapter files cards (lib/said.ts): two nouns, and a pronoun, agree with the count;
+  // and the plural that names its series pairs with the one that does not, as "{n} chapters behind in 1 series" does.
+  '1 disk or folder needs a look': '{n} disks or folders need a look',
+  '1 of them is in a library you built: replace it by hand': '{n} of them are in a library you built: replace them by hand',
+  '{n} chapter files have no page that can be read': '{n} chapter files in {m} series have no page that can be read',
   '1 folder belongs to series someone removed, and was left alone; Admin → Library puts a series back.':
     '{n} folders belong to series someone removed, and were left alone; Admin → Library puts a series back.',
   '1 folder is more than {max} levels deep and was not looked into (LIBRARY_MAX_DEPTH)':
@@ -267,10 +272,15 @@ const IRREGULAR_PAIRS: Record<string, string> = {
   // v0.55.7, the import sheet's count against the current pick: "fewer" stands between the count and its noun, so
   // the matcher does not ask for this pair by itself, and it left SHIPPED_UNPAIRED with its "+1 chapter" sibling.
   '1 fewer chapter than the current pick': '{n} fewer chapters than the current pick',
+  // #240, hiding chapters: one asked about by its number, as its ⋯ names it, several by how many.
+  'Hide chapter {n}?': 'Hide {n} chapters?',
 };
 /** Keys that look counted and are not a pair, each with why. Not a place to park a new key. */
 const NOT_PAIRED: Record<string, string> = {
   '1 to 64 letters, digits, - or _': 'a range, not a count',
+  // #275: the setup card's memory, as docs/extensions.md says it.
+  'The extension engine runs Mihon and Tachiyomi extensions for Uchiyomi. It is an optional extra that uses 1 to 1.5 GB of memory; MangaDex and sites you add by address work without it.':
+    'a range, not a count',
   'Up to {n} hours': 'etaLine says hours only past 90 minutes, rounded up: never 1',
   // One whole sentence per status (FindMissingDialog healthLine), each with its streak inside.
   'rate-limited us {n} times in a row': 'shown only when consecutive > 1; one time is the bare status',
@@ -304,10 +314,9 @@ const SHIPPED_UNPAIRED = [
   'failed {n} times',
   '{n} titles matched', '{n} chapters listed', '{n} chapters listed · none fetched yet',
   '{n} chapters saved', '{n} chapters qualify right now.', '{n} chapters qualify today and would go on the first run.',
-  'Fetch {n} chapters again?',
 ];
 /** What SHIPPED_UNPAIRED may hold at most: lower it with every entry fixed, never raise it. */
-const SHIPPED_UNPAIRED_MAX = 30;
+const SHIPPED_UNPAIRED_MAX = 29;
 
 test('counted strings come in pairs: every "1 chapter" has its "{n} chapters", and back', () => {
   // Reintroduce by deleting the singular of a pair from the app -- `tr('Refreshed — 1 extension available')`

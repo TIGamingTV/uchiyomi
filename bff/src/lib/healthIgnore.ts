@@ -15,7 +15,11 @@ import { q } from './db';
 import type { HealthItem } from './health';
 
 /** The checks an admin can ignore findings of, and nothing else (the route's allow-list). */
-export const IGNORABLE_CHECKS = ['chapter-gaps', 'chapter-failures', 'sources', 'frozen-series', 'duplicates', 'outliers', 'downloads-missing'] as const;
+export const IGNORABLE_CHECKS = [
+  'chapter-gaps', 'chapter-failures', 'sources', 'frozen-series', 'duplicates', 'outliers', 'downloads-missing',
+  // v0.72.0: Disk space and folders, Tracker sync, Chapter files (lib/healthDisk.ts, healthTrackers.ts, healthFiles.ts).
+  'disk', 'trackers', 'files',
+] as const;
 export type IgnorableCheck = (typeof IGNORABLE_CHECKS)[number];
 
 /** A finding as a check reports it for ignoring: a stable key, and what it is about. */
@@ -145,6 +149,18 @@ export async function ignoreFinding(check: IgnorableCheck, key: string, f: Findi
        by_user = EXCLUDED.by_user, at = now(), seen_at = now()`,
     [check, key, f.members, f.title.slice(0, 300), userId],
   );
+}
+
+/**
+ * The runs of one series' chapter gaps an admin ignored on Health, as [lo, hi] (#236): what the reader leaves unsaid as it
+ * moves on to the next chapter. The card's own key and members, so the two can never disagree about what was ignored. A
+ * failed read is "nothing ignored", as for the page.
+ */
+export async function ignoredGapRuns(seriesId: string): Promise<Array<[number, number]>> {
+  const rows = await q<{ members: string[] }>(
+    `SELECT members FROM health_ignored WHERE check_id = 'chapter-gaps' AND item_key = $1`, [`series:${seriesId}`],
+  ).catch(() => [] as Array<{ members: string[] }>);
+  return (rows[0]?.members ?? []).map(parseRange).filter((x): x is [number, number] => !!x);
 }
 
 export async function unignoreFinding(check: IgnorableCheck, key: string): Promise<boolean> {

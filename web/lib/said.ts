@@ -168,6 +168,8 @@ const loopedTo = (p: P): string =>
     : tr('the same folder as the root, reached again through a mount');
 
 const engineVersion = (p: P): string => str(p, 'version').replace(/^v/i, '');
+/** An engine version inside a sentence, as the server writes it: "v2.3.2243", whether or not it came with its "v". */
+const verText = (p: P, k: string): string => `v${str(p, k).replace(/^v/i, '')}`;
 
 /** The solvers Health names by their kind (v0.55.3, bff lib/said.ts solverName): names, never translated. */
 const solverName = (kind: string): string => (kind === 'flaresolverr' ? 'FlareSolverr' : kind === 'trawl' ? 'trawl' : '');
@@ -199,6 +201,7 @@ const REASON_WORDS: Record<string, () => string> = {
   rate_limited: () => tr('This source asked us to slow down.'),
   // "the extension engine", the component's name everywhere else in the app (the server's says "server").
   upstream_down: () => tr('The extension engine did not answer.'),
+  engine_incompatible: () => tr('The extension engine does not match this version of Uchiyomi.'),
   extension_error: () => tr('This source\'s extension reported an error.'),
   unnumbered: () => tr('This source lists chapters without numbers Uchiyomi can use.'),
   site_offline: () => tr('The site says it is offline (its own page)'),
@@ -344,6 +347,9 @@ const WORDS: Record<string, (p: P) => string | null> = {
   'frozen.engineOff': (p) => (num(p, 'n') === 1
     ? tr('1 chapter; its source {source} can’t be reached because the extension engine is off', { source: str(p, 'source') })
     : tr('{n} chapters; its source {source} can’t be reached because the extension engine is off', { n: num(p, 'n'), source: str(p, 'source') })),
+  'frozen.engineIncompatible': (p) => (num(p, 'n') === 1
+    ? tr('1 chapter; its source {source} can’t be reached because the extension engine does not match this Uchiyomi', { source: str(p, 'source') })
+    : tr('{n} chapters; its source {source} can’t be reached because the extension engine does not match this Uchiyomi', { n: num(p, 'n'), source: str(p, 'source') })),
   'frozen.switchedOff': (p) => (num(p, 'n') === 1
     ? tr('1 chapter; its source {source} is switched off', { source: str(p, 'source') })
     : tr('{n} chapters; its source {source} is switched off', { n: num(p, 'n'), source: str(p, 'source') })),
@@ -665,6 +671,26 @@ const WORDS: Record<string, (p: P) => string | null> = {
     ? tr('Ready (v{version}); its Cloudflare helper is not answering', { version: engineVersion(p) })
     : tr('Ready; its Cloudflare helper is not answering')),
   'engine.solverQuietDetail': () => tr('It is connected to Uchiyomi’s own Cloudflare helper, which is not answering (the Cloudflare solver row says what to do). Extension sources on Cloudflare-protected sites fail until it answers again.'),
+  // The engine upgrade: the engine's version against the tested one, and an engine that refuses. The image, file,
+  // command, service and path are parameters, never words: what someone copies survives any translation.
+  'engine.incompatible': (p) => (p.version ? tr('Not compatible (v{version})', { version: engineVersion(p) }) : tr('Not compatible')),
+  'engine.incompatibleTitle': () => tr('Not compatible with this Uchiyomi'),
+  'engine.incompatibleNote': () => tr('It answers, but its extensions are unavailable until the engine and Uchiyomi match. Restarting it does not help.'),
+  'engine.refused': (p) => tr('It refused what Uchiyomi asked: {error}', { error: str(p, 'error') }),
+  'engine.updateEngine': (p) => tr('Update the engine to {tested}, the version this Uchiyomi was tested with.', { tested: verText(p, 'tested') }),
+  'engine.updateUchiyomi': (p) => tr('The engine is newer than this Uchiyomi. Update Uchiyomi; until a release supports this engine, {tested} is the version that works.', { tested: verText(p, 'tested') }),
+  'engine.matchEngine': (p) => tr('Run the version this Uchiyomi was tested with, {tested}.', { tested: verText(p, 'tested') }),
+  'engine.backupFirst': () => tr('Back up the engine’s data first: the engine upgrades its database when it starts, and an older engine cannot read it again.'),
+  'engine.stepCompose': (p) => tr('In {file}, set the engine’s image to {image}, then run {command}.', { file: str(p, 'file'), image: str(p, 'image'), command: str(p, 'command') }),
+  'engine.stepUnraid': (p) => tr('On the Docker tab, edit {service}, set its Repository to {image} and apply. Its data stays in {path}.', { service: str(p, 'service'), image: str(p, 'image'), path: str(p, 'path') }),
+  'engine.stepCasaos': (p) => tr('In CasaOS, edit the {service} app, set its image to {image} and save. Its data stays in {path}.', { service: str(p, 'service'), image: str(p, 'image'), path: str(p, 'path') }),
+  'engine.stepDesktop': () => tr('Quit and reopen Uchiyomi. If Admin → Sources then offers to download the extension engine, download it: that is the version this Uchiyomi was tested with.'),
+  'engine.stepOther': (p) => tr('Run {image} in place of the engine you have, on the same data.', { image: str(p, 'image') }),
+  'engine.versionTitle': () => tr('Engine version'),
+  'engine.versionNewer': (p) => tr('{version} is newer than the version this Uchiyomi was tested with ({tested}).', { version: verText(p, 'version'), tested: verText(p, 'tested') }),
+  'engine.versionOlder': (p) => tr('{version} is older than the version this Uchiyomi was tested with ({tested}). It works; updating it is recommended.', { version: verText(p, 'version'), tested: verText(p, 'tested') }),
+  'engine.versionTooOld': (p) => tr('{version} is older than the oldest version this Uchiyomi works with ({oldest}).', { version: verText(p, 'version'), oldest: verText(p, 'oldest') }),
+  'engine.goBackWithBackup': (p) => tr('To go back to {tested}, restore a backup of the engine’s data from before the update: an older engine cannot read what a newer one wrote.', { tested: verText(p, 'tested') }),
 
   // ---- A download job's reason. `source`, `from` and `to` are sources' names.
   'job.noSpace': (p) => tr('Not enough free space: {error}', { error: str(p, 'error') }),
@@ -757,10 +783,22 @@ const WORDS: Record<string, (p: P) => string | null> = {
   'main.renumberPending': () => tr('This series’ chapters are waiting to be renumbered. Review that on the series page first.'),
   'main.unavailable': () => tr('That source cannot be used right now: it is not installed, it is switched off, or it is not available on this account.'),
   'main.moved': () => tr('This series’ main source changed meanwhile. Look again.'),
+  // ---- Attaching a source by hand refused (#243, bff lib/manualAttach.ts). `title` is what the source calls the pick.
+  'attach.titleDiffers': (p) => tr('{name} calls it “{title}”, which is not this series’ title or one of its other names. If the cover and the chapters show it is the same work, attach it anyway.', {
+    name: str(p, 'name'), title: titled(p, 'title'),
+  }),
+  'attach.unreachable': (p) => tr('{name} did not say what that title is. Try again in a minute.', { name: str(p, 'name') }),
+  'attach.cooling': (p) => tr('{name} is cooling down after errors, so it is not asked anything right now. Try again later.', { name: str(p, 'name') }),
+  'attach.cap': (p) => (num(p, 'n') === 1
+    ? tr('This series already follows 1 other source, as many as it may. Remove one first, or move the series to this source.')
+    : tr('This series already follows {n} other sources, as many as it may. Remove one first, or move the series to this source.', { n: num(p, 'n') })),
+  'detach.noMain': () => tr('This series has no main source to detach.'),
   // A source retired, or a site removed, while some series still has it as its main source (bff lib/retireSource.ts).
   'retire.inUse': (p) => (num(p, 'n') === 1
     ? tr('It is the main source of 1 series. Replace it first.')
     : tr('It is the main source of {n} series. Replace it first.', { n: num(p, 'n') })),
+  // Rating a source Adult only past the list's limit (bff lib/visibility.ts MAX_ADULT_SOURCES): always a big number.
+  'rating.tooMany': (p) => tr('At most {limit} sources can be rated Adult only.', { limit: num(p, 'limit') }),
 
   // ---- Fix everything (v0.55.0, bff lib/autofix.ts): what the run is on, what it did, what clears by itself and what
   // only a person can do. A series title is isolated in right-to-left text (titled), so a Latin one keeps its order.
@@ -909,6 +947,12 @@ const WORDS: Record<string, (p: P) => string | null> = {
     ? tr('1 downloaded chapter is where the library scan never looks')
     : tr('{n} downloaded chapters are where the library scan never looks', { n: num(p, 'n') })),
   'autofix.needs.noRoom': (p) => tr('{name} may carry your series, but the source limit is full: free a slot', { name: str(p, 'name') }),
+  // v0.72.0: the cards no run changes (bff lib/healthDisk.ts, lib/healthTrackers.ts, lib/healthFiles.ts).
+  'autofix.needs.disk': (p) => (num(p, 'n') === 1 ? tr('1 disk or folder needs a look') : tr('{n} disks or folders need a look', { n: num(p, 'n') })),
+  'autofix.needs.trackers': (p) => (num(p, 'n') === 1
+    ? tr('1 tracker connection needs a look')
+    : tr('{n} tracker connections need a look', { n: num(p, 'n') })),
+  'autofix.needs.files': (p) => (num(p, 'n') === 1 ? tr('1 chapter file cannot be read') : tr('{n} chapter files cannot be read', { n: num(p, 'n') })),
 
   'autofix.clears.cooldown': (p) => tr('{name} is cooling down', { name: str(p, 'name') }),
   'autofix.clears.sweep': (p) => (num(p, 'n') === 1
@@ -927,6 +971,58 @@ const WORDS: Record<string, (p: P) => string | null> = {
   // v0.55.3: one of two solvers is not answering while the other solves (never on the desktop app: one helper, no backup).
   'autofix.clears.mainSolverDown': () => tr('The main Cloudflare solver is not answering, and the backup is solving meanwhile'),
   'autofix.clears.backupSolverDown': () => tr('The backup Cloudflare solver is not answering, and the main one is solving'),
+
+  // ---- Disk space and folders (v0.72.0, bff lib/healthDisk.ts, from #253): sizes in GB, one decimal, the reader's way.
+  'disk.title': () => tr('Downloads disk'),
+  'disk.free': (p) => tr('{free} GB free of {total} GB', { free: numText(num(p, 'free')), total: numText(num(p, 'total')) }),
+  'disk.full': (p) => tr('{free} GB free of {total} GB: new downloads stop under {floor} GB', {
+    free: numText(num(p, 'free')), total: numText(num(p, 'total')), floor: numText(num(p, 'floor')),
+  }),
+  'disk.archiveWaits': (p) => tr('{free} GB free of {total} GB: the slow archive waits until {floor} GB are free', {
+    free: numText(num(p, 'free')), total: numText(num(p, 'total')), floor: numText(num(p, 'floor')),
+  }),
+  'disk.empty': (p) => (num(p, 'n') === 1
+    ? tr('Empty, but the library records 1 chapter in it: is the share mounted?')
+    : tr('Empty, but the library records {n} chapters in it: is the share mounted?', { n: num(p, 'n') })),
+  'disk.live': (p) => (num(p, 'n') === 1 ? tr('1 disk or folder needs a look') : tr('{n} disks or folders need a look', { n: num(p, 'n') })),
+  'disk.fine': (p) => tr('{free} GB free for downloads', { free: numText(num(p, 'free')) }),
+  'disk.unmeasured': () => tr('Free space could not be measured here'),
+  'disk.noteFloor': (p) => tr('New downloads stop when the downloads disk has less than {floor} GB free.', { floor: numText(num(p, 'floor')) }),
+  'disk.noteNoFloor': () => tr('Downloads are never stopped for free space here (MIN_FREE_GB is 0).'),
+  'disk.noteArchive': (p) => tr('The slow archive waits below {floor} GB (Admin → Settings → Downloads).', { floor: numText(num(p, 'floor')) }),
+  'disk.noteFolders': () => tr('A library or download folder that cannot be read, or that is empty while the library records chapters in it, is usually a share that is not mounted; nothing is marked missing because of it. Only the top of each folder is read here: Verify chapter files (Admin → Tasks) checks every file.'),
+
+  // ---- Tracker sync (v0.72.0, bff lib/healthTrackers.ts, @Squeaks72's card from #253). `error` is the tracker's own.
+  'trackers.refused': () => tr('The tracker refused the saved sign-in'),
+  'trackers.failed': (p) => tr('The last sync failed: {error}', { error: str(p, 'error') }),
+  'trackers.ended': (p) => tr('The sign-in ended {date}', { date: dayText(p.at) }),
+  'trackers.ending': (p) => tr('The sign-in ends {date}', { date: dayText(p.at) }),
+  'trackers.live': (p) => (num(p, 'n') === 1 ? tr('1 tracker connection needs a look') : tr('{n} tracker connections need a look', { n: num(p, 'n') })),
+  'trackers.fine': (p) => (num(p, 'n') === 1 ? tr('The one tracker connection is syncing') : tr('All {n} tracker connections are syncing', { n: num(p, 'n') })),
+  'trackers.none': () => tr('Nobody has connected a tracker'),
+  'trackers.note': () => tr('Only the person can sign in again, under Profile → Connections; a sign-in the tracker refused stays off until they do. A sign-in ending within 14 days is a finding, and within 30 days is listed for reference.'),
+
+  // ---- Chapter files (v0.72.0, bff lib/healthFiles.ts, rebuilt from #252)
+  'files.detail': (p) => {
+    const more = num(p, 'more');
+    const numbers = strs(p, 'numbers').join(listSep()) + (more > 0 ? ` ${tr('and {n} more', { n: more })}` : '');
+    return num(p, 'n') === 1
+      ? tr('1 chapter file with no page that can be read: {numbers}', { numbers })
+      : tr('{n} chapter files with no page that can be read: {numbers}', { n: num(p, 'n'), numbers });
+  },
+  'files.notOurs': (p) => (num(p, 'n') === 1
+    ? tr('1 of them is in a library you built: replace it by hand')
+    : tr('{n} of them are in a library you built: replace them by hand', { n: num(p, 'n') })),
+  'files.live': (p) => {
+    const n = num(p, 'n');
+    const m = num(p, 'm');
+    if (n === 1) return tr('1 chapter file has no page that can be read');
+    return m > 1
+      ? tr('{n} chapter files in {m} series have no page that can be read', { n, m })
+      : tr('{n} chapter files have no page that can be read', { n });
+  },
+  'files.none': () => tr('Every chapter file the nightly count opened has pages'),
+  'files.note': () => tr('The nightly repair opens each chapter file once to count its pages, and these are the files it found no page in: empty, cut short by a download, damaged, or gone. Fetch again downloads a new copy of a file Uchiyomi fetched itself and keeps the old one until the new copy lands; a file in a library you built is yours to replace. Nothing here deletes a file, and Fix everything leaves these to you.'),
 
   // ---- A diagnosis's fix (bff lib/sourceDiagnosis.ts FixCode). ADMIN ONLY, like the server's.
   'fix.solverCrash': () => (isDesktop()
@@ -949,6 +1045,9 @@ const WORDS: Record<string, (p: P) => string | null> = {
   'fix.engineDown': () => (isDesktop()
     ? tr('This is Uchiyomi\'s extension engine, not the site. Quit and reopen Uchiyomi to restart it.')
     : tr('This is the Suwayomi extension server, not the site. Check that container.')),
+  'fix.engineIncompatible': () => (isDesktop()
+    ? tr('Uchiyomi\'s extension engine refused Uchiyomi\'s request. Quit and reopen Uchiyomi, and download the extension engine again if Admin → Sources offers it.')
+    : tr('The extension engine refused Uchiyomi\'s request: it is older or newer than the version this Uchiyomi works with. Health → Extension engine says which, and how to change it.')),
   'fix.engineTimeout': (p) => joinPart(byStage(p, {
     none: () => tr('The extension engine did not answer in time.'),
     search: () => tr('The extension engine did not answer in time while searching.'),

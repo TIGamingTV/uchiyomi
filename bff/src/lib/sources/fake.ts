@@ -119,10 +119,18 @@ export function makeFakeSource(id: string, base: string, cloudflare = false): So
     name: id,
     base,
     requiresCloudflare: cloudflare,
+    // The end-to-end stub serves its pages from loopback, which the downloader refuses for any site (types.ts).
+    localImages: true,
     async search(query) {
       return arrayOf<any>(await json(base, `/search?q=${encodeURIComponent(query)}`, false, cloudflare))
         .filter((v) => v && v.sourceId && v.title)
         .map(series);
+    },
+    // v0.56.0 (v560Walk.mjs): Discover's Newest wall, which no walk could reach before: the site's whole catalogue on page
+    // one (an empty search answers it), nothing after.
+    async latest(page = 1) {
+      if (page > 1) return [];
+      return arrayOf<any>(await json(base, '/search?q=', false, cloudflare)).filter((v) => v && v.sourceId && v.title).map(series);
     },
     async getSeries(sourceId) {
       const body = await json(base, `/series/${encodeURIComponent(sourceId)}`, true, cloudflare);

@@ -42,13 +42,20 @@ function hotp(secret: string, counter: number): string {
   return (code % 1_000_000).toString().padStart(6, '0');
 }
 
-/** Verify a 6-digit code against the secret, allowing ±`window` 30s steps for clock drift. */
-export function verifyTotp(secret: string, token: string, window = 1): boolean {
+/**
+ * The 30 s step a 6-digit code was made for, within ±`window` steps of `now` for clock drift; null when it is none of
+ * them. The latest matching step, so a code that happens to match two steps is spent for both.
+ *
+ * A step, not a yes or no (v0.77.1): a code is good once, and the caller records the step it took in the same statement
+ * that checks it is later than the last one (lib/auth.ts spendTotpStep, RFC 6238 section 5.2). There is no
+ * boolean check beside this on purpose, so no route can accept a code without spending it.
+ */
+export function totpStep(secret: string, token: string, window = 1, now = Date.now()): number | null {
   const t = (token || '').trim();
-  if (!/^\d{6}$/.test(t)) return false;
-  const step = Math.floor(Date.now() / 1000 / 30);
-  for (let w = -window; w <= window; w++) if (hotp(secret, step + w) === t) return true;
-  return false;
+  if (!/^\d{6}$/.test(t)) return null;
+  const step = Math.floor(now / 1000 / 30);
+  for (let w = window; w >= -window; w--) if (hotp(secret, step + w) === t) return step + w;
+  return null;
 }
 
 export const otpauthURL = (secret: string, account: string, issuer = 'Uchiyomi'): string =>
@@ -65,4 +72,17 @@ export const sha256 = (s: string): string => createHash('sha256').update(s).dige
  */
 export function generateRecoveryCodes(n = 8): string[] {
   return Array.from({ length: n }, () => randomBytes(10).toString('hex').replace(/(.{5})(.{5})(.{5})(.{5})/, '$1-$2-$3-$4'));
+}
+
+/**
+ * A typed recovery code in the form its hash was taken of, or null when it cannot be one. Case, spaces and dashes
+ * are forgiven, so a code read aloud or pasted without its dashes still works. Two shapes: today's 20 hex digits
+ * (xxxxx-xxxxx-xxxxx-xxxxx, generateRecoveryCodes) and the 10 of codes made before the move to 10 bytes (xxxx-xxxxxx),
+ * which accounts may still hold. Sign-in tested only the old shape, so no code made since v0.21.0 was ever accepted.
+ */
+export function recoveryCodeForm(typed: string): string | null {
+  const hex = (typed || '').toLowerCase().replace(/[\s-]/g, '');
+  if (/^[0-9a-f]{20}$/.test(hex)) return hex.replace(/(.{5})(.{5})(.{5})(.{5})/, '$1-$2-$3-$4');
+  if (/^[0-9a-f]{10}$/.test(hex)) return hex.replace(/(.{4})(.{6})/, '$1-$2');
+  return null;
 }

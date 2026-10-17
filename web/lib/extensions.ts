@@ -103,10 +103,12 @@ export interface InstalledExt extends CatalogExt {
   used: number;
 }
 
-/** A language's name for an extension or a source: "Multiple languages" for `all`, "No language" for none. */
+/**
+ * A source's language's name: "All languages, mixed" for `all` (lib/format.ts languageName says why), "No language" for
+ * none. An EXTENSION's `all` is another thing -- sources in several languages -- and extLanguagesText says that itself.
+ */
 export function extLanguageName(code: string | null): string {
   if (!code) return tr('No language');
-  if (code === 'all') return tr('Multiple languages');
   return languageName(code);
 }
 
@@ -155,7 +157,7 @@ export function extLanguagesText(e: Pick<InstalledExt, 'lang' | 'sources'>): str
   const langs = [...new Set(e.sources.map((s) => s.lang))];
   if (langs.length === 1) return extLanguageName(langs[0]);
   if (langs.length > 1) return tr('{n} languages', { n: numberText(langs.length) });
-  return extLanguageName(e.lang);
+  return e.lang === 'all' ? tr('Multiple languages') : extLanguageName(e.lang);
 }
 
 /** An engine's version as the strip prints it: "v2.3.2243", whether or not the engine sent its "v". */
@@ -171,6 +173,10 @@ export const versionText = (v: string): string => (/^\d/.test(v) ? `v${v}` : v);
  */
 export function engineLine(s: ExtStatus): { state: Headline; tone: Tone; label: string } {
   const h = headline(s);
+  // The engine upgrade: an engine that answers and refuses what Uchiyomi asks is not ready, whatever else it says.
+  // Health → Extension engine quotes it and says what to do. Reintroduce by dropping this line: the strip reads "Ready"
+  // over an engine none of whose extensions can load ("an engine that refuses" in extensions.test.ts).
+  if (h === 'ready' && s.refused?.length) return { state: h, tone: 'problem', label: tr('Not compatible with this Uchiyomi') };
   if (h === 'ready') return { state: h, tone: 'ok', label: tr('Ready') };
   if (h === 'unreachable') return { state: h, tone: 'problem', label: tr('The extension engine isn’t answering') };
   if (h === 'switched_off') return { state: h, tone: 'off', label: tr('Extensions are turned off') };

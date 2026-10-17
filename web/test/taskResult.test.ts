@@ -27,6 +27,16 @@ test('a chapter sweep distinguishes a quiet week from a broken one', () => {
   assert.notEqual(broken, ' · +0 chapters');
 });
 
+test('a smart sweep says how many quiet series it left for later', () => {
+  // v0.61.0, Smart update checks: a sweep that visited 40 of 224 series rested the rest on purpose, and the Tasks line
+  // says so rather than leaving it to look like a sweep that missed them. Reintroduce by dropping `rested`: the first
+  // line reads " · +3 chapters" alone.
+  assert.equal(taskResult({ added: 3, healthy: true, rested: 184 }), ' · +3 chapters · 184 quiet series not due');
+  assert.equal(taskResult({ added: 1, healthy: true, rested: 1 }), ' · +1 chapter · 1 quiet series not due');
+  assert.equal(taskResult({ added: 0, healthy: true, rested: 0 }), ' · +0 chapters', 'the switch off says nothing new');
+  assert.match(taskResult({ added: 0, healthy: false, failed: 2, rested: 5 }), /^ · \+0 chapters · 5 quiet series not due · 2 series did not answer$/);
+});
+
 test('the read-chapter cleanup is not mistaken for a backup', () => {
   // ⚠️ Both results carry `bytes`. The cleanup branch has to come first, or "12 chapters deleted, 4 MB
   // freed" renders as an archive size and the only number that matters -- how many files were destroyed --
@@ -256,6 +266,17 @@ test('the repair says when it learned reading directions, and a directions-only 
   assert.doesNotMatch(taskResult({ ...base, directions: { asked: 40, learned: 0 } }), /reading direction/);
   assert.equal(taskResult({ ...base, only: ['directions'], directions: { asked: 2, learned: 0 } }), ' · 0 reading directions learned');
   assert.equal(taskResult({ ...base, only: ['directions'], directions: { asked: 1, learned: 1 } }), ' · 1 reading direction learned');
+});
+
+test('the repair says when it filled in missing details, never that the switch is off, and a details-only run always answers', () => {
+  // v0.73.0 (bff lib/autoDetails.ts). Off by default, like the group upgrades: a nightly line that said "details: off"
+  // every night would be noise about a switch nobody chose. Reintroduce by dropping `!r.details.off`: the off case reads.
+  const base = { counted: 0, uncounted: 0, short: {}, gaps: {}, failures: { reset: 0 }, solver: {} };
+  assert.match(taskResult({ ...base, details: { asked: 12, filled: 4 } }), /missing details filled in for 4 series/);
+  assert.doesNotMatch(taskResult({ ...base, details: { asked: 12, filled: 0 } }), /missing details/);
+  assert.doesNotMatch(taskResult({ ...base, only: ['details'], details: { off: true, asked: 0, filled: 0 } }), /missing details/);
+  assert.equal(taskResult({ ...base, only: ['details'], details: { asked: 3, filled: 1 } }), ' · missing details filled in for 1 series');
+  assert.equal(taskResult({ ...base, only: ['details'], details: { asked: 3, filled: 0 } }), ' · missing details filled in for 0 series');
 });
 
 // ---- v0.49.0: how long, and the Tasks tab in every language ----

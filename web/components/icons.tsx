@@ -19,6 +19,18 @@ export const IcHome = (p: P) => (
 export const IcGrid = (p: P) => (
   <svg {...base(p)}><rect x="3" y="3" width="7" height="7" rx="1.5" /><rect x="14" y="3" width="7" height="7" rx="1.5" /><rect x="3" y="14" width="7" height="7" rx="1.5" /><rect x="14" y="14" width="7" height="7" rx="1.5" /></svg>
 );
+// The Library's layouts (v0.60.0): Comfortable is IcGrid's four covers, Compact nine smaller ones, List covers in rows.
+export const IcGridDense = (p: P) => (
+  <svg {...base(p)}><rect x="3" y="3" width="5" height="5" rx="1" /><rect x="9.5" y="3" width="5" height="5" rx="1" /><rect x="16" y="3" width="5" height="5" rx="1" /><rect x="3" y="9.5" width="5" height="5" rx="1" /><rect x="9.5" y="9.5" width="5" height="5" rx="1" /><rect x="16" y="9.5" width="5" height="5" rx="1" /><rect x="3" y="16" width="5" height="5" rx="1" /><rect x="9.5" y="16" width="5" height="5" rx="1" /><rect x="16" y="16" width="5" height="5" rx="1" /></svg>
+);
+export const IcRows = (p: P) => (
+  <svg {...base(p)}><rect x="3" y="4" width="4.5" height="6" rx="1" /><rect x="3" y="14" width="4.5" height="6" rx="1" /><path d="M11 6h10M11 9h6M11 16h10M11 19h6" /></svg>
+);
+// Sort (v0.60.0, the Library's Sort key): bars getting shorter, the shelf from most to least. Flipped upside down, the
+// other way round.
+export const IcSort = (p: P) => (
+  <svg {...base(p)}><path d="M4 6h11M4 12h7.5M4 18h4" /><path d="M18.5 5v14" /><path d="m15.5 16 3 3 3-3" /></svg>
+);
 export const IcSearch = (p: P) => (
   <svg {...base(p)}><circle cx="11" cy="11" r="7" /><path d="m21 21-3.5-3.5" /></svg>
 );
@@ -35,8 +47,14 @@ export const IcCloudDownload = (p: P) => (
 export const IcUser = (p: P) => (
   <svg {...base(p)}><circle cx="12" cy="8" r="4" /><path d="M4 21c0-4 4-6 8-6s8 2 8 6" /></svg>
 );
+/** People: how many readers have a series on a list (v0.60.0, the AniList tile and the Library's popularity value). */
+export const IcUsers = (p: P) => (
+  <svg {...base(p)}><circle cx="9" cy="8" r="3.5" /><path d="M2.5 20c0-3.6 3-5.5 6.5-5.5s6.5 1.9 6.5 5.5" /><path d="M15.5 4.6a3.5 3.5 0 0 1 0 6.8" /><path d="M17.5 14.8c2.4.5 4 2.3 4 5.2" /></svg>
+);
+// Mirrored about x = 12, the tip's line (v0.60.1, from Squeaks72's fork): the old path's lobes met at x = 10, so the heart
+// leaned left -- visible since v0.60.0 drew it at 20 px on the Favourite key. v601Fixes.test.ts checks the mirror.
 export const IcHeart = (p: P) => (
-  <svg {...base(p)}><path d="M12 20s-7-4.6-9.2-9C1.3 8 2.6 4.8 6 4.8c2 0 3.2 1.2 4 2.4.8-1.2 2-2.4 4-2.4 3.4 0 4.7 3.2 3.2 6.2C19 15.4 12 20 12 20Z" /></svg>
+  <svg {...base(p)}><path d="M12 20s-8-4.9-9.4-9.6C1.7 7.2 3.6 4.5 6.6 4.5c2.1 0 3.9 1.1 5.4 3.1 1.5-2 3.3-3.1 5.4-3.1 3 0 4.9 2.7 4 5.9C20 15.1 12 20 12 20Z" /></svg>
 );
 export const IcStar = (p: P) => (
   <svg {...base(p)}><path d="m12 3 2.6 5.6 6 .8-4.4 4.2 1.1 6L12 16.8 6.7 19.6l1.1-6L3.4 9.4l6-.8L12 3Z" /></svg>
@@ -99,6 +117,11 @@ export const IcAlert = (p: P) => (
   <svg {...base(p)}><path d="M12 3.5 2.5 20h19L12 3.5Z" /><path d="M12 10v4.5" /><path d="M12 17.5h.01" /></svg>
 );
 // Waiting its turn: a queued cover in the Downloads view, a refused action that will run later.
+// Admin (UI refresh): the sidebar's way into the console. A shield rather than the gear, which already means a
+// person's own Settings on their profile.
+export const IcShield = (p: P) => (
+  <svg {...base(p)}><path d="M12 3 4.5 6v5.5c0 4.6 3.1 8.2 7.5 9.5 4.4-1.3 7.5-4.9 7.5-9.5V6L12 3Z" /><path d="m9 12 2.2 2.2L15.5 10" /></svg>
+);
 export const IcClock = (p: P) => (
   <svg {...base(p)}><circle cx="12" cy="12" r="9" /><path d="M12 7v5l3 2" /></svg>
 );
@@ -122,6 +145,10 @@ export const IcImport = (p: P) => (
 );
 export const IcFilter = (p: P) => (
   <svg {...base(p)}><path d="M4 5h16" /><path d="M7 12h10" /><path d="M10 19h4" /></svg>
+);
+/** v0.61.0: Incognito reading -- an eye, struck through. */
+export const IcEyeOff = (p: P) => (
+  <svg {...base(p)}><path d="M3 3l18 18" /><path d="M10.6 5.1A10.9 10.9 0 0 1 12 5c5.5 0 9 5.5 9.6 7a13.6 13.6 0 0 1-3 3.9M6.4 6.4C4.2 7.9 2.8 10 2.4 12c.6 1.5 4.1 7 9.6 7 1.7 0 3.2-.5 4.5-1.3" /><path d="M9.9 9.9a3 3 0 0 0 4.2 4.2" /></svg>
 );
 export const IcWifiOff = (p: P) => (
   <svg {...base(p)}><path d="M2 4l20 20M8.5 16.5a5 5 0 0 1 7 0M5 12.5a10 10 0 0 1 4-2.6M2 9a15 15 0 0 1 4-2.5M19 12.5q.8.6 1.5 1.3M22 9a15 15 0 0 0-7-4" /><circle cx="12" cy="20" r="0.6" fill="currentColor" /></svg>

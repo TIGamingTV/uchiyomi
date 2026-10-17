@@ -35,9 +35,9 @@ test('the series page has no Who-scanlates card and no version strip', () => {
 test('every sheet the series page opens clears the phone bottom nav', () => {
   // ⚠️ `Sheet` pads for the reader by default, which has no nav; opened from this page the last rows of a
   // sheet sit under the bar (the library's filters sheet hit this first). Reintroduce by dropping
-  // `overBottomNav` from any of the four: the patience footer, the last group chip or the last copy's
-  // Fetch is under the nav at 390 px.
-  for (const f of ['components/SourcesSheet.tsx', 'components/ChapterFilterSheet.tsx', 'components/ChapterVersionsSheet.tsx', 'components/SourcesExplainer.tsx']) {
+  // `overBottomNav` from any of the five: the patience footer, the last group chip, the last copy's Fetch or
+  // More's Remove from library (v0.60.0, components/SeriesKeys.tsx) is under the nav at 390 px.
+  for (const f of ['components/SourcesSheet.tsx', 'components/ChapterFilterSheet.tsx', 'components/ChapterVersionsSheet.tsx', 'components/SourcesExplainer.tsx', 'components/SeriesKeys.tsx']) {
     const src = code(read(f));
     assert.match(src, /<Sheet\b[^>]*\boverBottomNav\b/s, `${f} opens a Sheet without overBottomNav`);
   }
@@ -71,14 +71,17 @@ const fn = (page: string, name: string): string => {
 test('Fetch all posts its chunks one after the other, each after the previous job has ended', () => {
   // ⚠️ The route answers 409 `busy` while the series' job runs and `startJob` returns when a job has
   // STARTED, so chunks posted back to back are chunks refused: a 500-chapter run fetched 300 and toasted an
-  // error for the rest. Reintroduce by deleting the `await awaitJob(` line from fetchMany (post the next
+  // error for the rest. Reintroduce by deleting the `await awaitJob(` line from postInChunks (post the next
   // chunk at once): "waits for the job between chunks" fails. Or by chunking inline with `slice(i, i + 300)`
   // instead of chunkNumbers: "cuts with the tested helper" fails.
   const page = code(read('app/series/page.tsx'));
-  const body = fn(page, 'fetchMany');
+  const body = fn(page, 'postInChunks');
   assert.match(body, /\bchunkNumbers\(/, 'cuts with the tested helper');
   assert.match(body, /await awaitJob\(/, 'waits for the job between chunks');
   assert.doesNotMatch(body, /await startJob\(/, 'one toast for the run, not one per chunk');
+  // Fetch all and the wrong-language notice's Fetch them again (v0.62.0) both post through it. Reintroduce by posting
+  // the notice's chapters in one request: the route refuses past 300, and "refetchMany posts in chunks" fails.
+  for (const name of ['fetchMany', 'refetchMany']) assert.match(fn(page, name), /\bpostInChunks\(/, `${name} posts in chunks`);
   const wait = fn(page, 'awaitJob');
   assert.match(wait, /status !== 'downloading'/, 'the wait ends when the job is no longer downloading');
   assert.match(wait, /\['source-jobs'\]/, 'through the shared jobs key, so the Library ring and the band read the same answer');
@@ -214,8 +217,10 @@ test('a grey row the reader marked reads as read, stays grey, and carries Mark r
   assert.match(row, /read \? 'bg-ink-600' : 'border border-ink-600'/, 'and the filled dot');
   assert.match(row, /read \? 'text-fog-500' : 'text-fog-300'/, 'and the dimmed title');
   assert.match(row, /border border-dashed border-ink-600/, 'the thumb stays dashed: still not on the server');
-  assert.match(row, /\{onMark && !selectable && \(/, 'the menu hides in select mode');
-  assert.match(row, /onMark\(!read\)/, 'the one action toggles');
+  // #240 put an admin's Hide on the same menu: it is drawn for either action, and still never in select mode.
+  assert.match(row, /const hasMenu = !!onMark \|\| !!onHide/, 'the menu is drawn for either of its actions');
+  assert.match(row, /\{hasMenu && !selectable && \(/, 'the menu hides in select mode');
+  assert.match(row, /onMark\(!read\)/, 'the mark toggles');
   assert.match(page, /onMark=\{\(completed\) => markGhost\(r\.ghost, completed\)\}/, 'the page hands every grey row the action and its stable identity');
 });
 
@@ -298,12 +303,15 @@ test('the header counts chapters or volumes in the reader\'s words, one key to a
   assert.doesNotMatch(page, /mostlyVolumes \? 'volumes' : 'chapters'/, 'the header count is bare English again');
 });
 
-test('an unrated series says "Rate this" in the reader\'s words', () => {
+test('an unrated series says "Rate this" in the reader\'s words, and a rated one how to take it back', () => {
   // It was a bare string literal beside the stars, English in every language (the v0.49.1 translation review, pt-BR).
-  // Reintroduce the literal: "Rate this is bare English again".
-  const page = code(read('app/series/page.tsx'));
-  assert.match(page, /\{rating \? `\$\{rating\}\/5` : tr\('Rate this'\)\}/, 'Rate this is bare English again');
-  assert.doesNotMatch(page, /: 'Rate this'\}/, 'Rate this is bare English again');
+  // Since v0.60.0 it is the ratings panel's caption (components/RatingsPanel.tsx), and a rated series says instead that
+  // tapping its star again clears it. Reintroduce the literal: "Rate this is bare English again".
+  const panel = code(read('components/RatingsPanel.tsx'));
+  assert.match(panel, /const caption = value \? tr\('Tap again to clear'\) : tr\('Rate this'\);/, 'Rate this is bare English again');
+  assert.doesNotMatch(panel, /: 'Rate this'/, 'Rate this is bare English again');
+  // Said once: the page does not say it again beside the panel.
+  assert.doesNotMatch(code(read('app/series/page.tsx')), /Rate this/, 'the page says Rate this again, beside the panel');
 });
 
 test('the chapter select bar says it removes chapters, and where the series\' own Remove is (v0.52.0)', () => {
@@ -355,10 +363,14 @@ test('an admin copies a chapter\'s file path and the series\' folder with one ta
 });
 
 test('the favourite button and the save notices are in the reader\'s words (v0.52.0)', () => {
-  // The button's two states have their own keys: the toast key "Saved" reads as a past action in ja and ar, where
-  // the button needs a state. Reintroduce `{fav ? 'Saved' : 'Favorite'}`: the button is English in every language.
+  // The toast key "Saved" read as a past action in ja and ar, where the button needs a state. Since v0.60.0 it is a key
+  // (components/SeriesKeys.tsx FavouriteKey) and a toggle: its word stays "Favourite", and `aria-pressed` with the filled
+  // heart says whether it is on -- a state said twice ("In favourites", pressed) reads as two. Reintroduce
+  // `label={fav ? 'Saved' : 'Favorite'}`: the key is English in every language, and this fails.
   const page = code(read('app/series/page.tsx'));
-  assert.match(page, /\{fav \? tr\('In favourites'\) : tr\('Favourite'\)\}/, 'the favourite button is not translated');
+  const keys = code(read('components/SeriesKeys.tsx'));
+  assert.match(keys, /<SeriesKey icon=\{heart\} label=\{tr\('Favourite'\)\}[^>]*attrs=\{\{ 'aria-pressed': on,/, 'the favourite key is not translated, or not a toggle');
+  assert.match(page, /<FavouriteKey on=\{fav\} pops=\{favPops\} onToggle=\{toggleFav\} \/>/, 'the page has no favourite key');
   assert.match(page, /tr\('Saved\. \{n\} readers had finished this chapter\.', \{ n: r\.affectedUsers \}\)/, 'the chapter save notice is not a counted pair');
   assert.doesNotMatch(page, /reader\(s\)/, 'a "(s)" plural is back');
   // Edit details' check key was the last bare English on the page (v0.52.0); it is components/SeriesEditor.tsx's
@@ -389,4 +401,74 @@ test('a file holding a range of chapters holds every number in it on the series 
     'the sheet\'s solid chips ignore range files');
   assert.match(page, /\.filter\(\(x\) => lastOf\(x\) < b\.number && !x\.readProgress\?\.completed\)/,
     'Mark previous as read marks a range file that runs past this chapter');
+});
+
+test('an admin fetches one chapter again, or deletes it from the server, from its ⋯ (v0.62.0)', () => {
+  // The report: "It would be nice if I could delete individual files rather than the whole manga." Both were in the
+  // select bar only. Reintroduce by dropping either entry: its line here fails.
+  const page = code(read('app/series/page.tsx'));
+  assert.match(page, /\.\.\.\(onRefetch \? \[\{ label: tr\('Fetch again'\), divider: true, onSelect: onRefetch \}\] : \[\]\)/, 'no Fetch again in the menu');
+  assert.match(page, /\.\.\.\(onDelete \? \[\{ label: tr\('Delete from server'\), divider: !onRefetch, danger: true, onSelect: onDelete \}\] : \[\]\)/, 'no Delete from server in the menu');
+  // An admin's, on a file Uchiyomi downloaded -- the routes refuse anything else -- and Delete not on a file already
+  // deleted. Reintroduce by dropping `b.owned`: a chapter in a library the admin built offers both, and both fail.
+  assert.match(page, /onRefetch=\{isAdmin && b\.owned \? \(\) => setConfirming\(\{ what: 'refetch', books: \[b\] \}\) : undefined\}/);
+  assert.match(page, /onDelete=\{isAdmin && b\.owned && !b\.pruned \? \(\) => setConfirming\(\{ what: 'delete', books: \[b\] \}\) : undefined\}/);
+  // Each asks first, in the select bar's own dialog, which acts on what it was opened with. Reintroduce by confirming
+  // with the selection (`deletable`): the row's Delete deletes nothing, or what is ticked.
+  assert.match(page, /onConfirm=\{\(\) => deleteBooks\(confirming\.books\)\}/);
+  assert.match(page, /onConfirm=\{\(\) => refetchBooks\(confirming\.books\)\}/);
+});
+
+// ---- #240, rebuilt to hide only: Hide chapter N, and Show hidden chapters ----------------------------------------
+
+test('Hide chapter N: an admin\'s, on both kinds of row and in the select bar, never a range, never a delete', () => {
+  // #240's labels sat beside "Remove from library" (the whole series, hidden) and the select bar's "Remove 3 chapters"
+  // (Delete from server): two near-identical destructive actions. Hide says what it does, in the plain key, and asks
+  // first in a dialog that is not red. Reintroduce by drawing it with `btn-key-danger`: "the select bar's Hide is not
+  // the red key" fails; by offering it on a range file: "never on a file holding a range" fails.
+  const page = code(read('app/series/page.tsx'));
+  const row = page.slice(page.indexOf('function ChapterRow('), page.indexOf('function SelectBubble('));
+  assert.match(row, /\.\.\.\(onHide \? \[\{ label: tr\('Hide chapter \{n\}', \{ n: book\.number \}\)/, 'a chapter row offers Hide chapter N');
+  assert.match(row, /hook: 'hide-chapter', onSelect: onHide/, 'the walks find it by what it does, in any language');
+  const ghost = page.slice(page.indexOf('function GhostRow('), page.indexOf('interface StartedJob'));
+  assert.match(ghost, /\.\.\.\(onHide \? \[\{ label: tr\('Hide chapter \{n\}', \{ n: ghost\.number \}\)/, 'a grey row offers Hide chapter N');
+  assert.match(ghost, /hook: 'hide-chapter', onSelect: onHide/);
+  assert.match(page, /onHide=\{isAdmin && b\.numberEnd == null \? \(\) => setHiding\(\[b\.number\]\) : undefined\}/, 'never on a file holding a range');
+  assert.match(page, /onHide=\{isAdmin && r\.ghost\.numberEnd == null \? \(\) => setHiding\(\[r\.ghost\.number\]\) : undefined\}/, 'an admin\'s alone');
+  const bar = page.slice(page.indexOf('data-hide-chapters') - 200, page.indexOf('data-hide-chapters') + 300);
+  assert.ok(bar.includes('isAdmin &&'), 'the select bar\'s Hide is an admin\'s');
+  assert.doesNotMatch(bar, /btn-key-danger/, "the select bar's Hide is not the red key");
+  assert.match(bar, /tr\('Hide 1 chapter'\)/, 'the bar counts what it hides');
+  // The confirmation: asked first, and not the red button.
+  const dialog = page.slice(page.indexOf('{hiding && ('), page.indexOf('{showHidden &&'));
+  assert.ok(dialog.length > 100, 'the hide asks first');
+  assert.doesNotMatch(dialog, /\bdanger\b/, 'the hide is drawn as a delete');
+  assert.match(dialog, /Nothing is deleted/, 'the confirmation says nothing is deleted');
+  // Nothing in it reads like Remove: #240's "Remove from library" and "Remove from series" were the collision.
+  for (const part of [row.slice(row.indexOf('onHide ?')), ghost.slice(ghost.indexOf('onHide ?')), bar, dialog]) {
+    assert.doesNotMatch(part.slice(0, 400), /tr\('Remove/, 'a Hide label says Remove');
+  }
+  // In chunks of the route's 500, and every surface refreshed after.
+  const hide = page.slice(page.indexOf('const hideChapters = async'), page.indexOf('const deleteBooks = async'));
+  assert.match(hide, /i \+= 500/, 'the hide is sent in chunks of the route\'s cap');
+  assert.match(hide, /\/chapters\/hide`/);
+  assert.match(hide, /invalidateChapters\(\)/, 'the chapters, grey rows and More\'s count are refreshed');
+});
+
+test('Show hidden chapters: from More, the hidden numbers with Restore, through the shared dialog', () => {
+  const page = code(read('app/series/page.tsx'));
+  assert.match(page, /case 'hidden': setShowHidden\(true\); break;/, 'More opens the list');
+  assert.match(page, /hiddenChapters: series\?\.hiddenChapters \?\? 0/, "More is told the series' count");
+  const dlg = code(read('components/HiddenChapters.tsx'));
+  // The shared Modal: aria-modal on the notices' dialog layer (useLayer('dialog')), Escape, focus back, and a panel
+  // the smooth scroller leaves alone (data-lenis-prevent). Reintroduce a hand-rolled overlay: this fails.
+  assert.match(dlg, /<Modal title=\{tr\('Hidden chapters'\)\}/, 'the list is a hand-rolled overlay');
+  assert.match(dlg, /const path = `\/api\/admin\/series\/\$\{encodeURIComponent\(seriesId\)\}\/chapters`/);
+  assert.match(dlg, /`\$\{path\}\/hidden`/, 'the list is asked of the hidden route');
+  assert.match(dlg, /`\$\{path\}\/unhide`/, 'Restore goes through the unhide route');
+  assert.match(dlg, /restore\(\{ numbers: \[h\.number\] \}\)/, 'Restore on each');
+  assert.match(dlg, /restore\(\{ all: true \}\)/, 'Restore all');
+  assert.match(dlg, /className="btn-key"/, 'the actions are squared keys');
+  // By the count: an array dependency made fresh each render re-ran the effect for ever (React #185).
+  assert.match(dlg, /\[list\.isSuccess, count, onClose\]/, 'the self-close effect depends on the array');
 });

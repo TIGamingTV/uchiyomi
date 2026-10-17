@@ -19,9 +19,10 @@ const PASS = process.env.E2E_PASS || 'e2e-passw0rd-123';
 // 700-1500 px -- the "768 px ribbon" the owner reported on the old admin console -- and must not overflow
 // at 390. The tab row's first panel is what a bare `/profile` or `/admin` measures, so the other tabs
 // were never measured at all before this.
+// Profile → Insights (v0.75.0) is a board like You: its cards must fill a wide window and fit 390.
 // Admin → Sources (v0.54.0; Admin → Extensions' strip, Installed | Browse since v0.53.0): its strip, Your sources |
 // Add sources and their rows at every width -- each view by its own address, since the tab opens on one of them only.
-const PAGES = (process.env.PAGES || '/,/library,/library/?view=downloads,/collections,/discover,/profile,/admin,/admin/import,/moments,/profile/?tab=Settings,/profile/?tab=Connections,/profile/?tab=Account,/admin/?tab=Settings,/admin/?tab=Sources&view=yours,/admin/?tab=Sources&view=add').split(',');
+const PAGES = (process.env.PAGES || '/,/updates,/history,/library,/library/?view=downloads,/collections,/discover,/profile,/admin,/admin/import,/moments,/profile/?tab=Insights,/profile/?tab=Settings,/profile/?tab=Connections,/profile/?tab=Account,/admin/?tab=Settings,/admin/?tab=Sources&view=yours,/admin/?tab=Sources&view=add').split(',');
 
 // How much of a wide viewport the content must actually occupy. Not 100%: a settings form SHOULD have
 // margins, and prose that runs 1900px wide is unreadable. But a page using less than this is a column
@@ -113,8 +114,12 @@ try {
       caps.push(`<${el.tagName.toLowerCase()} class="${(el.className || '').toString().slice(0, 70)}"> max-width:${Math.round(m)}px`);
     }
 
+    // The desktop sidebar (components/Sidebar.tsx, UI refresh) is fixed over the start edge from lg up and absent below:
+    // the shell's start padding clears it, so the usable width loses its width as well as the two gutters.
+    const rail = Math.round(document.querySelector('[data-sidebar]')?.getBoundingClientRect().width ?? 0);
     return {
       vw,
+      rail,
       painted,
       scrollW: document.documentElement.scrollWidth,
       fill: max > min ? (max - min) / vw : 0,
@@ -171,6 +176,85 @@ try {
   }
   await page.evaluate(() => localStorage.removeItem('uchiyomi.lang'));
 
+  // The sidebar (components/Sidebar.tsx, UI refresh). Opened by the pointer at 1024 px, the narrowest desktop, every
+  // label of it fits whole in the languages with the longest words; in Arabic it is on the right-hand edge; and the top
+  // bar is see-through over Home's art until the page scrolls, then glass again.
+  await page.setViewport({ width: 1024, height: 800 });
+  for (const lang of (process.env.RAIL_LANGS || 'en,de,ru,fr').split(',')) {
+    await page.evaluate((c) => localStorage.setItem('uchiyomi.lang', c), lang);
+    await page.goto(BASE + '/library', { waitUntil: 'networkidle2', timeout: 60000 }).catch(() => {});
+    await sleep(1500);
+    await page.mouse.move(30, 400);
+    await sleep(900);
+    const r = await page.evaluate(() => {
+      const nav = document.querySelector('[data-sidebar] nav');
+      if (!nav) return null;
+      const box = nav.getBoundingClientRect();
+      const cut = [...nav.querySelectorAll('a[data-nav] > span:last-child')]
+        .filter((el) => el.scrollWidth > el.clientWidth + 1 || el.getBoundingClientRect().right > box.right + 0.5)
+        .map((el) => (el.textContent || '').trim());
+      return { open: box.width, cut, lang: document.documentElement.lang };
+    });
+    await page.mouse.move(700, 400);
+    if (!r) bad(`sidebar @1024 ${lang}: no sidebar`);
+    else if (r.lang !== lang) bad(`sidebar @1024 ${lang}: the page is in "${r.lang}"`);
+    else if (r.open < 200) bad(`sidebar @1024 ${lang}: did not open under the pointer (${Math.round(r.open)} px)`);
+    else if (r.cut.length) bad(`sidebar @1024 ${lang}: labels cut short -- ${r.cut.join(', ')}`);
+    else ok(`sidebar @1024 ${lang}: opens to ${Math.round(r.open)} px, every label whole`);
+  }
+  await page.setViewport({ width: 1280, height: 800 });
+  await page.evaluate(() => localStorage.setItem('uchiyomi.lang', 'ar'));
+  await page.goto(BASE + '/library', { waitUntil: 'networkidle2', timeout: 60000 }).catch(() => {});
+  await sleep(1500);
+  const rtl = await page.evaluate(() => {
+    const r = document.querySelector('[data-sidebar]')?.getBoundingClientRect();
+    return r ? { left: Math.round(r.left), right: Math.round(r.right), vw: document.documentElement.clientWidth, dir: document.documentElement.dir } : null;
+  });
+  if (!rtl) bad('sidebar @1280 ar: no sidebar');
+  else if (rtl.dir !== 'rtl' || rtl.right < rtl.vw - 1 || rtl.left < rtl.vw / 2) bad(`sidebar @1280 ar: not on the right-hand edge (${rtl.left}..${rtl.right} of ${rtl.vw}, dir ${rtl.dir})`);
+  else ok('sidebar @1280 ar: on the right-hand edge');
+  await page.evaluate(() => localStorage.removeItem('uchiyomi.lang'));
+  await page.goto(BASE + '/', { waitUntil: 'networkidle2', timeout: 60000 }).catch(() => {});
+  await sleep(1800);
+  const clearAtTop = await page.evaluate(() => document.querySelector('[data-topbar]')?.hasAttribute('data-clear') ?? null);
+  await page.evaluate(() => window.scrollTo(0, 900));
+  await sleep(800);
+  const clearScrolled = await page.evaluate(() => document.querySelector('[data-topbar]')?.hasAttribute('data-clear') ?? null);
+  await page.evaluate(() => window.scrollTo(0, 0));
+  if (clearAtTop !== true) bad(`top bar @1280 /: not see-through over the hero at the top (${clearAtTop})`);
+  else if (clearScrolled !== false) bad('top bar @1280 /: still see-through after the page scrolled');
+  else ok('top bar @1280 /: see-through over the hero, glass once scrolled');
+
+  // v0.67.1 (the owner: "scrolling with the mouse wheel stops when the pointer is on top of a series"): with the pointer
+  // held where Home's cards pass under it, a steady wheel must carry the page past the rails to its end. The rails had
+  // the plain data-lenis-prevent, which handed Lenis's vertical wheel to the browser mid-ease, and the page stopped dead
+  // at the first rail. Long rails as a real library has them: each rail's cards repeated in the DOM.
+  await page.setViewport({ width: 1366, height: 560 });
+  await page.goto(BASE + '/', { waitUntil: 'networkidle2', timeout: 60000 }).catch(() => {});
+  await sleep(1800);
+  const wheelSetup = await page.evaluate(() => {
+    const rails = [...document.querySelectorAll('div')].filter((e) => getComputedStyle(e).overflowX === 'auto' && e.querySelector('a[href*="/series/"]'));
+    for (const rail of rails) { const kids = [...rail.children]; for (let i = 0; i < 10; i++) for (const k of kids) rail.appendChild(k.cloneNode(true)); }
+    window.scrollTo(0, 0);
+    return { rails: rails.length, max: document.documentElement.scrollHeight - innerHeight };
+  });
+  await sleep(900);
+  await page.mouse.move(200, 300);
+  let overRail = 0;
+  for (let i = 0; i < 30; i++) {
+    await page.mouse.wheel({ deltaY: 100 });
+    await sleep(60);
+    // Over a rail = under an element that scrolls sideways, whatever it tells Lenis (the old build said it the wrong way).
+    if (await page.evaluate(() => { for (let e = document.elementFromPoint(200, 300); e; e = e.parentElement) if (getComputedStyle(e).overflowX === 'auto') return true; return false; })) overRail++;
+  }
+  await sleep(1500);
+  const wheeled = await page.evaluate(() => Math.round(scrollY));
+  if (!wheelSetup.rails) bad('wheel @1366 /: no card rail on Home to scroll over');
+  else if (!overRail) bad('wheel @1366 /: the pointer never crossed a rail -- the check proves nothing');
+  else if (wheeled < Math.min(wheelSetup.max, 2000) - 40) bad(`wheel @1366 /: the page stopped at ${wheeled} px of ${wheelSetup.max} with the pointer over a rail`);
+  else ok(`wheel @1366 /: a steady wheel carries the page past ${wheelSetup.rails} rail(s) to ${wheeled} px of ${wheelSetup.max}`);
+  await page.evaluate(() => window.scrollTo(0, 0));
+
   for (const w of [2560, 1920, 1280, 1024, 390]) {
     const mobile = w < 700;
     console.log(`\n  ${w}px`);
@@ -196,6 +280,8 @@ try {
         else ok(`/ @${w}: the hero reaches both edges`);
       }
 
+      if (mobile && m.rail) bad(`${path} @${w}: a sidebar on a phone`);
+
       if (m.scrollW > m.vw + 1) {
         bad(`${path} @${w}: ${m.scrollW - m.vw}px of horizontal overflow${m.over.length ? ` — ${m.over[0]}` : ''}`);
         for (const o of m.over.slice(1)) console.log(`             also ${o}`);
@@ -204,9 +290,10 @@ try {
       if (!mobile) {
         // The shell owns the geometry now, so every page is the same width at a given viewport. It used to
         // be owned by ~98 individual elements and pages disagreed with each other by hundreds of pixels.
-        // Viewport minus two 2rem gutters, at every width: the shell is deliberately uncapped, because a cap
-        // centres it and the full-bleed home hero then stops reaching the edges of a large display.
-        const expect = w - 64;
+        // Viewport minus two 2rem gutters and the sidebar, at every width: the shell is deliberately uncapped, because a
+        // cap centres it and the full-bleed home hero then stops reaching the edges of a large display.
+        if (!m.rail) bad(`${path} @${w}: no sidebar at a desktop width`);
+        const expect = w - 64 - m.rail;
         Math.abs(m.content - expect) <= 1
           ? ok(`${path} @${w}: ${m.content}px of usable width`)
           : bad(`${path} @${w}: ${m.content}px of usable width, expected ${expect} — this page is not on the shell`);

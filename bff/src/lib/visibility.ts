@@ -11,6 +11,7 @@
 // one more clause on `visible()`, and every caller inherits it because they all go through here.
 import { q, one } from './db';
 import { noticeBook } from './noticeChapters';
+import { genresByIdOf } from './autoDetailsSql';
 
 export interface ViewCtx {
   /** null only for background work that legitimately sees everything: the scanner, the hero pre-warmer. */
@@ -49,7 +50,11 @@ export interface ViewCtx {
    * behaves exactly as it did when libraries were the only thing it knew about.
    */
   readonly adultGenres: readonly string[];
-  /** Source ids the 18+ switch treats as adult, on top of whatever the extension itself declares. */
+  /**
+   * Source ids the admin rated Adult only (Sources → a source → Age rating), on top of whatever the extension itself
+   * declares, as this request read them. Since v0.73.0 the rating is a permission as well, and the permission does not
+   * read it from here (see `sourceRatedAdult`): this copy is the 18+ switch's, loaded only while it hides.
+   */
   readonly adultSources: readonly string[];
 }
 
@@ -177,12 +182,74 @@ export async function adultFilter(): Promise<{ genres: string[]; sources: string
   if (adultCache && Date.now() - adultCache.at < ADULT_CACHE_MS) return adultCache;
   const row = await one<{ adult_genres: unknown; adult_sources: unknown }>(
     'SELECT adult_genres, adult_sources FROM server_settings WHERE id = 1').catch(() => null);
+  // The same column is the Adult only rating that `sourceAllowedFor` refuses by (v0.73.0): every read refreshes that
+  // copy too, so it cannot drift from what is stored. A failed read leaves it as it was, never empty.
+  if (row) applyAdultSources(row.adult_sources);
   adultCache = {
     at: Date.now(),
     genres: sanitiseAdultList(row?.adult_genres),
     sources: sanitiseSourceIds(row?.adult_sources),
   };
   return adultCache;
+}
+
+/**
+ * The sources the admin rated Adult only (v0.73.0, #256 from @Squeaks72): `server_settings.adult_sources`, lowercased,
+ * the list the 18+ filter's source chips used to tick.
+ *
+ * Until then the list only tidied listings ("nothing is refused"), so a source the admin knew to be adult but whose
+ * extension declared nothing left Discover and still answered a capped account by id: its latest and popular pages,
+ * a series' detail, an add. Now it is what an extension's own adult flag is, a permission, refused everywhere
+ * `sourceAllowedFor` is asked. Held here, in memory, because that check is synchronous and called from some forty
+ * places: loaded at boot (server.ts), replaced on every write and on every read of the 18+ lists (adultFilter), so a
+ * copy that missed a write heals within the lists' cache time. There is no rating BELOW the extension's flag: the
+ * contributor's "Mixed" would have let an age-capped account into a whole site because one admin judged it fine.
+ */
+let ratedAdult: ReadonlySet<string> = new Set();
+/** Whether any read has filled the copy yet: until one has, a capped account's request reads it first (viewCtxFor). */
+let ratedAdultRead = false;
+
+/** Replace the in-memory copy from a stored value (boot, every read of the lists, every write). */
+export function applyAdultSources(stored: unknown): void {
+  ratedAdult = new Set(sanitiseSourceIds(stored));
+  ratedAdultRead = true;
+}
+
+/** Read the stored list into the in-memory copy. Throws when the read fails, so boot can say so; the copy is then kept. */
+export async function loadAdultSources(): Promise<void> {
+  const row = await one<{ adult_sources: unknown }>('SELECT adult_sources FROM server_settings WHERE id = 1');
+  applyAdultSources(row?.adult_sources);
+}
+
+/** Whether the admin rated this source Adult only. By id, lowercased, as the list is stored. */
+export function sourceRatedAdult(src: { id?: string } | null | undefined): boolean {
+  return !!src?.id && ratedAdult.has(String(src.id).trim().toLowerCase());
+}
+
+/** How many sources one list may hold: the settings route's own limit on `adultSources`. */
+export const MAX_ADULT_SOURCES = 200;
+
+/**
+ * Rate one source Adult only (`adult`), or take the rating off. One statement either way, so two sheets saving at
+ * once cannot undo each other the way a read-modify-write of the whole list would. Answers the stored list, or null
+ * when adding would pass MAX_ADULT_SOURCES. The 18+ lists' cache is dropped and the in-memory copy replaced.
+ */
+export async function rateSourceAdult(id: string, adult: boolean): Promise<string[] | null> {
+  const key = id.trim().toLowerCase();
+  const row = adult
+    ? await one<{ adult_sources: unknown }>(
+      `UPDATE server_settings
+          SET adult_sources = CASE WHEN adult_sources ? $1 THEN adult_sources ELSE adult_sources || to_jsonb($1::text) END,
+              updated_at = now()
+        WHERE id = 1 AND jsonb_typeof(adult_sources) = 'array' AND (adult_sources ? $1 OR jsonb_array_length(adult_sources) < $2)
+        RETURNING adult_sources`, [key, MAX_ADULT_SOURCES])
+    : await one<{ adult_sources: unknown }>(
+      `UPDATE server_settings SET adult_sources = adult_sources - $1::text, updated_at = now()
+        WHERE id = 1 AND jsonb_typeof(adult_sources) = 'array' RETURNING adult_sources`, [key]);
+  invalidateAdultFilter();
+  if (!row) return null;
+  applyAdultSources(row.adult_sources);
+  return sanitiseSourceIds(row.adult_sources);
 }
 
 /**
@@ -222,16 +289,17 @@ export function browsable(alias: string, ctx: ViewCtx, p: Params): string {
   // with `lower(btrim())` on both sides, the same fold the genre overview applies. The first branch is
   // uncorrelated, so Postgres evaluates it once per query: with no genre configured, no row pays for the rest.
   // An admin override of a series' genres wins over what the scan read, as the age rating does in `visible()`,
-  // and an `adult_exempt` override lets one series through.
+  // and an `adult_exempt` override lets one series through. The genres are the ones the series SHOWS
+  // (lib/autoDetailsSql.ts): since v0.73.0 that includes genres the server filled in for a series with none of its
+  // own, so a series whose filled-in genres name an adult genre is hidden like one that was scanned with it.
+  // Reintroduce by reading the override and the scan alone: "filled-in genres are judged by the 18+ filter" in
+  // autoDetails.int.test.ts lists the series while Show 18+ is off.
   parts.push(`(
     NOT EXISTS (SELECT 1 FROM server_settings s_ad
                  WHERE s_ad.id = 1 AND jsonb_typeof(s_ad.adult_genres) = 'array' AND jsonb_array_length(s_ad.adult_genres) > 0)
     OR NOT (
       EXISTS (
-        SELECT 1 FROM unnest(COALESCE(
-          (SELECT o_ad.genres FROM series_overrides o_ad WHERE o_ad.series_id = ${alias}.id),
-          ${alias}.genres
-        )) AS g_ad
+        SELECT 1 FROM unnest(${genresByIdOf(alias)}) AS g_ad
         WHERE lower(btrim(g_ad)) IN (
           SELECT lower(btrim(x_ad)) FROM server_settings s2_ad, jsonb_array_elements_text(s2_ad.adult_genres) AS x_ad
            WHERE s2_ad.id = 1 AND jsonb_typeof(s2_ad.adult_genres) = 'array')
@@ -285,6 +353,23 @@ export async function browsableIds(ids: readonly string[], ctx: ViewCtx): Promis
  * judged, and is not named. Reintroduce `browsableIds` in its place: "a merge of a series that is not 18+ is still said"
  * in repairRoutes.int.test.ts finds the line gone.
  */
+/**
+ * Which of these series this viewer may OPEN: visible(), the permission, without the 18+ surfacing switch that
+ * browsableIds also applies -- for an answer that links to a series rather than lists it (Discover's Open, v0.69.1).
+ * A failed lookup is an empty answer: nothing named.
+ */
+export async function visibleIds(ids: readonly string[], ctx: ViewCtx): Promise<Set<string>> {
+  const list = [...new Set(ids.filter(Boolean))];
+  if (!list.length) return new Set();
+  const p = new Params();
+  const arr = p.add(list);
+  const rows = await q<{ id: string }>(
+    `SELECT s.id FROM lib_series s WHERE s.id = ANY(${arr}) AND ${visible('s', ctx, p)}`,
+    p.values as any[],
+  ).catch(() => [] as Array<{ id: string }>);
+  return new Set(rows.map((r) => r.id));
+}
+
 export async function nameableIds(ids: readonly string[], ctx: ViewCtx): Promise<Set<string>> {
   const list = [...new Set(ids.filter(Boolean))];
   if (!list.length) return new Set();
@@ -329,9 +414,14 @@ export const ADULT_RATING = 18;
  * Undefined `isNsfw` means allowed, matching `visible()`'s rule about unrated content: only Suwayomi tells
  * us anything, and treating every built-in and custom site as adult would empty Discover for a capped
  * account rather than filter it.
+ *
+ * Since v0.73.0 the admin can say it too: a source rated Adult only (`sourceRatedAdult`) is refused exactly as a
+ * flagged one is, whatever its extension declares, built-in and added sites included. Reintroduce by reading the
+ * flag alone: the latest, popular, detail and add steps of sourceAdultRating.int.test.ts answer the capped account
+ * again.
  */
-export function sourceAllowedFor(src: { isNsfw?: boolean } | null | undefined, maxAgeRating: number | null): boolean {
-  if (!src?.isNsfw) return true;
+export function sourceAllowedFor(src: { id?: string; isNsfw?: boolean } | null | undefined, maxAgeRating: number | null): boolean {
+  if (!src?.isNsfw && !sourceRatedAdult(src)) return true;
   return maxAgeRating === null || maxAgeRating >= ADULT_RATING;
 }
 
@@ -368,9 +458,9 @@ export function adultFilterConfigured(ctx: ViewCtx): boolean {
 export function sourceBrowsableFor(src: { id?: string; isNsfw?: boolean } | null | undefined, ctx: ViewCtx): boolean {
   if (!sourceAllowedFor(src, ctx.maxAgeRating)) return false;
   if (!ctx.hideAdultLibraries) return true;
-  if (src?.isNsfw) return false;
-  // Named by the admin as adult even though its extension does not say so. The list is lowercased on the
-  // way in, so the comparison is too.
+  if (src?.isNsfw || sourceRatedAdult(src)) return false;
+  // Rated Adult only by the admin even though its extension does not say so, as this request read the list. The list is
+  // lowercased on the way in, so the comparison is too.
   return !(src?.id && (ctx.adultSources ?? []).includes(String(src.id).toLowerCase()));
 }
 
@@ -426,8 +516,15 @@ export async function viewCtxFor(
   // nobody sees.
   const [rows, cap] = await Promise.all([
     q<{ library_id: string }>('SELECT library_id FROM user_libraries WHERE user_id = $1', [userId]),
-    one<{ max_age_rating: number | null }>('SELECT max_age_rating FROM users WHERE id = $1', [userId]),
+    one<{ max_age_rating: number | null; disabled: boolean }>('SELECT max_age_rating, disabled FROM users WHERE id = $1', [userId]),
   ]);
+  // No account behind the id (deleted while a cookie or token signed for it still lives), or a disabled one: it
+  // sees nothing. Without this a vanished row read as null for BOTH restrictions -- the same "fallback to
+  // unrestricted" as above, with the deleted grants widening the viewer to every library and no age cap.
+  if (!cap || cap.disabled) return { userId, libraryIds: [], maxAgeRating: 0, hideAdultLibraries, adultGenres, adultSources };
+  // A capped account is refused the sources rated Adult only from the in-memory copy (sourceRatedAdult). A boot that
+  // could not read it leaves it empty, which would let this account in: read it first, and fail as the reads above do.
+  if (cap.max_age_rating !== null && cap.max_age_rating < ADULT_RATING && !ratedAdultRead) await loadAdultSources();
   return {
     userId,
     libraryIds: rows.length ? rows.map((r) => r.library_id) : null,

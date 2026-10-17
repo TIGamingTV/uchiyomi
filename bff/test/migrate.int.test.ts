@@ -449,6 +449,199 @@ test("migrate: v0.52.0's data migration states a MangaDex series' language from 
   }
 });
 
+test("migrate: v0.62.0 moves a series the English MangaDex fallback filled to MangaDex in its own language", { skip }, async () => {
+  // English MangaDex no longer falls back to Spanish, Portuguese and the rest (lib/sources/mangadex.ts). A series that
+  // fallback filled would stop updating, so it moves to MangaDex in its language, which is switched on. Each series:
+  // main source, stated language, the language of its MangaDex listing's chosen copies, and whether it is deleted.
+  const SEED: Record<string, [string, string | null, string, boolean]> = {
+    't-mdm-es': ['mangadex', 'es-419', 'es-419', false],
+    't-mdm-es-md': ['mangadex', 'es-419', 'es-la', false],
+    't-mdm-pt': ['mangadex', 'pt-BR', 'pt-br', false],
+    't-mdm-label': ['mangadex', 'ja', 'en', false],
+    't-mdm-en': ['mangadex', 'en', 'en', false],
+    't-mdm-unstated': ['mangadex', null, 'es-la', false],
+    't-mdm-gone': ['mangadex', 'es-419', 'es-419', true],
+  };
+  const ids = Object.keys(SEED);
+  const [{ langs: before }] = await q<{ langs: unknown }>(`SELECT mangadex_langs AS langs FROM server_settings WHERE id = 1`);
+  try {
+    await q(`UPDATE server_settings SET mangadex_langs = '["fr"]'::jsonb WHERE id = 1`);
+    for (const [id, [source, lang, chosen, gone]] of Object.entries(SEED)) {
+      await q(`INSERT INTO lib_series (id, source, title, folder, source_id, source_series_id, lang, deleted_at)
+               VALUES ($1, 'test', 'T', $1, $2, 'md-uuid', $3, $4)`, [id, source, lang, gone ? new Date() : null]);
+      await q(`INSERT INTO series_listing (series_id, number, source_id, chosen) VALUES ($1, 1, 'mangadex', $2::jsonb)`,
+        [id, JSON.stringify({ sourceId: `${id}-c1`, number: 1, lang: chosen })]);
+      await q(`INSERT INTO chapter_failures (series_id, number, source_id, status) VALUES ($1, 1, 'mangadex', 'error')`, [id]);
+    }
+    // Already following the language it moves to: that row must not stay, a main is never also a follower.
+    await q(`INSERT INTO series_sources (series_id, source_id, source_series_id) VALUES ('t-mdm-pt', 'mangadex-pt-br', 'md-uuid')`);
+    await q(`DELETE FROM schema_migrations WHERE id = 'v0.62.0-mangadex-series-to-their-language'`);
+    await migrate();
+    const rows = await q<{ id: string; source_id: string }>(`SELECT id, source_id FROM lib_series WHERE id = ANY($1)`, [ids]);
+    assert.deepEqual(Object.fromEntries(rows.map((r) => [r.id, r.source_id])), {
+      't-mdm-es': 'mangadex-es-419',
+      // A listing written before v0.52.0 stamped MangaDex's own code. Reintroduce by matching the app code alone.
+      't-mdm-es-md': 'mangadex-es-419',
+      't-mdm-pt': 'mangadex-pt-br',
+      // Reintroduce by dropping the EXISTS (the label alone): a series stated Japanese while its listing chose English
+      // moves to MangaDex (Japanese), and Japanese is switched on.
+      't-mdm-label': 'mangadex',
+      't-mdm-en': 'mangadex',
+      // Only a stated language moves a series. Reintroduce by moving on the listing alone.
+      't-mdm-unstated': 'mangadex',
+      // Reintroduce by dropping "deleted_at IS NULL": a removed series moves and switches a language on.
+      't-mdm-gone': 'mangadex',
+    }, 'the data migration moved the wrong series');
+    const follows = await q(`SELECT 1 FROM series_sources WHERE series_id = 't-mdm-pt'`);
+    assert.equal(follows.length, 0, 'the new main source is still listed as one of its followers');
+    const oldRows = await q<{ series_id: string }>(
+      `SELECT series_id FROM series_listing WHERE series_id = ANY($1) AND source_id = 'mangadex' ORDER BY 1`, [ids]);
+    assert.deepEqual(oldRows.map((r) => r.series_id), ['t-mdm-en', 't-mdm-gone', 't-mdm-label', 't-mdm-unstated'],
+      "a moved series kept English MangaDex's listing rows, or one that stayed lost them");
+    const failures = await q<{ series_id: string; source_id: string; status: string }>(
+      `SELECT series_id, source_id, status FROM chapter_failures WHERE series_id IN ('t-mdm-es', 't-mdm-label') ORDER BY 1`);
+    assert.deepEqual(failures.map((f) => [f.series_id, f.source_id, f.status]),
+      [['t-mdm-es', 'mangadex-es-419', 'moved'], ['t-mdm-label', 'mangadex', 'error']],
+      "the moved series' failures were not re-filed under its new main source");
+    const [{ langs }] = await q<{ langs: string[] }>(`SELECT mangadex_langs AS langs FROM server_settings WHERE id = 1`);
+    assert.deepEqual([...langs].sort(), ['es-419', 'fr', 'pt-BR'],
+      'the languages the moved series need were not switched on, or a language was switched on for nothing');
+    assert.equal((await q(`SELECT 1 FROM schema_migrations WHERE id = 'v0.62.0-mangadex-series-to-their-language'`)).length, 1,
+      'the data migration did not run, or did not stamp itself');
+  } finally {
+    await q(`DELETE FROM lib_series WHERE id = ANY($1)`, [ids]);
+    await q(`UPDATE server_settings SET mangadex_langs = $1::jsonb WHERE id = 1`, [JSON.stringify(before ?? [])]);
+  }
+});
+
+test("migrate: v0.62.0 keeps the language of each chapter English MangaDex took in another", { skip }, async () => {
+  // Once English MangaDex lists English alone, nothing on the server says which copy a file the fallback fetched was,
+  // and the wrong-language notice could never find it. So each one keeps its language on its row, from the listing copy
+  // its chapter id names -- before the next step moves a series and drops its English MangaDex listing.
+  const series: Record<string, [string | null, string]> = { 't-mdk': ['en', 'en'], 't-mdk-moved': ['es-419', 'es-419'] };
+  const copies = [
+    { source: 'mangadex', sourceId: 'c-es', lang: 'es-419' },
+    { source: 'mangadex', sourceId: 'c-en', lang: 'en' },
+    { source: 'mdk-ext', sourceId: 'c-ext', lang: 'fr' },
+    { source: 'mangadex', sourceId: 'm-es', lang: 'es-419' },
+  ];
+  // Each chapter: its series, source, chapter id stamp, and whether its file was deleted.
+  const BOOKS: Record<string, [string, string, string | null, boolean]> = {
+    't-mdk-b-es': ['t-mdk', 'mangadex', 'c-es', false],
+    't-mdk-b-en': ['t-mdk', 'mangadex', 'c-en', false],
+    't-mdk-b-nostamp': ['t-mdk', 'mangadex', null, false],
+    't-mdk-b-gone': ['t-mdk', 'mangadex', 'c-es', true],
+    't-mdk-b-ext': ['t-mdk', 'mdk-ext', 'c-ext', false],
+    't-mdk-b-moved': ['t-mdk-moved', 'mangadex', 'm-es', false],
+  };
+  const ids = Object.keys(series);
+  const [{ langs: before }] = await q<{ langs: unknown }>(`SELECT mangadex_langs AS langs FROM server_settings WHERE id = 1`);
+  try {
+    for (const [id, [lang, chosen]] of Object.entries(series)) {
+      await q(`INSERT INTO lib_series (id, source, title, folder, source_id, source_series_id, lang) VALUES ($1, 'test', 'T', $1, 'mangadex', 'md-uuid', $2)`,
+        [id, lang]);
+      await q(`INSERT INTO series_listing (series_id, number, source_id, chosen, copies) VALUES ($1, 1, 'mangadex', $2::jsonb, $3::jsonb)`,
+        [id, JSON.stringify({ sourceId: `${id}-c1`, number: 1, lang: chosen }), JSON.stringify(copies)]);
+    }
+    for (const [id, [sid, source, stamp, gone]] of Object.entries(BOOKS)) {
+      await q(`INSERT INTO lib_books (id, series_id, source, file, number, title, source_id, source_chapter_id, pruned_at)
+               VALUES ($1, $2, 'test', $1, 1, 'Chapter 1', $3, $4, $5)`, [id, sid, source, stamp, gone ? new Date() : null]);
+    }
+    await q(`DELETE FROM schema_migrations WHERE id = ANY($1)`,
+      [['v0.62.0-chapters-keep-their-language', 'v0.62.0-mangadex-series-to-their-language']]);
+    await migrate();
+    const rows = await q<{ id: string; lang: string | null }>(`SELECT id, lang FROM lib_books WHERE id = ANY($1)`, [Object.keys(BOOKS)]);
+    assert.deepEqual(Object.fromEntries(rows.map((r) => [r.id, r.lang])), {
+      't-mdk-b-es': 'es-419',
+      // An English copy from English MangaDex is in its source's language: nothing to keep. Reintroduce by dropping the
+      // English exclusion: 'en'.
+      't-mdk-b-en': null,
+      // No stamp, no copy to read it from: the file reads as its source's.
+      't-mdk-b-nostamp': null,
+      // A tombstone is no file. Reintroduce by dropping "pruned_at IS NULL": 'es-419'.
+      't-mdk-b-gone': null,
+      // Only the source that fell back, the file's and the copy's. Reintroduce by dropping both source checks: 'fr'.
+      't-mdk-b-ext': null,
+      // Read before the move drops the series' English MangaDex listing. Reintroduce by running this step after it: null.
+      't-mdk-b-moved': 'es-419',
+    }, 'the data migration kept the wrong languages');
+    assert.equal((await q(`SELECT source_id FROM lib_series WHERE id = 't-mdk-moved'`))[0].source_id, 'mangadex-es-419');
+    assert.equal((await q(`SELECT 1 FROM schema_migrations WHERE id = 'v0.62.0-chapters-keep-their-language'`)).length, 1,
+      'the data migration did not run, or did not stamp itself');
+  } finally {
+    await q(`DELETE FROM lib_series WHERE id = ANY($1)`, [ids]);
+    await q(`UPDATE server_settings SET mangadex_langs = $1::jsonb WHERE id = 1`, [JSON.stringify(before ?? [])]);
+  }
+});
+
+test('migrate: chapter dates the engine gave in SECONDS are put right everywhere a chapter keeps its date', { skip }, async () => {
+  // v2.3.2243 stamps a new chapter its extension listed without a date with the current time in epoch SECONDS, and the
+  // adapter read every date as milliseconds, so it was stored as 1970-01-21 (sources.ts uploadedAt). The repair turns a
+  // stored date between the epoch and 1973-03-04 into that many seconds after the epoch, when that lands between
+  // 2000-01-01 and two days from now, and no date otherwise -- in lib_books, series_listing (its column, `chosen` and
+  // each of `copies`) and series_post_numbers. Reintroduce by repairing lib_books alone: the listing's dates still read
+  // 1970. Drop the 2000..now+2d window: a date that was never one becomes year 2026 + 3000.
+  const { CHAPTER_DATES_MIGRATION } = await import('../src/lib/migrate');
+  const SECONDS = '1970-01-21T17:40:17.209Z'; // 1791617209 s read as ms: 2026-10-10T07:26:49Z
+  const FIXED = '2026-10-10T07:26:49.000Z';
+  const FUTURE = '1972-12-31T00:00:00.000Z'; // as seconds: past year 5000
+  const ANCIENT = '1970-01-02T00:00:00.000Z'; // as seconds: 1972, before 2000
+  const REAL = '2024-07-29T14:44:42.000Z';
+  const BEFORE_EPOCH = '1969-12-31T00:00:00.000Z';
+  const SID = 't-cds';
+  const books: Record<string, string | null> = {
+    't-cds-b-seconds': SECONDS, 't-cds-b-future': FUTURE, 't-cds-b-ancient': ANCIENT, 't-cds-b-real': REAL,
+    't-cds-b-epoch': '1970-01-01T00:00:00.000Z', 't-cds-b-before': BEFORE_EPOCH, 't-cds-b-none': null,
+  };
+  try {
+    await q(`INSERT INTO lib_series (id, source, title, folder, source_id, source_series_id) VALUES ($1, 'test', 'T', $1, 'sw:1', '1')`, [SID]);
+    for (const [id, at] of Object.entries(books)) {
+      await q(`INSERT INTO lib_books (id, series_id, source, file, number, title, published_at) VALUES ($1, $2, 'test', $1, 1, 'C', $3)`, [id, SID, at]);
+    }
+    const copy = (sourceId: string, publishedAt?: string) => ({ source: 'sw:1', sourceId, ...(publishedAt === undefined ? {} : { publishedAt }) });
+    await q(`INSERT INTO series_listing (series_id, number, source_id, chosen, copies, published_at) VALUES ($1, 1, 'sw:1', $2::jsonb, $3::jsonb, $4)`, [SID,
+      JSON.stringify(copy('c1', SECONDS)),
+      JSON.stringify([copy('c1', SECONDS), copy('c2', REAL), copy('c3', '1970-01-21T17:40:17.209+00:00'), copy('c4', 'last Tuesday'), copy('c5'), copy('c6', FUTURE)]),
+      SECONDS]);
+    // The chosen copy is fine and another one is not (192 such rows live): the copies are put right all the same.
+    await q(`INSERT INTO series_listing (series_id, number, source_id, chosen, copies, published_at) VALUES ($1, 2, 'sw:1', $2::jsonb, $3::jsonb, $4)`, [SID,
+      JSON.stringify(copy('d1', REAL)), JSON.stringify([copy('d1', REAL), copy('d2', SECONDS)]), REAL]);
+    await q(`INSERT INTO series_listing (series_id, number, source_id, chosen, copies, published_at) VALUES ($1, 3, 'sw:1', $2::jsonb, '[]'::jsonb, $3)`, [SID,
+      JSON.stringify(copy('e1', FUTURE)), FUTURE]);
+    await q(`INSERT INTO series_post_numbers (series_id, source_id, post_id, number, published_at) VALUES ($1, 'sw:1', 'p1', 1, $2), ($1, 'sw:1', 'p2', 2, $3)`,
+      [SID, SECONDS, REAL]);
+
+    await q(`DELETE FROM schema_migrations WHERE id = $1`, [CHAPTER_DATES_MIGRATION]);
+    await migrate();
+
+    const iso = (v: Date | null) => (v ? v.toISOString() : null);
+    const b = await q<{ id: string; published_at: Date | null }>(`SELECT id, published_at FROM lib_books WHERE series_id = $1`, [SID]);
+    assert.deepEqual(Object.fromEntries(b.map((r) => [r.id, iso(r.published_at)])), {
+      't-cds-b-seconds': FIXED,
+      't-cds-b-future': null,
+      't-cds-b-ancient': null,
+      't-cds-b-real': REAL,
+      't-cds-b-epoch': '1970-01-01T00:00:00.000Z',
+      't-cds-b-before': BEFORE_EPOCH,
+      't-cds-b-none': null,
+    }, 'lib_books');
+    const l = await q<{ number: number; published_at: Date | null; chosen: any; copies: any[] }>(
+      `SELECT number, published_at, chosen, copies FROM series_listing WHERE series_id = $1 ORDER BY number`, [SID]);
+    assert.equal(iso(l[0].published_at), FIXED, 'the listing\'s column');
+    assert.deepEqual(l[0].chosen, copy('c1', FIXED), 'the chosen copy, written back as the adapter writes a date');
+    assert.deepEqual(l[0].copies, [copy('c1', FIXED), copy('c2', REAL), copy('c3', FIXED), copy('c4', 'last Tuesday'), copy('c5'), copy('c6')],
+      'each copy: put right, left alone, or its non-date dropped -- in order');
+    assert.deepEqual(l[1].copies, [copy('d1', REAL), copy('d2', FIXED)], 'a row whose chosen copy was fine');
+    assert.equal(l[2].published_at, null);
+    assert.deepEqual(l[2].chosen, copy('e1'), 'a chosen copy whose date was never one has none');
+    const p = await q<{ post_id: string; published_at: Date | null }>(`SELECT post_id, published_at FROM series_post_numbers WHERE series_id = $1 ORDER BY post_id`, [SID]);
+    assert.deepEqual(p.map((r) => iso(r.published_at)), [FIXED, REAL], 'series_post_numbers');
+    assert.equal((await q(`SELECT 1 FROM schema_migrations WHERE id = $1`, [CHAPTER_DATES_MIGRATION])).length, 1, 'stamped');
+  } finally {
+    await q(`DELETE FROM lib_series WHERE id = $1`, [SID]);
+  }
+});
+
 test("migrate: v0.55.2's data migration types a series from its genres, and only one nothing has typed", { skip }, async () => {
   // Notice chapters are switched per series type (lib/noticeChapters.ts), so every series whose genres say what it is
   // has a type at the first boot. Each: its genres, the admin's genres (null for none), the type it already had and
@@ -958,4 +1151,32 @@ test('migrate: v0.55.8 distinguishes Rescan-missing legacy tombstones from prove
     await q('DELETE FROM lib_books WHERE series_id = ANY($1)', [ids]).catch(() => {});
     await q('DELETE FROM lib_series WHERE id = ANY($1)', [ids]).catch(() => {});
   }
+});
+
+test('migrate: v0.61.0 only adds -- the release radar and the smart checks\' switch -- and v0.60.1 keeps writing its rows', { skip }, async () => {
+  // v0.60.1 boots on this schema after a rollback and never names either. The radar's only required column is its key
+  // (v0.60.1 never writes a row), and the switch is off unless an admin turns it on: an upgrade must not change how
+  // often a sweep asks the sources. Reintroduce DEFAULT true on update_smart: "update_smart is not off by default".
+  const required = await q<{ column_name: string }>(
+    `SELECT column_name FROM information_schema.columns
+      WHERE table_schema = 'public' AND table_name = 'series_radar' AND is_nullable = 'NO' AND column_default IS NULL`);
+  assert.deepEqual(required.map((r) => r.column_name), ['series_id']);
+  const [smart] = await q<{ data_type: string; column_default: string | null; is_nullable: string }>(
+    `SELECT data_type, column_default, is_nullable FROM information_schema.columns
+      WHERE table_schema = 'public' AND table_name = 'server_settings' AND column_name = 'update_smart'`);
+  assert.deepEqual([smart?.data_type, smart?.column_default, smart?.is_nullable], ['boolean', 'false', 'NO'], 'update_smart is not off by default');
+  // A series v0.60.1 deletes outright -- its Forget names the tables it knows, and the radar is not one -- takes its
+  // radar with it rather than failing on a foreign key. In a transaction that is rolled back.
+  await withClient(async (c) => {
+    await c.query('BEGIN');
+    try {
+      await c.query(`INSERT INTO lib_series (id, source, title, folder) VALUES ('t-radar', 'test', 'T', 'T!radar-m/T')`);
+      await c.query(`INSERT INTO series_radar (series_id) VALUES ('t-radar')`);
+      await c.query(`DELETE FROM lib_series WHERE id = 't-radar'`);
+      const { rows } = await c.query(`SELECT 1 FROM series_radar WHERE series_id = 't-radar'`);
+      assert.equal(rows.length, 0, 'the radar outlives a series v0.60.1 deletes');
+    } finally {
+      await c.query('ROLLBACK');
+    }
+  });
 });

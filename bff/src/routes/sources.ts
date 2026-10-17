@@ -13,9 +13,10 @@ import { selectChapters, type ChapterFrom } from '../lib/selectChapters';
 import { noteChapterFailure } from '../lib/chapterFailures';
 import { scanOrder } from '../lib/scanOrder';
 import { followGuard, seriesLanguage } from '../lib/seriesLang';
-import { searchAll, groupByTitle, bySource, ratingOf, SEARCH_FIRST_ANSWER_MS, type Rated, type RatingFilter } from '../lib/searchAll';
-import { budgetFor } from '../lib/sources/budget';
-import { SOLVER_CONCURRENCY } from '../lib/sources/flaresolverr';
+import { searchAll, groupByTitle, bySource, ratingOf, narrowTo, SEARCH_FIRST_ANSWER_MS, type Rated, type RatingFilter } from '../lib/searchAll';
+import type { SourceSeries as DiscoverItem } from '../lib/sources/types';
+import { budgetFor, listBudgetFor } from '../lib/sources/budget';
+import { SOLVER_CONCURRENCY, withSolverDeadline } from '../lib/sources/flaresolverr';
 
 /**
  * How many searches a fill scan runs at once, and when it stops starting new ones.
@@ -88,6 +89,7 @@ import { registerArchiveRoutes } from './archive';
 import { chooseReleases, groupsOf, releaseOrder } from '../lib/releases';
 import { effectivePrefsFor, readSeriesPrefs } from '../lib/scanlatorPrefs';
 import { automaticChapterAllowedFor, automaticCopiesFor, copyToChapter, declaredLang, listingRows, replaceListing, sameRelease, seriesFollowsSource, type ListingCopy } from '../lib/seriesListing';
+import { languageRulesFor, type LanguageRules } from '../lib/copyLanguage';
 import { cleanSourceOrder } from '../lib/sourcePrefs';
 import { paceLevel, rateKeyOf, restLeft } from '../lib/pace';
 import { haveNumbers } from '../lib/libraryNumbers';
@@ -98,14 +100,16 @@ import {
 } from '../lib/numbering';
 import { numKey } from '../lib/postingOrder';
 import { groupStats } from '../lib/groupStats';
-import { fetchAniListArt, fetchTrendingManhwa, TrendingItem } from '../lib/anilist';
+import { fetchAniListArt, fetchTrending, TREND_COUNTRIES, type TrendCountry, TrendingItem } from '../lib/anilist';
+import { adultOk, becauseYouRead } from '../lib/anilistRelated';
 import { automaticAniListAllowed, withAniListMutation } from '../lib/anilistPolicy';
 import { learnDirection, learnDirectionWith, directionFromAniListMatch } from '../lib/readingDirection';
 import { learnTypeFromSource, learnTypeFromAniListWith } from '../lib/seriesType';
-import { linkSeriesWith } from '../lib/trackers';
+import { linkSeriesWith, planSeriesOnAddAsync } from '../lib/trackers';
 import { noticeListed } from '../lib/noticeChapters';
+import { hiddenNumbersOf } from '../lib/hiddenChapters';
 import { q, one } from '../lib/db';
-import { healthAll, isDisabled, blockedNow, reportLatest, reportFail, reportSlow, classify, noteStage } from '../lib/sourceHealth';
+import { healthAll, isDisabled, blockedNow, reportLatest, reportFail, reportSlow, classify, noteStage, slowStreakNow } from '../lib/sourceHealth';
 import { diagnose, EMPTY_SUSPECT } from '../lib/sourceDiagnosis';
 import {
   gapsOf, assess, verdict, authorise, putPlan, getPlan, planKey, sweepPlans,
@@ -123,7 +127,8 @@ export const FILL_MAX_CHAPTERS = 300;
 export const REFRESH_BUDGET_MS = 10_000;
 import { logAudit } from '../lib/audit';
 import { autoFollow, refusals, MAX_AUTO_CANDIDATES, type FollowCandidate, type FollowResult } from '../lib/autoFollow';
-import { altTitlesFor, exactHit, learnAltTitles, learnFromMainSource, namesOf, SEARCH_NAMES } from '../lib/altTitles';
+import { altTitlesFor, exactHit, learnAltTitles, learnFromMainSource, namesOf, parseAltTitles, SEARCH_NAMES } from '../lib/altTitles';
+import { currentWork, heldFor, learnPageNames, libraryChanged, libraryIndex, nameableFor, noIndex, noteTitles, pendingOf, workOf, type Held, type LibraryIndex } from '../lib/discoverIdentity';
 import { env } from '../env';
 import { runtime } from '../lib/runtime';
 import { dismissRun, listRuns, requestStop } from '../lib/downloadJobs';
@@ -136,6 +141,7 @@ import {
   visibleToAll, viewCtxFor, sourceAllowedFor, sourceBrowsableFor, browsable, visible, seriesVisible, Params, type ViewCtx, hideAdult, adultFilter,
   ADULT_RATING,
 } from '../lib/visibility';
+import { adultContentRating } from '../lib/ageRating';
 // v0.52.0 (#72): language editions of one work, and the language model they stand on.
 import { editionFolder, linkEdition, workRows, type WorkRow } from '../lib/editions';
 import { effectiveLang, sourceLanguage } from '../lib/seriesLang';
@@ -831,8 +837,11 @@ export function startDownloadJob(input: DownloadJobInput, reserved?: DownloadJob
   return { total: chapters.length };
 }
 
-// Trending recommendations are global + slow-moving; cache the AniList pull for a few hours.
-let trendingCache: { at: number; items: TrendingItem[] } | null = null;
+// Trending recommendations are global + slow-moving; cache the AniList pull for a few hours. One entry per country of
+// origin since v0.61.0 (Discover's manhwa, manga and manhua rails), each six hours on its own; `pending` is the pull
+// under way, so two pages opened together ask AniList once.
+const trendingCache = new Map<TrendCountry, { at: number; items: TrendingItem[] }>();
+const trendingPending = new Map<TrendCountry, Promise<TrendingItem[]>>();
 /** Canonical title key used for dedupe, grouping and "already in library" checks. */
 export const norm = (t: string) => t.toLowerCase().replace(/[^a-z0-9]+/g, '');
 
@@ -850,30 +859,35 @@ import { cleanGenres } from '../lib/genres';
 export type { MatchConfidence };
 
 /**
- * Which of these titles the library already has, and in which languages.
- *
- * Was `SELECT s.title FROM lib_series` -- every row, every column value in memory, once per source per wall
- * paint, and again per page as you scroll. Six sources on a 214-series library is six full scans to answer a
- * question about twenty-four titles. Returns the entry's id too, so a card for an owned title can open it. The normalisation matches `norm()` and the duplicate check in
- * `addSeriesFromSource`, which has always compared this way.
- *
- * v0.52.0 (#72): every series holding the title, with the language each is in (lib/seriesLang.ts effectiveLang),
- * because "owned" is now "owned in this source's language" (`owned` below): an English Blue Lock no longer folds a
- * Spanish provider under an "In library" card that opens the English series -- what blocked p3t3t3.
+ * Which library series a Discover item is (v0.56.0, lib/discoverIdentity.ts heldFor): its very source series, then any
+ * name the series goes by -- each followed source's own name for it included -- then the work its name is known to be.
+ * Before, only the library's own title was compared, by an ASCII-only key: a series followed on a site that spells it
+ * differently, held under another name, or named in another script, read as not held. Every series holding it, with the
+ * language each is in, so `owned` below can answer for this source's language. On the server, not the viewer: whether
+ * adding this would be a second copy is a property of the server (the add route's duplicate check reads it the same way).
  */
-const NORM_SQL = "lower(regexp_replace(s.title, '[^a-zA-Z0-9]', '', 'g'))";
-interface Held { id: string; lang: string }
-async function inLibrary(titles: Array<string | undefined>): Promise<Map<string, Held[]>> {
-  const keys = [...new Set(titles.map((t) => norm(t || '')).filter(Boolean))];
-  if (!keys.length) return new Map();
-  const rows = await q<{ k: string; id: string; lang: string | null; source_id: string | null }>(
-    `SELECT ${NORM_SQL} AS k, s.id, s.lang, s.source_id FROM lib_series s WHERE ${visibleToAll('s')} AND ${NORM_SQL} = ANY($1) ORDER BY s.id`,
-    [keys],
-  ).catch(() => []);
-  // Two series can share a normalised title; the first by id is the entry the card opens.
-  const out = new Map<string, Held[]>();
-  for (const r of rows) out.set(r.k, [...(out.get(r.k) ?? []), { id: r.id, lang: effectiveLang(r.lang, r.source_id) }]);
-  return out;
+function heldOf(idx: LibraryIndex, item: { title: string; sourceId: string }, source: string): Held[] {
+  return heldFor(idx, { source, sourceId: item.sourceId, title: item.title });
+}
+
+/** One series per id, in the order found: a card's providers may point at the same series more than once. */
+const uniqueHeld = (all: Held[]): Held[] => all.filter((h, i) => all.findIndex((x) => x.id === h.id) === i);
+
+/**
+ * One source's items as Discover answers them (v0.56.0): each with what its card says about the library for this
+ * source's language (`owned` below), the work its card folds by (`work`), and whether the library holds that work in ANY
+ * language (`owned`: browsing leaves those out, search marks them). Names nobody has looked up yet are queued for the
+ * online lookups, which never hold this answer up. A library that cannot be read is an empty one, as it always was here.
+ */
+async function decorate<T extends { title: string; sourceId: string }>(items: T[], source: string, ctx: ViewCtx) {
+  const idx = await libraryIndex().catch(() => noIndex());
+  const may = await nameableFor(idx, ctx);
+  noteTitles(items.map((r) => r.title));
+  return items.map((r) => {
+    const held = heldOf(idx, r, source);
+    const seen = held.filter((h) => may(h.id));
+    return { ...r, ...owned(held, source, seen), work: workOf(idx, { source, sourceId: r.sourceId, title: r.title }, seen), owned: held.length > 0 };
+  });
 }
 
 /**
@@ -884,12 +898,16 @@ async function inLibrary(titles: Array<string | undefined>): Promise<Map<string,
  * Reintroduce by answering `inLibrary: !!held.length`: "a Spanish provider of a title held in English is not owned"
  * in editions.int.test.ts reads true.
  */
-function owned(held: Held[] | undefined, source: string): { inLibrary: boolean; librarySeriesId?: string; libraryLangs?: string[]; lang: string | null } {
+function owned(held: Held[] | undefined, source: string, seen: Held[] = held ?? []): { inLibrary: boolean; librarySeriesId?: string; libraryLangs?: string[]; lang: string | null } {
   const lang = canonLang(getSource(source)?.lang);
   if (!held?.length) return { inLibrary: false, lang };
   const serves = sourceLanguage(source);
   const mine = serves === 'any' ? held[0] : held.find((h) => sameLanguage(h.lang, serves));
-  return { inLibrary: !!mine, librarySeriesId: (mine ?? held[0]).id, libraryLangs: [...new Set(held.map((h) => h.lang))], lang };
+  // `inLibrary` is the server's fact (would adding this be a second copy); the id and the languages only from `seen`, the
+  // series this viewer may open (nameableFor, v0.69.1).
+  if (!seen.length) return { inLibrary: !!mine, lang };
+  const shown = serves === 'any' ? seen[0] : seen.find((h) => sameLanguage(h.lang, serves));
+  return { inLibrary: !!mine, librarySeriesId: (shown ?? seen[0]).id, libraryLangs: [...new Set(seen.map((h) => h.lang))], lang };
 }
 
 /**
@@ -897,7 +915,7 @@ function owned(held: Held[] | undefined, source: string): { inLibrary: boolean; 
  * English and a Spanish provider stays addable while only the English edition is here. Each provider says for
  * itself (`inLibrary`, `lang`): the add dialog marks the held ones "in your library".
  */
-function ownedGroup<G extends { providers: Array<{ source: string }> }>(g: G, held: Held[] | undefined) {
+function ownedGroup<G extends { providers: Array<{ source: string }> }>(g: G, held: Held[] | undefined, seen: Held[] = held ?? []) {
   const providers = g.providers.map((p) => {
     const o = owned(held, p.source);
     return { ...p, inLibrary: o.inLibrary, lang: o.lang };
@@ -906,9 +924,10 @@ function ownedGroup<G extends { providers: Array<{ source: string }> }>(g: G, he
   return {
     ...g, providers,
     inLibrary: providers.length > 0 && providers.every((p) => p.inLibrary),
-    ...(held?.length ? {
-      librarySeriesId: (mine ? owned(held, mine.source).librarySeriesId : undefined) ?? held[0].id,
-      libraryLangs: [...new Set(held.map((h) => h.lang))],
+    // Named only from the series this viewer may open, as owned() above.
+    ...(seen.length ? {
+      librarySeriesId: (mine ? owned(held, mine.source, seen).librarySeriesId : undefined) ?? seen[0].id,
+      libraryLangs: [...new Set(seen.map((h) => h.lang))],
     } : {}),
   };
 }
@@ -922,6 +941,14 @@ function ownedGroup<G extends { providers: Array<{ source: string }> }>(g: G, he
  * for a single source, against a median of 355ms. Eight seconds is well past the p90 of 2.5s.
  */
 const LATEST_TIMEOUT = env.SOURCE_LATEST_TIMEOUT_MS;
+/** The add dialog's "find this title" asks this many sources at a time (v0.59.0, /api/sources/find). */
+const FIND_AT_ONCE = 6;
+/**
+ * A listing's budget (v0.59.0, lib/sources/budget.ts): 45 s behind the Cloudflare solver, where a cold solve takes 15-25 s.
+ * The search gives those sources the whole solver budget (90 s); a wall caps it lower so a dead site does not hold its
+ * Still loading card for a minute and a half.
+ */
+const listBudget = (src: SourceAdapter) => listBudgetFor(src);
 const LATEST_TTL = 10 * 60_000;
 /** What the two lookups an add must do inline are allowed to take. Matches the /find handler's budget. */
 const ADD_LOOKUP_TIMEOUT = 20_000;
@@ -984,6 +1011,9 @@ export async function seriesAndChapters(src: SourceAdapter, sourceId: string):
     // Only names not stored yet: one an admin removed stays removed (its tombstone is the row already there).
     // Detached and never throwing: a lookup must not wait on, or fail over, a ledger of names.
     if (series?.summary) void learnFromMainSource(src.id, sourceId, series.summary);
+    // v0.56.0: the other names the page lists join the work its title is (lib/discoverIdentity.ts), so a Discover card
+    // under any of them folds with the card under the title. Detached, never throwing, like the line above.
+    if (series?.summary && series.title) void learnPageNames(series.title, parseAltTitles(series.summary)).catch(() => {});
     // Only a real answer is remembered. Caching the failure -- which this did when the cache was added --
     // turns a hiccup into a confident "No readable chapters for this title on this source. Try a different
     // source." pinned for ten minutes, so retrying inside the window returns the same wrong advice. Before
@@ -1087,6 +1117,40 @@ export async function previewPageList(ctx: ViewCtx, source: string | undefined, 
   previewPages.set(key, { at: Date.now(), urls });
   return { src: r.src, chapter, urls };
 }
+/**
+ * The page list of ONE named copy of a chapter of a library series, for the compare view (#241, @Squeaks72): unlike a
+ * preview, which takes the copy the rules would pick for a number, this is the copy the admin is looking at. The copy
+ * must be one the series' own listing holds (source and the source's chapter id), so the id is never a free-form request
+ * to the source, and the series must be one `ctx` may see -- a hidden or merged series' listing is not read. Callers
+ * check that the viewer is an admin, and the image route that its credential carries the admin scope.
+ * Reintroduce by dropping the seriesVisible line: "a hidden series' copies are not served" in copyPages.int.test.ts.
+ */
+export async function copyPageList(seriesId: string, source: string | undefined, chapterId: string | undefined, ctx: ViewCtx):
+  Promise<{ src: SourceAdapter; chapter: SourceChapter; urls: string[] } | PreviewRefusal> {
+  const src = source ? getSource(source) : null;
+  if (!src || !chapterId || chapterId.length > 2048) return refused(400, 'bad_request', 'Name a source and one of its chapters.');
+  if (!(await seriesVisible(seriesId, ctx))) return refused(404, 'not_found', 'That series is not there.');
+  const known = await one<{ n: number }>(
+    'SELECT 1 AS n FROM series_listing WHERE series_id = $1 AND copies @> $2::jsonb LIMIT 1',
+    [seriesId, JSON.stringify([{ source: src.id, sourceId: chapterId }])],
+  );
+  if (!known) return refused(404, 'not_listed', 'That copy is not in this series\u2019 listing.');
+  if (await isDisabled(src.id).catch(() => false)) return refused(403, 'disabled', `${src.name} is switched off.`);
+  if (await blockedNow(src.id).catch(() => null)) return refused(429, 'cooldown', `${src.name} asked us to slow down. Try again later.`);
+  const chapter = { sourceId: chapterId, number: 0 } as SourceChapter;
+  const key = `${src.id}\u0000${chapterId}`;
+  const hit = previewPages.get(key);
+  if (hit && Date.now() - hit.at < PREVIEW_PAGES_TTL) return { src, chapter, urls: hit.urls };
+  const urls = await withTimeout(src.getPageUrls(chapterId), budgetFor(src, 20_000)).catch((e) => {
+    if (!e?.selfTimeout) void noteStage(src.id, 'pages', 'fail', { error: String(e?.message || 'getPageUrls failed') });
+    return null;
+  });
+  if (urls?.length) void noteStage(src.id, 'pages', 'ok');
+  if (!urls?.length) return refused(502, 'unreadable', 'That chapter would not load from the source.');
+  if (previewPages.size >= PREVIEW_PAGES_MAX) previewPages.delete(previewPages.keys().next().value!);
+  previewPages.set(key, { at: Date.now(), urls });
+  return { src, chapter, urls };
+}
 const latestCache = new Map<string, { at: number; items: SourceSeries[] }>();
 const latestInflight = new Map<string, Promise<SourceSeries[]>>();
 
@@ -1103,6 +1167,17 @@ const latestInflight = new Map<string, Promise<SourceSeries[]>>();
  */
 export type ListMode = 'latest' | 'popular';
 
+/**
+ * A rest a source earned only by being slow (reportSlow's five-minute breather): its status is still 'ok' -- a failure
+ * sets one of its own (reportFail). With nothing cached for the page, the listing asks anyway (v0.59.0): Popular's
+ * cache is rarely filled, and on the owner's install five working sites answered Popular with nothing for the length of
+ * a breather. A failure's cooldown is unchanged: a site that refused us is not asked again early. Reintroduce by always
+ * serving the cache: "a slow source's breather does not blank a listing it has never cached" in
+ * discoverSources.int.test.ts reads nothing.
+ */
+const restingForSlowness = (h: { status?: string | null; slow_streak?: number | null }) =>
+  (h.status ?? 'ok') === 'ok' && (h.slow_streak ?? 0) > 0;
+
 async function latestPage(src: SourceAdapter, page: number, mode: ListMode = 'latest'): Promise<SourceSeries[]> {
   // The mode belongs in the key. Without it the two listings share a cache entry and an in-flight promise,
   // so whichever is asked for first answers both -- Popular would serve Newest's results for ten minutes,
@@ -1116,7 +1191,10 @@ async function latestPage(src: SourceAdapter, page: number, mode: ListMode = 'la
   const run = async (): Promise<SourceSeries[]> => {
     try {
       const fetchList = mode === 'popular' ? src.popular! : src.latest!;
-      const raw = await withTimeout(fetchList(page), LATEST_TIMEOUT);
+      // The solves the adapter queues carry the same deadline (lib/sources/flaresolverr.ts withSolverDeadline): one
+      // still waiting for a slot when the listing gives up is dropped, not solved for nobody.
+      const budget = listBudget(src);
+      const raw = await withTimeout(withSolverDeadline(budget, () => fetchList(page)), budget);
       const seen = new Set<string>();
       // dedupe by sourceId (duplicate ids collide on the React key -> wrong cover/title on a card)
       const items = raw.filter((r) => !!r.sourceId && !seen.has(r.sourceId) && (seen.add(r.sourceId), true)).slice(0, 24);
@@ -1150,7 +1228,11 @@ async function latestPage(src: SourceAdapter, page: number, mode: ListMode = 'la
       // removed the very requests that would have shown it working, which is how a healthy source went
       // missing for a day while every diagnostic said it was fine.
       if ((e as { selfTimeout?: boolean })?.selfTimeout) {
-        void reportSlow(src.id, (e as { ms?: number }).ms ?? LATEST_TIMEOUT);
+        if (page === 1) void reportSlow(src.id, (e as { ms?: number }).ms ?? listBudget(src));
+        // Page 1 only, as reportLatest counts (v0.59.0): a later page is asked while the reader scrolls, often behind
+        // the solver's queue, and its timeouts made five working sites "slow" for a day on the owner's install --
+        // which the wall then asked last. Reintroduce by reporting every page: "only page 1 makes a source slow" in
+        // discoverSources.int.test.ts counts page 3.
       } else {
         // Nothing reported health from here, so a source that failed on every single visit kept its `ok`
         // status forever and the client's ranking kept putting it first. Reporting earns it a cooldown.
@@ -1291,8 +1373,13 @@ async function archiveRest(seriesId: string, a: { by: string | null; ctx: ViewCt
  * neither waits for AniList nor fails over it. By folder where the add has not learned the id yet.
  * Reintroduce by keeping AniList's answer unchecked: "an add keeps AniList's art only from an entry named as the
  * series" in onlineMatch.int.test.ts finds the other work's banner stored.
+ *
+ * `addedBy` (v0.68.0, #223): the person whose add this is. Once the lookup has run -- linked or not, answered or not, the
+ * series may be linked already, as an edition copies its links -- their trackers get the series as Plan to Read if they
+ * asked for that (lib/trackers.ts planSeriesOnAdd). After it, because a fresh add has its AniList link from here.
  */
-async function artByTitle(where: { id: string } | { folder: string }, title: string): Promise<void> {
+async function artByTitle(where: { id: string } | { folder: string }, title: string, addedBy: string | null = null): Promise<void> {
+  let seriesId: string | null = 'id' in where ? where.id : null;
   try {
     // This add-time enrichment is implicit. Resolve the policy from the series' current library immediately before
     // sending its title; by-folder covers a fresh download after persistScan, and fails closed if that row vanished.
@@ -1310,7 +1397,7 @@ async function artByTitle(where: { id: string } | { folder: string }, title: str
     // A source cover can have created the row while automatic lookups were disabled. Completing the lookup later
     // fills only what is missing. The series/library locks make the final privacy decision and all derived DML one
     // atomic act: a move or opt-out cannot slip between the last check and art/link/type/direction writes.
-    await withAniListMutation(where, 'automatic', async (qq, seriesId) => {
+    const done = await withAniListMutation(where, 'automatic', async (qq, seriesId) => {
       await qq(`INSERT INTO series_art (series_id, banner, cover, checked_at) VALUES ($1, $2, $3, now())
         ON CONFLICT (series_id) DO UPDATE SET
           banner = COALESCE(series_art.banner, EXCLUDED.banner),
@@ -1320,7 +1407,14 @@ async function artByTitle(where: { id: string } | { folder: string }, title: str
       await learnDirectionWith(qq, { id: seriesId }, directionFromAniListMatch(names, a), 'anilist');
       await learnTypeFromAniListWith(qq, { id: seriesId }, names, a);
     });
+    seriesId = done.seriesId ?? seriesId;
   } catch { /* AniList is best effort on an add */ }
+  if (!addedBy) return;
+  if (!seriesId && 'folder' in where) {
+    seriesId = (await one<{ id: string }>(`SELECT id FROM lib_series WHERE folder = $1 AND ${visibleToAll('lib_series')}`, [where.folder])
+      .catch(() => null))?.id ?? null;
+  }
+  if (seriesId) planSeriesOnAddAsync(addedBy, seriesId);
 }
 
 /** Add one series from a source to the library (downloads chapter 1 synchronously, the rest in background).
@@ -1348,6 +1442,11 @@ export async function addSeriesFromSource(opts: {
   req?: FastifyRequest;
   /** Which sources THIS viewer may reach; a candidate outside it is reported `unavailable` and never asked. */
   sourceAllowed?: (source: string) => boolean;
+  /**
+   * Refuse a title its source rates adults-only (erotica, pornographic): set for an account capped below 18. The
+   * source-level check above cannot see it, because MangaDex as a whole is not an adult source.
+   */
+  refuseAdultTitle?: boolean;
   /**
    * Queue the rest of the series for the slow archive once the add has settled (#117), as `by`, seen through
    * `ctx` (lib/archive.ts enqueueArchive: the same rules as the queue route). Ignored when the selection is the
@@ -1377,6 +1476,9 @@ export async function addSeriesFromSource(opts: {
   // which the add dialog calls seconds earlier for the very same two things: without that, opening the
   // dialog and pressing Add paid for four challenge solves to learn two facts.
   const { series, chapters: listed } = await seriesAndChapters(src, sourceId);
+  if (opts.refuseAdultTitle && adultContentRating(series?.contentRating)) {
+    return { ok: false, status: 403, error: 'forbidden', message: 'That source is not available on this account.' };
+  }
   // No title, no add. This used to fall back to the literal string 'Series', which becomes the folder --
   // so a `getSeries` that timed out while `listChapters` succeeded filed the title under `<Source>/Series`,
   // and the NEXT one to do that was told "already in library" and quietly merged into the same shelf.
@@ -1461,6 +1563,8 @@ export async function addSeriesFromSource(opts: {
   if (existing && !existing.deleted_at) {
     // The edition's own folder, already here: added again, or left on its own by an unlink. It is that edition.
     const linked = await linkHere(existing.id);
+    // Added again by someone (#223): their intent is the same as a first add's, and its links are already here.
+    if (opts.userId) planSeriesOnAddAsync(opts.userId, existing.id);
     return { ok: true, status: 200, title, folder, chapters: 0, seriesId: existing.id, message: 'already in library', ...(linked ? { edition: linked } : {}) };
   }
   // Numbered here, before the chooser (#116): the selection, the floor, the have-set, the listing and the files
@@ -1486,11 +1590,25 @@ export async function addSeriesFromSource(opts: {
     // dialog can offer "Open it" -- and precisely because the row may be one the caller cannot see, the
     // route gates the id on `seriesVisible` before it answers. The title and the source were always
     // answered here and are unchanged.
-    const dup = await one<{ id: string; title: string; source: string }>(
+    let dup = await one<{ id: string; title: string; source: string }>(
       `SELECT id, title, source FROM lib_series
         WHERE lower(regexp_replace(title, '[^a-zA-Z0-9]', '', 'g')) = $1 AND folder <> $2
           AND ${visibleToAll('lib_series')} LIMIT 1`,
       [norm(title), folder]);
+    if (!dup) {
+      // v0.56.0: the same work under another name, or this very source series already followed by a series under another
+      // title (lib/discoverIdentity.ts heldFor). Only the same title, by the ASCII key, was a duplicate before, so an add
+      // from a site that names the series differently made a second copy of it. Reintroduce by dropping this: "a series
+      // you hold under another name is a duplicate" in discoverIdentity.int.test.ts adds the second copy.
+      const idx = await libraryIndex().catch(() => null);
+      const ids = idx ? heldFor(idx, { source: source!, sourceId: sourceId!, title }).map((h) => h.id) : [];
+      if (ids.length) {
+        dup = await one<{ id: string; title: string; source: string }>(
+          `SELECT id, title, source FROM lib_series
+            WHERE id = ANY($1::text[]) AND folder <> $2 AND ${visibleToAll('lib_series')} ORDER BY id LIMIT 1`,
+          [ids, folder]);
+      }
+    }
     if (dup) {
       // The same title in a language the library does not hold it in is a new edition, not a second copy (v0.52.0):
       // the answer carries the offer, which the route passes on only to a viewer who may open `of`. A source in
@@ -1523,7 +1641,13 @@ export async function addSeriesFromSource(opts: {
   // ComicInfo the downloader writes and, through the scanner, into lib_series.summary.
   // Its genres without a site's genre menu (lib/genres.ts, v0.55.5), whichever source read them: they go into the row and
   // every chapter file's ComicInfo, which a scan reads back.
-  const meta = { series: title, summary: cleanDescription(series?.summary), author: series?.author, genres: cleanGenres(series?.genres), url: series?.url, status: series?.status };
+  const meta = { series: title, summary: cleanDescription(series?.summary), author: series?.author, genres: cleanGenres(series?.genres), url: series?.url, status: series?.status, contentRating: series?.contentRating };
+  // The rating the source itself gives the title. It was dropped here, so a MangaDex title rated erotica was stored
+  // unrated and visible() let every age-capped account read it. Written with GREATEST below: an existing or higher
+  // rating is never lowered, and an admin's override still wins in visible(). Every chapter's ComicInfo carries it
+  // too (downloader.ts), so a rescan from the files keeps it. Reintroduce by writing NULL: "a MangaDex title rated
+  // erotica is stored 18+" in ageRatingOnAdd.int.test.ts reads null.
+  const addedAgeRating = adultContentRating(series?.contentRating) ? ADULT_RATING : null;
 
   /**
    * "Nothing yet": the series is created and followed, and no chapter is fetched.
@@ -1577,16 +1701,16 @@ export async function addSeriesFromSource(opts: {
       : libraryIdFor(folder, libs);
     const { id } = (await q<{ id: string }>(
       `INSERT INTO lib_series (id, source, title, summary, author, status, genres, web, folder, books_count, library_id, scanned_at,
-                               auto_update, source_id, source_series_id, chapter_floor, source_checked_at, source_chapters, source_missing, lang)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,0,$10,now(),$11,$12,$13,$14,now(),$15,0,$16)
+                               auto_update, source_id, source_series_id, chapter_floor, source_checked_at, source_chapters, source_missing, lang, age_rating)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,0,$10,now(),$11,$12,$13,$14,now(),$15,0,$16,$17)
        ON CONFLICT (library_id, folder) DO UPDATE SET
          auto_update = EXCLUDED.auto_update, source_id = EXCLUDED.source_id, source_series_id = EXCLUDED.source_series_id,
          chapter_floor = EXCLUDED.chapter_floor, scanned_at = now(), deleted_at = NULL,
          source_checked_at = now(), source_chapters = EXCLUDED.source_chapters, source_missing = EXCLUDED.source_missing,
-         lang = COALESCE(lib_series.lang, EXCLUDED.lang)
+         lang = COALESCE(lib_series.lang, EXCLUDED.lang), age_rating = GREATEST(lib_series.age_rating, EXCLUDED.age_rating)
        RETURNING id`,
       [newSeriesId(), src.name, title, meta.summary || null, meta.author ?? null, meta.status ?? null, meta.genres ?? [], meta.url ?? null,
-       folder, libraryId, autoUpdate !== false, source, sourceId, floor, chosen.length, stateLang],
+       folder, libraryId, autoUpdate !== false, source, sourceId, floor, chosen.length, stateLang, addedAgeRating],
     ))[0];
     const linked = await linkHere(id);
     await stampAddNumbering({ id }, source!, numbered.decision).catch((e) => console.warn(`[add] ${folder}: numbering not recorded: ${(e as Error)?.message || e}`));
@@ -1619,7 +1743,7 @@ export async function addSeriesFromSource(opts: {
     }
     await learnDirection({ id }, series?.readingDirection, 'source').catch(() => {});
     await learnTypeFromSource({ id }, series);
-    void artByTitle({ id }, title);
+    void artByTitle({ id }, title, opts.userId ?? null);
     return { ok: true, status: 200, title, folder, chapters: 0, started: false, nothing: true, seriesId: id, ...(archive ? { archive } : {}), ...(linked ? { edition: linked } : {}) };
   }
 
@@ -1702,8 +1826,8 @@ export async function addSeriesFromSource(opts: {
     let heldArchive: AddResult['archive'];
     // The numbering before the routing, so no check can reach the row routed and not yet numbered.
     await stampAddNumbering({ folder }, source!, numbered.decision).catch((e) => console.warn(`[add] ${folder}: numbering not recorded: ${(e as Error)?.message || e}`));
-    await q('UPDATE lib_series SET auto_update = $1, source_id = $2, source_series_id = $3, chapter_floor = $5, lang = COALESCE(lang, $6) WHERE folder = $4',
-      [autoUpdate !== false, source, sourceId, folder, floor, stateLang]).catch(() => {});
+    await q('UPDATE lib_series SET auto_update = $1, source_id = $2, source_series_id = $3, chapter_floor = $5, lang = COALESCE(lang, $6), age_rating = GREATEST(age_rating, $7::int) WHERE folder = $4',
+      [autoUpdate !== false, source, sourceId, folder, floor, stateLang, addedAgeRating]).catch(() => {});
     await learnDirection({ folder }, series?.readingDirection, 'source').catch(() => {});
     await learnTypeFromSource({ folder }, series);
     // The same call the run makes on its full selection, and for the same reason: these dates are the
@@ -1725,7 +1849,7 @@ export async function addSeriesFromSource(opts: {
       await q(`INSERT INTO series_art (series_id, cover, checked_at) SELECT id, $1, NULL FROM lib_series WHERE folder = $2
         ON CONFLICT (series_id) DO UPDATE SET cover = COALESCE(series_art.cover, EXCLUDED.cover)`, [series.coverUrl, folder]).catch(() => {});
     }
-    void artByTitle({ folder }, title);
+    void artByTitle({ folder }, title, opts.userId ?? null);
     return {
       ok: true, status: 200, title, folder, chapters: 0, started: false, alreadyHere: selected.length, seriesId: heldId,
       ...(opts.archive ? { archive: heldArchive ?? 'nothing' } : {}), ...(heldEdition ? { edition: heldEdition } : {}),
@@ -1825,8 +1949,8 @@ export async function addSeriesFromSource(opts: {
     await stampAddNumbering({ folder }, source!, numbered.decision).catch((e) => console.warn(`[add] ${folder}: numbering not recorded: ${(e as Error)?.message || e}`));
     // The floor the person's selection earns, computed above the "nothing left to fetch" branch so both
     // writers use the one expression -- and from `selected`, which is what was asked for.
-    await q('UPDATE lib_series SET auto_update = $1, source_id = $2, source_series_id = $3, chapter_floor = $5, lang = COALESCE(lang, $6) WHERE folder = $4',
-      [autoUpdate !== false, source, sourceId, folder, floor, stateLang]).catch(() => {});
+    await q('UPDATE lib_series SET auto_update = $1, source_id = $2, source_series_id = $3, chapter_floor = $5, lang = COALESCE(lang, $6), age_rating = GREATEST(age_rating, $7::int) WHERE folder = $4',
+      [autoUpdate !== false, source, sourceId, folder, floor, stateLang, addedAgeRating]).catch(() => {});
     // Which way it reads, when the source can say (MangaDex: the original language). After persistScan, so
     // the row exists; below a ComicInfo that already said otherwise (lib/readingDirection.ts).
     await learnDirection({ folder }, series?.readingDirection, 'source').catch(() => {});
@@ -1861,7 +1985,7 @@ export async function addSeriesFromSource(opts: {
       await q(`INSERT INTO series_art (series_id, cover, checked_at) SELECT id, $1, NULL FROM lib_series WHERE folder = $2
         ON CONFLICT (series_id) DO UPDATE SET cover = COALESCE(series_art.cover, EXCLUDED.cover)`, [series.coverUrl, folder]).catch(() => {});
     }
-    void artByTitle({ folder }, title);
+    void artByTitle({ folder }, title, opts.userId ?? null);
     void (async () => {
       let failures = 0;
       // As in startDownloadJob: a failed add says what is still to fetch, when the loop stops and at the end.
@@ -2159,6 +2283,17 @@ export default async function sourceRoutes(app: FastifyInstance) {
   /** Same shape for every by-id rejection, and it does not say what is being withheld. */
   const denySource = (reply: FastifyReply) =>
     reply.code(403).send({ error: 'forbidden', message: 'That source is not available on this account.' });
+  /** An account capped below 18: the age cap's per-title half, for sources (MangaDex) that rate each title. */
+  const cappedBelowAdult = (req: FastifyRequest) => { const cap = vc(req).maxAgeRating; return cap !== null && cap < ADULT_RATING; };
+  /**
+   * What a by-id listing may show this viewer: a title its source rates adults-only is left out for an account capped
+   * below 18 and while the "Show 18+" chip is off -- the rule search-all already applies (ratingOf). sourceAllowedFor
+   * cannot do it, because MangaDex as a whole is not an adult source; without this its erotica covers listed for a
+   * child's account. Reintroduce by returning `items`: "a capped account's MangaDex listing leaves erotica out" in
+   * ageRatingOnAdd.int.test.ts lists it.
+   */
+  const ratedForViewer = <T extends { contentRating?: string }>(req: FastifyRequest, items: T[]): T[] =>
+    cappedBelowAdult(req) || vc(req).hideAdultLibraries ? items.filter((r) => !adultContentRating(r.contentRating)) : items;
   /** The sources this viewer may reach, in registry order. This is the ACCESS rule and nothing else. */
   const reachable = (req: FastifyRequest): SourceAdapter[] =>
     listSources().filter((s) => sourceAllowedFor(s, vc(req).maxAgeRating));
@@ -2254,13 +2389,18 @@ export default async function sourceRoutes(app: FastifyInstance) {
       content: show.map((s) => {
         const h = health.get(s.id);
         const blocked = !!(h?.blocked_until && new Date(h.blocked_until).getTime() > now);
-        const suspect = (h?.empty_streak ?? 0) >= EMPTY_SUSPECT || (h?.slow_streak ?? 0) >= EMPTY_SUSPECT;
+        // v0.59.0: slow is not quiet. Both still get the diagnosis (the sheet's note says which), but only an empty
+        // streak makes a source `quiet`, which the wall asks last: a site that answers slowly behind the solver --
+        // Natomanga, with 114 of the owner's series -- was being asked 24th of 29. Reintroduce by folding them
+        // together: "a slow source is not quiet" in discoverSources.int.test.ts reads quiet.
+        const emptySuspect = (h?.empty_streak ?? 0) >= EMPTY_SUSPECT;
+        const suspect = emptySuspect || slowStreakNow(h, now) >= EMPTY_SUSPECT;
         const d = (blocked || suspect) && h
           ? diagnose({
               status: h.status, lastError: h.last_error, consecutive: h.consecutive,
               lastOkAt: h.last_ok_at, emptyStreak: h.empty_streak ?? 0,
               blockedUntil: h.blocked_until, disabled: !!h.disabled,
-              slowStreak: h.slow_streak ?? 0, budgetMs: LATEST_TIMEOUT,
+              slowStreak: slowStreakNow(h, now), budgetMs: listBudget(s),
             })
           : null;
         return {
@@ -2286,7 +2426,7 @@ export default async function sourceRoutes(app: FastifyInstance) {
           // has drifted answers 200 with an empty page and throws nothing, so it never earned a cooldown and
           // `status` stayed 'ok' forever while the wall kept fetching it first. `budgetFor` sorts on
           // `status !== 'ok'`, so naming it is all it takes to stop ranking it above sources that work.
-          status: h?.disabled ? 'disabled' : blocked ? h!.status : suspect ? 'quiet' : 'ok',
+          status: h?.disabled ? 'disabled' : blocked ? h!.status : emptySuspect ? 'quiet' : 'ok',
           blockedUntil: blocked ? h!.blocked_until : null,
           // The PUBLIC sentence only, and only when something is actually wrong. Never `fix`, which names
           // containers and config files, and never `last_error`, which carries internal hostnames and ports.
@@ -2321,10 +2461,9 @@ export default async function sourceRoutes(app: FastifyInstance) {
     const raw = await src.search(query.trim()).catch(() => []);
     // dedupe by sourceId (duplicate ids collide on the React key → wrong cover/title on a card)
     const seen = new Set<string>();
-    const results = raw.filter((r) => !!r.sourceId && !seen.has(r.sourceId) && (seen.add(r.sourceId), true)).slice(0, 24);
+    const results = ratedForViewer(req, raw.filter((r) => !!r.sourceId && !seen.has(r.sourceId) && (seen.add(r.sourceId), true))).slice(0, 24);
     // flag titles already in the library so the UI can mark them instead of offering a duplicate add
-    const have = await inLibrary(results.map((r) => r.title));
-    return { content: results.map((r) => ({ ...r, ...owned(have.get(norm(r.title)), src.id) })) };
+    return { content: await decorate(results, src.id, vc(req)) };
   });
 
   // Search a title across ALL enabled providers at once, grouped so one card carries every source that
@@ -2995,6 +3134,9 @@ export default async function sourceRoutes(app: FastifyInstance) {
     const chapters: Array<SourceChapter & { pinned?: boolean }> = [];
     // Health is per source, asked once per source rather than once per number.
     const sourceState = new Map<string, 'ok' | 'source_unavailable' | 'cooldown' | 'denied'>();
+    // The series' language rules (v0.62.0), read once and only when a blocked number needs explaining.
+    let languageRules: Promise<LanguageRules> | null = null;
+    const languageOf = () => (languageRules ??= languageRulesFor(seriesId, [...followed]).catch((): LanguageRules => ({})));
     const stateOf = async (sid: string) => {
       let st = sourceState.get(sid);
       if (st) return st;
@@ -3006,9 +3148,18 @@ export default async function sourceRoutes(app: FastifyInstance) {
       sourceState.set(sid, st);
       return st;
     };
+    // A number an admin hid from the series (#240, lib/hiddenChapters.ts) is fetched by nobody, a pick included: said so
+    // rather than started and skipped by the download (lib/chapterFallback.ts), which is what a page from before the
+    // hide would otherwise get. Reintroduce by dropping it: "a fetch of a hidden number is skipped as hidden" in
+    // hiddenChapters.int.test.ts starts a job.
+    const hiddenNums = await hiddenNumbersOf(seriesId);
     for (const n of numbers) {
       const row = listed.get(n);
       const pick = pickOf.get(n);
+      if (hiddenNums.has(numKey(n))) {
+        skipped.push({ number: n, reason: 'hidden', ...(pick ? { source: pick.source, sourceId: pick.sourceId } : {}) });
+        continue;
+      }
       if (pick) {
         // A pick is authorised by the stored copy it names, and by nothing else: the row's status (the
         // group rules' verdict on the NUMBER, blocklist included) is deliberately not consulted -- see the
@@ -3027,7 +3178,14 @@ export default async function sourceRoutes(app: FastifyInstance) {
         continue;
       }
       if (!row) { skipped.push({ number: n, reason: 'not_listed' }); continue; }
-      if (row.status === 'blocked') { skipped.push({ number: n, reason: 'blocked_group' }); continue; }
+      if (row.status === 'blocked') {
+        // v0.62.0: a number whose every copy is in another language than the series' is left out by the language
+        // rule (lib/copyLanguage.ts), and unblocking a group would not bring it back: say which it is.
+        const language = (await languageOf()).inLanguage;
+        const otherLanguage = !!language && row.copies.length > 0 && row.copies.every((c) => !language(c));
+        skipped.push({ number: n, reason: otherLanguage ? 'other_language' : 'blocked_group' });
+        continue;
+      }
       if (here.has(n)) { skipped.push({ number: n, reason: 'already_here' }); continue; }
       const st = await stateOf(row.source_id);
       // The same by-id rejection the rest of this file gives, and it does not say what is being withheld.
@@ -3042,8 +3200,10 @@ export default async function sourceRoutes(app: FastifyInstance) {
       const first = skipped.find((x) => x.reason !== 'duplicate')?.reason ?? skipped[0]?.reason;
       const message = first === 'not_listed' ? 'Not in the last listing -- run Check for new chapters first.'
         : first === 'blocked_group' ? 'Only blocked groups released that chapter. Unblock the group and check again.'
+        : first === 'other_language' ? 'That chapter is only in another language than the series. Pick a copy under Versions to fetch it anyway.'
         : first === 'already_here' ? 'That chapter is already here.'
         : first === 'cooldown' ? 'That source is in a cooldown. Try again later.'
+        : first === 'hidden' ? 'That chapter is hidden from this series. Restore it under More to fetch it.'
         : 'That source is not available right now.';
       return reply.code(409).send({ error: 'nothing_to_fetch', message, skipped });
     }
@@ -3081,7 +3241,7 @@ export default async function sourceRoutes(app: FastifyInstance) {
    * polls the same URL with a short `wait` until it is 0.
    */
   app.get('/api/sources/search-all', async (req) => {
-    const { q: rawQ, groupBy, wait, source, rating: rawRating } = req.query as { q?: string; groupBy?: string; wait?: string; source?: string; rating?: string };
+    const { q: rawQ, groupBy, wait, source, sources: rawSources, rating: rawRating } = req.query as { q?: string; groupBy?: string; wait?: string; source?: string; sources?: string; rating?: string };
     // The 18+ filter (v0.55.4, #158): `rating=all|safe|adult`, anything else read as all. Applied to this viewer's
     // answer only, after the shared entry (lib/searchAll.ts ratingOf, groupByTitle). An account capped below 18 is never
     // shown an 18+ result whatever it asks: the add checks only the source, so the cap is held here. And with "Show 18+"
@@ -3117,7 +3277,10 @@ export default async function sourceRoutes(app: FastifyInstance) {
     // nobody is asked, and the answer is the ordinary nothing-found shape. The entry is still keyed by the
     // term alone, so a narrowed search and a full one share whatever the sources have already answered.
     const only = typeof source === 'string' ? source : '';
-    const ask = only ? all.filter((s) => s.id === only) : all;
+    // `sources`: a comma-separated list of ids, for a search that picks which sources to ask (the Add more sources sheet).
+    // Narrows the same way `source` does -- never widens `surfaceable` -- and an empty value is no list.
+    const picked = narrowTo(rawSources);
+    const ask = all.filter((s) => (!only || s.id === only) && (!picked || picked.has(s.id)));
     const health = new Map((await healthAll().catch(() => [])).map((h) => [h.source_id, h] as const));
     const ans = await searchAll(term, ask, { waitMs, health });
     const byId = new Map(ask.map((s) => [s.id, s] as const));
@@ -3135,17 +3298,27 @@ export default async function sourceRoutes(app: FastifyInstance) {
     // wants but hides which specific source a manual pick would come from.
     if (groupBy === 'source') {
       const rails = bySource(ans.per, order, rated);
-      const have = await inLibrary(rails.flatMap((g) => g.results.map((r) => r.title)));
-      return {
-        content: rails.map((g) => ({ ...g, results: g.results.map((r) => ({ ...r, ...owned(have.get(norm(r.title)), g.source) })) })),
-        ...rest,
-      };
+      return { content: await Promise.all(rails.map(async (g) => ({ ...g, results: await decorate(g.results, g.source, vc(req)) }))), ...rest };
     }
 
-    // group by normalized title → one card that carries every provider offering it (preferred order preserved)
-    const groups = groupByTitle(ans.per, order, 30, rated);
-    const have = await inLibrary(groups.map((g) => g.title));
-    return { content: groups.map((g) => ownedGroup(g, have.get(norm(g.title)))), ...rest };
+    // One card per WORK (v0.56.0, lib/discoverIdentity.ts): the work the library holds, else the one the name is known to
+    // be, else the name by nameKey -- so two sites naming one series differently are one card, carrying both. `owned`:
+    // the library holds the work in any language; the providers still say for their own language (ownedGroup).
+    const idx = await libraryIndex().catch(() => noIndex());
+    const may = await nameableFor(idx, vc(req));
+    noteTitles([...ans.per.values()].flatMap((c) => c.items.map((r) => r.title)));
+    const keyOf = (r: DiscoverItem) => {
+      const it = { source: r.source, sourceId: r.sourceId, title: r.title };
+      return workOf(idx, it, heldFor(idx, it).filter((h) => may(h.id)));
+    };
+    const groups = groupByTitle(ans.per, order, 30, rated, keyOf);
+    return {
+      content: groups.map((g) => {
+        const held = uniqueHeld(g.providers.flatMap((p) => heldFor(idx, { source: p.source, sourceId: p.sourceId, title: p.title })));
+        return { ...ownedGroup(g, held.length ? held : undefined, held.filter((h) => may(h.id))), owned: held.length > 0 };
+      }),
+      ...rest,
+    };
   });
 
   // Browse a source's newest / recently-updated series (no query). Same card shape as search.
@@ -3168,14 +3341,13 @@ export default async function sourceRoutes(app: FastifyInstance) {
     // cannot answer still cost the full timeout on every single visit: on this install two of them burned
     // 8s each, every time, for nothing. Whatever was last cached is still served, because an old page is
     // better than a blank one. blocked_until expires on its own, so the source heals without intervention.
-    if (await blockedNow(source!).catch(() => null)) {
+    const resting = await blockedNow(source!).catch(() => null);
+    if (resting) {
       const stale = cachedLatest(src.id, p);
-      const had = await inLibrary(stale.map((r) => r.title));
-      return { content: stale.map((r) => ({ ...r, ...owned(had.get(norm(r.title)), src.id) })) };
+      if (stale.length || !restingForSlowness(resting)) return { content: await decorate(ratedForViewer(req, stale), src.id, vc(req)) };
     }
     const results = await latestPage(src, p);
-    const have = await inLibrary(results.map((r) => r.title));
-    return { content: results.map((r) => ({ ...r, ...owned(have.get(norm(r.title)), src.id) })) };
+    return { content: await decorate(ratedForViewer(req, results), src.id, vc(req)) };
   });
 
   /**
@@ -3195,14 +3367,13 @@ export default async function sourceRoutes(app: FastifyInstance) {
     if (!surfaceable(req).some((s) => s.id === src.id)) return { content: [] };
     if (await isDisabled(source!).catch(() => false)) return { content: [] };
     const p = Math.max(1, parseInt(page || '1', 10) || 1);
-    if (await blockedNow(source!).catch(() => null)) {
+    const resting = await blockedNow(source!).catch(() => null);
+    if (resting) {
       const stale = cachedLatest(src.id, p, 'popular');
-      const had = await inLibrary(stale.map((r) => r.title));
-      return { content: stale.map((r) => ({ ...r, ...owned(had.get(norm(r.title)), src.id) })) };
+      if (stale.length || !restingForSlowness(resting)) return { content: await decorate(ratedForViewer(req, stale), src.id, vc(req)) };
     }
     const results = await latestPage(src, p, 'popular');
-    const have = await inLibrary(results.map((r) => r.title));
-    return { content: results.map((r) => ({ ...r, ...owned(have.get(norm(r.title)), src.id) })) };
+    return { content: await decorate(ratedForViewer(req, results), src.id, vc(req)) };
   });
 
   /**
@@ -3361,37 +3532,85 @@ export default async function sourceRoutes(app: FastifyInstance) {
   // this is both budgets at once. AniList returns 40 in the one query already, so raising it costs nothing.
   const TREND_KEEP = 36;
 
-  // Globally trending manhwa you don't already have, for the Discover recommendations rail.
-  app.get('/api/discover/trending', async (_req, reply) => {
-    reply.header('cache-control', 'no-store'); // never let a stale/empty copy get pinned client-side
-    if (!trendingCache || Date.now() - trendingCache.at > 6 * 3600_000) {
-      try {
-        let items = await fetchTrendingManhwa();
+  /** One country's trending titles, from the cache while it is under six hours old; one pull at a time per country. */
+  const trendingFor = async (country: TrendCountry): Promise<TrendingItem[] | null> => {
+    const cached = trendingCache.get(country);
+    if (cached && Date.now() - cached.at <= 6 * 3600_000) return cached.items;
+    let pull = trendingPending.get(country);
+    if (!pull) {
+      pull = (async () => {
+        let items = await fetchTrending(country);
         // A second page, only when the first cannot fill the wall. On a large library most of page 1 is
         // already owned: measured on a 215-series install, 40 fetched became 28 after the library filter,
         // and only 7 of those carried the wide art the hero prefers. The common case still costs one
         // request per six-hour cache miss, and the page argument has been there unused since this shipped.
         if (items.length < TREND_KEEP + 8) {
-          const more = await fetchTrendingManhwa(2).catch(() => [] as typeof items);
+          const more = await fetchTrending(country, 2).catch(() => [] as typeof items);
           const seen = new Set(items.map((t) => norm(t.title)));
           items = items.concat(more.filter((t) => !seen.has(norm(t.title))));
         }
-        trendingCache = { at: Date.now(), items };
-      } catch { if (!trendingCache) return { content: [] }; }
+        trendingCache.set(country, { at: Date.now(), items });
+        return items;
+      })().finally(() => trendingPending.delete(country));
+      trendingPending.set(country, pull);
     }
-    // No per-user filter here on purpose: `isAdult:false` is an argument to the AniList query, so adult
-    // titles never arrive, and the cache is shared for six hours -- filtering it per viewer would pin one
-    // capped account's view for everyone.
-    const have = await inLibrary(trendingCache.items.map((t) => t.title));
+    // Stale beats empty: an old answer is still what was trending, where nothing reads as "nothing is".
+    return pull.catch(() => trendingCache.get(country)?.items ?? null);
+  };
+
+  // Globally trending titles you don't already have, for Discover's hero and rails: `country` KR (manhwa, the default --
+  // what this route always answered), JP (manga) or CN (manhua), v0.61.0.
+  app.get('/api/discover/trending', async (req, reply) => {
+    reply.header('cache-control', 'no-store'); // never let a stale/empty copy get pinned client-side
+    const asked = (req.query as { country?: unknown }).country;
+    const country = (asked === undefined ? 'KR' : typeof asked === 'string' ? asked.toUpperCase() : '') as TrendCountry;
+    if (!TREND_COUNTRIES.includes(country)) return reply.code(400).send({ error: 'bad_request', message: 'country is one of KR, JP, CN' });
+    const items = await trendingFor(country);
+    if (!items) return { content: [] };
+    // `isAdult:false` is an argument to the AniList query, so adult titles never arrive. The cache is shared for six
+    // hours, so it is never filtered per viewer -- that would pin one capped account's view for everyone; the ANSWER is
+    // (v0.61.0): a viewer hiding 18+ is not shown a title carrying a genre the admin named as adult, as no listing of
+    // the library's own shows them one. Reintroduce the unfiltered answer: "a trending title in an adult genre is not
+    // shown to a viewer hiding 18+" in anilistRelated.int.test.ts finds it.
+    const ctx = vc(req);
+    const idx = await libraryIndex().catch(() => noIndex());
     // Deduped by normalised title, not raw: the hero and its dots are keyed by title, so two spellings of
     // the same series would collide on a React key and swap art under the reader. Rare on one page, less so
-    // across two.
+    // across two. Left out when the library holds it (v0.56.0): by any name the library knows it by, or by its
+    // AniList entry -- before, only by the library's own title.
     const seen = new Set<string>();
-    const out = trendingCache.items.filter((t) => {
+    const out = items.filter((t) => {
       const k = norm(t.title);
-      return !have.has(k) && !seen.has(k) && (seen.add(k), true);
+      const held = heldFor(idx, { source: '', sourceId: '', title: t.title }).length > 0
+        || (t.id != null && (idx.byWork.get(`al:${t.id}`)?.length ?? 0) > 0);
+      return !held && adultOk({ adult: false, genres: t.genres }, ctx) && !seen.has(k) && (seen.add(k), true);
     });
     return { content: out.slice(0, TREND_KEEP) };
+  });
+
+  /**
+   * Discover's "Because you read {title}" (v0.61.0, lib/anilistRelated.ts becauseYouRead): what AniList's readers
+   * recommend after a series this viewer read lately, less what the server holds and what is 18+ for them. `seed` is the
+   * series it is about, or null with nothing to show. Behind this file's canDownload hook, as everything on Discover is:
+   * it is a list of things to add. Reads the table only, never AniList.
+   */
+  app.get('/api/discover/because', async (req) => becauseYouRead(userIdOf(req), vc(req)));
+
+  /**
+   * What the page's work keys are now (v0.56.0, lib/discoverIdentity.ts currentWork). Discover's wall and search ask again
+   * while names are being looked up, so cards fold and the ones the library holds leave the wall without a reload. Up to
+   * 200 keys, comma-separated (a key never holds a comma); one the server knows nothing new about comes back as it was.
+   * `pending`: how many of them are still being looked up -- the page stops asking at 0. Reintroduce by answering every key
+   * as it was: "an n: key placed with a work since comes back as that work" in discoverIdentity.int.test.ts reads n:.
+   */
+  app.get('/api/discover/works', async (req) => {
+    const raw = String((req.query as { keys?: string }).keys ?? '');
+    const keys = [...new Set(raw.split(',').map((k) => k.trim()).filter(Boolean))].slice(0, 200);
+    const idx = await libraryIndex().catch(() => noIndex());
+    const may = await nameableFor(idx, vc(req));
+    const works: Record<string, { work: string; owned: boolean }> = {};
+    for (const key of keys) works[key] = currentWork(idx, key, may);
+    return { works, pending: pendingOf(keys) };
   });
 
   // Find a title across all providers (Aqua first) → the best match per provider that carries it.
@@ -3406,24 +3625,33 @@ export default async function sourceRoutes(app: FastifyInstance) {
     // source the "Show 18+" chip is hiding must be neither asked nor listed here (#64). A client naming it
     // in `sources` does not override the hide -- `wanted` only narrows the set, it never widens it.
     const allowed = new Set(surfaceable(req).map((x) => x.id));
-    const found = await Promise.all(
-      findOrder().filter((id) => allowed.has(id) && (!wanted || wanted.has(id))).map(async (id) => {
-        const src = getSource(id);
-        if (!src) return null;
-        // search-all and latest both skip disabled sources and this did not, so it offered a provider an
-        // admin had switched off and the add then failed with "disabled by the admin".
-        if (await isDisabled(id).catch(() => false)) return null;
-        try {
-          const best = pickBest(await withTimeout(src.search(term), budgetFor(src, 25000)), term);
-          return best ? { source: id, name: src.name, sourceId: best.sourceId, title: best.title, coverUrl: best.coverUrl } : null;
-        } catch { return null; }
-      }),
-    );
+    const ids = findOrder().filter((id) => allowed.has(id) && (!wanted || wanted.has(id)));
+    const one = async (id: string) => {
+      const src = getSource(id);
+      if (!src) return null;
+      // search-all and latest both skip disabled sources and this did not, so it offered a provider an
+      // admin had switched off and the add then failed with "disabled by the admin".
+      if (await isDisabled(id).catch(() => false)) return null;
+      try {
+        const best = pickBest(await withTimeout(src.search(term), budgetFor(src, 25000)), term);
+        return best ? { source: id, name: src.name, sourceId: best.sourceId, title: best.title, coverUrl: best.coverUrl } : null;
+      } catch { return null; }
+    };
+    // At most FIND_AT_ONCE searches in flight, in the ask order (v0.59.0). This asked every source it was given at
+    // the same moment; with Discover asking every source since v0.58.0, a client naming all of them would put
+    // twenty-nine searches -- the solver's among them -- on the wire at once. Reintroduce Promise.all over every id:
+    // "the add dialog's search asks a few sources at a time" in discoverSources.int.test.ts counts them all at once.
+    const found: Array<Awaited<ReturnType<typeof one>>> = new Array(ids.length).fill(null);
+    let next = 0;
+    await Promise.all(Array.from({ length: Math.min(FIND_AT_ONCE, ids.length) }, async () => {
+      for (let i = next++; i < ids.length; i = next++) found[i] = await one(ids[i]);
+    }));
     // Each provider says its language and whether the library holds its title in it (v0.52.0), as a Discover card
     // does: the add dialog marks the held ones and offers the others as a new edition.
     const hits = found.filter((f): f is NonNullable<typeof f> => !!f);
-    const have = await inLibrary(hits.map((f) => f.title));
-    return { content: hits.map((f) => ({ ...f, ...owned(have.get(norm(f.title)), f.source) })) };
+    const idx = await libraryIndex().catch(() => noIndex());
+    const may = await nameableFor(idx, vc(req));
+    return { content: hits.map((f) => { const held = heldOf(idx, f, f.source); return { ...f, ...owned(held, f.source, held.filter((h) => may(h.id))) }; }) };
   });
 
   /**
@@ -3517,6 +3745,8 @@ export default async function sourceRoutes(app: FastifyInstance) {
     if (!sourceAllowedFor(src, vc(req).maxAgeRating)) return denySource(reply);
     // Through the shared lookup so the add that usually follows this reuses it rather than re-solving.
     const { series, chapters: raw } = await seriesAndChapters(src, sourceId);
+    // The cap's per-title half, as the add below applies it: the chip does not apply here (named, not surfaced).
+    if (cappedBelowAdult(req) && adultContentRating(series?.contentRating)) return denySource(reply);
     // Numbered as the add will number them (#116, lib/numbering.ts): a source that gives many different posts one
     // number is counted in posting order, 1..K, and `numbering` says so -- with the other reading's count under
     // `alt`, for the dialog's "Keep the source's numbers" switch. The cache keeps the raw list: it is shared.
@@ -3608,6 +3838,7 @@ export default async function sourceRoutes(app: FastifyInstance) {
     const r = await addSeriesFromSource({
       source, sourceId, force, chapterCount, chapterFrom, autoUpdate, wait: false,
       alsoFollow, userId: userIdOf(req), req, sourceAllowed: (s) => sourceAllowedFor(getSource(s), maxAge),
+      refuseAdultTitle: cappedBelowAdult(req),
       numbering: b.data.numbering,
       ...(b.data.archive ? { archive: { by: userIdOf(req), ctx: vc(req) } } : {}),
       ...(b.data.edition ? { edition: b.data.edition } : {}),
@@ -3630,6 +3861,8 @@ export default async function sourceRoutes(app: FastifyInstance) {
       const edition = r.edition && 'of' in r.edition && seen ? r.edition : undefined;
       return reply.code(r.status).send({ error: r.error, message: r.message, existing, status: r.blockStatus, ...(edition ? { edition } : {}) });
     }
+    // Discover's next answers read the library afresh (v0.56.0): the card just added leaves the wall at once.
+    libraryChanged();
     // Audited here rather than after the download, so a slow or failing download does not delay the record
     // of who asked for it. What actually landed is the job's business.
     logAudit('download.add', { userId: (req as any).user?.sub, detail: { title: r.title, source, chapters: r.chapters }, req });

@@ -13,12 +13,15 @@
 import { q, one } from './db';
 import { seal, open as unseal } from './secretbox';
 import { withGate } from './gate';
-import { ADAPTERS, PROVIDERS, type Provider } from './trackerProviders';
+import { ADAPTERS, PROVIDERS, verdictOf, type Provider, type PushStatus, type SeriesState } from './trackerProviders';
 import { ghostsEnabled, ghostNumbers } from './komgaGhosts';
 import { continuousRun, marksFor, mergeRun, realRows } from './listingProgress';
 import { noticeShown } from './noticeChapters';
 import { lastNumber } from './chapterRanges';
 import type { ScopedQuery } from './anilistPolicy';
+import { incognitoOn } from './incognito';
+import { isRateLimit } from './anilistLimit';
+import { RATE_LIMITED, isRateLimitedError } from './trackerPace';
 export type { Provider } from './trackerProviders';
 
 
@@ -27,6 +30,8 @@ export interface TrackerStatus {
   /** Display name and where to get a token, so the UI does not hardcode the provider list. */
   label: string;
   tokenHelp: string;
+  /** A page that shows a token to copy (v0.61.0): AniList's, for the project's public client. Absent for the others. */
+  authorizeUrl?: string;
   connected: boolean;
   accountName: string | null;
   expiresAt: string | null;
@@ -34,9 +39,42 @@ export interface TrackerStatus {
   expiringSoon: boolean;
   lastSyncAt: string | null;
   lastError: string | null;
+  /**
+   * Only a new token mends it (#246): the service rejected the saved one (the row is switched off), it lapsed, or it can
+   * no longer be read. Not set by a rate limit, an outage or the floor refusal, which also write `lastError` but which a
+   * reconnect does nothing for: the web's line above every page and the import's tracker box read this, never
+   * `lastError` alone.
+   */
+  needsReconnect: boolean;
+  /**
+   * v0.73.0: the service asked us to wait (a 429 that outlasted every retry), so pushes go slowly for now. Said as
+   * "Syncing slowly", never as an error: `lastError` is null for it, and the next push that lands clears it.
+   */
+  slowedDown: boolean;
 }
 
 const EXPIRY_WARN_DAYS = 30;
+
+/** The `last_error` lines only a new token mends: what the push writes for a lapsed, unreadable or rejected token. */
+export const TOKEN_EXPIRED = 'the access token has expired -- reconnect to resume syncing';
+export const TOKEN_UNREADABLE = 'stored token could not be read -- reconnect to resume syncing';
+export const TOKEN_REJECTED = 'the tracker rejected the saved token -- reconnect to resume syncing';
+const RECONNECT_ERRORS: ReadonlySet<string> = new Set([TOKEN_EXPIRED, TOKEN_UNREADABLE, TOKEN_REJECTED]);
+// The `last_error` a rate limit leaves (v0.73.0): a state, not an error (lib/trackerPace.ts says why).
+export { RATE_LIMITED } from './trackerPace';
+const slowedDown = isRateLimitedError;
+
+/**
+ * Whether a stored connection needs a new token (#246). A row that exists but is switched off is one whose token was
+ * rejected (a disconnect deletes the row); a token past its `expires_at` is lapsed whatever the last push said.
+ * Reintroduce "any lastError": "a rate limit or the floor refusal never asks for a reconnect" in trackerReconnect.test.ts
+ * fails.
+ */
+export function needsReconnect(r: { enabled: boolean; expires_at: string | Date | null; last_error: string | null }, now = Date.now()): boolean {
+  if (!r.enabled) return true;
+  if (r.expires_at && new Date(r.expires_at).getTime() <= now) return true;
+  return !!r.last_error && RECONNECT_ERRORS.has(r.last_error);
+}
 
 // ---- connection management -------------------------------------------------
 
@@ -55,10 +93,18 @@ export async function saveConnection(
            expires_at = EXCLUDED.expires_at, enabled = true, last_error = NULL`,
     [userId, provider, seal(token), accountName, expiresAt],
   );
+  // A new sign-in can be a different account, whose list is not the one cached (#248, lib/trackerRecs.ts). Written here,
+  // not imported: lib/trackerRecs.ts reads this module's TOKEN_REJECTED, and the two must not import each other.
+  await dropListCache(userId, provider);
+}
+
+async function dropListCache(userId: string, provider: Provider): Promise<void> {
+  await q('DELETE FROM tracker_list_cache WHERE user_id = $1 AND provider = $2', [userId, provider]).catch(() => {});
 }
 
 export async function disconnect(userId: string, provider: Provider): Promise<void> {
   await q('DELETE FROM user_trackers WHERE user_id = $1 AND provider = $2', [userId, provider]);
+  await dropListCache(userId, provider);
 }
 
 export async function statusFor(userId: string): Promise<TrackerStatus[]> {
@@ -76,23 +122,28 @@ export async function statusFor(userId: string): Promise<TrackerStatus[]> {
   const byProvider = new Map(rows.map((r) => [r.provider, r]));
   return PROVIDERS.map((p) => {
     const r = byProvider.get(p);
+    // Additive (v0.61.0): only a provider with such a page carries the key at all.
+    const authorizeUrl = ADAPTERS[p].authorizeUrl ? { authorizeUrl: ADAPTERS[p].authorizeUrl } : {};
     if (!r) {
       return {
         provider: p, connected: false, accountName: null, expiresAt: null,
-        expiringSoon: false, lastSyncAt: null, lastError: null,
-        label: ADAPTERS[p].label, tokenHelp: ADAPTERS[p].tokenHelp,
+        expiringSoon: false, lastSyncAt: null, lastError: null, needsReconnect: false, slowedDown: false,
+        label: ADAPTERS[p].label, tokenHelp: ADAPTERS[p].tokenHelp, ...authorizeUrl,
       };
     }
     return {
     label: ADAPTERS[p].label,
     tokenHelp: ADAPTERS[p].tokenHelp,
+    ...authorizeUrl,
     provider: r.provider,
     connected: r.enabled,
     accountName: r.account_name,
     expiresAt: r.expires_at ? new Date(r.expires_at).toISOString() : null,
     expiringSoon: !!r.expires_at && new Date(r.expires_at).getTime() - Date.now() < EXPIRY_WARN_DAYS * 86_400_000,
     lastSyncAt: r.last_sync_at ? new Date(r.last_sync_at).toISOString() : null,
-    lastError: r.last_error,
+    lastError: slowedDown(r.last_error) ? null : r.last_error,
+    needsReconnect: needsReconnect(r),
+    slowedDown: slowedDown(r.last_error),
     };
   });
 }
@@ -178,12 +229,47 @@ export async function whoAmI(token: string, provider: Provider = 'anilist'): Pro
   return adapter.whoAmI(token);
 }
 
+/** What Test connection found (v0.61.0): the token works, the service says no, or something between the two. */
+export type TestVerdict = 'connected' | 'rejected' | 'unreachable' | 'refused' | 'expired' | 'not_connected';
+export interface TestResult { ok: boolean; verdict: TestVerdict; account?: string; status?: number }
+
+/**
+ * Ask the service whether the saved token still works (v0.61.0, #190): unseal it and make the one call Connect proves a
+ * token with (the adapter's whoAmI). It changes NOTHING -- not `enabled`, not `last_error`, not the account name: a
+ * person checking a connection must not be able to disable it, and a service having a bad minute is not a verdict the
+ * card should keep (verdictOf, trackerProviders.ts, says which answers are). Outside the push gate on purpose: behind a
+ * backfill's queue a test would wait minutes; the route is rate-limited instead.
+ *
+ * `not_connected` is no row, a disabled one (GET /api/trackers says `connected: false` for it), or a token this server
+ * can no longer unseal -- each needs a new token pasted, which is what reconnecting is. `expired` is said without
+ * sending the token, as a push would not send it either (pushOne). Reintroduce a write (markError on a failure, say):
+ * "test: each verdict, and nothing about the connection is written" in trackerVerdicts.int.test.ts fails.
+ */
+export async function testConnection(userId: string, provider: Provider): Promise<TestResult> {
+  const row = await one<{ access_token: string; expires_at: string | null; enabled: boolean }>(
+    'SELECT access_token, expires_at, enabled FROM user_trackers WHERE user_id = $1 AND provider = $2',
+    [userId, provider],
+  );
+  if (!row || !row.enabled) return { ok: false, verdict: 'not_connected' };
+  if (row.expires_at && new Date(row.expires_at).getTime() < Date.now()) return { ok: false, verdict: 'expired' };
+  const token = unseal(row.access_token);
+  if (!token) return { ok: false, verdict: 'not_connected' };
+  try {
+    const who = await ADAPTERS[provider].whoAmI(token);
+    return who ? { ok: true, verdict: 'connected', account: who.name } : { ok: false, verdict: 'rejected' };
+  } catch (e) {
+    const v = verdictOf(e);
+    return { ok: false, verdict: v.verdict, ...(v.status ? { status: v.status } : {}) };
+  }
+}
+
 // ---- progress push ---------------------------------------------------------
 
 
 /**
  * What we would tell a tracker about this series: the highest chapter number the user has *completed*,
- * and whether every chapter is done.
+ * and whether every chapter here is done. ⚠️ Since v0.61.2 (#201) `finished` no longer decides the status a
+ * tracker is told: every chapter on this server read is not the series read, so pushStatus asks the service.
  *
  * Deliberately the maximum completed chapter rather than the one just finished — re-reading chapter 3 of a
  * series you're 200 chapters into must not rewind the tracker, and a backfill pushing chapters in arbitrary
@@ -241,17 +327,38 @@ export async function seriesProgressFor(userId: string, seriesId: string): Promi
 }
 
 /**
- * Push a series' progress for one user. Resolves the highest completed chapter rather than the chapter
- * just finished, so reading out of order (or backfilling) can't move a tracker backwards.
+ * What a push tells a tracker, from what the service already holds (v0.61.2, #201) -- or null, nothing at all.
+ *
+ * - The service holds this chapter or a later one: nothing. Saying it again could only rewind the entry, or move it
+ *   between lists for no new reading. `lower` is the resync's deliberate way down (POST /api/trackers/:p/resync).
+ * - COMPLETED only when the SERVICE says the series has ended and gives a chapter count this reaches: Mihon's rule.
+ *   It used to be "every chapter on this server is read", which a series still coming out reaches at every catch-up,
+ *   so the entry sat under Completed between releases (#201). An ended series with no count stays reading.
+ * - A re-read stays a re-read; an entry completed on a series that has ended stays completed (the person put it
+ *   there, and Mihon keeps it too).
+ * - Everything else is reading: a planned, paused or dropped entry picked up again, a new entry, and an entry left
+ *   under Completed on a series still coming out -- which is how the ones this bug completed come back.
+ * Reintroduce the old rule by returning 'completed' for any entry at the end of the local chapters:
+ * trackerStatus.test.ts "a series still coming out, read to its newest chapter, stays reading" fails.
  */
+export function pushStatus(chapters: number, s: SeriesState, opts: { lower?: boolean } = {}): PushStatus | null {
+  const e = s.entry;
+  if (e && e.progress >= chapters && !opts.lower) return null;
+  if (s.ended && s.total != null && chapters >= s.total) return 'completed';
+  if (e?.status === 'rereading') return 'rereading';
+  if (e?.status === 'completed' && s.ended) return 'completed';
+  return 'reading';
+}
+
 /**
- * Push one series to every tracker this user has connected.
+ * Push one series to every tracker this user has connected. The highest completed chapter is resolved rather
+ * than the chapter just finished, so reading out of order (or backfilling) can't move a tracker backwards.
  *
  * Fans out because a user may have AniList and MyAnimeList on at once, and one service being down or having
  * rejected its token must not stop the other from receiving progress. Each connection keeps its own error,
- * its own high-water mark, and its own gate lane.
+ * its own high-water mark, and its own gate lane. `lower` names the one provider a resync may take DOWN.
  */
-export async function pushSeriesProgress(userId: string, seriesId: string): Promise<void> {
+export async function pushSeriesProgress(userId: string, seriesId: string, opts: { lower?: Provider } = {}): Promise<void> {
   const conns = await q<{ provider: Provider; access_token: string; expires_at: string | null }>(
     `SELECT provider, access_token, expires_at FROM user_trackers
       WHERE user_id = $1 AND enabled = true`,
@@ -259,10 +366,10 @@ export async function pushSeriesProgress(userId: string, seriesId: string): Prom
   );
   if (!conns.length) return;
 
-  const { chapters, finished } = await seriesProgressFor(userId, seriesId);
+  const { chapters } = await seriesProgressFor(userId, seriesId);
   if (chapters <= 0) return;
 
-  await Promise.all(conns.map((conn) => pushOne(userId, seriesId, conn, chapters, finished)));
+  await Promise.all(conns.map((conn) => pushOne(userId, seriesId, conn, chapters, opts.lower === conn.provider)));
 }
 
 async function pushOne(
@@ -270,7 +377,7 @@ async function pushOne(
   seriesId: string,
   conn: { provider: Provider; access_token: string; expires_at: string | null },
   chapters: number,
-  finished: boolean,
+  lower: boolean,
 ): Promise<void> {
   const adapter = ADAPTERS[conn.provider];
   if (!adapter) return;
@@ -282,12 +389,12 @@ async function pushOne(
   if (!link) return; // this series was never matched on this service
 
   if (conn.expires_at && new Date(conn.expires_at).getTime() < Date.now()) {
-    await markError(userId, conn.provider, 'the access token has expired -- reconnect to resume syncing');
+    await markError(userId, conn.provider, TOKEN_EXPIRED);
     return;
   }
   const token = unseal(conn.access_token);
   if (!token) {
-    await markError(userId, conn.provider, 'stored token could not be read -- reconnect to resume syncing');
+    await markError(userId, conn.provider, TOKEN_UNREADABLE);
     return;
   }
 
@@ -337,12 +444,20 @@ async function pushOne(
   }
 
   // one lane per user AND provider: a burst of completions trickles out politely to each service, and a slow
-  // one cannot hold up a fast one.
+  // one cannot hold up a fast one. 2.4 s apart since v0.61.2: a push is a read and a write now, so the calls per
+  // minute are what the 1.2 s of one write each used to be. AniList's calls are spaced by the server's one AniList
+  // quota instead (v0.73.0, lib/anilistLimit.ts), which every user's pushes and every other AniList job share.
   await withGate(`tracker:${userId}:${conn.provider}`, async () => {
     try {
-      await adapter.setProgress(token, link.external_id, chapters, finished);
+      // What the service holds first (v0.61.2, #201): whether the series has ended, its chapter count, and this
+      // account's entry -- pushStatus decides from those, never from the chapters on this server alone.
+      const state = await adapter.seriesState(token, link.external_id);
+      const status = pushStatus(chapters, state, { lower });
+      if (status) await adapter.setProgress(token, link.external_id, chapters, status, state);
       await q('UPDATE user_trackers SET last_sync_at = now(), last_error = NULL WHERE user_id=$1 AND provider=$2',
         [userId, conn.provider]);
+      // The service is level or ahead and nothing was sent: no floor to raise, nothing this app said.
+      if (!status) return;
       // raise the floor only after the tracker actually accepted it
       await q(
         `INSERT INTO tracker_progress (user_id, series_id, provider, chapters, pushed_at)
@@ -352,25 +467,128 @@ async function pushOne(
         [userId, seriesId, conn.provider, chapters],
       );
     } catch (e) {
-      const err = e as Error & { authFailed?: boolean };
-      // a bad token will fail on every future chapter too -- disable it rather than retry forever
-      if (err.authFailed) {
-        await q('UPDATE user_trackers SET enabled=false, last_error=$3 WHERE user_id=$1 AND provider=$2',
-          [userId, conn.provider, 'the tracker rejected the saved token -- reconnect to resume syncing']);
-      } else {
-        await markError(userId, conn.provider, err.message?.slice(0, 200) || 'sync failed');
-      }
+      await syncFailed(userId, conn.provider, e);
     }
-  }, { concurrency: 1, minGapMs: 1200 });
+  }, { concurrency: 1, minGapMs: laneGapMs(conn.provider) });
+}
+
+/** The pause between two pushes in one lane: none for AniList, whose quota spaces every call (lib/anilistLimit.ts). */
+const laneGapMs = (provider: Provider): number => (provider === 'anilist' ? 0 : 2400);
+
+/** A write the service refused: a bad token fails every future write too, so it disables the connection; else it says why. */
+async function syncFailed(userId: string, provider: Provider, e: unknown): Promise<void> {
+  const err = e as Error & { authFailed?: boolean };
+  // a bad token will fail on every future chapter too -- disable it rather than retry forever
+  if (err.authFailed) {
+    await q('UPDATE user_trackers SET enabled=false, last_error=$3 WHERE user_id=$1 AND provider=$2',
+      [userId, provider, TOKEN_REJECTED]);
+  } else if (isRateLimit(e)) {
+    // The service asked for room and every retry was spent: a state the next good push clears, never an error.
+    // Reintroduce by writing the message: "a 429 that does not end reads 'syncing slowly'" in anilistQuota.int.test.ts.
+    await markError(userId, provider, RATE_LIMITED);
+  } else {
+    await markError(userId, provider, err.message?.slice(0, 200) || 'sync failed');
+  }
 }
 
 async function markError(userId: string, provider: Provider, msg: string): Promise<void> {
   await q('UPDATE user_trackers SET last_error = $3 WHERE user_id = $1 AND provider = $2', [userId, provider, msg]).catch(() => {});
 }
 
-/** Fire-and-forget wrapper used from the reading path — must never delay or fail a page turn. */
+/**
+ * Fire-and-forget wrapper used from the reading path — must never delay or fail a page turn.
+ *
+ * Every AUTOMATIC push goes through here -- the reader's progress write, Mihon's read-progress PUT, a listing's read
+ * marks, a bulk Mark read -- so this is where Incognito reading (v0.61.0, lib/incognito.ts) stops them, whichever
+ * client wrote the progress. The deliberate ones on Profile → Connections (Push everything finished, Resync) call
+ * pushSeriesProgress directly and still go: the person asked for them. Once Incognito is off, the next push for a series
+ * sends its real highest chapter, so the tracker catches up then. Reintroduce by pushing without the check: "a Mihon
+ * read-progress PUT pushes nothing under Incognito" in incognito.int.test.ts sees a push.
+ */
 export function pushSeriesProgressAsync(userId: string, seriesId: string): void {
-  void pushSeriesProgress(userId, seriesId).catch(() => {});
+  void (async () => {
+    if (await incognitoOn(userId)) return;
+    await pushSeriesProgress(userId, seriesId);
+  })().catch(() => {});
+}
+
+/**
+ * Whether this account asked for the series it adds to go on its trackers as Plan to Read (v0.68.0, #223): app_settings
+ * `trackerPlanOnAdd`, set on Profile → Connections → Progress tracking. Off unless it is exactly `true`, and off when
+ * the setting cannot be read: an unasked-for entry on someone's list is worse than a missing one.
+ */
+export async function planOnAddWanted(userId: string): Promise<boolean> {
+  try {
+    const row = await one<{ on: boolean | null }>(
+      `SELECT (data -> 'trackerPlanOnAdd') = 'true'::jsonb AS on FROM app_settings WHERE user_id = $1`, [userId]);
+    return row?.on === true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * A series someone added to the library goes on their trackers as Plan to Read (v0.68.0, #223, "adding a series is a
+ * deliberate act ... the list entry should be created at the moment of commitment"), when they asked for that.
+ *
+ * - Only where their list has nothing for it yet. An entry they already have -- planned, reading, finished, on hold,
+ *   dropped -- is theirs, read first through the same seriesState a push reads, and never touched.
+ * - Only on a service the series is linked to: an add links it to AniList through its own art lookup (sources.ts
+ *   artByTitle, which calls this once that has run, whether or not it linked anything this time), and an import links
+ *   MyAnimeList and Kitsu. Every connected service with a link gets it, through the adapters every push goes through.
+ * - Never under Incognito (lib/incognito.ts): nothing about this account reaches a tracker while it is on.
+ * - Each service through its own lane, as a push is, so a burst of adds trickles out politely.
+ *
+ * Reintroduce writing over an existing entry by dropping the `state.entry` check: "an entry already on the list is left
+ * alone" in planOnAdd.int.test.ts sees the planned status sent.
+ */
+export async function planSeriesOnAdd(userId: string, seriesId: string): Promise<void> {
+  if (!(await planOnAddWanted(userId))) return;
+  if (await incognitoOn(userId)) return;
+  const conns = await q<{ provider: Provider; access_token: string; expires_at: string | null }>(
+    `SELECT provider, access_token, expires_at FROM user_trackers WHERE user_id = $1 AND enabled = true`,
+    [userId],
+  );
+  await Promise.all(conns.map((conn) => planOne(userId, seriesId, conn)));
+}
+
+async function planOne(
+  userId: string,
+  seriesId: string,
+  conn: { provider: Provider; access_token: string; expires_at: string | null },
+): Promise<void> {
+  const adapter = ADAPTERS[conn.provider];
+  if (!adapter) return;
+  const link = await one<{ external_id: string }>(
+    `SELECT external_id FROM series_trackers WHERE series_id = $1 AND provider = $2`,
+    [seriesId, conn.provider],
+  );
+  if (!link) return; // not matched on this service: nothing to add it as
+  if (conn.expires_at && new Date(conn.expires_at).getTime() < Date.now()) {
+    await markError(userId, conn.provider, TOKEN_EXPIRED);
+    return;
+  }
+  const token = unseal(conn.access_token);
+  if (!token) {
+    await markError(userId, conn.provider, TOKEN_UNREADABLE);
+    return;
+  }
+  await withGate(`tracker:${userId}:${conn.provider}`, async () => {
+    try {
+      const state = await adapter.seriesState(token, link.external_id);
+      if (state.entry) return; // on their list already, in whatever state they put it
+      await adapter.setProgress(token, link.external_id, 0, 'planning', state);
+      await q('UPDATE user_trackers SET last_sync_at = now(), last_error = NULL WHERE user_id=$1 AND provider=$2',
+        [userId, conn.provider]);
+    } catch (e) {
+      await syncFailed(userId, conn.provider, e);
+    }
+  }, { concurrency: 1, minGapMs: laneGapMs(conn.provider) });
+}
+
+/** Fire-and-forget, from an add: an add never waits for a tracker, nor fails over one. */
+export function planSeriesOnAddAsync(userId: string, seriesId: string): void {
+  void planSeriesOnAdd(userId, seriesId).catch(() => {});
 }
 
 /**

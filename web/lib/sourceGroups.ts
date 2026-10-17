@@ -40,6 +40,43 @@ export interface Src {
   noteCode?: string | null;
   /** How many series in the library came from this source. See `budgetFor`. */
   used?: number;
+  /**
+   * The extension the source came out of (v0.52.0): its package, or `mangadex` for every MangaDex language; null for the
+   * other built-ins, packs and custom sites. Read by a Discover card's icons (`iconStack`), one per extension.
+   */
+  extension?: SrcExtension | null;
+}
+
+/**
+ * An extension as GET /api/sources names it. `pkgName` is null when the engine never said (a source remembered before
+ * it did), and `name` is then the source's own name minus its ` (EN)`, so an extension's languages still meet by it.
+ */
+export interface SrcExtension { pkgName: string | null; name: string }
+
+/** One place a Discover card can be added from, as its icons need it (v0.56.0). */
+export interface StackSource { source: string; name: string; extension?: SrcExtension | null }
+
+/**
+ * A Discover card's source icons (v0.56.0): the first `max`, how many more, and every name.
+ *
+ * One per extension, not one per source: MangaDex is an adapter per language (`mangadex`, `mangadex-es-419`, …) and an
+ * extension a source per language, and a title on two of them is on one site -- drawn per id, the same icon sat twice
+ * in a three-icon corner. Keyed by the package; by the extension's name when the engine gave none; by the id for
+ * everything else. An icon standing for several sources is named for the extension ("MangaDex"), one standing for one
+ * keeps the source's own name ("MangaDex (ES-419)"). `names` lists them all, the ones behind "+2" too: it is the
+ * stack's tooltip and what a screen reader hears.
+ */
+export function iconStack(providers: StackSource[], max = 3): { icons: Array<{ id: string; name: string }>; more: number; names: string } {
+  const byKey = new Map<string, { id: string; name: string }>();
+  for (const p of providers) {
+    const ext = p.extension;
+    const key = ext ? (ext.pkgName ? `pkg:${ext.pkgName}` : `ext:${ext.name}`) : `id:${p.source}`;
+    const icon = byKey.get(key);
+    if (!icon) byKey.set(key, { id: p.source, name: p.name });
+    else if (ext && icon.id !== p.source) icon.name = ext.name;
+  }
+  const all = [...byKey.values()];
+  return { icons: all.slice(0, max), more: Math.max(0, all.length - max), names: all.map((s) => s.name).join(', ') };
 }
 
 /**
@@ -54,7 +91,8 @@ export type SrcState = 'ok' | 'empty' | 'idle' | 'blocked';
 /**
  * Which sources to actually fetch, and in what order.
  *
- * The page that fetched every registered source opened forty-five concurrent scrapes. Six, best-first:
+ * The page that fetched every registered source opened forty-five concurrent scrapes. Six, best-first -- and since
+ * v0.58.0 every one again (`max` Infinity), but in this order and WALL_IN_FLIGHT at a time, never all at once:
  *   1. healthy before rate-limited or blocked, because a blocked source is a guaranteed timeout for a
  *      guaranteed nothing;
  *   2. what the library actually came from;
@@ -64,9 +102,13 @@ export type SrcState = 'ok' | 'empty' | 'idle' | 'blocked';
  * extension sources with no series behind any of them, while Aqua Manga -- 189 of that library's 214 series,
  * answering in 2.5s -- was never among the six. Ranking by what someone demonstrably reads from fixed it.
  */
-export function budgetFor(sources: Src[], max = 6): Src[] {
+export function budgetFor(sources: Src[], max = 6, can: 'latest' | 'popular' = 'latest'): Src[] {
   return sources
-    .filter((s) => s.latest && s.status !== 'disabled')
+    // The listing being asked for, not always `latest` (v0.59.0): Popular filtered on popular and then again on latest,
+    // so MangaYi, Alpha Manga and AHottie -- extensions with a popular listing and no latest -- were on neither wall.
+    // Reintroduce `s.latest` alone: "a source with only a popular listing is on the Popular wall" in
+    // sourcePicker.test.ts finds it missing.
+    .filter((s) => s[can] && s.status !== 'disabled')
     .sort((a, b) =>
       Number(a.status !== 'ok') - Number(b.status !== 'ok') ||
       (b.used ?? 0) - (a.used ?? 0))
@@ -137,13 +179,30 @@ export function aloneEmpty(src: Src, state: SrcState, now = Date.now()): { text:
 export type ListMode = 'newest' | 'popular';
 
 /**
+ * How many sources the wall has asking at once (named in v0.58.0; the page's literal 4 before). Each answer releases
+ * the next, so asking every source -- as the wall does since v0.58.0 -- never widens the burst: it only makes the wall
+ * fill for longer.
+ */
+export const WALL_IN_FLIGHT = 4;
+
+/**
+ * How many of the wall's sources have answered page `page` (v0.58.0): `keys` are the page's `${listMode}:${id}`, and
+ * `upTo` the furthest page each key has answered. The gate is WALL_IN_FLIGHT more than this, and the next page waits
+ * until it is every one of them. By page, because a count of the sources that ever answered -- what the gate counted
+ * before -- is all of them from page 2 on, and opened the gate to every source at once.
+ */
+export function answeredPage(keys: readonly string[], upTo: Readonly<Record<string, number>>, page: number): number {
+  return keys.filter((k) => (upTo[k] ?? 0) >= page).length;
+}
+
+/**
  * Sources worth asking for the mode currently selected.
  *
  * A source that cannot answer the chosen listing drops out entirely, the same way one without `latest`
  * already does -- showing a chip that can never fill would be worse than showing one fewer chip.
  */
 export function budgetForMode(sources: Src[], mode: ListMode, max = 6): Src[] {
-  return budgetFor(mode === 'popular' ? sources.filter((s) => s.popular) : sources, max);
+  return budgetFor(sources, max, mode === 'popular' ? 'popular' : 'latest');
 }
 
 /** Where the browser can find a source's icon. The route answers 404 when there is none; the tile covers it. */

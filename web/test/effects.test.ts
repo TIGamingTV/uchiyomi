@@ -60,7 +60,8 @@ function cssRules(css: string): Rule[] {
       let j = open + 1;
       while (j < s.length && depth) { if (s[j] === '{') depth++; else if (s[j] === '}') depth--; j++; }
       const body = s.slice(open + 1, j - 1);
-      if (/^@(media|layer|supports|theme)\b/.test(pre)) walk(body, [...ctx, pre.replace(/\s+/g, ' ')]);
+      // @starting-style too (v0.67.3): a rule inside it restyles a layer as it appears, and the scan below must see it.
+      if (/^@(media|layer|supports|theme|starting-style)\b/.test(pre)) walk(body, [...ctx, pre.replace(/\s+/g, ' ')]);
       else out.push({ sel: pre.replace(/\s+/g, ' '), body, ctx });
       i = j;
     }
@@ -85,6 +86,8 @@ const PINNED: Record<string, string[]> = {
     'opacity: 0.05', 'mix-blend-mode: overlay',
     `background-image: ${GRAIN_URL}`,
     'background-size: 180px 180px',
+    // v0.67.3: the fade back in after a scroll (the pause is pinned in "the grain steps aside while the page moves").
+    'transition: opacity 0.3s ease-out',
   ],
   '.fx-vignette': [
     'position: fixed', 'inset: 0', 'z-index: 2', 'pointer-events: none',
@@ -126,6 +129,9 @@ test('nothing outside the pinned rules restyles a cinematic layer, except the sw
     if (r.ctx.length === 0 && r.sel in PINNED) continue;
     if (r.ctx.length === 0 && r.sel.split(',').every((s) => s.trim().startsWith('html.reduce-effects '))) continue;
     if (r.ctx.join('|') === '@media (prefers-reduced-motion: reduce)' && r.sel === '.fx-mesh' && flat(r.body) === 'animation: none;') continue;
+    // v0.67.3, the owner's call: the grain is out of the page while it moves, and fades back in -- these two exactly.
+    if (r.ctx.length === 0 && r.sel === 'html.lenis-scrolling .fx-grain' && flat(r.body) === 'display: none;') continue;
+    if (r.ctx.join('|') === '@starting-style' && r.sel === '.fx-grain' && flat(r.body) === 'opacity: 0;') continue;
     assert.fail(`a rule outside the pinned three restyles ${r.sel.match(/\.fx-\w+/)![0]}: ${r.ctx.join(' ')} ${r.sel} { ${flat(r.body)} }`);
   }
 });
@@ -134,10 +140,14 @@ test('prefers-reduced-motion does exactly what it did before the switch existed'
   // The system setting and the switch are different requests: someone who asked their OS for less motion did
   // not ask for the grain or the glass to go. So the media block stays the two rules it was -- no drift, near
   // zero durations -- and gains nothing. Reintroduce by folding the switch into it (hiding the fx layers
-  // under the media query): "the reduced-motion block changed" fails.
+  // under the media query): "the reduced-motion block changed" fails. (v0.75.0: the phone hero's drift, a CSS
+  // animation since then, stops here as the mesh's does -- the same "no drift", not a Reduce effects rule -- and so do the
+  // badge emblems' sheen and Legend's halo, v0.75.0.)
   const inPrm = CSS().filter((r) => r.ctx.join('|') === '@media (prefers-reduced-motion: reduce)');
   assert.deepEqual(inPrm.map((r) => `${r.sel} { ${flat(r.body)} }`), [
     '.fx-mesh { animation: none; }',
+    '.hero-drift { animation: none; }',
+    '.badge-sheen, .badge-halo { animation: none; }',
     '*, *::before, *::after { animation-duration: 0.001ms !important; transition-duration: 0.001ms !important; }',
   ], 'the reduced-motion block changed');
 });
@@ -305,6 +315,34 @@ test('every consumer honours the switch', () => {
   assert.match(toast, /exit=\{reduced \? \{ opacity: 0, transition: \{ duration: 0 \} \}/, 'Toast.tsx still slides out under Reduce effects');
 });
 
+test("the series page's new motion and glow (v0.60.0) are the default look, and step aside for the switch and for reduced motion", () => {
+  // The phone's Continue bar slides up, the favourite heart pops, AniList's meter grows in, and the reading button
+  // glows in the series' cover colour. Each reads BOTH settings on every render, as Toast.tsx does, and draws still
+  // under either. Reintroduce `initial={{ opacity: 0, y: 16 }}` on the bar, or drop the heart's `reduced ||`: the
+  // matching assertion fails.
+  const both = /const plain = useReduceEffects\(\);\s*const still = useReducedMotion\(\);\s*const reduced = plain \|\| !!still;/;
+  const bar = code(read('components/ContinueBar.tsx'));
+  assert.match(bar, both, 'ContinueBar.tsx reads the motion settings conditionally, or only one of them');
+  assert.match(bar, /initial=\{reduced \? false : \{ opacity: 0, y: \d+ \}\}/, 'the Continue bar still slides in under Reduce effects');
+  assert.match(bar, /exit=\{reduced \? undefined : \{ opacity: 0, y: \d+ \}\}/, 'the Continue bar still slides out under Reduce effects');
+  assert.match(bar, /transition=\{reduced \? \{ duration: 0 \} : \{ duration: 0\.2\d/, 'the Continue bar still animates under Reduce effects');
+  const keys = code(read('components/SeriesKeys.tsx'));
+  assert.match(keys, both, 'SeriesKeys.tsx reads the motion settings conditionally, or only one of them');
+  assert.match(keys, /initial=\{reduced \|\| pops === 0 \? false : \{ scale: [\d.]+ \}\}/, 'the heart still pops under Reduce effects, or pops on arrival');
+  assert.match(keys, /transition=\{reduced \? \{ duration: 0 \} : \{ type: 'spring'/);
+  const panel = code(read('components/RatingsPanel.tsx'));
+  assert.match(panel, both, 'RatingsPanel.tsx reads the motion settings conditionally, or only one of them');
+  assert.match(panel, /initial=\{reduced \? false : \{ scaleX: 0 \}\}/, 'the AniList meter still grows in under Reduce effects');
+  // The glow: the default in the components layer, after `.btn-accent` whose plain shadow it replaces; the switch puts
+  // the plain one back, unlayered as every Reduce effects rule is.
+  const rules = CSS();
+  const glow = rules.find((r) => r.sel === '.cta-glow' && r.ctx.join('|') === '@layer components');
+  assert.ok(glow && /rgb\(var\(--cover, var\(--accent\)\) \/ 0\.\d+\)/.test(flat(glow.body)), 'the reading button is not lit in the cover colour by default');
+  const plainGlow = rules.find((r) => r.ctx.length === 0 && r.sel.split(',').map((x) => x.trim()).includes('html.reduce-effects .cta-glow'));
+  assert.ok(plainGlow && /box-shadow: 0 8px 30px -10px rgb\(var\(--accent\) \/ 0\.7\)/.test(flat(plainGlow.body)), 'Reduce effects leaves the cover glow on');
+  assert.match(code(read('components/ContinueBar.tsx')), /\$\{disabled \? '' : 'cta-glow'\}/, 'the reading button does not wear the glow');
+});
+
 /* ================================================================ the setting itself */
 
 test('the Appearance section has the Reduce effects switch, and it saves to the account', () => {
@@ -317,10 +355,13 @@ test('the Appearance section has the Reduce effects switch, and it saves to the 
   const slice = src.slice(start, end);
   assert.match(slice, /<SwitchRow label=\{tr\('Reduce effects'\)\}\s*help=\{tr\('Turns off the animated background, blur, smooth scrolling and transitions\. Try it if scrolling feels slow\.'\)\}\s*on=\{reduceEffects\} onChange=\{saveReduceEffects\} \/>/,
     'the Reduce effects row is not in Appearance');
-  assert.match(slice, /const reduceEffects = user\?\.settings\?\.reduceEffects === true;/, 'the row does not read the account setting');
-  assert.match(slice, /setSettings\(\{ reduceEffects: next \}\);/, 'the switch is not applied the moment it is flipped');
-  assert.match(slice, /json: \{ reduceEffects: next \}/, 'the switch does not save reduceEffects to the account');
-  assert.match(slice, /catch \(e\) \{ setSettings\(\{ reduceEffects: prev \}\); throw e; \}/, 'a refused save leaves the switch applied');
+  assert.match(slice, /const \[reduceEffects, saveReduceEffects\] = useReduceEffects\(\);/, 'the row does not read the account setting');
+  // The hook is shared with the profile's quick settings (components/ProfileMenu.tsx), so it is read where it lives.
+  const hook = code(read('lib/useReduceEffects.ts'));
+  assert.match(hook, /user\?\.settings\?\.reduceEffects === true;/, 'the row does not read the account setting');
+  assert.match(hook, /setSettings\(\{ reduceEffects: next \}\);/, 'the switch is not applied the moment it is flipped');
+  assert.match(hook, /json: \{ reduceEffects: next \}/, 'the switch does not save reduceEffects to the account');
+  assert.match(hook, /catch \(e\) \{ setSettings\(\{ reduceEffects: prev \}\); throw e; \}/, 'a refused save leaves the switch applied');
 });
 
 test('the class is applied before the app shell renders, and follows the account both ways', () => {
@@ -445,4 +486,27 @@ test('the perf rig sets the switch off for its baseline instead of inheriting it
     // visible in the log rather than being read as a number.
     assert.match(src, /fmtState\(/, `${f} prints no page state beside its rows`);
   }
+});
+
+test('the grain steps aside while the page moves, and only then', async () => {
+  // v0.67.3, asked as "fast scrolling on desktop lags a bit" and decided by the owner ("pause it while scrolling"). The
+  // grain's overlay blend has the GPU redraw everything under it and blend the two on every frame the content moves: with
+  // it out of the page, a fast scroll went from 39-55 fps to 60 on Home and the Library (Chrome). It is OUT (display: none)
+  // while Lenis marks the page `lenis-scrolling` -- at opacity 0 the blend was still prepared and the Library stayed at 48
+  // -- and fades back in over 0.3 s from @starting-style. Reintroduce the always-on grain by deleting the rule: this fails.
+  const rules = CSS();
+  const pause = rules.filter((r) => r.ctx.length === 0 && r.sel === 'html.lenis-scrolling .fx-grain');
+  assert.equal(pause.length, 1, 'the grain no longer steps aside while the page moves');
+  assert.equal(flat(pause[0].body), 'display: none;', 'paused some cheaper-looking way that still blends: opacity 0 kept the cost');
+  const back = rules.filter((r) => r.ctx.join('|') === '@starting-style' && r.sel === '.fx-grain');
+  assert.equal(back.length, 1, 'the grain no longer fades back in after a scroll');
+  assert.equal(flat(back[0].body), 'opacity: 0;');
+  // Nothing else may pause it: the switch and this are the only two ways the grain leaves the page.
+  assert.ok(!rules.some((r) => /lenis-(smooth|stopped|locked)[^,{]*\.fx-/.test(r.sel)), 'another Lenis state hides an fx layer');
+  // ⚠️ The minifier is where CSS fixes have vanished before (the backdrop-filter trap above): both rules must survive it.
+  const css = read('app/globals.css');
+  const block = css.slice(css.indexOf('html.lenis-scrolling .fx-grain'), css.indexOf('@starting-style { .fx-grain { opacity: 0; } }') + 46);
+  const out = await minify(`.fx-grain{opacity:.05;transition:opacity .3s ease-out}${block}`);
+  assert.match(out, /html\.lenis-scrolling \.fx-grain\{display:none\}/, `the minifier dropped the pause: ${out}`);
+  assert.match(out, /@starting-style\{\.fx-grain\{opacity:0\}\}/, `the minifier dropped the fade back in: ${out}`);
 });

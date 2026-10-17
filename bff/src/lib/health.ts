@@ -18,6 +18,7 @@ import { isBehind, latestRelease } from './githubRelease';
 import { appVersion } from './appVersion';
 import { solverPingShared, solverUrl, type SolverAt, type SolverPing } from './sources/flaresolverr';
 import { getSource } from './sources';
+import { keepOrder, type KeepFacts } from './libraryAdmin';
 import { effectiveLang } from './seriesLang';
 import { sameLanguage } from './lang';
 import { suwayomiConfigured } from './sources/suwayomi/client';
@@ -30,8 +31,12 @@ import { gapsOf, splitAtFloor } from './fill';
 import { CHAPTER_RETRY_CAP } from './updater';
 import { diagnose, currentError, type DiagnosisCode } from './sourceDiagnosis';
 import { currentFailures, isRateLimit, openFailures, stageLines, type Stage, type StageLine, type Stages } from './sourceEvidence';
-import { haveNumbers } from './libraryNumbers';
-import { DL_ROOT, LIBRARY_ROOT, lastScanReport, QUIET_WALK, type WalkIssue, type WalkReason } from './library';
+import { haveNumbers, impossibleLimit, median, plausibleNumbers } from './libraryNumbers';
+import { atHiddenNumber } from './noticeChapters';
+import { slowStreakNow } from './sourceHealth';
+import { listBudgetFor } from './sources/budget';
+import { cbzPageDims, DL_ROOT, LIBRARY_ROOT, lastScanReport, QUIET_WALK, type WalkIssue, type WalkReason } from './library';
+import { longStrip, type PageDim } from './longStrip';
 import { countsAsMissing, downloadCensus, fsTypeOf, type Census } from './downloadCensus';
 import { applyIgnores, keepIgnoresAlive, loadIgnores, noIgnores, type Finding, type IgnorableCheck, type IgnoreCtx } from './healthIgnore';
 import { chapterFileRel } from './downloader';
@@ -44,6 +49,10 @@ import { mainSourceCounts } from './findScope';
 import { carries, EXTENSION_OFF, EXTENSION_OFF_BY, standingOf, standingRows, type Standing, type StandingRow } from './sourceStanding';
 import { numKey } from './postingOrder';
 import type { ListingCopy } from './seriesListing';
+import { ALL_ROWS, DAY_MS, MAX_BOOK_IDS, MAX_ITEMS, allRows, hiddenPart, ignoredPart, truncate, verdict, withAll } from './healthKit';
+import { diskAndFolders } from './healthDisk';
+import { trackerSync } from './healthTrackers';
+import { chapterFiles } from './healthFiles';
 
 export type HealthStatus = 'ok' | 'warn' | 'problem';
 
@@ -80,7 +89,11 @@ export type HealthAction =
   | 'link_editions'
   // v0.55.0: a frozen row whose source is dropped by SUWAYOMI_MAX_SOURCES -- open Admin → Sources on `sourceId` to free
   // a slot (no server action). Offered in place of Replace there: the source works, the limit is the cause.
-  | 'free_slot';
+  | 'free_slot'
+  // v0.72.0, the Chapter files card (lib/healthFiles.ts): Fetch again for the row's `bookIds` -- the series page's own
+  // route (POST /api/admin/series/{id}/chapters/refetch), which sets each old file aside until the new copy lands and
+  // puts it back when it does not. Only on files Uchiyomi downloaded and named itself.
+  | 'refetch';
 
 export interface HealthItem {
   seriesId?: string;
@@ -118,8 +131,17 @@ export interface HealthItem {
    * for -- every series whose main source it is (lib/findScope.ts), the run's own `total`.
    */
   findSeries?: number;
-  /** Of `seriesIds`, the one the merge should keep: more live chapters, then more readers, then older. */
+  /**
+   * Of `seriesIds`, the one the merge should keep (lib/libraryAdmin.ts keepOrder, v0.57.0): one in a work, then the one
+   * whose main source still works, then more live chapters, more readers, the older.
+   */
   keep?: string;
+  /**
+   * v0.57.0, beside `seriesIds` on a duplicates row, in the same order: what the merge dialog shows of each copy so the
+   * admin can see why one is suggested -- its live chapters and its main source with how that source stands (null for a
+   * series with no main source: files only).
+   */
+  copies?: Array<{ id: string; chapters: number; source: { id: string; name: string; standing: Standing } | null }>;
   /** v0.52.0, beside `seriesIds` on a duplicates row: the language each is in, for Link as editions' confirmation. */
   langs?: string[];
   /** What an admin can do about this item, in the order the chips are shown. */
@@ -283,42 +305,32 @@ export interface HealthCheck {
   items: HealthItem[];
   /** #115, 'sources' only: how long one Test may take (the smoke test's wall plus the homepage probe). */
   testMs?: number;
+  /** Every row before the cut, for the By series view (lib/healthKit.ts withAll). Never on the wire: a symbol key. */
+  [ALL_ROWS]?: readonly HealthItem[];
+}
+
+/**
+ * One series and everything Health found wrong with it (v0.72.0, the By series view, #254): its findings from every
+ * card that is about one series, each with its card's id, in the cards' order. `status` is the worst of those cards'.
+ */
+export interface SeriesFindings {
+  seriesId: string;
+  title: string;
+  status: Exclude<HealthStatus, 'ok'>;
+  findings: Array<{ check: string; item: HealthItem }>;
 }
 
 export interface HealthReport {
   generatedAt: string;
   checks: HealthCheck[];
+  /** Only when asked for (GET /api/admin/health?view=series): every series with a finding, worst first. */
+  bySeries?: SeriesFindings[];
 }
 
-const MAX_ITEMS = 50; // keep the payload sane; the summary always reports the true total
 /** The most gap numbers one item carries. A "Fill now" chip needs to NAME them; it does not need 4,000. */
 const MAX_NUMBERS = 100;
-/** The most chapters one Delete chip acts on, and the most an admin can sensibly read in a confirmation. */
-const MAX_BOOK_IDS = 20;
-const DAY_MS = 24 * 60 * 60 * 1000;
 /** How long a repair's conclusion about a gap stays a conclusion rather than a finding again. */
 const GAPS_FRESH_MS = 7 * DAY_MS;
-
-/**
- * ⚠️ FINDINGS FIRST, always, before the slice. A check's status is decided by the items WITHOUT `info`
- * (the page's one invariant, pinned in health.int.test.ts), so a check holding sixty greyed rows and three
- * real ones could cut the real ones off and report a warning with nothing in it -- which reads as a page
- * bug rather than as a finding. Sorting by severity first costs nothing and makes the slice safe whatever
- * order the check itself built its rows in.
- */
-function truncate<T extends { info?: boolean }>(rows: T[]): { items: T[]; hidden: number } {
-  const ordered = [...rows].sort((a, b) => Number(!!a.info) - Number(!!b.info));
-  return { items: ordered.slice(0, MAX_ITEMS), hidden: Math.max(0, rows.length - MAX_ITEMS) };
-}
-
-/** A check's verdict, from the items that are findings: the invariant, written once. */
-const verdict = (items: HealthItem[], bad: HealthStatus = 'warn'): HealthStatus =>
-  items.some((i) => !i.info) ? bad : 'ok';
-
-/** A summary's "; 2 ignored": the findings an admin chose to stop being told about (lib/healthIgnore.ts). */
-const ignoredPart = (n: number): Part | null => (n ? say('ignored', { n }) : null);
-/** A note's " 3 more not shown.": the rows past the slice. */
-const hiddenPart = (n: number): Part | null => (n > 0 ? joined('sentence', say('hidden', { n })) : null);
 
 /**
  * The shape lib/repair.ts stores in `lib_series.gaps_result`.
@@ -589,7 +601,7 @@ async function chapterGaps(held: HeldSeries[], ctx: IgnoreCtx = noIgnores()): Pr
   const archiving = items.filter((i) => i.info && !i.ignored && i.outcome?.kind === 'gaps' && i.outcome.why === 'archiving').length;
   const beforeStart = items.filter((i) => i.beforeStart).length;
   const quiet = items.length - live - ignored - archiving - beforeStart;
-  return {
+  return withAll({
     id: 'chapter-gaps',
     title: 'Chapter gaps',
     status: verdict(items),
@@ -602,7 +614,7 @@ async function chapterGaps(held: HeldSeries[], ctx: IgnoreCtx = noIgnores()): Pr
     ]),
     ...noteOf([say('gaps.note'), hiddenPart(hidden)]),
     items: shown.map(({ beforeStart: _b, ...it }) => it),
-  };
+  }, items.map(({ beforeStart: _b, ...it }) => it));
 }
 
 /** How long a series numbered by posting order on its own is listed (for reference) after the change. */
@@ -688,7 +700,7 @@ async function numberingCheck(): Promise<HealthCheck | null> {
   const live = items.filter((i) => !i.info).length;
   const numbered = items.filter((i) => i.info && i.actions?.includes('keep_numbers')).length;
   const { items: shown, hidden } = truncate(items);
-  return {
+  return withAll({
     id: 'numbering',
     title: 'Chapter numbering',
     status: verdict(items),
@@ -698,25 +710,62 @@ async function numberingCheck(): Promise<HealthCheck | null> {
     ]),
     ...noteOf([say('numbering.note'), hiddenPart(hidden)]),
     items: shown,
-  };
+  }, items);
 }
 
-/** Whole-numbered chapters that turned out to be one or two images: almost always a failed download. */
+/**
+ * The most chapters one report reads page sizes from: the rest are measured by the next report (the cache keeps them).
+ * The repair's short step takes the same share per run (repair.ts stepShort, v0.60.1).
+ */
+export const MEASURE_PER_REPORT = 100;
+
+/**
+ * A short chapter's page sizes: the reader's cache (lib_books.page_dims, lib/ownedCatalog.ts bookPages), else read from
+ * the file and cached the same way, so the next report and the reader open nothing. Null for a file that cannot be read,
+ * or past this report's share of reads (`budget`): a chapter not measured stays a finding.
+ */
+export async function measured(
+  r: { id: string; root: string | null; file: string; page_dims: PageDim[] | null }, budget: { left: number },
+): Promise<PageDim[] | null> {
+  if (Array.isArray(r.page_dims) && r.page_dims.length) return r.page_dims;
+  if (budget.left <= 0) return null;
+  budget.left--;
+  const dims = await cbzPageDims(`${r.root || LIBRARY_ROOT}/${r.file}`).catch(() => []);
+  if (!dims.length) return null;
+  // Only an empty cache: the reader may have written the same thing meanwhile.
+  await q('UPDATE lib_books SET page_dims = $1 WHERE id = $2 AND page_dims IS NULL', [JSON.stringify(dims), r.id]).catch(() => {});
+  return dims;
+}
+
+/**
+ * Whole-numbered chapters that turned out to be one or two images: almost always a failed download.
+ *
+ * Not a chapter stitched into one or two long strips (v0.55.10, lib/longStrip.ts): on the live server 6 of the 20 were,
+ * Eleceed 215 two 689 × 54,000 strips among them, and a file in the read library is never the repair's to look at, so
+ * they stayed findings until somebody pressed "It's fine" on each. Reintroduce by dropping the `longStrip` test: "a
+ * chapter stitched into long strips is not short" in health.int.test.ts finds it listed.
+ */
 async function shortChapters(): Promise<HealthCheck> {
   // Decimal chapters are excluded on purpose: ".5" entries are usually author notices, legitimately 1 page.
   // A tombstone is excluded too -- those bytes are gone on purpose (or already reported as missing by the
   // verify task), and a page count taken before they went says nothing about anything anybody can fix.
-  const rows = await q<{
+  const found = await q<{
     id: string; series_id: string; title: string; folder: string; number: number; pages: number;
     root: string | null; file: string; short_confirmed_at: string | null; missing_pages: number[] | null;
     short_result: { at?: string; why?: string; asked?: number; answered?: number; best?: number; hunt?: string; by?: string | null } | null;
+    page_dims: PageDim[] | null;
   }>(
     `SELECT b.id, b.series_id, ls.title, ls.folder, b.number::float8 AS number, b.pages, b.root, b.file,
-            b.short_confirmed_at, b.missing_pages, b.short_result
+            b.short_confirmed_at, b.missing_pages, b.short_result, b.page_dims
        FROM lib_books b JOIN lib_series ls ON ls.id = b.series_id AND ${visibleToAll('ls')}
       WHERE b.pages BETWEEN 1 AND 2 AND b.number = floor(b.number) AND b.pruned_at IS NULL
+        -- Not a chapter at a number an admin hid (#240): no chapter here, and its Fix would be refused.
+        AND NOT ${atHiddenNumber('b')}
       ORDER BY ls.title, b.number`,
   );
+  const budget = { left: MEASURE_PER_REPORT };
+  const rows: typeof found = [];
+  for (const r of found) if (!longStrip(await measured(r, budget))) rows.push(r);
   const item = (r: typeof rows[number]): HealthItem => {
     // "Fix" replaces the file, so it is offered ONLY for a file this server downloaded and named itself:
     // the download root, under exactly the name chapterFileRel writes. Somebody's own copy in the read
@@ -764,7 +813,7 @@ async function shortChapters(): Promise<HealthCheck> {
   const { items: shown, hidden } = truncate(items);
   const live = items.filter((i) => !i.info).length;
   const quiet = items.length - live;
-  return {
+  return withAll({
     id: 'short-chapters',
     title: 'Suspiciously short chapters',
     status: verdict(items, 'problem'),
@@ -774,7 +823,7 @@ async function shortChapters(): Promise<HealthCheck> {
     ]),
     ...noteOf([say('short.note'), hiddenPart(hidden)]),
     items: shown,
-  };
+  }, items);
 }
 
 /** Sources that are failing or blocked, and how much of the library depends on them. */
@@ -1023,7 +1072,7 @@ export async function frozenSeries(
       ...detailOf([!r.source_id
         ? say('frozen.noSource', { n: r.books_count })
         : engineWhy(r)
-          ? say(engine === 'unreachable' ? 'frozen.engineDown' : 'frozen.engineOff', p)
+          ? say(engine === 'unreachable' ? 'frozen.engineDown' : engine === 'incompatible' ? 'frozen.engineIncompatible' : 'frozen.engineOff', p)
           : why(r, p)]),
       ...keysFor(r, ['replace_source', 'find_sources']),
     };
@@ -1043,7 +1092,7 @@ export async function frozenSeries(
       ...keysFor(r, ['replace_source']),
     });
   }
-  return {
+  return withAll({
     id: 'frozen-series',
     title: 'Series that can no longer update',
     status: stuck ? 'warn' : 'ok',
@@ -1058,7 +1107,7 @@ export async function frozenSeries(
       hiddenPart(frozen.length - 20),
     ]),
     items,
-  };
+  }, found);
 }
 
 /**
@@ -1148,7 +1197,9 @@ export async function sourceTrouble(ctx: IgnoreCtx = noIgnores()): Promise<Healt
   // that made the page cry wolf are exactly what the streak rule filters out.
   const unused = (r: typeof rows[number]) =>
     !r.disabled && r.series === 0 && !(r.blocked_until && new Date(r.blocked_until).getTime() > now);
-  const traffic = (r: typeof rows[number]) => r.status !== 'ok' || r.empty_streak >= 3 || r.slow_streak >= 3;
+  // A slow streak counts while somebody is still running into it (lib/sourceHealth.ts slowStreakNow, v0.55.10): one
+  // evening's slow searches held the card amber for six days of fast answers.
+  const traffic = (r: typeof rows[number]) => r.status !== 'ok' || r.empty_streak >= 3 || slowStreakNow(r, now) >= 3;
   const WEEK = 7 * DAY_MS;
   const items: Array<HealthItem & { members?: string[] }> = [];
   for (const row of rows) {
@@ -1196,7 +1247,7 @@ export async function sourceTrouble(ctx: IgnoreCtx = noIgnores()): Promise<Healt
       {
         status: r.status as any, lastError: currentError(r), consecutive: r.consecutive,
         lastOkAt: r.last_ok_at, emptyStreak: r.empty_streak ?? 0, blockedUntil: r.blocked_until, disabled: r.disabled,
-        slowStreak: r.slow_streak ?? 0, budgetMs: env.SOURCE_LATEST_TIMEOUT_MS,
+        slowStreak: slowStreakNow(r, now), budgetMs: listBudgetFor(src),
       },
       // The confirmed failure is live evidence of the most specific kind: its stage and its own error.
       lead && !r.disabled ? { adapterOk: false, failure: { stage: lead.stage, kind: lead.kind, error: lead.error } } : undefined,
@@ -1371,29 +1422,47 @@ export async function duplicateSeries(ctx: IgnoreCtx = noIgnores()): Promise<Hea
     }
     return { external_id: f.external_id, ids: pick.map((m) => m.id), titles: pick.map((m) => m.title).join(' + '), langs: pick.map((m) => m.lang), languages };
   });
-  // Which copy should survive a merge. A merge is ONE-WAY and it moves everything (progress, bookmarks,
-  // trackers, chapters) into the survivor, so the suggestion has to be the copy that would lose the most by
-  // being the one absorbed: most live chapters first, then the one people have actually read, and an older
-  // row as the tie-break because it is the one whose id is in everybody's links and history.
+  // Which copy should survive a merge. A merge is ONE-WAY and it moves everything (progress, bookmarks, trackers,
+  // chapters) into the survivor. Since v0.57.0 the suggestion is the owner's own rule ("keep the series with the
+  // healthier source and more chapters", lib/libraryAdmin.ts keepOrder): one in a work, then the copy whose main source
+  // can still update it -- the absorbed copy's chapters come across anyway, and the survivor's source is the one that
+  // keeps the series going -- then most live chapters, the one people have read, and the older row as the tie-break.
+  // Each copy's facts go with the row, so the dialog can say why.
   // ⚠️ A suggestion only. The merge itself is never automatic -- an admin confirms it, naming both titles.
+  // Reintroduce chapters-first: "Health suggests keeping the copy whose source works" in extraCopies.int.test.ts finds
+  // the bigger copy on a failing source suggested.
   const ids = [...new Set(rows.flatMap((r) => r.ids))];
-  const rank = new Map<string, { books: number; readers: number; created: number }>();
+  const rank = new Map<string, KeepFacts & { sourceId: string | null }>();
+  const standing = new Map<string, Standing>();
   if (ids.length) {
-    const stats = await q<{ id: string; books: number; readers: number; created_at: string }>(
-      `SELECT ls.id, ls.created_at,
+    const stats = await q<{ id: string; books: number; readers: number; created_at: string; source_id: string | null; work_id: string | null }>(
+      `SELECT ls.id, ls.created_at, ls.source_id, ls.work_id::text AS work_id,
               (SELECT count(*) FROM lib_books b WHERE b.series_id = ls.id AND b.pruned_at IS NULL)::int AS books,
               (SELECT count(*) FROM read_progress rp WHERE rp.series_id = ls.id)::int AS readers
          FROM lib_series ls WHERE ls.id = ANY($1::text[])`,
       [ids],
     ).catch(() => []);
-    for (const s of stats) rank.set(s.id, { books: s.books, readers: s.readers, created: new Date(s.created_at).getTime() });
+    const sources = [...new Set(stats.map((s) => s.source_id).filter((x): x is string => !!x))];
+    const standingRowsOf = await standingRows(sources).catch(() => new Map<string, StandingRow>());
+    for (const id of sources) standing.set(id, standingOf(id, standingRowsOf.get(id)));
+    for (const s of stats) {
+      const st = s.source_id ? standing.get(s.source_id) : undefined;
+      rank.set(s.id, {
+        inWork: !!s.work_id, works: !!st && carries(st), chapters: Number(s.books), readers: Number(s.readers),
+        created: new Date(s.created_at).getTime(), sourceId: s.source_id,
+      });
+    }
   }
-  const keepOf = (group: string[]): string =>
-    [...group].sort((a, b) => {
-      const x = rank.get(a) ?? { books: 0, readers: 0, created: 0 };
-      const y = rank.get(b) ?? { books: 0, readers: 0, created: 0 };
-      return y.books - x.books || y.readers - x.readers || x.created - y.created;
-    })[0];
+  const none: KeepFacts = { inWork: false, works: false, chapters: 0, readers: 0, created: 0 };
+  const keepOf = (group: string[]): string => [...group].sort((a, b) => keepOrder(rank.get(a) ?? none, rank.get(b) ?? none))[0];
+  const copyOf = (id: string) => {
+    const r = rank.get(id);
+    const sid = r?.sourceId ?? null;
+    return {
+      id, chapters: r?.chapters ?? 0,
+      source: sid ? { id: sid, name: getSource(sid)?.name ?? sid, standing: standing.get(sid) ?? 'not_loaded' as Standing } : null,
+    };
+  };
   const items: Array<HealthItem & { members?: string[] }> = rows.map((r) => {
       const keep = keepOf(r.ids);
       return {
@@ -1402,6 +1471,7 @@ export async function duplicateSeries(ctx: IgnoreCtx = noIgnores()): Promise<Hea
         titles: r.titles.split(' + '),
         title: r.titles,
         keep,
+        copies: r.ids.map(copyOf),
         langs: r.langs,
         // Ignored while the copies are the same ones: a third copy of the entry is a new finding.
         key: `anilist:${r.external_id}`,
@@ -1427,40 +1497,9 @@ export async function duplicateSeries(ctx: IgnoreCtx = noIgnores()): Promise<Hea
   };
 }
 
-/** percentile_cont(0.5), in JS: the interpolated median, so this check and the SQL it replaced agree. */
-function median(sorted: number[]): number {
-  if (!sorted.length) return 0;
-  const mid = (sorted.length - 1) / 2;
-  return (sorted[Math.floor(mid)] + sorted[Math.ceil(mid)]) / 2;
-}
-
-/**
- * The impossible-number rule over a series' held numbers: the limit a chapter number may not pass -- four times the
- * median, or the median plus 500, whichever is more -- when one does, else null. Exported (v0.55.0) for the repair's
- * gap step under Fix everything, which leaves such a series to the files phase: one chapter numbered 9001 is a
- * 9000-chapter "gap".
- */
-export function impossibleLimit(numbers: readonly number[]): number | null {
-  // Positive numbers only, as the SQL this replaced did: a chapter 0 is a legitimate prologue and
-  // including it would drag the median down towards nothing.
-  const nums = numbers.filter((n) => n > 0).sort((a, b) => a - b);
-  if (!nums.length) return null;
-  const med = median(nums);
-  const limit = Math.max(med * 4, med + 500);
-  return nums[nums.length - 1] > limit ? limit : null;
-}
-
-/**
- * The numbers a series' holes are counted between: all of them but the ones the outliers card names (impossibleLimit).
- * One chapter numbered 9001 among 1 to 4 is a chapter numbered impossibly, not 8,996 missing chapters: counted as a gap
- * it filled the gaps card with a hole nothing can fetch -- which Fix everything left alone, so a bookmarked 9001 kept
- * "the next run continues" and Run again on the end for good -- and sent the nightly searching other sites for
- * thousands of chapters. Health's gaps check and the repair's gap step both count this way (v0.55.0 integration).
- */
-export function plausibleNumbers(numbers: readonly number[]): number[] {
-  const limit = impossibleLimit(numbers);
-  return limit === null ? [...numbers] : numbers.filter((n) => n <= limit);
-}
+// median, impossibleLimit and plausibleNumbers live beside the held numbers they judge (lib/libraryNumbers.ts, #240):
+// a number hidden by hand closes a hole only between plausible numbers. Exported from here too, as they always were.
+export { impossibleLimit, plausibleNumbers } from './libraryNumbers';
 
 /** Chapter numbers far beyond the rest of the series: the sidebar-widget scraping bug's signature. */
 async function outlierChapters(held: HeldSeries[], ctx: IgnoreCtx = noIgnores()): Promise<HealthCheck> {
@@ -1491,6 +1530,8 @@ async function outlierChapters(held: HeldSeries[], ctx: IgnoreCtx = noIgnores())
       `SELECT b.id, COALESCE(o.number, b.number)::float8 AS number
          FROM lib_books b LEFT JOIN book_overrides o ON o.book_id = b.id
         WHERE b.series_id = $1 AND b.pruned_at IS NULL AND COALESCE(o.number, b.number) > $2
+          -- Not a chapter at a number an admin hid (#240): haveNumbers leaves it out, and so does the Delete chip.
+          AND NOT ${atHiddenNumber('b')}
         ORDER BY 2 DESC`,
       [r.s.id, r.limit],
     ).catch(() => { readFailed = true; return [] as Array<{ id: string; number: number }>; });
@@ -1511,14 +1552,14 @@ async function outlierChapters(held: HeldSeries[], ctx: IgnoreCtx = noIgnores())
   const ignored = applyIgnores('outliers', items, ctx, !readFailed);
   const live = items.filter((i) => !i.info).length;
   items.sort((a, b) => Number(!!a.info) - Number(!!b.info));
-  return {
+  return withAll({
     id: 'outliers',
     title: 'Impossible chapter numbers',
     status: verdict(items, 'problem'),
     ...summaryOf([live ? say('outliers.live', { n: live }) : say('outliers.none'), ignoredPart(ignored)]),
     ...noteOf([say('outliers.note'), hiddenPart(items.length - MAX_ITEMS)]),
     items: items.slice(0, MAX_ITEMS),
-  };
+  }, items);
 }
 
 /**
@@ -1558,6 +1599,8 @@ export async function savedTwiceGroups(): Promise<Array<{ seriesId: string; titl
        LEFT JOIN book_overrides o ON o.book_id = b.id
       WHERE b.pruned_at IS NULL AND b.source_id IS NOT NULL AND ${visibleToAll('s')}
         AND s.numbering IS DISTINCT FROM 'posting_order' AND s.numbering_pending IS NULL AND s.renumber_plan IS NULL
+        -- A chapter at a number an admin hid (#240) is no chapter here, and Fix everything deletes from this list.
+        AND NOT ${atHiddenNumber('b')}
       ORDER BY s.title, b.series_id, 4`,
   );
   type Book = (typeof rows)[number];
@@ -1624,14 +1667,14 @@ async function savedTwice(): Promise<HealthCheck> {
       actions: ['delete'],
     });
   }
-  return {
+  return withAll({
     id: 'saved-twice',
     title: 'The same chapter saved twice',
     status: verdict(items),
     ...summaryOf([items.length ? say('twice.live', { n: items.length }) : say('twice.none')]),
     ...noteOf([say('twice.note'), hiddenPart(items.length - MAX_ITEMS)]),
     items: items.slice(0, MAX_ITEMS),
-  };
+  }, items);
 }
 
 /**
@@ -2003,7 +2046,7 @@ async function downloadsMissing(ctx: IgnoreCtx = noIgnores()): Promise<HealthChe
   const n = live.reduce((k, m) => k + m.files.length, 0);
   const unread = all.filter((it) => it.key?.startsWith('unreadable:') && !it.info).length;
   const { items } = truncate(all);
-  return {
+  return withAll({
     ...base,
     status: n || unread ? 'problem' : 'ok',
     ...summaryOf([
@@ -2014,7 +2057,7 @@ async function downloadsMissing(ctx: IgnoreCtx = noIgnores()): Promise<HealthChe
     ]),
     ...noteOf(downloadsNoteParts(c, strays)),
     items,
-  };
+  }, all);
 }
 
 /**
@@ -2069,7 +2112,12 @@ async function foldersScannedTwice(): Promise<HealthCheck | null> {
 
 // ---- report -----------------------------------------------------------------
 
-export async function runHealthChecks(): Promise<HealthReport> {
+/**
+ * Every check, worst first. `bySeries` (v0.72.0, the page's By series view): also every series with a finding, grouped
+ * from each check's FULL list (groupBySeries) -- asked for by GET /api/admin/health?view=series only, never by the
+ * header's six-hourly refresh, which needs the cards alone.
+ */
+export async function runHealthChecks(opts: { bySeries?: boolean } = {}): Promise<HealthReport> {
   // The two checks that reason about chapter NUMBERS share one read of what every series holds, because
   // that read applies the override and tombstone rules per series and is the expensive part of this page.
   const held = await heldBySeries();
@@ -2096,12 +2144,54 @@ export async function runHealthChecks(): Promise<HealthReport> {
     ...(suwayomiConfigured() ? [extensionCap()] : []),
     // #72: the engine itself; null when there is none and nothing depends on one (lib/engineHealth.ts).
     extensionEngineCheck().catch(() => null),
+    // v0.72.0 (#253, #252): the downloads disk and the library's folders, members' tracker sign-ins, and the chapter
+    // files the nightly count could read no page of. A statfs, an opendir and a few queries: never a walk of the
+    // library and never reading_events, because this runs every six hours and after every scan (lib/healthSummary.ts).
+    diskAndFolders(ctx).catch(() => null),
+    trackerSync(ctx).catch(() => null),
+    chapterFiles(ctx).catch(() => null),
   ])).filter((c): c is HealthCheck => c !== null);
   await keepIgnoresAlive(ctx);
   // worst first, so the page opens on whatever needs attention
-  const rank: Record<HealthStatus, number> = { problem: 0, warn: 1, ok: 2 };
-  checks.sort((a, b) => rank[a.status] - rank[b.status]);
-  return { generatedAt: new Date().toISOString(), checks };
+  checks.sort((a, b) => RANK[a.status] - RANK[b.status]);
+  return { generatedAt: new Date().toISOString(), checks, ...(opts.bySeries ? { bySeries: await groupBySeries(checks) } : {}) };
+}
+
+const RANK: Record<HealthStatus, number> = { problem: 0, warn: 1, ok: 2 };
+
+/**
+ * Cards that are about one series per row but stay out of By series: a duplicate pair is about two series at once, and
+ * its Merge acts on both, so it keeps its own card.
+ */
+const NOT_BY_SERIES: ReadonlySet<string> = new Set(['duplicates']);
+
+/**
+ * Health turned around (v0.72.0, @Squeaks72's idea in #254): every series with a finding, and each of its findings with
+ * its card, worst series first, then the one with most findings, then by title. Built on the server, from each card's
+ * FULL list (lib/healthKit.ts allRows): #254 grouped the fifty rows each card sends, so a series past a card's fifty was
+ * missing, and the count, Select all and Remove acted on part of the library. A greyed row is not a finding, and a row
+ * about no single series (a source, a folder) has no series to go under. Reintroduce the cut lists: "By series has every
+ * series, past the fifty a card shows" in healthBySeries.int.test.ts finds series missing.
+ */
+export async function groupBySeries(checks: readonly HealthCheck[]): Promise<SeriesFindings[]> {
+  const by = new Map<string, SeriesFindings>();
+  for (const c of checks) {
+    if (c.status === 'ok' || NOT_BY_SERIES.has(c.id)) continue;
+    for (const item of allRows(c)) {
+      if (!item.seriesId || item.info) continue;
+      const g = by.get(item.seriesId) ?? { seriesId: item.seriesId, title: item.title, status: 'warn' as const, findings: [] };
+      g.findings.push({ check: c.id, item });
+      if (c.status === 'problem') g.status = 'problem';
+      by.set(item.seriesId, g);
+    }
+  }
+  if (!by.size) return [];
+  // A row's title is its series' on every card but Downloads missing, whose rows are titled by their folder.
+  const titles = new Map((await q<{ id: string; title: string }>('SELECT id, title FROM lib_series WHERE id = ANY($1)', [[...by.keys()]])
+    .catch(() => [])).map((r) => [r.id, r.title]));
+  for (const g of by.values()) g.title = titles.get(g.seriesId) ?? g.title;
+  return [...by.values()].sort((a, b) =>
+    RANK[a.status] - RANK[b.status] || b.findings.length - a.findings.length || a.title.localeCompare(b.title));
 }
 
 /**
@@ -2119,6 +2209,9 @@ export async function findingOf(check: IgnorableCheck, key: string): Promise<Fin
     case 'frozen-series': await frozenSeries(ctx); break;
     case 'duplicates': await duplicateSeries(ctx); break;
     case 'downloads-missing': await downloadsMissing(ctx); break;
+    case 'disk': await diskAndFolders(ctx); break;
+    case 'trackers': await trackerSync(ctx); break;
+    case 'files': await chapterFiles(ctx); break;
   }
   return ctx.found.get(`${check}\u0000${key}`) ?? null;
 }

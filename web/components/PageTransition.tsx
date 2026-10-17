@@ -1,7 +1,58 @@
 'use client';
+import { useContext, useLayoutEffect, useRef } from 'react';
 import { usePathname } from 'next/navigation';
+import { LayoutRouterContext } from 'next/dist/shared/lib/app-router-context.shared-runtime';
+import {
+  NavigationPromisesContext, PathnameContext, PathParamsContext, SearchParamsContext,
+} from 'next/dist/shared/lib/hooks-client-context.shared-runtime';
 import { AnimatePresence, motion } from 'framer-motion';
 import { useReduceEffects } from '@/lib/effects';
+import { scrollMemory } from '@/lib/scrollMemory';
+
+/**
+ * The page a fade is taking away, held as it was (2026-10-15).
+ *
+ * The router hands a page its route through contexts, not through `children`, so the wrapper AnimatePresence keeps for
+ * the fade-out rendered the NEW route: a click showed the next page at once inside the outgoing fade, faded it away to
+ * nothing and faded the same page in again -- and built it twice, once in each wrapper. Here the outgoing page keeps
+ * every context it read its route from (the route itself, the path, the search params, the params) as they were when it
+ * was the current page, so the old page is what fades out, unchanged -- a series fading away is still that series, not
+ * the same page asked for a series with no id -- and the new one is built once, as it fades in. While its path is still
+ * the current one a page follows the live contexts, so a change of search params alone (one series to another,
+ * `/series/?id=…`) updates it in place as before. Because the page being returned to arrives only after the fade, Back
+ * and Forward put the scroll back themselves (lib/scrollMemory.ts).
+ *
+ * ⚠️ These contexts are Next's internals (next/dist/shared/lib): web/test/pageTransition.test.ts checks they still exist
+ * and that `usePathname` and `useSearchParams` still read them, so a Next upgrade that moves them fails a test, not the fade.
+ */
+function FrozenRoute({ path, children }: { path: string; children: React.ReactNode }) {
+  const live = {
+    layout: useContext(LayoutRouterContext),
+    pathname: useContext(PathnameContext),
+    search: useContext(SearchParamsContext),
+    params: useContext(PathParamsContext),
+    promises: useContext(NavigationPromisesContext),
+  };
+  const held = useRef(live);
+  const current = live.pathname === path;
+  if (current) held.current = live;
+  const h = held.current;
+  // Back and Forward put the page where it was left, once it is here to put back (lib/scrollMemory.ts): the browser would
+  // have scrolled the page still fading out instead. On every arrival -- a mount, or new search params on the same page.
+  const url = `${live.pathname}?${live.search?.toString() ?? ''}`;
+  useLayoutEffect(() => { if (current) scrollMemory().putBack(); }, [current, url]);
+  return (
+    <LayoutRouterContext.Provider value={h.layout}>
+      <PathnameContext.Provider value={h.pathname}>
+        <SearchParamsContext.Provider value={h.search}>
+          <PathParamsContext.Provider value={h.params}>
+            <NavigationPromisesContext.Provider value={h.promises}>{children}</NavigationPromisesContext.Provider>
+          </PathParamsContext.Provider>
+        </SearchParamsContext.Provider>
+      </PathnameContext.Provider>
+    </LayoutRouterContext.Provider>
+  );
+}
 
 export function PageTransition({ children }: { children: React.ReactNode }) {
   const path = usePathname();
@@ -19,7 +70,7 @@ export function PageTransition({ children }: { children: React.ReactNode }) {
         exit={reduced ? undefined : { opacity: 0, y: -6 }}
         transition={reduced ? { duration: 0 } : { duration: 0.26, ease: [0.22, 1, 0.36, 1] }}
       >
-        {children}
+        <FrozenRoute path={path}>{children}</FrozenRoute>
       </motion.div>
     </AnimatePresence>
   );

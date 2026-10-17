@@ -1,5 +1,1457 @@
 # Changelog
 
+## v0.77.1 — 2026-10-16
+
+**Sign-in and backup hardening, and recovery codes that work.** Update soon, especially if people outside your
+household can reach your server. Thank you to **@globalteddy**, who reported these and sent
+[#279](https://github.com/AngeloSha/uchiyomi/pull/279), [#280](https://github.com/AngeloSha/uchiyomi/pull/280) and
+[#281](https://github.com/AngeloSha/uchiyomi/pull/281).
+
+### Security fixes
+
+- **The account lock covers every password and two-factor check.** A wrong two-factor or recovery code at sign-in
+  counts toward it, as a wrong password does. So does a wrong current password when you change your password or turn
+  two-factor on or off, and those three take at most 10 tries in 5 minutes from one address, like sign-in. Once a lock
+  has run out, the count starts again from one.
+- **Turning two-factor on asks for your password,** as turning it off already did. **Profile → Account → Two-factor
+  authentication** has a **Current password** field beside the code.
+- **A two-factor code signs in once.** After a code is used, only a newer one works: if you sign out and back in within
+  the same half minute, wait for the next code.
+- **First-run setup makes one admin,** however many setups arrive at once.
+- **Backups are readable only by the app's user and its group.** Each backup folder is `0750` from the moment it is
+  made, and its files are `0640`. Backups made before this version are tightened the next time a backup runs.
+- **A cover that redirects to another site is fetched without the first site's cookies, login or extra headers.**
+- **Every response carries a base Content-Security-Policy,** `object-src 'none'; base-uri 'self'; frame-ancestors
+  'self'; form-action 'self'`, from the server and from nginx in the split layout
+  ([#281](https://github.com/AngeloSha/uchiyomi/pull/281)).
+- **Signing out clears the page's cached answers,** and so does every sign-in and sign-up, so the next person on a
+  shared device sees nothing of the last one's ([#280](https://github.com/AngeloSha/uchiyomi/pull/280)).
+
+### Fixed
+
+- **Recovery codes work at sign-in.** The codes handed out since v0.21.0 were longer than sign-in accepted, so none of
+  them ever worked. They do now, typed with or without their dashes and in any case, and each one works once
+  ([#279](https://github.com/AngeloSha/uchiyomi/pull/279)).
+
+### Upgrading
+
+- **If something outside the app reads your backup folder** (a job on the host, a NAS share), it now has to run as the
+  app's user or as a member of its group. Reading through the container (`docker compose exec`) works as before.
+- **Database:** additive only. A nullable `totp_last_step` column on `users`, created when the server starts. The
+  previous release starts on this schema.
+- **API:** `POST /auth/totp/enable` takes `password` beside `code`. `POST /auth/password`, `/auth/totp/enable` and
+  `/auth/totp/disable` answer **423** `locked` while the account is locked, and **429** past 10 requests in 5 minutes
+  from one address, as `/auth/login` does. The sign-in body's `code` takes up to 32 characters.
+
+## v0.77.0 — 2026-10-16
+
+**Spreads that a source served as two pages can be read as one, and one page of a pair can be brought into frame.**
+Both began as pull requests from **@Squeaks72** ([#229](https://github.com/AngeloSha/uchiyomi/pull/229),
+[#232](https://github.com/AngeloSha/uchiyomi/pull/232), [#261](https://github.com/AngeloSha/uchiyomi/pull/261)); the
+spread detector is theirs. Thank you.
+
+### Double-page spreads, joined
+
+- **Join split double pages** ([#229](https://github.com/AngeloSha/uchiyomi/pull/229), from @Squeaks72), in Reader
+  settings and Profile → Settings → Reading. **It is off until you turn it on.** Some sources serve a double-page
+  spread as two ordinary pages. In Paged mode the reader then shows the two as the spread, on one slide with the halves
+  touching, in single page and Double spread alike.
+  - The halves sit the way the picture runs, on the side the server found, whatever your reading direction.
+  - The page before a spread gets a slide of its own, so the pairs after it stay as they were drawn. A chapter can open
+    on a spread.
+  - On a phone held upright, **Wide pages** works as it does for a spread scanned in one piece. *Whole* shows it across
+    the screen, *Split* shows its two pages one after the other, and *Rotate* turns it on its side.
+  - Only a joined spread loses the gap down the middle. Every other pair keeps its gutter.
+  - The pages themselves never change: the counter, your progress, OPDS and your trackers still count two.
+- **Found in the background, once.** The server compares the inner edge of each page with the next page's. It looks
+  the first time someone with the setting on opens a chapter, one chapter at a time, and never while it answers the page
+  list. A chapter opens at once, and its spreads join a moment later without moving the page you're on.
+  - The answer is kept with the chapter, even when nothing was found or the file could not be read, so no chapter is
+    looked at twice. A replaced file is looked at again.
+  - A chapter downloaded after its spreads were found joins them offline too.
+- **Checked against this server's own library first.** As first written, the detector joined separate pages far more
+  often than it found spreads. In a sample of 375 chapters, 12 of its 80 joins were real spreads. Two facing pages whose
+  borders line up (a black bleed down both inner edges, or a white gutter crossed by panel borders at the same heights)
+  match as well as a real seam. Four tests now come after the match:
+  - the same texture on both sides of the cut;
+  - the small steps down the edge lining up, not only the bands;
+  - no other page of the chapter fitting either edge as well;
+  - the outermost columns of both pages being the same kind of thing.
+
+  On the first sample it now makes the 12 real joins and no others. On a second sample of 410 chapters, 16 of its 17
+  joins were real, and the one that was not led to the last test. On a third sample of 380 chapters, which it was never
+  tuned on, 14 of its 16 joins were real; the other 2 are facing pages whose drawings run to the seam on panels that
+  line up. No sample had a join in a webtoon chapter.
+
+### One page of a pair in frame
+
+- **Z** ([#261](https://github.com/AngeloSha/uchiyomi/pull/261), from @Squeaks72) brings the first page of the pair on
+  screen into frame, in Double spread or on a joined spread. The arrows then step to the other page before they turn,
+  and Z again gives both back. A small squared key at the bottom names the page and gives both back too.
+  - Z is an action like the others under **Keys and controller**: it can be rebound, Y does it on a controller, and the
+    key list shows it.
+- **Tap a page of a pair to see it alone** ([#232](https://github.com/AngeloSha/uchiyomi/pull/232), from @Squeaks72),
+  a setting for this device. **It is off until you turn it on.** On a slide of two pages, a tap on one of them fills the
+  screen with it in place of what its tap zone does. Turning toward the other page then shows that one.
+  - Taps beside the pages still do what Tap zones says.
+  - Off, every tap works as before, and the middle of the screen shows the controls.
+
+### Fixed
+
+- **Crop page borders on a pair read right to left** trimmed the inner edges of the two pages and left their outer
+  margins. It now trims the outer margins and keeps the gutter, as it always did left to right.
+
+### Upgrading
+
+- **Database:** one new column, `lib_books.spreads`, empty until a chapter is looked at. Additive: v0.76.x ignores it.
+- **API:** `GET /api/books/:id/pages?spreads=1` adds `join` to the pages of a spread. The `x-spreads` header says
+  whether the chapter has been looked at yet. Without the parameter nothing changes. See [docs/api.md](docs/api.md).
+
+## v0.76.0 — 2026-10-16
+
+**Hide a chapter a source lists that is not part of the series, and the extension engine gets the memory it really
+uses.** Hiding is **@Squeaks72**'s idea, from pull request [#240](https://github.com/AngeloSha/uchiyomi/pull/240),
+rebuilt to hide only: nothing is ever deleted. The engine's memory was reported by **@Kedryn**
+([#275](https://github.com/AngeloSha/uchiyomi/issues/275)). Thank you both.
+
+### Hide a chapter that does not belong
+
+- A source sometimes lists a chapter that is not part of the work, such as a 0.5 from an unrelated title or a number a
+  wrong match brought in. Nothing on the source's side takes it away. An admin can now hide that number with
+  **Hide chapter N** in a chapter's or a grey row's **⋯**, or **Hide n chapters** in the select bar. It asks first.
+- A hidden chapter is gone for everyone: the chapter list and its grey rows, the reader's next and previous, Continue,
+  the unread counts and badges, Updates, history, Insights, OPDS and the Komga-compatible API. Neither Health nor the
+  reader's note about missing chapters counts it as missing, and Health does not call it an impossible number.
+- It is never downloaded, by the nightly check, Check for new chapters, Fetch newest, the slow archive or Find missing
+  chapters. A download already waiting when you hide it stops before it asks the source.
+- Nothing is deleted. The file, the chapter's row and everyone's reading progress stay as they were, and neither the
+  read-chapter cleanup nor Fix everything touches it.
+- **More → Show hidden chapters** lists what is hidden and what each one is, with **Restore** and **Restore all**. A
+  restored chapter is back everywhere at once, and the next check fetches it if it is missing.
+- Merging two series keeps what either one hid, and renumbering a series by posting order moves a hidden number with
+  its post.
+
+### The extension engine gets the memory it uses
+
+- **Its memory ceiling is 2 GB, up from 1.5 GB** ([#275](https://github.com/AngeloSha/uchiyomi/issues/275), reported by
+  **@Kedryn**). Its Java heap stays at 768 MB. The rest of the ceiling is for what the heap does not cover: Java's own
+  native memory, and the Chromium and Xvfb the engine runs, which came to 770 MB beside a 630 MB heap on a server with
+  45 extensions. At 1.5 GB that server's engine lived only by swapping; on a server without swap, Unraid's default, the
+  kernel kills it at the ceiling instead, which is what #275 reports.
+- **`MALLOC_ARENA_MAX=2` on the engine's container.** The C library otherwise keeps what a thread frees in that thread's
+  own arena, up to eight arenas per CPU core: 94 of them held 428 MB on that server, and two held about 120 MB less
+  under the same load.
+- The engine's card on **Admin → Sources** says it uses 1 to 1.5 GB, where it said about 750 MB. That figure is the
+  desktop app's engine, which runs without Chromium.
+
+### Upgrading
+
+- ⚠️ **An existing install keeps its old engine settings.** An update changes the image, never your compose file, your
+  Unraid container or your CasaOS app.
+  [If the engine keeps restarting](docs/extensions.md#if-the-engine-keeps-restarting) has the two settings to add, and
+  how to tell whether the ceiling is what stops it.
+- **Database:** additive only. A nullable `hidden_numbers` column on `lib_series` and a small partial index, created
+  when the server starts. The previous release starts on this schema and shows every chapter.
+- **API:** new `POST /api/admin/series/:id/chapters/hide`, `POST /api/admin/series/:id/chapters/unhide` and
+  `GET /api/admin/series/:id/chapters/hidden`. `POST /api/sources/fetch` skips a hidden number as `hidden`, and the
+  series DTO carries `hiddenChapters` for an admin.
+
+## v0.75.0 — 2026-10-16
+
+**Your reading, all of it: the Reading studio goes back to your first read, badges say what they take, and a new
+Insights tab shows what your reading adds up to.** The Insights tab began as **@Squeaks72**'s pull request
+([#249](https://github.com/AngeloSha/uchiyomi/pull/249)), rebuilt on the app's own parts. All time and the badges are
+**CheetahDoesStuff**'s ideas ([#265](https://github.com/AngeloSha/uchiyomi/issues/265),
+[#267](https://github.com/AngeloSha/uchiyomi/issues/267)). Thank you both.
+
+### A new Insights tab
+
+- **A new tab** ([#249](https://github.com/AngeloSha/uchiyomi/pull/249), from @Squeaks72), worked out from the chapters you
+  have finished, each counted once:
+  - **At this pace**: when you would finish each series you are reading, at your pace through it over the last four weeks.
+  - **Your best** day and week.
+  - **Genre and source mix**: this month's chapters by genre or by source, and the change since last month.
+  - **Series you started**: how many you finished, are still reading or dropped (chapters left and nothing read in two
+    months), and around which chapter you usually stop.
+  - **Backlog**: the unread chapters of the series you have started, which hold the most and which have waited longest.
+- Incognito reads are not in it, and an 18+ series is named only while Show 18+ is on.
+- The pull request's other cards (when you read, the year in review, numbers on the heatmap) were left out: the Reading
+  studio and Wrapped already show them.
+
+### Reading studio: All time
+
+- **All time** ([#265](https://github.com/AngeloSha/uchiyomi/issues/265), suggested by CheetahDoesStuff). Beside 90, 180
+  and 365 days, the Reading studio shows one heatmap from the day you started reading to today, up to about ten years.
+  - Its days keep their size, so a long history scrolls sideways inside the card.
+  - It opens on the newest weeks, in Arabic too, where the weeks run the other way.
+  - The year and the month are written over the first week of each.
+  - Only the heatmap: the other panels are built for a window of up to a year.
+
+### Badges say what they take
+
+- **Each badge says what it takes** ([#267](https://github.com/AngeloSha/uchiyomi/issues/267), suggested by
+  CheetahDoesStuff). Hover it, tab to it or tap it, and the line under the badges says it: *Bookworm · Read 50 chapters
+  · you have 40*. Until you pick one, the line is about the next badge.
+- **Show locked** lists the badges you have not earned yet, nearest first. It is off until you turn it on.
+- **Badges are drawn emblems now**, in place of the emoji: medals of bronze, silver, gold and an aurora for the chapter
+  badges, ember and moonlight for the streaks, each with its own picture. A locked one shows how close you are: a ring
+  round a chapter badge, the days already done on a streak's rim, both in your accent colour. A shine passes over the
+  earned ones now and then, and Legend glows; both stay still under Reduce effects or your system's reduced motion.
+
+### Phones
+
+- **The cover at the top of a series page and of Home now drifts**, slowly closer and back, as it was designed to in
+  v0.67.0. Until now it sat still, slightly enlarged: the animation was skipped before it began. Reduce effects or your
+  system's reduced motion keep it still.
+
+### Upgrading
+
+- **Database:** no changes.
+- **API:** `GET /api/stats?days=all` and `GET /api/stats/insights` are new; see [docs/api.md](docs/api.md).
+
+## v0.74.0 — 2026-10-16
+
+**The reader keeps your place through a refresh, a resized window and a turned phone, says which chapters a series is
+missing as you move on, and can narrow its column or fetch pages at your screen's size.** All four began as pull requests
+from **@Squeaks72** ([#263](https://github.com/AngeloSha/uchiyomi/pull/263), [#236](https://github.com/AngeloSha/uchiyomi/pull/236), [#233](https://github.com/AngeloSha/uchiyomi/pull/233),
+[#234](https://github.com/AngeloSha/uchiyomi/pull/234)), rebuilt on the app's own parts. Thank you.
+
+### The reader keeps your place
+
+- **A refresh reopens the chapter you are reading** ([#263](https://github.com/AngeloSha/uchiyomi/pull/263)). Reading on into the next chapters
+  kept the address on the chapter you had opened, so a refresh went back there -- to its first page, if you had
+  finished it. The address now follows the chapter on screen, and a refresh resumes where you are.
+- **A window made wider or narrower keeps its page** ([#263](https://github.com/AngeloSha/uchiyomi/pull/263)). In paged mode, dragging the window
+  to another screen or resizing it could move you to another page, even chapters on. Turning a phone with Wide pages:
+  Split keeps the page as well.
+
+### Missing chapters
+
+- **Moving on to a chapter that skips numbers says so** ([#236](https://github.com/AngeloSha/uchiyomi/pull/236)): "Chapters 44–99 are missing here.
+  This continues at chapter 100." It is said as you reach the next chapter, and when you go to it with Next chapter,
+  `]`, a controller or the right-click menu.
+  - It counts what Admin → Health → Chapter gaps counts. A file holding several chapters, a chapter deleted on purpose
+    and a gap an admin chose to ignore are not missing.
+  - Offline, nothing is said.
+
+### On this device
+
+- **Column width** ([#233](https://github.com/AngeloSha/uchiyomi/pull/233)). In webtoon scroll, Reader settings → Column width · This device
+  narrows the column to 30–100 % of what Fit gives, for a wide screen. At 100 % it is the column as it was.
+- **Fit pages to my screen** ([#234](https://github.com/AngeloSha/uchiyomi/pull/234)), off until you turn it on. Each page comes at the size it
+  is drawn at instead of as scanned: less data and memory on a phone or a slow connection.
+  - It follows your zoom, Wide pages and Crop page borders, and zooming in fetches a sharper copy.
+  - A page already that small comes exactly as it is, and so do downloaded chapters.
+
+### For scripts
+
+- `GET /api/series/:id/gaps` answers the runs of numbers a series is missing, by Health's Chapter gaps rule.
+- `GET /img/books/:id/page/:n?fit=<px>` answers a page for a screen that shows it that wide. `?w=` is unchanged.
+
+### Upgrading
+
+- **Database:** no new tables or columns.
+- **Nothing changes until you choose:** Column width is 100 % and Fit pages to my screen is off on every device.
+
+## v0.73.0 — 2026-10-16
+
+**A series with no description, genres or author can have them filled in, a whole source can be rated Adult only,
+AniList sync waits when AniList asks instead of giving up, and a new Unraid extension engine asks for a password.**
+The first two began as pull requests from **@Squeaks72**
+([#257](https://github.com/AngeloSha/uchiyomi/pull/257), [#245](https://github.com/AngeloSha/uchiyomi/pull/245),
+[#256](https://github.com/AngeloSha/uchiyomi/pull/256)), rebuilt on the app's own parts. Thank you.
+
+### Missing details, filled in
+
+- **Admin → Settings → Library housekeeping → Fill in missing details** ([#257](https://github.com/AngeloSha/uchiyomi/pull/257),
+  [#245](https://github.com/AngeloSha/uchiyomi/pull/245)). It is off by default. Once a night it fills in a description,
+  genres or an author for a series that has none of its own.
+  - It asks AniList first, for series linked there, in English, in libraries that look AniList up. Fifty series go in
+    one request, by id.
+  - Then it asks the series' own source and the sources it follows, in its language, for up to 15 series a night that
+    you keep updated. A source that is switched off, failing or cooling down is never asked.
+  - A series with no chapters yet gets a cover too.
+- **Nothing is replaced.** A series' own details win as soon as a scan brings them, and anything you set in Edit
+  details wins over both. Genres you cleared on purpose stay cleared.
+- **The 18+ filter sees the genres it adds**, like any others.
+- **A series it could not describe is asked again after a month.** Following a source by hand asks that source at once.
+- **Switching it off takes back everything it filled in**, covers included.
+
+### A whole source can be rated Adult only
+
+- **Admin → Sources**, open a source, **Age rating** ([#256](https://github.com/AngeloSha/uchiyomi/pull/256)): **Automatic**
+  leaves it to the source's extension, and **Adult only** makes the whole source adult whatever the extension says.
+  That helps with built-in sources and sites added by address, which can never say.
+- **Accounts limited below 18 cannot use an Adult only source at all**, by any route, just as with a source whose
+  extension marks itself 18+. With Show 18+ off, it also leaves Discover, search and the latest and popular lists.
+- **No rating opens a source to a younger account.** A source whose extension marks it 18+ stays 18+.
+- **The 18+ filter's "Sources to treat as adult" chips are gone.** Those sources are now rated Adult only (see Upgrading).
+
+### Everywhere else
+
+- **AniList sync waits when AniList asks, instead of giving up.** AniList limits how many requests a server may make
+  a minute, and every AniList request Uchiyomi makes now shares that one limit: everyone's progress, ratings, art,
+  Discover and the new missing details. A push that AniList turns away is sent again after the wait AniList asks for,
+  so connecting AniList and pushing everything you have finished goes slowly instead of stopping after a dozen series.
+  Profile → Connections says **Syncing slowly** meanwhile, not an error, and Health's Tracker sync card leaves it out.
+- **A new Unraid install of the extension engine asks for a password**, and Uchiyomi's template has the matching user
+  name. An engine installed before keeps its settings. [A password on the engine](docs/extensions.md#a-password-on-the-engine)
+  says how to add one.
+- **The desktop app's extension engine gets a new password every time the app starts.** Nothing changes on screen.
+
+### Upgrading
+
+- **Sources you had ticked under Settings → 18+ filter → "Sources to treat as adult" are now rated Adult only, and
+  accounts limited below 18 can no longer use them.** Before, they only left the lists while Show 18+ was off. To let
+  such accounts use one again, set its Age rating back to Automatic under Admin → Sources.
+- **Database:** one new table (`series_auto_details`) and one new setting (`fill_details`, off). Both are additive.
+- **Optional:** `REPAIR_DETAILS_MAX` (1 to 200, 15 by default) sets how many series a night are asked about their
+  sources.
+
+## v0.72.0 — 2026-10-16
+
+**Health turns around: one card per series, with everything wrong with it. Three new cards say when the downloads
+disk is too full to download, which members' tracker sign-ins need them, and which chapter files cannot be read.**
+All of it began as pull requests from **@Squeaks72** ([#252](https://github.com/AngeloSha/uchiyomi/pull/252), [#253](https://github.com/AngeloSha/uchiyomi/pull/253), [#254](https://github.com/AngeloSha/uchiyomi/pull/254)), rebuilt on Health's own parts.
+Thank you.
+
+### Health by series
+
+- **By check / By series** ([#254](https://github.com/AngeloSha/uchiyomi/pull/254)), above the cards. By series shows one card per series with every finding about
+  it, each with the keys its own card has. The series that most need you come first.
+  - Every series is there, not only the fifty a card shows.
+  - **Remove from library** hides a series. Tick several to remove them together, after a confirmation that names
+    them. No file is deleted, and everyone's progress is kept.
+  - Only the series on the screen can be ticked, so a series that left the list after a re-check is never removed by
+    mistake.
+  - A finding about no single series, and a duplicate pair, stay in the By check view. Each device remembers its view.
+
+### New Health cards
+
+- **Disk space and folders** ([#253](https://github.com/AngeloSha/uchiyomi/pull/253)). The card turns red when the downloads disk has less than `MIN_FREE_GB`
+  free (10 GB unless you set it), the point where new downloads stop. Before, only each download's error said so. It
+  turns amber below the slow archive's own floor while the archive has a series queued.
+  - It also names a library or download folder that cannot be opened, or that is empty while the library still
+    records chapters in it. That is almost always a network share that is not mounted.
+  - It reads only the first entry of each folder, so it never wakes every disk of an Unraid array.
+  - Ignoring a warning here does not silence a later problem.
+- **Tracker sync** ([#253](https://github.com/AngeloSha/uchiyomi/pull/253)) lists every member's tracker connection with something wrong: a sign-in the tracker
+  refused, a sync that failed, or a sign-in that ended or ends within 14 days. Only the member can sign in again, so
+  the card tells you whom to ask.
+- **Chapter files** ([#252](https://github.com/AngeloSha/uchiyomi/pull/252)) lists the chapter files the nightly repair found no page in: empty, cut short by a
+  download, damaged or gone. Nothing showed them before.
+  - **Fetch again** on a row downloads new copies of the files Uchiyomi downloaded itself. Each old file is kept
+    until its new copy lands.
+  - The card reads only what the nightly count stored, so it costs nothing to run. A file that changes is counted
+    again.
+  - Nothing on the card deletes a file.
+- **Fix everything lists these three under Needs you**, after everything else a person decides. It changes nothing
+  about them.
+
+### For API clients
+
+- `GET /api/admin/health?view=series` adds `bySeries`: every series with a finding, grouped from each card's whole
+  list. The new checks are `disk`, `trackers` and `files`, and each can be ignored.
+
+## v0.71.0 — 2026-10-16
+
+**Reading defaults for a whole library, sources and covers picked by hand, MangaUpdates tracking, and suggestions from
+your own tracker lists.** All of it began as pull requests from **@Squeaks72**, taken and finished on the app's own parts
+([#235](https://github.com/AngeloSha/uchiyomi/pull/235), [#241](https://github.com/AngeloSha/uchiyomi/pull/241), [#242](https://github.com/AngeloSha/uchiyomi/pull/242),
+[#243](https://github.com/AngeloSha/uchiyomi/pull/243), [#244](https://github.com/AngeloSha/uchiyomi/pull/244), [#246](https://github.com/AngeloSha/uchiyomi/pull/246),
+[#248](https://github.com/AngeloSha/uchiyomi/pull/248)). Thank you.
+
+### MangaUpdates, and Recommended for you
+
+- **MangaUpdates** ([#244](https://github.com/AngeloSha/uchiyomi/pull/244)) is a fourth progress tracker: it syncs the chapters you finish and
+  its list can be imported. You paste a session token, which its login gives you; the guide has the command, and your
+  password goes to MangaUpdates only. Uchiyomi asks MangaUpdates at most once a second.
+- **Recommended for you** ([#248](https://github.com/AngeloSha/uchiyomi/pull/248)). With AniList or MyAnimeList connected, Discover shows what
+  their readers suggest after the series you rated well or read, minus everything on your lists and in the library.
+  - Each card says which service suggested it and *Because you read …*.
+  - Your list is read at most twice a day and each title's suggestions once in two weeks for the whole server, so
+    opening Discover again asks nothing.
+  - What is 18+ for you is left out, as in every Discover rail, and so are series of the library you may not open.
+- **A line above every page when a tracker needs a new token** ([#246](https://github.com/AngeloSha/uchiyomi/pull/246)), with **Reconnect** and **Not
+  now**. Only when reconnecting would help: a rejected, lapsed or unreadable token, never a rate limit or an outage.
+
+### Series and libraries
+
+- **Reading defaults for a library** ([#235](https://github.com/AngeloSha/uchiyomi/pull/235)). An admin can give a library a reading mode, pages per
+  view and reading direction, in its dialog under Admin → Libraries, or from the reader with **Use these settings for
+  every series in …**, which asks first. Every account gets them, under a source's default and a series' own; the theme
+  stays each reader's choice. A chapter downloaded for offline reading opens with them too.
+- **Add or move a source by hand** ([#243](https://github.com/AngeloSha/uchiyomi/pull/243)). The Sources sheet has **Add more sources…**: search
+  the sources, compare a pick's cover, title and chapter count, then add it as an extra source or move the series to it.
+  It is for the series *Find other sources* cannot judge, those with fewer than three chapters.
+  - The title is still checked with the source. When the source calls it something else, the sheet says so and offers
+    **Attach anyway**.
+  - The **×** on the main source now detaches it, after asking: the next source takes over, or the series is left with
+    none. Chapters and progress stay. A series numbered by posting order keeps its main source.
+- **Change a cover to a source's** ([#242](https://github.com/AngeloSha/uchiyomi/pull/242)): **More → Change cover**, or a click on the cover on a
+  computer. It shows the cover each source the series uses has for it, and takes an upload too. The server keeps its own
+  copy, and the new cover shows at once on this device's cards. Sources that are switched off, cooling down or failing
+  are not asked.
+- **Compare copies before replacing** ([#241](https://github.com/AngeloSha/uchiyomi/pull/241)). A chapter's **⋯** menu has **Replace from another
+  source…** when another source has a copy: this server's file and that copy side by side, page by page, before the
+  usual *Replace with this version?*.
+
+### Upgrading
+
+- **Database:** additive only. A `reader_prefs` column on `libraries`, and two tables for Recommended for you,
+  `tracker_list_cache` and `tracker_rec_cache`. They are created when the server starts.
+- **Privacy:** *Recommended for you* reads the lists of the trackers a person connected, and asks AniList and
+  MyAnimeList about a few titles of them. [CONFIGURATION.md](docs/CONFIGURATION.md#progress-trackers) says what is
+  sent, with and without a token. An account that may not add series, or has no tracker connected, sends nothing.
+- **API:** `GET /api/trackers` rows carry `needsReconnect`. New: `POST /api/admin/series/:id/attach-source`,
+  `GET /api/admin/series/:id/cover-candidates`, `GET /api/admin/series/:id/copy-pages`,
+  `GET /img/series/:id/copy-page`, `GET /api/discover/recommendations`.
+
+## v0.70.0 — 2026-10-16
+
+**Each chapter you finish counts once. The reader gains a right-click menu and a list of its keys, and the 18+ reveal
+says it is on wherever you are.** Most of this release began as pull requests from **@Squeaks72**, taken as they were
+or rebuilt on the app's own parts ([#231](https://github.com/AngeloSha/uchiyomi/pull/231), [#239](https://github.com/AngeloSha/uchiyomi/pull/239), [#251](https://github.com/AngeloSha/uchiyomi/pull/251),
+[#254](https://github.com/AngeloSha/uchiyomi/pull/254), [#255](https://github.com/AngeloSha/uchiyomi/pull/255), [#258](https://github.com/AngeloSha/uchiyomi/pull/258), [#259](https://github.com/AngeloSha/uchiyomi/pull/259), [#260](https://github.com/AngeloSha/uchiyomi/pull/260)). The
+counting fix is **CheetahDoesStuff**'s report ([#264](https://github.com/AngeloSha/uchiyomi/issues/264)). Thank you both.
+
+### Each finished chapter counts once
+
+- **Reading a chapter through counted it twice** ([#264](https://github.com/AngeloSha/uchiyomi/issues/264), reported by CheetahDoesStuff). The page
+  before the last already counts as the end, and the last page then counted the chapter again. Re-reading a chapter
+  added more. So Wrapped, your profile's chapters, the Reading studio, the weekly goal, reading time and the admin's
+  member stats all said more than you had read. On one real server, 1,812 finished chapters were really 1,336.
+  - Each chapter now counts once, as the household board always counted it.
+  - This applies to the reading already recorded, too.
+- **Your numbers may go down.** The chapters on your profile, the badges they earn and the weekly goal count fewer than
+  before. A badge you had only because of the double count waits until you earn it.
+- **A chapter you mark as read from a list, and then really read, still counts.** One you only mark still does not.
+- **The Reading studio counts chapters over its heatmap.** A chapter read again on another day lights that day on the
+  heatmap, but it still counts once in the total.
+
+### Reading
+
+- **Right-click a page for a menu** ([#259](https://github.com/AngeloSha/uchiyomi/pull/259)). It has zoom, bookmark the page, jump to a page, the next
+  and previous chapter, the chapter list, single pages or double spreads, full screen, show or hide the controls, the
+  reader's settings, the series and leaving the reader.
+  - Esc closes the menu, not the reader.
+  - Shift + right-click still opens the browser's own menu, and so does holding a page on a touch screen.
+- **Press ? for the reader's keys** ([#260](https://github.com/AngeloSha/uchiyomi/pull/260)), as this device has them bound. On a computer there is also
+  a keyboard button in the top bar.
+- **A right or middle click no longer turns the page or toggles the controls** ([#258](https://github.com/AngeloSha/uchiyomi/pull/258)).
+
+### Everywhere else
+
+- **"18+ titles are showing"** ([#255](https://github.com/AngeloSha/uchiyomi/pull/255)). While the Show 18+ reveal is on, a line above every page says
+  so, with a **Hide 18+** key, as Incognito reading's line does. Before, a series page or a search reached from the
+  Library showed 18+ titles with no sign of it until the browser closed.
+  - The line appears only when the reveal has something to show you.
+  - The Show 18+ chips still turn it on and off.
+- **Your profile photo opens quick settings** ([#251](https://github.com/AngeloSha/uchiyomi/pull/251)): Incognito reading, Show 18+ (where there is
+  something to show), Reduce effects, Profile, Profile settings and Sign out. On a phone, it is the photo on Home.
+- **Genres while you type** ([#239](https://github.com/AngeloSha/uchiyomi/pull/239)). Edit details offers the genres your library already uses. A genre
+  typed in another case takes the library's spelling.
+- **Health says how the last Fix everything went** ([#254](https://github.com/AngeloSha/uchiyomi/pull/254)), under its header: "Last nightly Fix
+  everything 3h ago: 1 needs you".
+- **`MAX_FOLLOWED_SOURCES`** ([#231](https://github.com/AngeloSha/uchiyomi/pull/231)) sets how many other sources a series may follow: 2 by default, up
+  to 6. The Add dialog no longer states a number.
+
+### Upgrading
+
+- **Database:** no new tables or columns. The `reading_stats` view is redefined when the server starts.
+- **Badges and the weekly goal may count fewer chapters than before** (see above).
+- **Optional:** set `MAX_FOLLOWED_SOURCES` (1 to 6) to let a series follow more than two other sources. Each one more
+  is another chapter list read on every update check, for every series.
+
+## v0.69.1 — 2026-10-15
+
+### Security fixes
+
+**Update soon, especially if people outside your household can reach your server.** A full security review of the
+server, web app, desktop app and deploy files found the problems below. None needs anything from you to be fixed
+except updating; the few settings to know about are under Upgrading.
+
+### Accounts and sign-in
+
+- **An API token can only create an admin token if it is one.** A read+write token belonging to an admin (the kind you
+  make for Mihon or Komga sync) could create an admin-scoped token for itself. Now only an admin session, or a token
+  that already has the admin scope, can.
+- **Restarting the server no longer makes the oldest account an admin again.** It did on every start, which undid a
+  demotion and, after the oldest account was deleted, promoted the next one. A server with no admin at all still makes
+  its one account the admin, as an upgrade from a single-user install needs.
+- **A disabled or deleted account's browser stops loading pages and covers.** The image cookie kept working for up to a
+  week; for a deleted account it could even open libraries it was never given.
+- **Single sign-on routes are rate limited and do a bounded amount of work.** Failed sign-ins are logged once a minute
+  per kind, a sign-in ticket works once, and old failed sign-in entries are tidied away nightly.
+- **OIDC_LINK_BY_USERNAME links an existing account only when the provider reports exactly that username.** It also
+  matched the part of an email before the @, and a username with characters removed. An adopted account's role now
+  follows OIDC_ADMIN_GROUP from its first sign-in.
+- **Only your own reverse proxy can tell the server a visitor's address.** Anyone reaching the app's port directly could
+  choose the address the sign-in limits counted. See TRUST_PROXY under Upgrading.
+
+### What members can see
+
+- **Titles a source rates erotica or pornographic (MangaDex) are added as 18+,** and an age-limited account no longer
+  sees them in that source's listings or can open or add them.
+- **An extension source answers only for its own series,** so a series from an 18+ extension cannot be opened through
+  another one.
+- **For you and Featured drop a series as soon as a member loses access to it,** instead of up to ten minutes later.
+- **Discover, push notifications, Hidden gems, series colours and source icons respect each member's libraries and age
+  limit.** Discover still says when the server already has a title, but only names it to members who may open it; a
+  new-chapter notification goes only to members who may open the series; Hidden gems no longer counts what another
+  member read with Incognito on; an 18+ source's icon is a lettered tile for an age-limited account.
+- **Avatar colours and list colours are colours.** Anything else is refused, and shown as the default.
+
+### Files and outside requests
+
+- **One damaged or hostile file can no longer take the server down.** Archive pages are read with a size limit (a
+  small file that unpacks to gigabytes is refused), PDF pages are drawn at no more than 32 megapixels, and a chapter
+  folder's pages must be real files inside it, not links to elsewhere.
+- **The server only fetches from the public internet on a site's say-so.** Chapter pages, source icons, covers, the
+  Cloudflare solver and web-push addresses all refuse addresses on your own network, and stop reading at a size limit.
+  The extension engine's login is sent only to the engine.
+- **A search can no longer be made big enough to tie up the database.** A filter of more than 128 conditions is refused.
+- **In the split layout the extension engine no longer shares the database's network.**
+
+### Also
+
+- **Health reads trawl 1.8.0's solve timeout as a timeout.** trawl 1.8.0 says "Scrape deadline exceeded" where 1.7.0
+  said "…-challenge-timeout", so a site whose solve ran out of time got no cooldown and an "unknown" diagnosis. It now
+  gets the usual cooldown and "The site presented a Cloudflare challenge the solver could not finish in time".
+
+### Upgrading
+
+- **TRUST_PROXY (new):** by default the server believes a forwarded visitor address only from a proxy on the same
+  machine, in Docker or on your local network (nginx, Nginx Proxy Manager, Caddy, Traefik, Umbrel, CasaOS, a Cloudflare
+  tunnel). If your reverse proxy is on a public address or reaches the server over Tailscale, add its address (or a
+  CIDR range) to the default list rather than replacing it, so a hop on this machine or in Docker stays trusted:
+  `TRUST_PROXY=loopback, linklocal, uniquelocal, 203.0.113.9`. Behind Cloudflare's proxy (the orange cloud), have
+  your reverse proxy restore the visitor's address from `CF-Connecting-IP`, or add Cloudflare's ranges the same way,
+  or the activity log shows Cloudflare's addresses. Otherwise nothing to do. See docs/CONFIGURATION.md.
+- **Split layout (docker-compose.split.yml):** `docker compose up -d` moves the extension engine to its new network.
+  Nothing else changes.
+- **OIDC_LINK_BY_USERNAME:** accounts already linked are unaffected. A first sign-in links an existing account only if
+  your provider sends a `preferred_username` (or `nickname`) equal to the account's username.
+
+## v0.69.0 — 2026-10-15
+
+**The extension engine moves to v2.4.2366.** Every install mode now pins Suwayomi-Server v2.4.2366: the compose files,
+the Unraid template, the CasaOS add-on and the desktop app. It ran on a real server for a day before this release. A
+server that keeps v2.3.2243 keeps working, and **Admin → Health** recommends the update, with the backup to take first.
+The desktop app updates its engine by itself, and keeps a copy of the engine's database before the new version first
+opens it.
+
+### The extension engine moves to v2.4.2366
+
+- **What the new engine brings**, from Suwayomi's own notes: an extension whose update fails is no longer lost;
+  a Cloudflare-protected source's search reaches the site through the solver with its whole request, not only when it
+  is a form, and the source's own errors come through instead of reading as a failed Cloudflare check; a new chapter
+  with no date is no longer dated 1970 by the engine (Uchiyomi reads both since v0.64.0); and fixes for some
+  extensions' series links, browse filters with nested groups, and pages in non-Latin scripts.
+- **On a server, you choose when, and it is one way.** `docker compose pull` fetches the same engine again. This
+  release's compose files, Unraid template and CasaOS add-on name v2.4.2366; an install you already have changes one
+  line. The engine upgrades its database when v2.4.2366 first starts, and v2.3.2243 cannot read it again, so back it
+  up first: [Updating the engine](docs/extensions.md#updating-the-engine) has the steps for Docker Compose, Unraid,
+  CasaOS and an engine you run yourself, each with the way back.
+- **Health says so, quietly.** On an engine still at v2.3.2243, **Admin → Health → Extension engine** adds a greyed
+  line: older than the version this Uchiyomi was tested with, it works, updating is recommended, then the backup and
+  the step for your setup. Nothing turns amber: this release works with v2.3.2243 too. The step to update an engine
+  that is too old to work starts with the backup now as well.
+- **Uchiyomi Desktop updates its engine by itself.** On a computer that had the engine, the first start after this
+  update downloads v2.4.2366 (about 200 MB) without a click; until now an engine update would have left extensions
+  stopped until someone found the download button again. Before the new engine first opens its data, the app keeps
+  a copy of the engine's database in `engine-snapshots` in its data folder (the two newest copies stay), and if it
+  cannot make one, on a full disk, it does not start the new engine and says why. The old engine's files are deleted
+  once the new one runs.
+
+### For contributors
+
+- `bff/test/enginePins.test.ts` holds the FlareSolverr DTO fixture to the pin too: the desktop solver's contract must
+  decode with the pinned engine's DTOs, verbatim, and with no other engine's.
+- The solver contract has v2.4's two rules: a POST body of any kind reaches the browser byte for byte (the Electron
+  check compares the bytes a site receives, where it compared lengths), and a solve counts for v2.4 only with a
+  `cf_clearance` cookie, which the solver hands back from its jar untouched.
+- No test hard-codes the tested engine any more: Health's wording tests fix their own versions and the web tests read
+  the pin, so the next `scripts/engine/bump.mjs` moves the pin without touching them. `startFakeSuwayomi({ schemaFile })`
+  runs one fake as another engine, and the 1970-date guard is checked end to end against v2.3.2243 as well as the pin.
+
+### Upgrading
+
+- **Uchiyomi's own database:** no change; v0.68.0 runs on it.
+- **The extension engine on a server:** nothing changes until you change its tag. Do it with a backup:
+  [Updating the engine](docs/extensions.md#updating-the-engine).
+- **Uchiyomi Desktop:** the first start after the update downloads about 200 MB, once, and keeps a copy of the
+  engine's database first.
+
+## v0.68.0 — 2026-10-15
+
+**A series you add can go on your trackers as Plan to read.**
+
+### Plan to read when you add a series
+
+- **A new switch at the foot of Profile → Connections → Progress tracking** ([#223](https://github.com/AngeloSha/uchiyomi/issues/223)).
+  With it on, a series you add to the library goes on your trackers as Plan to read: AniList's Planning,
+  MyAnimeList's Plan to Read, Kitsu's Want to Read. It is off until you turn it on.
+- **Only where your list has nothing for it yet.** An entry you already have, in any state, is left exactly as it is.
+- **On every tracker the series is linked to.** An add links it to AniList by itself; MyAnimeList and Kitsu links come
+  from importing your list from them.
+- **Only for you, and never while Incognito reading is on.** Adding a series that is already in the library counts too;
+  a series that arrives any other way (a library scan, an admin's import) is nobody's add.
+
+### Upgrading
+
+- Nothing to do.
+
+## v0.67.3 — 2026-10-15
+
+**Fast scrolling on a computer is smooth: the film grain steps aside while the page moves.**
+
+### Fast scrolling
+
+- **The film grain pauses while the page moves, and fades back in when it stops.** Its blend over the whole screen
+  made the graphics card redraw everything beneath it on every frame of a scroll, and that alone made a fast scroll
+  stutter. A fast flick through the Library now runs at about 56 frames a second instead of 39, and Home at 53–58
+  instead of 49–55. At rest nothing looks different.
+- **Scrolling does less work on every frame.** The scroll position is no longer measured on every frame of a scroll.
+
+### Upgrading
+
+- Nothing to do.
+
+## v0.67.2 — 2026-10-15
+
+**The app does about half the work while you are not touching it, a page change is the fade it was designed to be
+instead of a flicker, and a series opens already loaded.**
+
+### Less work, the same look
+
+- **Covers still loading below the screen no longer cost anything.** A cover that has not loaded wears a shimmering
+  placeholder, and the Library kept up to 158 of them shimmering where nobody could see them, every frame of them work
+  for the whole page. Off the screen they are now skipped, and a placeholder starts shimmering as it comes near. With
+  the processor slowed four times, as a modest computer or a phone: an idle Library does 47% less work, Home on a phone
+  49% less, scrolling Home on a phone 47% less, and running the pointer across covers 51% less.
+- **A phone no longer runs smooth scrolling's frame loop.** It only ever moves a mouse wheel's scroll, and a phone ran it
+  on every frame of every page, the reader's included, for nothing. A computer's is unchanged.
+
+### The page change, as designed
+
+- **The old page fades out, then the new one fades in, once.** Since it was written, a click showed the next page at
+  once inside the fade-out, faded it to black and faded it in again, and built it twice. Changing pages now does a third
+  to half less work.
+- **A series opens already loaded.** Its details and chapters are asked for at the click on its cover, not after the
+  fade, so it fades in with them.
+
+### Upgrading
+
+- Nothing to do.
+
+## v0.67.1 — 2026-10-14
+
+**Scrolling with a mouse wheel works over a series again, and on a phone Home opens on a cover too.**
+
+### Scrolling with a mouse wheel
+
+- **The page scrolls when the pointer is over a series.** On a computer, the page stopped dead wherever a series in a
+  row of covers was under the pointer (Home's rows, a series' Related, Discover, Admin's Top 10), so only the scrollbar
+  moved it. A sideways swipe or Shift+wheel still scrolls the row itself. The Settings index and a series' genres had
+  the same problem and are fixed too.
+
+### Home on a phone
+
+- **Home's hero is the daily pick's cover**, filling it edge to edge as a series page's has since v0.67.0, where it
+  showed the automatic banner's panels. A computer keeps the banner.
+
+### Upgrading
+
+- Nothing to do.
+
+## v0.67.0 — 2026-10-14
+
+**On a phone, a series opens on its cover.** The cover fills the top of the page edge to edge — a phone held upright is
+the cover's own shape — with the title on its lower edge and the reading button right under it. A computer's series page
+is unchanged.
+
+### A series opens on its cover
+
+- **The cover is the hero**: sharp, the screen's width, drifting slowly closer (still under **Reduce effects**). The wide
+  banner showed only a slice of its middle on a phone, in a strip a third of this height.
+- **The title sits on the art**: the status, the title and its details are on the cover's foot, where they had been
+  squeezed beside a small cover in up to four lines.
+- **A clean bar when you scroll**: clear over the art, then glass with the title once you scroll past it. Before, the
+  reading button showed through the bar as it scrolled under it.
+- **Continue comes first**: under the art, the reading button and the four keys, then the ratings and the sources. The
+  genres are one row you swipe.
+
+### The Cloudflare solver
+
+- **trawl 1.8.0 for the extension engine.** A Madara extension asks a Cloudflare-protected site for its lists and
+  searches with a form post, and trawl 1.7.0 refused every one (*body requires a Content-Type header to be set*), so a
+  site like ManhuaUS failed its Popular and Search through it. 1.8.0 takes them, and the trawl service in
+  [the Cloudflare solver](docs/CONFIGURATION.md#the-cloudflare-solver) now pins it.
+
+### Upgrading
+
+- Nothing to do in Uchiyomi itself.
+- **If you run trawl**, move its image to `ghcr.io/germondai/trawl:1.8.0` and recreate its container. No setting
+  changed, and neither FlareSolverr nor Byparr is affected.
+
+## v0.66.0 — 2026-10-14
+
+**Make Uchiyomi look the way you like.** Home's rails can go in the order you read them, and the background can be
+softer than true black. True black stays the default and looks exactly as before.
+
+### Home in your order, and two softer backgrounds
+
+- **Customize**, at the end of Home's greeting line, lists Home's rails with arrows to move each one and a switch to
+  hide it. Home changes as you go, and the arrangement is saved to your account, so your other devices open the same
+  Home. **Reset** brings back the original order.
+- **Your lists move as one rail.** Which lists Home shows is still chosen on **Lists**; the sheet's **Choose lists**
+  takes you there.
+- **A hidden rail isn't loaded at all.**
+- **Background**, in **Profile → Settings → Appearance**, offers **OLED black** (the default), **Graphite**, a soft
+  charcoal, and **Midnight**, a deep blue, for screens where true black feels harsh. The whole app follows: the page,
+  cards, sheets, the sidebar, and a phone browser's own bar.
+- **It is saved to your account** like the accent colour, and applied before the first frame, so a reload never
+  flashes black first. The sign-in screen stays black.
+
+### Upgrading
+
+- Nothing to do. For scripts: `/api/settings` carries two more keys the app writes, `homeRails` and `tone`
+  ([docs/api.md](docs/api.md)).
+
+## v0.65.1 — 2026-10-14
+
+**Two requests from @klave7, the first of them promised for the new look: chapters as one list, and Mark unread on a
+chapter you are part-way through.** Thank you.
+
+### Chapters as one list
+
+- **Layout**, at the end of a series' chapter toolbar, switches the chapters between **Columns** (side by side, as
+  before) and **List** (one row per chapter, the page's width), so a long chapter title is read whole
+  ([#214](https://github.com/AngeloSha/uchiyomi/issues/214)). It is the Library's own Layout control, remembered on
+  this device; a phone shows one list either way.
+
+### Mark unread
+
+- **A chapter you are part-way through offers Mark unread** in its menu, beside Mark read, and its page goes with it
+  ([#215](https://github.com/AngeloSha/uchiyomi/issues/215)). Before, only a finished chapter could be marked unread,
+  and one that was showed *page 0/19*.
+- **The series page's select bar** (Mark read, Mark unread, Fetch, Remove…) is keys, like the Library's.
+
+### Upgrading
+
+- Nothing to do.
+
+## v0.65.0 — 2026-10-14
+
+**A new look.** On a computer the menu is a slim sidebar with the art running under it, Home's banner shows whole
+pictures instead of slices, and a series opens on its banner at the window's full width. The rest of the app follows:
+Lists with covers, Offline downloads by series, Updates and History in columns, and Admin with a compact header and a
+Settings index. Nothing moved out of reach, and **Reduce effects** calms all of it as before.
+
+### On a computer
+
+- **A sidebar instead of the top menu.** Home, Library, Lists, Discover, History, Moments, Offline and Admin sit in a
+  rail of icons down the side, which opens into a labelled panel while the pointer rests on it (or when you Tab into
+  it). The Library's downloads ring and Admin's Health mark moved with them. The top bar keeps search, Updates and your
+  avatar, and it is see-through over a banner until you scroll.
+- **Check for new chapters** left the top bar for a key on **Updates**. The search palette and Admin still have it.
+- **Narrower than 1280 px**, the Library's filters are behind its **Filters** key, so the covers keep their room.
+
+### Home and the series page
+
+- **Home's banner shows whole pictures.** The automatic banner is four series side by side, and a narrower screen used
+  to cut the outer two in half. Now it shows three or four whole ones (two by two on a phone), faded into the page.
+- **Rails have arrows**, and their cards grow with the screen. **Continue reading** shows the page you're on.
+- **A series opens on its banner**, the window's full width, with the cover overlapping it. Its genres open the Library
+  filtered by them, and the chapter list's toolbar and pager are keys.
+
+### Everywhere else
+
+- **Lists:** each list shows its first covers, and New list and Delete use the app's own dialogs. The series page's
+  key says *Add to list*, and Lists is in the search palette.
+- **Offline downloads** are grouped by series, with their covers, even with no connection.
+- **Updates and History** use the screen's width instead of one narrow column.
+- **Admin:** the big header is on Overview only; the other tabs have a compact one. **Settings** has a row of keys that
+  jump to each section, and **Members'** actions are keys.
+- **Profile:** its tabs are one row, with Admin, Support and Sign out at its end.
+- **Tabs on a phone** are underlined rather than pills, and buttons that act are squared keys. Only filters and sorts
+  stay round.
+
+### Upgrading
+
+- Nothing to do. For scripts: `GET /api/lists` items carry `preview`, the ids of a list's first four series
+  ([docs/api.md](docs/api.md)).
+
+## v0.64.0 — 2026-10-14
+
+**You decide what a new member starts with, and Uchiyomi is ready for the next extension engine.** The first is the
+last part of **@DrummyFloyd**'s request ([#208](https://github.com/AngeloSha/uchiyomi/issues/208)): a server that lets
+people sign up, or lets them in through its sign-on provider, no longer gives every new account the whole library. Thank
+you. The second changes no one's engine: every install mode still pins v2.3.2243, but Uchiyomi now works with v2.4.2366
+as well, says plainly when an engine doesn't match, and tests every new engine release before anyone runs it.
+
+### What new members start with
+
+- **Admin → Members → When someone signs up** sets what an account starts with when no admin chose for it. That is
+  someone signing up while Open registration is on, or signing in through your provider for the first time with
+  `OIDC_ALLOW_SIGNUP`. The card has a member card's own three chips: downloads, which libraries they can open, and an
+  age limit. In SSO-only mode the chips are on the *New accounts* card.
+- **The account is made with them.** Even its first page view is limited. Before, you had to find each new account in
+  Members and limit it after its first visit had already seen everything.
+- **Nothing else changes.** The defaults don't apply to the server's first admin or to an account you make in Members,
+  and saving them changes no account that exists. An account your provider makes an admin (`OIDC_ADMIN_GROUP`) sees
+  everything while it is one, and has the defaults if the provider ever makes it a member.
+- **A library you remove leaves the defaults.** If it was the last one, new members see nothing until you choose again,
+  never every library.
+- **For scripts:** `newMemberDefaults` on `PATCH /api/admin/settings`, in the shapes a member's own settings take
+  ([docs/api.md](docs/api.md#admin)).
+
+### The extension engine
+
+- **An engine that doesn't match says so.** When the engine refuses what Uchiyomi asks (an engine much older or newer
+  than this Uchiyomi knows), **Health → Extension engine** now reads *Not compatible*, quotes the engine, and gives the
+  one step for your setup: Docker Compose, Unraid, CasaOS, the desktop app or anything else. It used to say *Not
+  answering*, and restarting the container changed nothing. Its series say why they wait, and **Admin → Sources** says
+  it too.
+- **Health shows the engine's version** when it isn't the one this Uchiyomi was tested with: newer (with how to go
+  back safely), older, or too old to work.
+- **No more chapters dated 1970.** The engine dated some new chapters in seconds instead of milliseconds, so they showed
+  as January 1970 in Releases, a group's history, the catalogue and the Komga API. Uchiyomi reads both now, and puts
+  right the dates it already stored when you upgrade.
+- **Nothing the engine has marked for removal is used any more**, so its next releases can't break Uchiyomi that way:
+  the 18+ flag (an extension marked *mixed* counts as 18+), the chapter list, the engine's version, and repositories.
+- **Repositories are the engine's extension stores.** An address is checked when you add it, and if the engine can't
+  read it, the message says why in the engine's words. Adding, removing and the nightly restore work as before.
+
+### Fixed
+
+- **Uchiyomi Desktop on Windows no longer fails to start** when another program has its `state.json` open at the moment
+  it saves it: an antivirus scan or a backup, for example. Saving that file waits up to two seconds and tries again,
+  where the first such moment stopped the start and left the loading page up for good.
+
+### For contributors
+
+- **A weekly canary** (`.github/workflows/engine-canary.yml`) runs every new stable Suwayomi-Server, and the newest
+  preview, through what Uchiyomi asks of an engine: its schema, every GraphQL document Uchiyomi sends (one registry,
+  `bff/src/lib/sources/suwayomi/operations.ts`), a source end to end, an extension store, and the fake-engine tests.
+  `scripts/engine/bump.mjs <tag>` moves every pin at once. It posts nothing until the repository variable
+  `ENGINE_CANARY_POST` is `on`.
+
+### Upgrading
+
+- **Database:** three new columns on `server_settings`, all unset. Until you set a default, a new account opens every
+  library, has no age limit and may download, as before. At the first start, chapter dates stored as 1970 are put right
+  once (chapters, the chapter lists, posting order). v0.63.0 runs on the upgraded database and ignores the new columns.
+- **The extension engine stays at v2.3.2243.** Moving to v2.4.2366 is a later release.
+
+## v0.63.0 — 2026-10-14
+
+**Single sign-on can now be the only way in.** This came from **@DrummyFloyd**'s request
+([#208](https://github.com/AngeloSha/uchiyomi/issues/208)), after a security review of their own server. Thank you.
+
+### SSO-only mode
+
+- **`AUTH_MODE=oidc-only`** makes your OpenID Connect provider (Authentik, Authelia, Keycloak…) the only way to sign
+  in. First-run setup, password sign-in, sign-up, password change and two-factor are not served at all, so a server on
+  the internet has nothing there to guess at or rate-limit. The sign-in screen shows the provider's button alone.
+- **The first admin comes from the provider.** On a new server, the first sign-in from the person
+  `OIDC_BOOTSTRAP_ADMIN_SUB` names, or else from someone in `OIDC_ADMIN_GROUP`, makes that person the admin. Nobody can
+  take a fresh server by being its first visitor. A refused first sign-in is logged with its subject, ready to copy.
+- **Accounts come from the provider.** With `OIDC_ALLOW_SIGNUP`, anyone the provider lets in gets an account at their
+  first sign-in. **Admin → Members** makes no account and resets no password in this mode.
+- **Linking the accounts you already have.** **Profile → Account** now has *Link to …*, which links the identity you
+  sign in with at the provider to your account here. Link accounts before you turn the mode on. At every start, the
+  log lists any account that can no longer sign in.
+- **A way back in.** If the provider is ever down, `AUTH_RESCUE_ADMIN` reopens password sign-in for one admin account
+  until you remove it. It's logged at every start and at every sign-in it allows.
+- **The server refuses to start in a configuration that can't work** and says why: a typo in `AUTH_MODE`, no provider,
+  `OIDC_LINK_BY_USERNAME`, or a new server with no way to make its admin.
+- **Setup:** the install guide's new *Single sign-on* section has an Authentik example. Every setting is in
+  [docs/api.md](docs/api.md#sso-only-mode).
+
+### Also
+
+- **The last admin keeps their role.** With `OIDC_ADMIN_GROUP` set, roles still follow the provider at every sign-in,
+  but the server's last admin is never demoted that way.
+
+### Upgrading
+
+- **Database:** no changes.
+- **Nothing changes unless you set `AUTH_MODE=oidc-only`.** The bundled compose files pass the three new settings
+  through from `.env`.
+
+## v0.62.0 — 2026-10-14
+
+**Chapters stay in the series' language, whatever the source. An admin can also fetch again, or delete, one chapter
+from its ⋯ menu.** Both came from a new user's report: a server set to English only downloaded a few series in
+Spanish; fetching them again gave every chapter two versions, and the Spanish one still won. Thank you.
+
+### Chapters in the series' language
+
+- **A chapter is never taken in another language than its series'.** Uchiyomi chose each chapter's copy by group,
+  source and date, and never looked at its language. Now a copy known to be in another language is never downloaded,
+  whichever source ranks first. A chapter out only in another language waits until it is out in the series' language.
+  *Fetch* on such a chapter says why, and the chapter's **Versions** mark that copy with its language.
+- **English MangaDex is English only.** For a title with no English chapters, it used to fall back to another
+  language, which is how an English series filled up with Spanish chapters. Its search now finds only titles that have
+  English chapters. Series that relied on the fallback move to MangaDex in their own language when you upgrade (see
+  *Upgrading*).
+- **Chapters already here in another language are listed above the chapter list**, for admins, with **Fetch them
+  again in English** (or whatever the series' language is). Each file is replaced on its own row, so everyone keeps
+  their place.
+- **A site added by address knows its language.** It is read from the site's homepage when you add it. The site's
+  sheet shows it and lets you change it. Before, every such site counted as English (or as your *Sites that do not say
+  their language*), so a Spanish site could be followed by an English series.
+- **A source in every language is never followed automatically.** An extension source that lists every language's
+  chapters together now reads *All languages, mixed*. Its sheet and **Languages** say what it is; before, *All
+  languages* there looked like a switch for every language. When a series does use one, Uchiyomi keeps to the group
+  of the chapters you have, instead of taking whichever translation came out first. In Discover's search, such a
+  source is offered last on a card.
+- **Changing a series' language re-picks its chapters at once**, not at the next check.
+- A series whose language was set by hand to one none of its sources has (Korean for a manhwa read in English, say)
+  updates as before.
+
+### One chapter at a time
+
+- **Fetch again** and **Delete from server** are in each chapter's ⋯ menu, for admins, on chapters Uchiyomi
+  downloaded. Before, they were only in the select bar. Each asks first.
+
+### Upgrading
+
+- **Database:** one new column, `lib_books.lang`, added automatically. It keeps the language of each chapter English
+  MangaDex fetched in another language, so those chapters can be listed and fetched again. v0.61.2 still runs on the
+  new schema if you need to go back.
+- **MangaDex:** a series stated in another language, whose chapters came from English MangaDex's fallback, moves to
+  MangaDex in that language. That language is switched on under **Admin → Sources → Add sources → MangaDex
+  languages**. Its chapters stay, and new ones come from the new source. Other series keep English MangaDex.
+- Nothing else to do.
+
+## v0.61.2 — 2026-10-13
+
+**AniList, MyAnimeList and Kitsu no longer mark a series Completed while it is still coming out. The Library's unread
+count no longer stops at 99+, and dashboards can show how many chapters you have.** All three came from
+**@CheetahDoesStuff** ([#201](https://github.com/AngeloSha/uchiyomi/issues/201),
+[#202](https://github.com/AngeloSha/uchiyomi/issues/202), [#204](https://github.com/AngeloSha/uchiyomi/issues/204)).
+Thank you.
+
+### Completed only when a series has ended
+
+- **A series still coming out stays Reading.** Once you had read every chapter on the server, your tracker was told you
+  had completed the series, even while it was still releasing. So it moved to your Completed list every time you
+  caught up. Now Uchiyomi asks the tracker first. It moves a series to Completed only when the tracker says the series
+  has ended and you've reached its last chapter, the rule Mihon uses.
+- **A re-read stays a re-read.** A series the tracker already has at or past your chapter is left alone, so the
+  tracker never moves backwards.
+- **Series this already marked Completed** go back to Reading the next time you finish a new chapter of them. You can
+  also fix them on the tracker straight away.
+
+### The whole unread count
+
+- **The unread tag on a series shows the whole number**, for example "1,150", instead of stopping at "99+". Before,
+  nearly every long series showed the same "99+". Hover the tag to see that it counts unread chapters.
+
+### Chapter totals, and Homepage
+
+- **Admin → Overview** shows how many chapters your library holds, next to the series count.
+- **[Homepage](https://gethomepage.dev)'s own Komga widget works with Uchiyomi.** It shows your libraries, series
+  and chapters, with a read token and nothing to map. The user guide has the snippet (section 9, *On a dashboard*).
+- `GET /api/admin/stats` also gives `booksTotal`, every chapter as one number, for your own dashboard tiles.
+  Uchiyomi doesn't record volumes, so there is no volume count.
+- For Komga apps, `GET /api/v1/books` now lists every chapter you can see; before, it was always empty. So the
+  *Books* type in Mihon's Komga extension lists them too.
+
+### Upgrading
+
+- **Database:** no changes.
+- Nothing else to do.
+
+## v0.61.1 — 2026-10-13
+
+**Backups stay small wherever the backup folder is mapped, and you choose how many to keep, or switch the nightly backup
+off.** Both came from **@Wolf92s**'s report ([#199](https://github.com/AngeloSha/uchiyomi/issues/199)). Thank you.
+
+### Backups that stay small
+
+- **A backup no longer includes the backup folder.** With the backup folder mapped inside the config folder, or onto
+  the same folder, every backup carried all the earlier ones, which carried the ones before them. The folder grew
+  exponentially, however few backups were kept. Each run now finds its own folder inside the config folder and leaves
+  it out, whatever the mapping. If yours grew like that, you can delete the old, oversized backups yourself.
+- **Admin → Settings → Updates & schedules** has two new rows beside the backup time:
+  - **Nightly backup**, on by default. Switch it off if you back up another way; *Run now* under Tasks still makes a
+    backup.
+  - **Backups to keep**, from 1 to 365. The oldest backups beyond that number are deleted after each backup, never
+    when you save the number. Until you save one, it is `BACKUP_KEEP`: 14, unless you set that variable.
+- **Run now on the backup** now reports a backup that missed the config folder, as the nightly one already did.
+
+### Dependency updates
+
+- The server's Fastify plugins and argon2, Next.js 16.4 and framer-motion 14 in the web app, and Electron 44.7 in the
+  desktop app ([#195](https://github.com/AngeloSha/uchiyomi/pull/195),
+  [#196](https://github.com/AngeloSha/uchiyomi/pull/196), [#197](https://github.com/AngeloSha/uchiyomi/pull/197),
+  [#198](https://github.com/AngeloSha/uchiyomi/pull/198)). Nothing should look or work differently.
+
+### Upgrading
+
+- **Database:** two new settings columns, `backup_enabled` and `backup_keep`, added automatically. v0.61.0 still runs
+  on the new schema if you need to go back.
+- Nothing else to do.
+
+## v0.61.0 — 2026-10-12
+
+**When the next chapter is due, how long you've read, what to read next, lists that keep themselves up to date, and a
+reader that fits more screens.** Also: connecting AniList works the first time
+([#190](https://github.com/AngeloSha/uchiyomi/issues/190)), a sign-up form, and Incognito reading.
+
+### Release radar
+
+- Uchiyomi now estimates **when a series' next chapter is likely**, from when its chapters usually come: the dates its
+  sources list, or, where they list none (most don't), when chapters arrived on this server. Only for a series that
+  keeps a rhythm (four releases or more, mostly evenly spaced, still running), and always said as an estimate:
+  *~Friday*, *usually Fridays*, *due any day*, *running late*.
+- It shows under the reading progress on the series page, on **Updates → Expected this week** (your favourites and what
+  you read in the last 90 days), as the Library's **Releasing soon** order, and on the reader's last page, which now
+  says *You're all caught up* when more is on the way.
+- **Smart update checks** (Admin → Settings → Updates & schedules, off by default): the scheduled check asks series
+  that have been quiet for a long time less often, at least every three days, and every series as usual while its next
+  chapter is due. *Check now* always asks at once. On the library it was tested on, about half as many requests a day.
+
+### Reading time
+
+- **How long you've read**, worked out from the page turns Uchiyomi already records, so it covers your reading from
+  before the update too. **Profile → Reading studio** shows the last 7 days, the last 30 days and the year, about how
+  long a chapter takes you, the hours of the day you read and on which devices. A pause of more than five minutes is a
+  break, and two devices reading at once are never counted twice.
+- **Wrapped** adds the year's hours, and a series page says *Catch up in ~2 h* beside the release estimate.
+- The household's weekly board stays a count of chapters.
+
+### Related works and recommendations
+
+- **Related** on the series page: AniList's sequels, prequels, main story, side stories, spin-offs and alternative
+  versions. One you have opens in your library; one you don't opens Discover searching your sources for it.
+- **Next in the story** on the reader's last page.
+- **More like this** now puts first what AniList's readers recommend that you already have.
+- **Discover**: *Because you read …* (for accounts that may add series), and **trending manga** and **manhua** rails
+  beside the manhwa one. A Discover address with `?q=` opens on that search.
+- All of it is kept in the background with the AniList scores, about every six hours: nothing asks AniList when a page
+  opens, a library with AniList lookups off sends nothing, and the 18+ switch and age limits apply to each person.
+
+### Lists
+
+- **Save as list** in the Library keeps the filters and order you have on as a **live list**, which follows your
+  library as it changes. *Edit filters* opens the Library with them on.
+- **Share** any list with the household: everyone else can read it and put it on their Home, never change it, and sees
+  only the series they may open.
+- Lists has *Your lists* and *Shared with you*; live and shared lists can be Home rails, and OPDS readers get each list.
+
+### Small touches
+
+- **Incognito reading** (Profile → Settings → Reading, or the reader's settings): your place is kept, but what you read
+  stays out of your history, stats and the household's boards, and nothing is sent to your trackers. It covers your
+  whole account, every device and Mihon, because the server applies it.
+- **Pick back up** on Home: series you stopped part-way through, three months to two years ago.
+- **Hidden gems** on Home: series AniList's readers score 75 or more that nobody on this server has read.
+- **OPDS readers** get your own shelves: Keep reading, Favourites and your lists.
+- **Reading done offline is dated when you read it.** It used to land on the day the phone came back online, in history,
+  streaks and Wrapped, and a chapter first opened offline resumed at the first page read offline, not the last.
+
+### The reader
+
+Every new setting is off, or the reader as before, until you change it.
+
+- **Wide pages:** on a phone held upright, a double-page spread can be split into its two pages or turned on its side.
+- **Crop page borders** trims the blank margins around scanned pages.
+- **Colour filter**, per device: invert, grayscale or e-ink (e-ink also turns pages without sliding).
+- **Tap zones, keys and a game controller**, per device: Edges, L shape, Kindle-style or Off; any key for any action;
+  and a controller, on an https address.
+- **Pick the mode for each series:** long strips and webtoons open in Webtoon mode, manga and right-to-left series in
+  Paged. A series or source you have set yourself keeps its own.
+- **Long webtoons** keep far fewer images decoded (three tall strips at most, down from nine), start loading the next
+  chapter earlier, and keep your place through a zoom.
+- Fixed: settings that synced late could change the open title's mode; a source's default mode could open a chapter on
+  its first page while the counter said 9; switching mode mid-chapter lost your place.
+
+### Connecting trackers
+
+- **Get a token from AniList** opens AniList's own page for Uchiyomi: approve it, copy the token AniList shows, paste it.
+  If what you paste is an app's client ID or secret, Uchiyomi says so. Thanks to **@Kedryn** for the report
+  ([#190](https://github.com/AngeloSha/uchiyomi/issues/190)).
+- Connecting says why it failed: a token the service turned down, a service this server could not reach, and a service
+  that refused the request are three different messages. **Test connection** checks a connection whenever you like.
+- The user guide has step-by-step guides for MyAnimeList and Kitsu tokens.
+
+### Sign-up
+
+- With Admin → Settings → **Open registration** on, the sign-in screen has **Create an account**. A name that differs
+  from an existing one only in capital letters is taken, and two people signing up for the same name at once can't both
+  get it.
+
+### Upgrading
+
+- **Database:** two new tables (`series_radar`, `anilist_related`) and new columns on `collections` and
+  `server_settings`, all added when the server starts. v0.60.1 still runs on the new database if you go back.
+- Release estimates appear a minute after the server starts; related works fill in over the next AniList round.
+- **For scripts** ([api.md](docs/api.md)): new `GET /api/updates/expected`, `GET /api/stats/time`,
+  `GET /api/series/:id/reading-pace`, `GET /api/series/:id/related`, `GET /api/discover/because`,
+  `POST /api/trackers/:provider/test`, `GET /opds/continue`, `GET /opds/favorites` and `GET /opds/lists/:id`. Every
+  series carries `yomi.radar`; `GET /api/collections?scope=all` adds live and shared lists; `GET /api/discover/trending`
+  takes `country`; `GET /api/series/:id` sends `seriesType`; `/auth/register` takes a device name and answers 409 for a
+  taken name.
+
+## v0.60.1 — 2026-10-12
+
+**Eight fixes found by reading a contributor's fork: Keep reading, extension installs, long strips in the nightly repair,
+and a few small ones.** Every one was found by **@Squeaks72**, who built them in their own fork and offered them back
+([#176](https://github.com/AngeloSha/uchiyomi/discussions/176)). Thank you.
+
+### Fixes found in a contributor's fork
+
+- **Keep reading lost a series** when the chapter you were part-way through was deleted: by an admin, by Verify, or by
+  the cleanup of read chapters. The row now offers the series' next chapter instead.
+- **Installing, updating or removing an extension** unregistered every extension source while the engine answered. For
+  those seconds:
+  - Health called every extension series "no longer installed".
+  - The check for new chapters skipped them.
+  - A download in progress could fail.
+  - Discover lost them.
+
+  Sources now stay registered until the new list is ready, and are swapped in one step.
+- **The nightly repair no longer replaces long-strip chapters.** Since v0.55.10, Health has known that a webtoon chapter
+  stitched into one or two very tall images is not a failed download. The repair didn't: it could follow new sources for
+  the series and swap the chapter for another site's sliced copy. It now leaves them alone, and long strips can no longer
+  use up its 20 chapters a night.
+- **With Fix everything as the nightly,** three steps never ran: the opt-in group upgrades and borrowed chapter names,
+  and learning which way series read. They now run after it, as they do in the plain nightly.
+- **Very tall strips** failed to load in the page grid, as chapter thumbnails, and as a series cover made from such a
+  page. These are images over 16,383 pixels tall at the size asked for. Such a page now comes as JPEG, and its thumbnail
+  shows the top of the strip. Every other image is unchanged.
+- **On a phone, a long series title** could slide under the banner and lose its first lines.
+- **The heart leaned left:** its two halves met two pixels to one side of its tip. It is symmetric now.
+- **After an admin adds, renames or removes a library,** the Library page's library filter and the 18+ switch update
+  straight away, instead of up to five minutes later.
+
+### Upgrading
+
+- **Database:** no changes.
+- Nothing else to do.
+
+## v0.60.0 — 2026-10-11
+
+**A calmer, cooler series page and Library, and ratings said once.**
+
+### The series page
+
+- **One button to read:** *Continue · Ch. 42* when a chapter is half read, *Next · Ch. 11* after chapters 1–10, *Start
+  reading* the first time, and *Read again* once everything is read. A line under it says how far you are.
+- **Four keys** under it: Favourite, Offline, List and **More**. Everything else (notes, mark all read, find missing
+  chapters, archive slowly, copy link, and the admin tools) is in More, in groups. Before, up to twelve buttons were
+  stacked under the cover, and on a short screen an admin's bottom ones could not be reached.
+- On a phone, a small bar with Continue, the heart and More stays at hand while you scroll the chapters.
+
+### The Library
+
+- A **toolbar**: search your library, one **Sort** menu where every order runs both ways (*Newest first* or *Oldest
+  first*, *A–Z* or *Z–A*, …), and **Comfortable, Compact or List**, remembered on each device. The sidebar keeps the filters.
+- **Covers show how far you are**: a thin progress bar along the bottom edge, and squared unread tags.
+- Changing a sort, filter or search keeps the grid on screen until the new one arrives, instead of blanking it, and a
+  library that fails to load says so, with Try again.
+- **The filters are rows, not pills.** Each choice has its own mark (a ring that fills for read state, a sign for status,
+  the source's icon, a cover mosaic for formats and genres), its count, and a tick when it is on. Sections fold, and a
+  folded one still says what it is filtering by.
+
+### Ratings, said once
+
+- The series page shows AniList's score and how many readers list it, beside **your own stars**, in one panel. Before,
+  both appeared up to three times on the same page.
+- The AniList tile opens the series' AniList page.
+- Tap your current star again to **clear your rating**. A rating that could not be saved now says so.
+- Library and Home cards show a score as ★ 84 and popularity as a count of readers.
+
+### Sources
+
+- A site added by address that has stopped answering a real search (its search now lands on its homepage) fails its
+  search, Newest and Popular instead of showing that homepage's titles as results.
+
+### Upgrading
+
+- **Database:** no changes.
+- **For scripts** ([api.md](docs/api.md)): `yomi.anilist` carries the AniList entry's `id`; `PUT /api/settings` accepts
+  `librarySortDir: 'asc' | 'desc' | null`.
+
+## v0.59.0 — 2026-10-11
+
+**Discover loads its sources more reliably, and a source you switched off no longer takes a working one's place.**
+
+These come from going through every extension and source on a real install with Discover asking all of them.
+
+### Sites behind Cloudflare
+
+- **More time for their first page.** A site this server opens through the Cloudflare solver now gets up to 45
+  seconds for its first Discover page, not 15. A fresh solve took 15 to 25 seconds, so the first visit of the day
+  lost exactly these sites, and then counted them as slow. The setting is `SOURCE_LATEST_SOLVER_TIMEOUT_MS`.
+- **Covers no longer tie up the solver.** A cover is fetched straight from the site first, and the solver is asked
+  only when the site actually refuses. Before, every cover from such a site asked the solver first: on one install
+  about 89 of those requests, all of which failed, kept the solver busy while Discover's own pages waited behind them.
+- **One solve per site at a time**, however many covers ask at once. A request whose page has stopped waiting is
+  dropped from the solver's queue instead of being solved for nobody.
+
+### Fairer to slow sources
+
+- Only a source's **first page** counts towards *slow*. Later pages, asked while you scroll, no longer do.
+- **Slow is not quiet.** A slow source keeps its place in Discover's order. Only a source whose page keeps coming back
+  empty is asked last.
+- A source **resting after being slow** still shows its Popular and Newest pages when nothing is saved for them, instead
+  of showing nothing. A source that refused the server still rests, as before.
+
+### Every source on its wall
+
+- A source with a Popular page and no Newest page now shows on Discover's **Popular** wall. It used to be on neither.
+
+### Extensions and the source limit
+
+- A source you **switched off in Health** no longer holds one of the extension source slots (`SUWAYOMI_MAX_SOURCES`)
+  that a working source needs. It registers after every working one. On one install, 16 of the 40 slots went to
+  switched-off sources while a working one was left out.
+- Switching a source off or on in Health takes effect **at once** while the limit is full. Before, a source switched
+  back on stayed out of everything until the next restart.
+- Fix everything's check for room counts the same way.
+
+### Smaller fixes
+
+- The add dialog's search asks **six sources at a time**, not every source at once.
+- A Discover cover that will not load no longer falls back to the extension engine's internal address in your
+  browser.
+- The *slow* note on a site behind Cloudflare names its real time limit.
+
+### Upgrading
+
+- **Database:** no changes.
+- **New setting:** `SOURCE_LATEST_SOLVER_TIMEOUT_MS` (default `45000`, see
+  [CONFIGURATION.md](docs/CONFIGURATION.md)).
+- **For scripts** ([api.md](docs/api.md)): in `GET /api/sources`, a source that is only slow now reads `ok`, with its
+  `note`, not `quiet`.
+
+## v0.58.0 — 2026-10-11
+
+**Ratings from AniList beside your own, sort the Library by popularity, chapters and more, and Discover asks every source.**
+
+### Ratings from AniList, and your own
+
+- Every series linked to its AniList entry now shows AniList's **score** and how many people have it in a list (its
+  **popularity**), next to your own star rating, which stays exactly as it was.
+- The server fetches them in the background: a few minutes after it starts, then every six hours, and only what is
+  missing or three days old. A library whose AniList lookups are off is never asked about.
+
+### More ways to sort the Library
+
+- New sorts: **Most popular**, **Top rated**, **My rating**, **Most chapters** and **Recently read**, beside Updated,
+  Newest, A–Z and Most unread.
+- With one of the new sorts, each card shows the number it is sorted by.
+- Series with no AniList score yet come after the ones that have one, whichever way you sort.
+
+### Home
+
+- A new **Most popular in your library** rail, with each card's AniList score. **See all** opens the Library sorted by
+  popularity.
+
+### Upgrading
+
+- **Database:** additive only. A new table `anilist_scores`.
+- **For scripts** ([api.md](docs/api.md)):
+  - Series carry `yomi.anilist {score, popularity}` and `yomi.lastReadAt`.
+  - `POST /api/series/search` sorts by `popularity`, `score`, `rating`, `chapters` and `lastRead`.
+  - `GET /api/home` carries `popular`.
+  - `librarySort` accepts `popular`, `score`, `rating`, `chapters` and `read`.
+
+## v0.57.0 — 2026-10-10
+
+**Merging duplicate series keeps each chapter once, and the merge shows which copy to keep.**
+
+### One copy of each chapter
+
+- **Before:** merging two copies of a series moved every chapter of one into the other, so a chapter both had was
+  listed twice, on the series page and in Mihon.
+- **Now:** a chapter both copies have is kept **once**.
+  - The kept series' copy stays, unless it is missing pages and the other copy is whole.
+  - What anyone read of the other copy moves onto the one that stays: a finished chapter stays finished, and a
+    chapter half read stays half read. Reading history and notes follow it too.
+  - The other copy leaves the list. Its file is deleted from the download folder. In a library folder the server
+    does not delete from, the file is left where it is and is no longer listed.
+  - A copy someone bookmarked stays, and the merge says so.
+- **Only real duplicates.** It only touches a chapter number each copy had exactly once. An extra filed under its
+  chapter's number (17 beside 17e), a chapter's parts (1053a–d), and a series numbered by posting order are left
+  as they are.
+
+### Duplicates from earlier merges, cleaned once
+
+- A few minutes after the update, the chapters that earlier merges left twice are kept once by themselves, by the
+  same rules. This happens once.
+- On a library with read-only folders, the copies there are set aside (no longer listed, never touched) rather than
+  deleted.
+
+### Which copy to keep
+
+- **Health → Duplicate series → Merge** and **Merge all** now show, for each copy:
+  - its number of chapters;
+  - its main source, and how that source is doing (healthy, failing, turned off…).
+- **Recommended** marks the copy to keep: the one whose source still works, then the one with more chapters. You can
+  still pick the other one.
+- Fix everything's merges pick by the same rule.
+
+### Upgrading
+
+- **Database:** additive only. A new table `set_aside_files` lists the files taken off the list but left on disk.
+- **Going back to v0.56.0:** its scan would list the set-aside files again. The deleted copies stay deleted.
+- **For scripts** ([api.md](docs/api.md)):
+  - `POST /api/admin/series/:id/merge` answers `duplicates` and `keptBoth`.
+  - A Health duplicates row carries `copies`.
+  - Audit: `series.extra_copies`.
+
+## v0.56.0 — 2026-10-10
+
+**Discover shows each series once, with every source that has it, and leaves out what you already have.**
+
+### One card per series
+
+- **Before:**
+  - Discover only merged two sources' copies of a series when their names matched letter for letter, after setting
+    aside case and punctuation.
+  - So "Solo Leveling (Webtoon)", "The Player Who Can't Level Up" against "Player Who Can't Level Up", "Pokémon" against
+    "Pokemon", and every completely different translation showed as separate cards.
+  - Titles in Korean or Japanese script dropped out of search entirely.
+- **Now:**
+  - Names are compared with accents, a "(…)" aside and a leading "The" set aside, in any script.
+  - Uchiyomi also asks which series a name is: AniList first, then MangaDex, then MangaUpdates, once per name, in the
+    background. It keeps every other name the answer lists, so "Solo Leveling" and "Only I Level Up" become one card.
+  - It also uses every name your library knows a series by, and the other names a source's own page lists.
+  - A card can fold into another within a minute or so of the wall appearing, as answers come in.
+- **The card shows each source's icon,** up to three plus "+N", instead of "{n} sources". MangaDex shows once, whatever
+  its languages.
+- **Only exact names count,** never "contains", so a spin-off like "Tokyo Ghoul:re" stays its own card.
+
+### Nothing you already have, while browsing
+
+- **Newest, Popular and Trending leave out every series your library holds,** in any language. Before, they were dimmed
+  with an *In library* ribbon.
+- **A series counts as held** when Discover's copy is:
+  - the very series on the very site you added or follow it from (still found after a site moves to a new address);
+  - any name it goes by, including what a followed source calls it;
+  - the same AniList entry.
+- **Search still shows them,** marked **✓ In library**, so searching for something you have finds it.
+- **Adding a series you already hold under another name** now asks first, as adding one with the same title always did.
+
+### Settings and privacy
+
+- **Admin → Settings → Match Discover titles online** switches the lookups off. Cards then fold by their names alone,
+  and nothing is sent anywhere.
+- **What the lookups send:** the title shown in Discover, and your server's address. Nothing about your library.
+
+### Upgrading
+
+- **Database:** additive only.
+  - a new table `title_works`;
+  - `server_settings.discover_lookups` (on by default);
+  - two indexes.
+
+  v0.55.11 runs on the same database, so going back is one line of your compose file.
+- **For scripts** ([api.md](docs/api.md)):
+  - Discover's items and cards carry `work` and `owned`.
+  - New: `GET /api/discover/works`.
+  - `MANGAUPDATES_API_URL` is a new test knob.
+
+## v0.55.11 — 2026-10-09
+
+**The desktop app no longer freezes on an error box when you quit it.**
+
+### Desktop app
+- **The bug (since v0.55.7):**
+  - Quitting could show "A JavaScript error occurred in the main process" and stop there. The built-in database had not
+    shut down yet.
+  - The cause: the app's server sometimes wrote its last log line after it had stopped, and the log file was already
+    closed by then.
+  - It hit about one quit in five on Windows. The newer Electron in v0.55.7 started delivering that late line, where the
+    old one dropped it.
+- **Now:** each log stays open until its background process has finished writing, so quitting is clean.
+- **v0.55.10's desktop downloads** were held back by this bug: the Windows check caught it on every attempt. This release
+  has them.
+
+### Under the hood
+- An error in the desktop app's main process now fails its automated checks at once, with the error's stack. Before, the
+  checks waited ten minutes for an app frozen on that box.
+
+### Upgrading
+- **Database:** no change. The server only changes its version number.
+
+## v0.55.10 — 2026-10-09
+
+**Safari no longer races through a right-to-left series near the end of a volume and marks the skipped volumes read.
+Health stops calling long-strip chapters short, and stops listing a source as slow days after it last was.**
+
+### Reader: the end of a volume in Safari
+
+- **The bug:**
+  - In paged mode, reading right to left, the reader adds the next volume four pages before the end of the current one.
+  - Safari, on iPhone, iPad and Mac, then jumped to the same spot near the end of the new volume. That added the next
+    volume, and so on to the last one.
+  - Every volume it went past was marked read, and the change was sent to your trackers.
+  - Right to left is the default for Japanese series since v0.48.0. Chrome and Firefox were never affected.
+  - Reported by **@elydan** ([#180](https://github.com/AngeloSha/uchiyomi/issues/180)): on volume 5, Safari jumped to the
+    end of volume 8.
+- **Now:** the page you are on stays put when the next volume, the *Up Next* card or a loading error is added, and each
+  page turn moves exactly one page.
+- **If it happened to you:** mark the skipped volumes unread on the series page, and check your tracker's progress for that
+  series.
+
+### Health
+
+- **Short chapters:**
+  - A chapter whose one or two images together are at least ten times as tall as they are wide is a complete chapter
+    stitched into long strips, so it is no longer listed as short.
+  - Health measures those pages once, the way the reader does.
+  - Placeholders, ads and credits banners are still listed.
+  - On the maintainer's library this cleared 6 of 20 findings. Eleceed 215, for example, is two strips each about 54,000
+    pixels tall.
+- **Slow sources:**
+  - A Discover search that took too long counted toward a source being "slow", but a search that answered in time never
+    reset that count.
+  - So one evening of slow searches kept four working sources on the Health card for six days.
+  - A search that answers in time now resets the count. Health, the *Test* button and Discover's source list ignore slowness
+    nobody has run into for a day.
+
+### Smaller
+
+- **Dependencies:** fast-jwt 6.3.4.
+
+### Upgrading
+
+- **Database:** no change. v0.55.9 runs on the same database, so going back is one line of your compose file.
+- **For scripts:** `diagnosis.code` `too_slow` now comes only from slowness seen in the last day.
+
+## v0.55.9 — 2026-10-09
+
+**New chapters download again for a series whose own source is an extension marked 18+.**
+
+### Downloads from a series' own 18+-marked source
+
+- **The bug (v0.55.8):**
+  - A series that isn't rated 18+ but follows a source marked adult had its new chapters listed but never downloaded, by the
+    update check or the slow archive. This is common with manhwa extensions, which mark their whole site.
+  - Nothing was logged, so the series quietly fell behind. Downloading by hand still worked.
+  - Found and fixed by **@TIGamingTV** ([#177](https://github.com/AngeloSha/uchiyomi/pull/177)).
+- **Now:** the copy a series takes from its own source answers to the series following that source, as before v0.55.8. The
+  adult rule still keeps everything else away from a series that isn't 18+: other sources' copies, and new sources found
+  for a missing chapter.
+- **The same for three older jobs:**
+  - completing a chapter saved with missing pages;
+  - replacing a chapter that came in too short;
+  - upgrading a chapter to your preferred group's version.
+
+  These now also use a series' own source when it is marked adult. Before, those chapters stayed as they were.
+
+### Upgrading
+
+- **Database:** no change. v0.55.8 runs on the same database, so going back is one line of your compose file.
+
 ## v0.55.8 — 2026-10-08
 
 **Your Library sort is now a default, up to three Lists can live on Home, and each library can opt out of automatic

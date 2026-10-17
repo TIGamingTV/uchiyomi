@@ -4,6 +4,8 @@
 // than re-resolved later by another fuzzy title search.
 import { plainText } from './htmlText';
 import { namesMatch } from './onlineMatch';
+import { readCapped } from './safeFetch';
+import { anilistFetch, WAIT_BACKGROUND_MS, WAIT_INTERACTIVE_MS, type AniListFetchOptions } from './anilistLimit';
 
 /**
  * Where AniList is: ANILIST_API_URL, the test knob the tracker calls already read (lib/trackerProviders.ts), moves these
@@ -12,6 +14,20 @@ import { namesMatch } from './onlineMatch';
  * Reintroduce the hard-coded address: "every AniList lookup goes where ANILIST_API_URL says" in anilistUrl.test.ts.
  */
 const ANILIST = (process.env.ANILIST_API_URL || 'https://graphql.anilist.co').replace(/\/+$/, '');
+
+/**
+ * Every request below goes through the server's one AniList quota (v0.73.0, lib/anilistLimit.ts), which spaces them by
+ * the limit AniList states and waits out its 429s. A lookup someone is waiting on -- art behind an image, a search, a
+ * rail -- is told "busy" rather than held past ASK's wait, and throws as any failure does, so nothing is cached as a
+ * miss; a batch in the background waits its turn (BATCH).
+ */
+const ASK: AniListFetchOptions = { maxWaitMs: WAIT_INTERACTIVE_MS, retries: 2, timeoutMs: 10_000 };
+const BATCH: AniListFetchOptions = { maxWaitMs: WAIT_BACKGROUND_MS, retries: 5, timeoutMs: 10_000 };
+const POST = (body: unknown): RequestInit => ({
+  method: 'POST',
+  headers: { 'content-type': 'application/json', accept: 'application/json' },
+  body: JSON.stringify(body),
+});
 
 // `countryOfOrigin` rides along for the series' reading direction (lib/readingDirection.ts), with every title
 // the entry goes by so the direction is taken only from an entry that is visibly the series searched for
@@ -55,21 +71,11 @@ export interface AniListArt {
  * the manga's AniList link). Reintroduce by returning the entry unchecked: "another work's answer is a miss" in
  * onlineMatch.int.test.ts stores the manga's cover.
  */
-export async function fetchAniListArt(rawTitle: string, names: readonly string[], retry = 0): Promise<AniListArt> {
+export async function fetchAniListArt(rawTitle: string, names: readonly string[]): Promise<AniListArt> {
   const s = clean(rawTitle);
   if (!s) return { banner: null, cover: null };
-  const r = await fetch(ANILIST, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json', accept: 'application/json' },
-    body: JSON.stringify({ query: QUERY, variables: { s } }),
-    signal: AbortSignal.timeout(10000),
-  });
-  // AniList rate-limits (~30/min); wait out Retry-After and retry so we don't lose the match.
-  if (r.status === 429 && retry < 2) {
-    const wait = Math.min(6, Number(r.headers.get('retry-after')) || 4);
-    await new Promise((res) => setTimeout(res, (wait + 0.5) * 1000));
-    return fetchAniListArt(rawTitle, names, retry + 1);
-  }
+  // A 429 is waited out by the quota (lib/anilistLimit.ts), so the match is not lost to a busy minute.
+  const r = await anilistFetch(ANILIST, POST({ query: QUERY, variables: { s } }), ASK);
   if (r.status === 404) return { banner: null, cover: null }; // no match -> cache the miss
   if (!r.ok) throw new Error(`anilist ${r.status}`); // transient -> don't cache
   const j: any = await r.json();
@@ -107,31 +113,66 @@ export async function fetchAniListCountries(ids: number[]): Promise<Map<number, 
   return out;
 }
 
+const SCORES = `query($ids:[Int]){Page(perPage:50){media(id_in:$ids,type:MANGA){id averageScore meanScore popularity}}}`;
+
+/** An entry's outside rating (v0.58.0, lib/anilistScores.ts): its score out of 100 and how many people list it. */
+export interface AniListScore { score: number | null; popularity: number | null }
+
 /**
- * One `query($ids)` over many entries, fifty ids per request, `each` called with every media AniList answers. Paced
- * like the art jobs between pages; a 429 is waited out as fetchAniListArt waits it out, anything else throws.
+ * The score and popularity of many linked entries at once (series_trackers' AniList ids), fifty per request: what the
+ * Library's Most popular / Top rated sorts and Home's Most popular rail read. `score` is AniList's weighted average,
+ * else its plain mean (an entry with few ratings has only that), out of 100; `popularity` how many AniList users have
+ * the entry in a list. An id AniList does not answer is absent from the map. Public data: no token. Paced and
+ * 429-handled by mediaById; anything else throws.
  */
-async function mediaById(query: string, ids: number[], each: (m: any) => void): Promise<void> {
-  for (let i = 0; i < ids.length; i += 50) {
-    if (i) await new Promise((res) => setTimeout(res, 2200)); // stay under AniList's ~30 req/min
-    const chunk = ids.slice(i, i + 50);
-    let j: any = null;
-    for (let retry = 0; ; retry++) {
-      const r = await fetch(ANILIST, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json', accept: 'application/json' },
-        body: JSON.stringify({ query, variables: { ids: chunk } }),
-        signal: AbortSignal.timeout(10000),
-      });
-      if (r.status === 429 && retry < 2) {
-        const wait = Math.min(6, Number(r.headers.get('retry-after')) || 4);
-        await new Promise((res) => setTimeout(res, (wait + 0.5) * 1000));
-        continue;
-      }
-      if (!r.ok) throw new Error(`anilist ${r.status}`);
-      j = await r.json();
-      break;
-    }
+export async function fetchAniListScores(ids: number[]): Promise<Map<number, AniListScore>> {
+  const out = new Map<number, AniListScore>();
+  const num = (v: unknown) => (typeof v === 'number' && Number.isFinite(v) ? Math.round(v) : null);
+  await mediaById(SCORES, ids, (m) => {
+    if (Number.isInteger(m?.id)) out.set(m.id, { score: num(m.averageScore) ?? num(m.meanScore), popularity: num(m.popularity) });
+  });
+  return out;
+}
+
+const DETAILS = `query($ids:[Int]){Page(perPage:50){media(id_in:$ids,type:MANGA){id description(asHtml:false) genres}}}`;
+
+/** What AniList says a linked entry is about (v0.73.0, lib/autoDetails.ts): its description as AniList writes it, and its genres. */
+export interface AniListDetails { description: string | null; genres: string[] }
+
+/**
+ * The description and genres of many linked entries at once (series_trackers' AniList ids), fifty per request, for the
+ * series that have none of their own (lib/autoDetails.ts; #245 from @Squeaks72, ported AniList-first). By id, never a
+ * search: no title is sent, and nothing can match another work. Raw: the caller cleans the text (cleanDescription,
+ * cleanGenres). An id AniList does not answer is absent from the map. Public data: no token. Paced and 429-handled by
+ * mediaById; anything else throws.
+ */
+export async function fetchAniListDetails(ids: number[]): Promise<Map<number, AniListDetails>> {
+  const out = new Map<number, AniListDetails>();
+  await mediaById(DETAILS, [...new Set(ids)], (m) => {
+    if (!Number.isInteger(m?.id)) return;
+    out.set(m.id, {
+      description: typeof m.description === 'string' && m.description.trim() ? m.description : null,
+      genres: Array.isArray(m.genres) ? m.genres.filter((g: unknown): g is string => typeof g === 'string') : [],
+    });
+  });
+  return out;
+}
+
+/** The most one batched answer may be: fifty entries with their descriptions are a few hundred KB. */
+const MEDIA_MAX_BYTES = 4 * 1024 * 1024;
+
+/**
+ * One `query($ids)` over many entries, `chunk` ids per request (fifty; v0.61.0's related query asks ten, as its
+ * `Page(perPage:10)` says), `each` called with every media AniList answers. Paced, and its 429s waited out, by the
+ * server's one AniList quota (lib/anilistLimit.ts); anything else throws. Read through readCapped (lib/safeFetch.ts), so
+ * an answer past MEDIA_MAX_BYTES throws rather than filling memory.
+ */
+async function mediaById(query: string, ids: number[], each: (m: any) => void, chunk = 50): Promise<void> {
+  for (let i = 0; i < ids.length; i += chunk) {
+    // Paced and 429-aware by the server's one quota (lib/anilistLimit.ts), which every other AniList caller shares.
+    const r = await anilistFetch(ANILIST, POST({ query, variables: { ids: ids.slice(i, i + chunk) } }), BATCH);
+    if (!r.ok) throw new Error(`anilist ${r.status}`);
+    const j: any = JSON.parse((await readCapped(r, MEDIA_MAX_BYTES)).toString('utf8'));
     for (const m of j?.data?.Page?.media ?? []) each(m);
   }
 }
@@ -168,54 +209,152 @@ export async function fetchAniListEntries(ids: number[]): Promise<Map<number, An
   return out;
 }
 
-const ANIME_QUERY = `query($s:String){Media(search:$s,type:ANIME,sort:SEARCH_MATCH){title{romaji english native}synonyms bannerImage}}`;
+/**
+ * The relations the app shows (v0.61.0), in the order the series page lists them: what comes next, what came before,
+ * the work this one belongs to, then the side stories, spin-offs and other versions. Anything else AniList relates an
+ * entry to (its adaptations, characters, summaries, compilations...) is not a manga to read next.
+ */
+export const RELATIONS = ['SEQUEL', 'PREQUEL', 'PARENT', 'SIDE_STORY', 'SPIN_OFF', 'ALTERNATIVE'] as const;
+export type Relation = (typeof RELATIONS)[number];
+/** The most relations and recommendations kept per entry: a long franchise lists dozens of side stories. */
+export const RELATIONS_MAX = 12;
+export const RECS_MAX = 10;
+
+/**
+ * One work AniList relates an entry to, as kept (anilist_related, lib/anilistRelated.ts). `rel` on a relation, `rating`
+ * on a recommendation (how many AniList readers voted it up). `titles` are its three titles, `synonyms` its other names,
+ * apart: a synonym names a work only when it is long enough to say which (lib/anilistRelated.ts heldEntry). `adult` and
+ * `genres` are AniList's own, kept raw -- who may see an 18+ entry is decided per viewer when it is read.
+ */
+export interface RelatedItem {
+  id: number;
+  rel?: Relation;
+  rating?: number;
+  title: string;
+  titles: string[];
+  synonyms: string[];
+  cover: string | null;
+  format: string | null;
+  status: string | null;
+  adult: boolean;
+  genres: string[];
+  country: string | null;
+  score: number | null;
+}
+export interface AniListRelated { relations: RelatedItem[]; recs: RelatedItem[] }
+
+const NODE = 'id type format status isAdult countryOfOrigin title{romaji english native} synonyms coverImage{large} genres averageScore';
+// Ten entries a request, not fifty: each brings up to ten recommendations and its relations, and AniList refuses a
+// query past its complexity limit. ⚠️ Not measured against the live AniList from the test rig: if it refuses this
+// shape, lower `perPage` here and the chunk below together.
+const RELATED = `query($ids:[Int]){Page(perPage:10){media(id_in:$ids,type:MANGA){id relations{edges{relationType(version:2) node{${NODE}}}} recommendations(sort:RATING_DESC,perPage:10){nodes{rating mediaRecommendation{${NODE}}}}}}}`;
+const RELATED_CHUNK = 10;
+
+const str = (v: unknown): string | null => (typeof v === 'string' && v.trim() ? v.trim() : null);
+
+/** A related node as kept, or null for one that is not a manga to read: an anime, a light novel, no id or no name. */
+function relatedNode(n: any): Omit<RelatedItem, 'rel' | 'rating'> | null {
+  if (!n || !Number.isSafeInteger(n.id) || n.id <= 0) return null;
+  // Light novels are type MANGA on AniList: format tells them apart.
+  if (n.type !== 'MANGA' || n.format === 'NOVEL') return null;
+  const romaji = str(n.title?.romaji), english = str(n.title?.english), native = str(n.title?.native);
+  const title = english || romaji || native;
+  if (!title) return null;
+  const titles = [...new Set([romaji, english, native].filter((t): t is string => !!t))];
+  const names = (list: unknown): string[] => (Array.isArray(list) ? list : []).map(str).filter((t): t is string => !!t);
+  const synonyms = [...new Set(names(n.synonyms))].slice(0, 20);
+  const score = typeof n.averageScore === 'number' && Number.isFinite(n.averageScore) ? Math.round(n.averageScore) : null;
+  return {
+    id: n.id,
+    title,
+    titles,
+    synonyms,
+    cover: str(n.coverImage?.large),
+    format: str(n.format),
+    status: str(n.status),
+    adult: n.isAdult === true,
+    genres: names(n.genres).slice(0, 20),
+    country: str(n.countryOfOrigin),
+    score,
+  };
+}
+
+/**
+ * An entry's answer to the related query, as kept (v0.61.0): its relations of the six kinds above, in their order, at
+ * most twelve; its recommendations that at least one reader voted up, in AniList's order (most voted first), at most
+ * ten. Only manga -- never an anime, never a light novel -- never the entry itself, each work once. Pure.
+ */
+export function normaliseRelated(m: any): AniListRelated {
+  const self = m?.id;
+  const relations: RelatedItem[] = [];
+  const seen = new Set<number>();
+  for (const e of Array.isArray(m?.relations?.edges) ? m.relations.edges : []) {
+    const rel = e?.relationType;
+    if (!(RELATIONS as readonly string[]).includes(rel)) continue;
+    const n = relatedNode(e?.node);
+    if (!n || n.id === self || seen.has(n.id)) continue;
+    seen.add(n.id);
+    relations.push({ ...n, rel });
+  }
+  // A stable sort: within a kind, AniList's own order.
+  relations.sort((a, b) => RELATIONS.indexOf(a.rel!) - RELATIONS.indexOf(b.rel!));
+  const recs: RelatedItem[] = [];
+  const seenRec = new Set<number>();
+  for (const r of Array.isArray(m?.recommendations?.nodes) ? m.recommendations.nodes : []) {
+    if (recs.length >= RECS_MAX) break;
+    const rating = typeof r?.rating === 'number' && Number.isFinite(r.rating) ? r.rating : 0;
+    if (rating <= 0) continue;
+    const n = relatedNode(r?.mediaRecommendation);
+    if (!n || n.id === self || seenRec.has(n.id)) continue;
+    seenRec.add(n.id);
+    recs.push({ ...n, rating });
+  }
+  return { relations: relations.slice(0, RELATIONS_MAX), recs };
+}
+
+/**
+ * What AniList relates many entries to, and what their readers recommend (v0.61.0, lib/anilistRelated.ts), ten entries
+ * a request, paced and 429-aware like every by-id read here. An id AniList does not answer for is absent from the map;
+ * a failure throws. Public data: no token.
+ */
+export async function fetchAniListRelated(ids: number[]): Promise<Map<number, AniListRelated>> {
+  const out = new Map<number, AniListRelated>();
+  await mediaById(RELATED, [...new Set(ids)], (m) => {
+    if (Number.isInteger(m?.id)) out.set(m.id, normaliseRelated(m));
+  }, RELATED_CHUNK);
+  return out;
+}
+
+const ANIME_QUERY =`query($s:String){Media(search:$s,type:ANIME,sort:SEARCH_MATCH){title{romaji english native}synonyms bannerImage}}`;
 
 /**
  * Banner from a direct ANIME search — adapted titles often match the anime by name when the manga entry has no banner.
  * Only from an anime named as the series is (`names`, lib/onlineMatch.ts namesMatch, v0.55.7): the search answers with
  * its best guess whatever it was asked.
  */
-export async function fetchAnimeBanner(rawTitle: string, names: readonly string[], retry = 0): Promise<string | null> {
+export async function fetchAnimeBanner(rawTitle: string, names: readonly string[]): Promise<string | null> {
   const s = clean(rawTitle);
   if (!s) return null;
-  const r = await fetch(ANILIST, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json', accept: 'application/json' },
-    body: JSON.stringify({ query: ANIME_QUERY, variables: { s } }),
-    signal: AbortSignal.timeout(10000),
-  });
-  if (r.status === 429 && retry < 2) {
-    const wait = Math.min(6, Number(r.headers.get('retry-after')) || 4);
-    await new Promise((res) => setTimeout(res, (wait + 0.5) * 1000));
-    return fetchAnimeBanner(rawTitle, names, retry + 1);
-  }
+  const r = await anilistFetch(ANILIST, POST({ query: ANIME_QUERY, variables: { s } }), ASK);
   if (!r.ok) return null;
   const j: any = await r.json();
   const m = j?.data?.Media;
   return m && namesMatch(names, titlesOf(m)) ? (m.bannerImage ?? null) : null;
 }
 
-const TRENDING = `query($page:Int){Page(page:$page,perPage:40){media(type:MANGA,countryOfOrigin:"KR",sort:TRENDING_DESC,isAdult:false){title{romaji english}coverImage{extraLarge large}bannerImage description(asHtml:false)genres averageScore chapters status}}}`;
+// v0.61.0: by country of origin, a variable (AniList's `CountryCode` scalar), and never a light novel -- those are type
+// MANGA on AniList and showed on the rail as "trending manhwa".
+const TRENDING = `query($page:Int,$country:CountryCode){Page(page:$page,perPage:40){media(type:MANGA,countryOfOrigin:$country,sort:TRENDING_DESC,isAdult:false,format_not_in:[NOVEL]){id title{romaji english}coverImage{extraLarge large}bannerImage description(asHtml:false)genres averageScore chapters status}}}`;
 
 const CANDIDATES = `query($s:String){Page(perPage:5){media(search:$s,type:MANGA,sort:SEARCH_MATCH){title{romaji english}coverImage{extraLarge}bannerImage}}}`;
 
 export interface ArtCandidate { title: string; banner: string | null; cover: string | null }
 
 /** Top AniList matches for a title (art review UI) — several options, not just the best match. */
-export async function fetchAniListCandidates(rawTitle: string, retry = 0): Promise<ArtCandidate[]> {
+export async function fetchAniListCandidates(rawTitle: string): Promise<ArtCandidate[]> {
   const s = rawTitle.trim();
   if (!s) return [];
-  const r = await fetch(ANILIST, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json', accept: 'application/json' },
-    body: JSON.stringify({ query: CANDIDATES, variables: { s } }),
-    signal: AbortSignal.timeout(10000),
-  });
-  if (r.status === 429 && retry < 2) {
-    const wait = Math.min(6, Number(r.headers.get('retry-after')) || 4);
-    await new Promise((res) => setTimeout(res, (wait + 0.5) * 1000));
-    return fetchAniListCandidates(rawTitle, retry + 1);
-  }
+  const r = await anilistFetch(ANILIST, POST({ query: CANDIDATES, variables: { s } }), ASK);
   if (!r.ok) return [];
   const j: any = await r.json();
   const media: any[] = j?.data?.Page?.media ?? [];
@@ -228,7 +367,30 @@ export async function fetchAniListCandidates(rawTitle: string, retry = 0): Promi
     .filter((c) => c.title && (c.banner || c.cover));
 }
 
+const WORKS = `query($s:String){Page(perPage:5){media(search:$s,type:MANGA,format_not_in:[NOVEL],sort:SEARCH_MATCH){id title{romaji english native}synonyms}}}`;
+
+/** An AniList entry as Discover's identity lookup needs it (lib/discoverIdentity.ts): its id and every name it goes by. */
+export interface AniListWork { id: number; titles: string[] }
+
+/**
+ * The entries a name may be, by AniList's own search: up to five, each with its titles and synonyms, for the caller to
+ * keep only one that IS the name (namesMatch). Empty for no answer. Throws on a transient failure -- a network error, a
+ * 5xx, a 429 still answered after two waits -- so the caller asks again later rather than storing a miss.
+ */
+export async function searchAniListWorks(rawTitle: string): Promise<AniListWork[]> {
+  const s = clean(rawTitle);
+  if (!s) return [];
+  const r = await anilistFetch(ANILIST, POST({ query: WORKS, variables: { s } }), ASK);
+  if (r.status === 404) return [];
+  if (!r.ok) throw Object.assign(new Error(`anilist ${r.status}`), { status: r.status });
+  const j: any = await r.json();
+  const media: any[] = j?.data?.Page?.media ?? [];
+  return media.filter((m) => typeof m?.id === 'number').map((m) => ({ id: m.id as number, titles: titlesOf(m) }));
+}
+
 export interface TrendingItem {
+  /** The AniList entry (v0.56.0): Discover hides a trending title the library holds by its AniList link as well as its name. */
+  id: number | null;
   title: string;
   cover: string | null;
   banner: string | null;
@@ -239,24 +401,22 @@ export interface TrendingItem {
   status: string | null;
 }
 
-/** Globally trending manhwa (Korean-origin manga) from AniList — for the Discover "Trending" rail. */
-export async function fetchTrendingManhwa(page = 1, retry = 0): Promise<TrendingItem[]> {
-  const r = await fetch(ANILIST, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json', accept: 'application/json' },
-    body: JSON.stringify({ query: TRENDING, variables: { page } }),
-    signal: AbortSignal.timeout(10000),
-  });
-  if (r.status === 429 && retry < 2) {
-    const wait = Math.min(6, Number(r.headers.get('retry-after')) || 4);
-    await new Promise((res) => setTimeout(res, (wait + 0.5) * 1000));
-    return fetchTrendingManhwa(page, retry + 1);
-  }
+/**
+ * Where a trending rail's titles come from (v0.61.0): Korea (manhwa), Japan (manga), China (manhua) -- AniList's country
+ * of origin. Discover's hero and its first rail are Korea's, as they always were.
+ */
+export const TREND_COUNTRIES = ['KR', 'JP', 'CN'] as const;
+export type TrendCountry = (typeof TREND_COUNTRIES)[number];
+
+/** Globally trending manga from one country of origin, from AniList -- for Discover's hero and its trending rails. */
+export async function fetchTrending(country: TrendCountry, page = 1): Promise<TrendingItem[]> {
+  const r = await anilistFetch(ANILIST, POST({ query: TRENDING, variables: { page, country } }), ASK);
   if (!r.ok) throw new Error(`anilist ${r.status}`);
   const j: any = await r.json();
   const media: any[] = j?.data?.Page?.media ?? [];
   return media
     .map((m) => ({
+      id: typeof m.id === 'number' ? m.id : null,
       title: m.title?.english || m.title?.romaji || '',
       // `large` (~230px) is plenty for the rail cards and lighter than extraLarge; loaded direct from AniList's CDN.
       cover: m.coverImage?.large || m.coverImage?.extraLarge || null,
@@ -268,4 +428,9 @@ export async function fetchTrendingManhwa(page = 1, retry = 0): Promise<Trending
       status: m.status ?? null,
     }))
     .filter((x) => x.title && x.cover);
+}
+
+/** Globally trending manhwa (Korean-origin manga): Discover's hero and first rail, as before v0.61.0. */
+export function fetchTrendingManhwa(page = 1): Promise<TrendingItem[]> {
+  return fetchTrending('KR', page);
 }

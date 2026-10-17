@@ -47,7 +47,7 @@ import { logAudit } from './audit';
 import { say, saidOf, type Part, type Said } from './said';
 import { SYSTEM_CTX, visibleToAll, type ViewCtx } from './visibility';
 import { beginRun, endRun, stopRequested, type RunCard } from './downloadJobs';
-import { repairState, repairForAutofix, type AutofixDrive, type RepairCurrent, type RepairResult, type RepairStep } from './repair';
+import { repairState, repairForAutofix, REPAIR_STEPS, type AutofixDrive, type RepairCurrent, type RepairResult, type RepairStep } from './repair';
 import { findRunning, findRunSettled, findState, startFind, stopFind, FIND_BUSY_WAIT_MS, type FindResult } from './findSources';
 import { persistScan, DL_ROOT } from './library';
 import { updateSeries, runsInside } from './updater';
@@ -77,10 +77,11 @@ import {
 import { gapsOf, splitAtFloor } from './fill';
 import { loadIgnores, noIgnores } from './healthIgnore';
 import { storeHealthSummary, scheduleHealthSummaryRefresh } from './healthSummary';
-import { mergeRefusal, mergeSeries, MergeConflictError, deleteChapterFiles, getSeriesRow } from './libraryAdmin';
+import { mergeRefusal, mergeSeries, MergeConflictError, deleteChapterFiles, getSeriesRow, keepOrder, type KeepFacts } from './libraryAdmin';
 import { claimWriterFolders } from './bulkNewest';
 import { linkPair } from './editions';
 import { haveNumbers } from './libraryNumbers';
+import { atHiddenNumber } from './noticeChapters';
 import { effectiveLang, seriesLanguage } from './seriesLang';
 import { canonLang, sameLanguage } from './lang';
 import { titleMatch } from './autoFollow';
@@ -93,6 +94,20 @@ import { clearRunDigest, pruneRuns } from './repairRuns';
 
 export const PHASES = ['preflight', 'scan', 'solver', 'sources', 'duplicates', 'numbering', 'chapters', 'extensions', 'files', 'recheck'] as const;
 export type AutofixPhase = (typeof PHASES)[number];
+
+/**
+ * The repair steps a run drives itself: `count` (the files phase), `solver` (its own phase) and the three chapters()
+ * runs. Every `repairForAutofix(..., { only })` below names steps from this list.
+ */
+export const AUTOFIX_REPAIR_STEPS: readonly RepairStep[] = ['count', 'solver', 'failures', 'short', 'gaps'];
+/**
+ * ...and the rest -- the opt-in group upgrades and borrowed names, and learning reading directions -- which a NIGHTLY
+ * Fix everything runs after it as a plain repair (server.ts). The plain nightly runs all eight; an install whose nightly
+ * was Fix everything never ran these three at all (v0.60.1, found in Squeaks72's fork). Reintroduce by dropping the
+ * follow-up from server.ts's repair tick: "a nightly Fix everything runs the repair steps it does not drive itself" in
+ * autofix.int.test.ts fails.
+ */
+export const AFTER_NIGHTLY_AUTOFIX: readonly RepairStep[] = REPAIR_STEPS.filter((s) => !AUTOFIX_REPAIR_STEPS.includes(s));
 
 export type DoneKind = 'replaced' | 'retired' | 'tested' | 'unblocked' | 'linked' | 'merged' | 'renumbered' | 'fetched' | 'refetched'
   | 'shortFixed' | 'shortConfirmed' | 'failuresCleared' | 'installed' | 'uninstalled' | 'deletedTwice' | 'deletedOdd' | 'scanned'
@@ -121,6 +136,11 @@ export interface AutofixRun {
   finishedAt?: string;
   /** The admin who started it, by name; null for the nightly (and for an account since deleted). */
   by: string | null;
+  /**
+   * How it began: `nightly` for the scheduled run, `manual` for one an admin pressed -- which `by: null` alone cannot
+   * say once the admin's account is gone (v0.70.0, for Health's "Last nightly Fix everything" line; #254, @Squeaks72).
+   */
+  origin: RunOrigin;
   phase: AutofixPhase | null;
   phaseIndex: number;
   /** Asked to stop and winding down to its next safe point: every viewer's "Stopping…", not only the one who pressed. */
@@ -460,12 +480,12 @@ export async function closeInterruptedAutofix(except: string | null = active?.id
 }
 
 type RunRow = {
-  id: string; started_at: Date; finished_at: Date | null; status: AutofixStatus; username: string | null; result: Stored | null;
+  id: string; started_at: Date; finished_at: Date | null; status: AutofixStatus; origin: RunOrigin; username: string | null; result: Stored | null;
 };
 const fromRow = (r: RunRow): AutofixRun => ({
   id: r.id, status: r.status, startedAt: new Date(r.started_at).toISOString(),
   ...(r.finished_at ? { finishedAt: new Date(r.finished_at).toISOString() } : {}),
-  by: r.username, phase: null, phaseIndex: r.result?.phaseIndex ?? 0,
+  by: r.username, origin: r.origin, phase: null, phaseIndex: r.result?.phaseIndex ?? 0,
   ...(r.result?.summary ? { summary: r.result.summary } : {}),
   log: r.result?.log ?? [],
 });
@@ -484,7 +504,7 @@ async function liveView(a: Run): Promise<AutofixRun> {
     }
     : undefined;
   return {
-    id: a.id, status: 'running', startedAt: new Date(a.startedAt).toISOString(), by, phase: a.phase, phaseIndex: a.phaseIndex,
+    id: a.id, status: 'running', startedAt: new Date(a.startedAt).toISOString(), by, origin: a.origin, phase: a.phase, phaseIndex: a.phaseIndex,
     // Stop asked, by the route or the run card's generic cancel: said to every viewer until the run reaches its safe point.
     ...(a.stop || stopRequested(a.card) ? { stopping: true } : {}),
     ...(current ? { current } : {}), log: [...a.lines],
@@ -553,7 +573,7 @@ export async function autofixState(): Promise<{ run: AutofixRun | null; last: Au
   await closeInterruptedAutofix().catch(() => {});
   const a = active;
   const rows = await q<RunRow>(
-    `SELECT r.id, r.started_at, r.finished_at, r.status, u.username, r.result FROM repair_runs r LEFT JOIN users u ON u.id = r.by_user
+    `SELECT r.id, r.started_at, r.finished_at, r.status, r.origin, u.username, r.result FROM repair_runs r LEFT JOIN users u ON u.id = r.by_user
       WHERE r.kind = 'autofix' AND r.status <> 'running' ORDER BY r.started_at DESC LIMIT 1`).catch(() => [] as RunRow[]);
   return { run: a ? await liveView(a) : null, last: rows[0] ? fromRow(rows[0]) : null };
 }
@@ -564,7 +584,7 @@ export async function autofixRun(id: string): Promise<AutofixRun | null> {
   if (a?.id === id) return liveView(a);
   await closeInterruptedAutofix().catch(() => {});
   const row = await one<RunRow>(
-    `SELECT r.id, r.started_at, r.finished_at, r.status, u.username, r.result FROM repair_runs r LEFT JOIN users u ON u.id = r.by_user
+    `SELECT r.id, r.started_at, r.finished_at, r.status, r.origin, u.username, r.result FROM repair_runs r LEFT JOIN users u ON u.id = r.by_user
       WHERE r.kind = 'autofix' AND r.id::text = $1`, [id]).catch(() => null);
   return row ? fromRow(row) : null;
 }
@@ -846,12 +866,16 @@ const SAME_CHAPTERS = 0.7;
 
 type Copy = { id: string; title: string; lang: string; sourceId: string | null; workId: string | null; books: number; readers: number; created: number; usable: boolean };
 
+/** A copy as keepOrder weighs it. */
+const factsOf = (c: Copy): KeepFacts => ({ inWork: !!c.workId, works: c.usable, chapters: c.books, readers: c.readers, created: c.created });
+
 /**
  * Link two-language pairs as editions, and merge same-language copies -- only when their AniList entry (the duplicate
  * check's own grouping), their language, and their titles (autoFollow.ts titleMatch, their other names included) or
  * their chapter lists (SAME_CHAPTERS of the shorter) agree. The copy kept is the one in a work, else the one whose main
  * source can still update it, then the one with more live chapters, more readers, the older; three or more copies merge
- * into it one pair at a time, each pair checked again. A merge carries the absorbed copy's working main source over as
+ * into it one pair at a time, each pair checked again (lib/libraryAdmin.ts keepOrder, which Health's suggestion sorts by
+ * too). Since v0.57.0 a merge keeps each chapter both copies had once (lib/extraCopies.ts). A merge carries the absorbed copy's working main source over as
  * a follower (libraryAdmin.ts mergeSeries). Ignored findings are left as they are.
  */
 async function duplicates(a: Run): Promise<void> {
@@ -909,8 +933,7 @@ async function mergeCopies(a: Run, ids: readonly string[]): Promise<void> {
   if (copies.length < 2) return;
   // The copy kept: one in a work (merging it away would take it out of its work), then one that still updates, then
   // the one with the most to lose (the duplicate check's own suggestion).
-  copies.sort((x, y) => Number(!!y.workId) - Number(!!x.workId) || Number(y.usable) - Number(x.usable)
-    || y.books - x.books || y.readers - x.readers || x.created - y.created);
+  copies.sort((x, y) => keepOrder(factsOf(x), factsOf(y)));
   const keep = copies[0];
   for (const other of copies.slice(1)) {
     if (halted(a)) return;
@@ -932,7 +955,8 @@ async function mergeCopies(a: Run, ids: readonly string[]): Promise<void> {
       : null;
     if (!claim) continue;
     try {
-      const r = await mergeSeries(other.id, keep.id);
+      // Each chapter both had, kept once (v0.57.0, lib/extraCopies.ts): the run holds both folders, as the route does.
+      const r = await mergeSeries(other.id, keep.id, { keepOnce: { userId: a.by, via: 'autofix', runId: a.id } });
       await logAudit('series.merge', {
         userId: a.by, detail: { from: other.id, fromTitle: other.title, into: keep.id, intoTitle: keep.title, ...r, via: 'autofix', runId: a.id },
       });
@@ -1390,9 +1414,11 @@ async function files(a: Run): Promise<void> {
       const have = await haveNumbers(it.seriesId!).catch(() => [] as number[]);
       const limit = impossibleLimit(have);
       if (limit === null) continue;
+      // Never a chapter at a number an admin hid (#240): hidden is left exactly as it is, and the card leaves it out too.
       const books = await q<{ id: string }>(
         `SELECT b.id FROM lib_books b LEFT JOIN book_overrides o ON o.book_id = b.id
-          WHERE b.series_id = $1 AND b.pruned_at IS NULL AND COALESCE(o.number, b.number) > $2`, [it.seriesId, limit]).catch(() => []);
+          WHERE b.series_id = $1 AND b.pruned_at IS NULL AND COALESCE(o.number, b.number) > $2
+            AND NOT ${atHiddenNumber('b')}`, [it.seriesId, limit]).catch(() => []);
       if (!books.length) continue;
       now(a, say('autofix.now.files'), { title: it.title, seriesIds: [it.seriesId!] });
       const row = await getSeriesRow(it.seriesId!);
@@ -1611,6 +1637,20 @@ function summarise(a: Run, report: HealthReport): AutofixSummary {
   if (paused) need('chapter-gaps', say('autofix.needs.gapsPaused', { n: paused }));
   if (cooldown) clear(say('autofix.clears.tomorrow', { n: cooldown }), new Date(Date.now() + 24 * 3600_000).toISOString());
   leftover += gaps.length - paused - cooldown;
+
+  // v0.72.0: the cards no phase of a run works on -- a chapter file to fetch again by hand, a disk to free or a share to
+  // mount, a member's tracker sign-in (a run deletes and replaces nothing new: the owner's rule). Each amber one is a
+  // person's, so the end never reads "All green" over it; LAST, after what a person decides (@Squeaks72's order, #254).
+  // Counted from the card's own summary, as its rows are cut at fifty. Reintroduce by leaving one out: "the cards no run
+  // changes are under Needs you, last" in autofix.int.test.ts.
+  const counted = (id: string, rows: number): number => Number(by.get(id)?.summarySaid?.[0]?.params?.n ?? rows) || rows;
+  const unreadable = findings(by.get('files')).length;
+  if (unreadable) need('files', say('autofix.needs.files', { n: counted('files', unreadable) }));
+  const disk = findings(by.get('disk')).length;
+  if (disk) need('disk', say('autofix.needs.disk', { n: disk }));
+  const trackers = findings(by.get('trackers')).length;
+  if (trackers) need('trackers', say('autofix.needs.trackers', { n: counted('trackers', trackers) }));
+
   if (leftover) clear(say('autofix.clears.nextRun', { n: leftover }));
 
   const green = clears.length === 0;

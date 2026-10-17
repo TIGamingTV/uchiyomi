@@ -7,8 +7,13 @@ import { cleanDescription } from './htmlText';
 import { effectiveLang } from './seriesLang';
 import { noticeBook, noticeShown, visibleBookCount } from './noticeChapters';
 import { rangeEnd, numberText } from './chapterRanges';
+import { anilistScoreOf } from './anilistScores';
+import { AUTO_DETAILS, authorOf, genresOf, summaryOf } from './autoDetailsSql';
 
 interface Page<T> { content: T[]; totalElements: number; totalPages: number; number: number; size: number; first: boolean; last: boolean }
+
+/** v0.61.0: the AniList score (out of 100) a series needs to be one of Home's Hidden gems. */
+export const GEM_MIN_SCORE = 75;
 function page<T>(content: T[], total: number, p: number, size: number): Page<T> {
   const totalPages = Math.max(1, Math.ceil(total / size));
   return { content, totalElements: total, totalPages, number: p, size, first: p <= 0, last: p >= totalPages - 1 };
@@ -34,9 +39,12 @@ const SERIES_COLS = 'id, title, summary, status, genres, author, age_rating, rea
 type Gate = (alias: string, ctx: ViewCtx, p: Params) => string;
 
 const seriesSrcWith = (gate: Gate, ctx: ViewCtx, p: Params, alias: string) => `(
-  SELECT s.id, COALESCE(o.title, s.title) AS title, COALESCE(o.summary, s.summary) AS summary,
-         COALESCE(o.status, s.status) AS status, COALESCE(o.genres, s.genres) AS genres,
-         COALESCE(o.author, s.author) AS author,
+  SELECT s.id, COALESCE(o.title, s.title) AS title,
+         -- The description, genres and author: the admin's, else the series' own, else what the server filled in where
+         -- both were empty (v0.73.0, lib/autoDetailsSql.ts) -- below the scan, so it never hides a scanned value.
+         ${summaryOf('o', 's', 'sad')} AS summary,
+         COALESCE(o.status, s.status) AS status, ${genresOf('o', 's', 'sad')} AS genres,
+         ${authorOf('o', 's', 'sad')} AS author,
          COALESCE(o.age_rating, s.age_rating) AS age_rating,
          -- The admin's direction, else what the evidence said (lib/readingDirection.ts), else NULL: unknown.
          COALESCE(o.reading_direction, s.reading_direction) AS reading_direction,
@@ -51,6 +59,7 @@ const seriesSrcWith = (gate: Gate, ctx: ViewCtx, p: Params, alias: string) => `(
          -- it is an edition of (lib/editions.ts), which the Library collapses to one card.
          s.source_id, s.lang, s.work_id
     FROM lib_series s LEFT JOIN series_overrides o ON o.series_id = s.id
+    LEFT JOIN ${AUTO_DETAILS} sad ON sad.series_id = s.id
    WHERE ${gate('s', ctx, p)}
 ) ${alias}`;
 
@@ -247,9 +256,37 @@ export class UnsupportedFilter extends Error {
  * said who is asking.
  */
 function condSql(cond: any, params: any[], hasUser = false): string {
+  assertCondBounded(cond);
+  return condSqlOf(cond, params, hasUser);
+}
+
+/**
+ * The largest condition tree a search may send. The Library builds one flat allOf (a library, the two source filters,
+ * a read state, a status and one leaf per chosen genre) and Komga clients nest an anyOf in it at most, so these are far
+ * above any real search. Without a bound the tree was the member's to size: a 1.9 MB body compiled to a 3 MB SQL
+ * string with 40,000 parameters that held a pooled connection for seconds (and each search runs it twice), and a
+ * 2,000-deep allOf chain overflowed this function's own recursion. Reintroduce by removing the call in condSql:
+ * conditionBounds.test.ts compiles the 40,000-leaf tree.
+ */
+export const MAX_COND_NODES = 128;
+export const MAX_COND_DEPTH = 6;
+
+function assertCondBounded(root: any): void {
+  let nodes = 0;
+  const walk = (c: any, depth: number) => {
+    if (!c || typeof c !== 'object') return;
+    if (depth > MAX_COND_DEPTH) throw new UnsupportedFilter('condition nested too deep');
+    if (++nodes > MAX_COND_NODES) throw new UnsupportedFilter('too many conditions');
+    const kids = Array.isArray(c.allOf) ? c.allOf : Array.isArray(c.anyOf) ? c.anyOf : null;
+    if (kids) for (const k of kids) walk(k, depth + 1);
+  };
+  walk(root, 0);
+}
+
+function condSqlOf(cond: any, params: any[], hasUser: boolean): string {
   if (!cond || typeof cond !== 'object') return 'TRUE';
-  if (Array.isArray(cond.allOf)) return cond.allOf.length ? '(' + cond.allOf.map((c: any) => condSql(c, params, hasUser)).join(' AND ') + ')' : 'TRUE';
-  if (Array.isArray(cond.anyOf)) return cond.anyOf.length ? '(' + cond.anyOf.map((c: any) => condSql(c, params, hasUser)).join(' OR ') + ')' : 'TRUE';
+  if (Array.isArray(cond.allOf)) return cond.allOf.length ? '(' + cond.allOf.map((c: any) => condSqlOf(c, params, hasUser)).join(' AND ') + ')' : 'TRUE';
+  if (Array.isArray(cond.anyOf)) return cond.anyOf.length ? '(' + cond.anyOf.map((c: any) => condSqlOf(c, params, hasUser)).join(' OR ') + ')' : 'TRUE';
 
   if (cond.genre && cond.genre.value != null) {
     params.push(String(cond.genre.value));
@@ -334,6 +371,13 @@ function sortSql(sort?: string, perUser = false): string {
   if (!sort) return 'title ASC';
   const [field, dir0] = String(sort).split(',');
   const dir = (dir0 || 'asc').toLowerCase() === 'desc' ? 'DESC' : 'ASC';
+  // v0.61.0, Releasing soon: the release radar's estimate (lib/releaseRadar.ts), soonest first -- only while the
+  // series is monitored and not yet quiet; one with no estimate, a quiet one and one nobody updates come after every
+  // dated series, whichever the direction, then by title. FIRST, so no older branch's pattern can take the field.
+  // Reintroduce by dropping it: "Releasing soon orders the Library by the radar" in releaseRadar.int.test.ts reads A-Z.
+  if (/releasing/i.test(field)) {
+    return `(SELECT CASE WHEN r.quiet_after > now() AND sv.auto_update THEN r.next_at END FROM series_radar r WHERE r.series_id = sv.id) ${dir} NULLS LAST, title ASC`;
+  }
   if (/random/i.test(field)) return 'random()';
   if (/title|name/i.test(field)) return `title ${dir}`;
   if (/created|added/i.test(field)) return `created_at ${dir}`;
@@ -349,6 +393,18 @@ function sortSql(sort?: string, perUser = false): string {
   if (/favou?rites?/i.test(field)) {
     return perUser ? `(f.series_id IS NOT NULL) ${dir}, (books_count - COALESCE(m.done, 0)) ${dir}, title ASC` : 'title ASC';
   }
+  // v0.58.0, the owner's sorts. The outside rating (lib/anilistScores.ts): how many AniList users list it, and its
+  // score out of 100 -- read through the series' checked AniList link; a series with none goes after every series that
+  // has one, whichever the direction. Then the viewer's own stars (per-user, $1), the chapters the series shows, and when
+  // the viewer last read in it (the `mine` CTE's last_at). Every one ties on the title. Reintroduce the fall-through
+  // (drop a branch): "each new sort orders the Library by its own value" in anilistScores.int.test.ts reads A-Z.
+  if (/popularity/i.test(field)) return `${anilistScoreOf('sv', 'popularity')} ${dir} NULLS LAST, title ASC`;
+  if (/score/i.test(field)) return `${anilistScoreOf('sv', 'score')} ${dir} NULLS LAST, title ASC`;
+  if (/rating/i.test(field)) {
+    return perUser ? `(SELECT r.stars FROM ratings r WHERE r.user_id = $1 AND r.series_id = sv.id) ${dir} NULLS LAST, title ASC` : `title ${dir}`;
+  }
+  if (/chapters/i.test(field)) return `books_count ${dir}, title ASC`;
+  if (/lastread/i.test(field)) return perUser ? `m.last_at ${dir} NULLS LAST, title ASC` : `title ${dir}`;
   return `title ${dir}`;
 }
 
@@ -610,6 +666,57 @@ export const owned = {
     return page(rows.map(seriesDto), await total(ctx), pg, size);
   },
 
+  /**
+   * v0.58.0, Home's "Most popular in your library": the series this viewer may browse that have an outside popularity
+   * (lib/anilistScores.ts, through the series' checked AniList link), the most listed on AniList first. A series with
+   * none is not on the rail. Reintroduce the plain order: "Home's Most popular rail" in anilistScores.int.test.ts finds
+   * an unscored series on it.
+   */
+  seriesPopular: async (ctx: ViewCtx, pg = 0, size = 20) => {
+    const p = new Params();
+    const src = browseSrc(ctx, p);
+    const pop = anilistScoreOf('sv', 'popularity');
+    const rows = await q(
+      `SELECT ${SERIES_COLS} FROM ${src} WHERE ${pop} IS NOT NULL ORDER BY ${pop} DESC, title ASC LIMIT ${p.add(size)} OFFSET ${p.add(pg * size)}`,
+      p.values as any[],
+    );
+    return page(rows.map(seriesDto), rows.length, pg, size);
+  },
+
+  /**
+   * v0.61.0, Home's "Hidden gems": what the household is sleeping on. Series this viewer may browse whose AniList score
+   * (lib/anilistScores.ts, through the checked link) is at least GEM_MIN_SCORE, and that NOBODY has a read_progress row
+   * for -- not in this series, and not in any other language edition of its work (another member reading the English
+   * edition is not a gem in Spanish). One card per work, the best-scored edition; best score first, then the more
+   * popular. A series with no score is never a gem: there is nothing to say it is good. Reintroduce by checking the
+   * series alone, or by dropping DISTINCT ON: "Hidden gems: well rated, read by nobody in any edition, one card per work"
+   * in homeRails.int.test.ts finds the Spanish edition, or a second edition of one work.
+   */
+  seriesGems: async (ctx: ViewCtx, pg = 0, size = 20) => {
+    const p = new Params();
+    const src = browseSrc(ctx, p);
+    const score = anilistScoreOf('sv', 'score');
+    const pop = anilistScoreOf('sv', 'popularity');
+    // A place another member kept under Incognito is not "read by the household": counting it showed this viewer
+    // which unread, well-rated series that member had opened privately (v0.69.1). The viewer's own private places
+    // still count -- they know what they opened. Reintroduce by dropping the incognito clause: "an Incognito read
+    // leaves another member's Hidden gems alone" in gemsIncognito.int.test.ts sees the gem disappear.
+    const counts = `(NOT rp.incognito OR rp.user_id = ${p.add(ctx.userId ?? null)})`;
+    const rows = await q(
+      `SELECT ${SERIES_COLS} FROM (
+         SELECT DISTINCT ON (COALESCE(sv.work_id::text, sv.id)) sv.*, ${score} AS gem_score, ${pop} AS gem_pop
+           FROM ${src}
+          WHERE ${score} >= ${GEM_MIN_SCORE}
+            AND NOT EXISTS (SELECT 1 FROM read_progress rp WHERE rp.series_id = sv.id AND ${counts})
+            AND NOT EXISTS (SELECT 1 FROM read_progress rp JOIN lib_series ed ON ed.id = rp.series_id WHERE ed.work_id = sv.work_id AND ${counts})
+          ORDER BY COALESCE(sv.work_id::text, sv.id), gem_score DESC, gem_pop DESC NULLS LAST, sv.title ASC
+       ) g
+       ORDER BY gem_score DESC, gem_pop DESC NULLS LAST, title ASC LIMIT ${p.add(size)} OFFSET ${p.add(pg * size)}`,
+      p.values as any[],
+    );
+    return page(rows.map(seriesDto), rows.length, pg, size);
+  },
+
   booksOnDeck: async (_ctx: ViewCtx, _p = 0, size = 20) => page([] as any[], 0, 0, size), // owned: continue-reading is served from read_progress in catalog
 
   /**
@@ -623,7 +730,7 @@ export const owned = {
   searchSeries: async (ctx: ViewCtx, body: any, pg = 0, size = 40, sort?: string) => {
     const collapse = body?.collapseEditions === true;
     const wantsUser = !!ctx.userId
-      && (collapse || JSON.stringify(body?.condition ?? {}).includes('readStatus') || /unread|favou?rite/i.test(sort || ''));
+      && (collapse || JSON.stringify(body?.condition ?? {}).includes('readStatus') || /unread|favou?rite|rating|lastread/i.test(sort || ''));
     const p = new Params();
     const cte = wantsUser ? mineCte() : '';
     if (wantsUser) p.add(ctx.userId); // mineCte reads $1
@@ -664,6 +771,35 @@ export const owned = {
       p.values as any[],
     );
     return page(rows.map((r) => bookDto({ ...r, series_title: st })), t, pg, size);
+  },
+
+  /**
+   * Every chapter this viewer may list, a page of them (v0.61.2, #204): the Komga API's GET /api/v1/books, which a
+   * Komga client reads for the library's chapter count (`totalElements`) -- Homepage's Komga widget, for its Books
+   * tile. Listed as the Library lists series (browsable: soft delete, merge, the grants, the age cap and the 18+ hide)
+   * and as each series lists its chapters (booksSrc: overrides, hidden notice chapters left out); by series title, then
+   * number. `search` matches a chapter's or its series' name; `readyOnly` leaves out pruned tombstones.
+   */
+  allBooks: async (ctx: ViewCtx, o: { page: number; size: number; desc: boolean; search: string | null; libraryIds: string[]; readyOnly: boolean }) => {
+    const p = new Params();
+    const from = `${booksSrc(ctx, p, 'b')} ${SERIES_TITLE_JOIN.replace('%col%', 'b.series_id')}`;
+    const where = [browsable('s', ctx, p)];
+    if (o.search) {
+      const term = p.add(`%${o.search}%`);
+      where.push(`(b.title ILIKE ${term} OR ${SERIES_TITLE_SQL} ILIKE ${term})`);
+    }
+    if (o.libraryIds.length) where.push(`s.library_id = ANY(${p.add(o.libraryIds)})`);
+    if (o.readyOnly) where.push('b.pruned_at IS NULL');
+    const cond = where.join(' AND ');
+    const t = (await one<{ c: number }>(`SELECT count(*)::int AS c FROM ${from} WHERE ${cond}`, [...p.values] as any[]))?.c ?? 0;
+    const dir = o.desc ? 'DESC' : 'ASC';
+    const rows = await q(
+      `SELECT b.*, ${SERIES_TITLE_SQL} AS series_title FROM ${from} WHERE ${cond}
+        ORDER BY ${SERIES_TITLE_SQL} ${dir}, b.series_id ${dir}, b.number ${dir}, b.file ${dir}
+        LIMIT ${p.add(o.size)} OFFSET ${p.add(o.page * o.size)}`,
+      p.values as any[],
+    );
+    return page(rows.map(bookDto), t, o.page, o.size);
   },
 
   book: async (ctx: ViewCtx, id: string) => {

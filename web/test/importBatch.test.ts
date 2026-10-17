@@ -435,6 +435,7 @@ test('a tracker batch is named after its tracker in Open imports', () => {
   assert.equal(batchOriginLabel('tracker', 'anilist'), 'AniList list', 'AniList');
   assert.equal(batchOriginLabel('tracker', 'myanimelist'), 'MyAnimeList list', 'MyAnimeList');
   assert.equal(batchOriginLabel('tracker', 'kitsu'), 'Kitsu list', 'Kitsu');
+  assert.equal(batchOriginLabel('tracker', 'mangaupdates'), 'MangaUpdates list', 'MangaUpdates');
   assert.equal(batchOriginLabel('tracker', null), 'Tracker list', 'a tracker the web does not know keeps a generic label');
   assert.equal(batchOriginLabel('paste'), 'Pasted titles', 'the other origins are unchanged');
   assert.equal(batchOriginLabel('backup', 'anilist'), 'Backup file', 'a tracker on a non-tracker origin is ignored');
@@ -472,7 +473,7 @@ test('the tracker intake is a nested box, and the intake card still ends on its 
   assert.match(intake, /<div className="mb-4 rounded-xl border border-ink-700 bg-ink-900\/50 p-2\.5" data-tracker-intake>/, 'the tracker intake is not the nested box');
   assert.match(intake, /<OpenImports batches=\{open\} onOpen=\{onOpen\} \/>\s*<TrackerIntake starting=\{starting\} onStart=\{onTracker\} \/>\s*<p className="mb-2 text-xs font-semibold uppercase tracking-wider text-fog-500">\{tr\('Bring your library over'\)\}<\/p>/, 'the box is not between Open imports and the eyebrow');
   // Not connected: one dim line that lands ON the Progress tracking card (tab + card, see the profile test).
-  assert.match(intake, /<Link href="\/profile\/\?tab=Connections&card=tracking"[^>]*>\s*\{NOT_CONNECTED\(\)\}/, 'the not-connected line does not point at the tracking card');
+  assert.match(intake, /<Link href="\/profile\/\?tab=Connections&card=tracking"[^>]*>\s*\{broken\.length \? tr\('Your tracker token no longer works\. Reconnect it under Profile\.'\) : NOT_CONNECTED\(\)\}/, 'the not-connected line does not point at the tracking card');
   // Reading + Plan to read on by default; "Finished" is the read-state word, never the series status "Completed".
   assert.match(src, /const LIST_STATUS_LABELS = keys\('Reading', 'Plan to read', 'Finished', 'On hold', 'Dropped'\);/, 'the list buckets are not declared through keys()');
   assert.match(src, /\{ id: 'reading', label: LIST_STATUS_LABELS\[0\], on: true \},\s*\{ id: 'plan_to_read', label: LIST_STATUS_LABELS\[1\], on: true \},\s*\{ id: 'completed', label: LIST_STATUS_LABELS\[2\], on: false \}/, 'Reading and Plan to read are not the defaults, or completed is not labelled Finished');

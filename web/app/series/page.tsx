@@ -1,7 +1,11 @@
 'use client';
+import { ScrollRail, CARD_RAIL } from '@/components/ScrollRail';
 import { Children, Suspense, useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import Link from 'next/link';
-import { motion } from 'framer-motion';
+import { motion, useReducedMotion, useScroll, useTransform } from 'framer-motion';
+import { HeroArt } from '@/components/MosaicArt';
+import { useArtUnderChrome } from '@/lib/overArt';
+import { useReduceEffects } from '@/lib/effects';
 import { useSearchParams, useRouter } from 'next/navigation';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { api, img } from '@/lib/api';
@@ -9,12 +13,12 @@ import { Book, EditionRow, Ghost, Listing, Page, Series, VersionCopy, Versions }
 import { bookCountText, chapterLabel, chapterName, isVolumeName, languageName, relativeTime, relativeTimeShort } from '@/lib/format';
 import { listDownloads, downloadChapter, deleteDownload } from '@/lib/downloads';
 import { applyCover, clearCover } from '@/lib/theme';
-import { Img, Backdrop, Rail, SectionTitle } from '@/components/ui';
+import { Img, Backdrop, SectionTitle, useWideViewport } from '@/components/ui';
 import { SeriesCard } from '@/components/cards';
 import { useToast } from '@/components/Toast';
 import { ConfirmDialog, Modal, msgOf } from '@/components/ConfirmDialog';
 import { useAuth, canDownload } from '@/lib/auth';
-import { IcChevronLeft, IcHeart, IcStar, IcPlay, IcDownload, IcCloudDownload, IcCheck, IcTrash, IcMoments, IcHourglass, IcRefresh } from '@/components/icons';
+import { IcChevronLeft, IcDownload, IcCloudDownload, IcCheck, IcTrash, IcHourglass, IcGrid, IcRows } from '@/components/icons';
 import { t as tr } from '@/lib/i18n';
 import { statusText } from '@/lib/activity';
 import { deletedText, selectedText, skippedBookmarkedText, skippedNotOursText } from '@/lib/counted';
@@ -28,14 +32,20 @@ import { effectsReduced } from '@/lib/effects';
 import { clampPage, pageCount, pageLabel, pageOf, pageSizeFor, pageSlice } from '@/lib/chapterPages';
 import { openRuns, showAllChaptersOn } from '@/lib/showAllChapters';
 import { buttonsClass, compactChaptersOn, dotHide, rowClass, thumbHide } from '@/lib/compactChapters';
-import { fetchAllBooks } from '@/lib/seriesBooks';
+import { chapterRowsClass, chapterViewOn, setChapterView, type ChapterView } from '@/lib/chapterView';
+import { PhoneHeroCover } from '@/components/PhoneHeroCover';
+import { Segmented } from '@/components/settings';
+import { seriesBooksQuery, seriesQuery } from '@/lib/seriesPrefetch';
 import { fetchingToast } from '@/lib/jobs';
 import { ALL_GROUPS, copySourceId, groupsOfRow, matchesGroup } from '@/lib/groupFilter';
-import { SourcesSheet, useSeriesGroups } from '@/components/SourcesSheet';
+import { SourcesSheet, useCheckNow, useSeriesGroups } from '@/components/SourcesSheet';
 import { SourcesExplainer } from '@/components/SourcesExplainer';
 import { SupplyLine } from '@/components/SupplyLine';
 import { ChapterFilterSheet } from '@/components/ChapterFilterSheet';
 import { ChapterVersionsSheet } from '@/components/ChapterVersionsSheet';
+import { HiddenChaptersDialog } from '@/components/HiddenChapters';
+import { CoverPickerSheet } from '@/components/CoverPickerSheet';
+import { CompareCopiesDialog } from '@/components/CompareCopiesDialog';
 import { GroupAvatar } from '@/components/GroupAvatar';
 import { supplyLine } from '@/lib/supplyLine';
 import { isDesktop } from '@/lib/desktop';
@@ -46,11 +56,22 @@ import { SeriesServerDownloads } from '@/components/SeriesServerDownloads';
 import { useArchiveEnqueue } from '@/components/ArchiveQueue';
 import { listingArchiveLine } from '@/lib/archive';
 import { NumberingNotice } from '@/components/NumberingNotice';
+import { LanguageNotice } from '@/components/LanguageNotice';
 import { NumberingSheet } from '@/components/NumberingSheet';
 import type { PlanMode } from '@/lib/numbering';
 import { AddSeriesDialog } from '@/components/AddSeriesDialog';
 import { editionChipLabels } from '@/lib/editions';
+import { continueChoice, continueText, readCountText } from '@/lib/continueLabel';
+import { radarText } from '@/lib/radar';
+import { catchUpText } from '@/lib/readingTime';
+import { offlineKeyShown, seriesActionGroups, type SeriesActionId } from '@/lib/seriesActions';
+import { RatingsPanel, useSeriesRating } from '@/components/RatingsPanel';
+import { ContinueBar, ContinueButton, ReadProgress, useOutOfView } from '@/components/ContinueBar';
+import { FavouriteKey, IcListAdd, MoreKey, SeriesKey, SeriesMoreSheet, moreMenuItems } from '@/components/SeriesKeys';
+import { ProgressRing } from '@/components/ProgressRing';
 import { SeriesEditor, copyPath, type EditTab } from '@/components/SeriesEditor';
+import { RelatedRail } from '@/components/RelatedRail';
+import { safeColor } from '@/lib/safeColor';
 
 /** "Marking 3 chapters read…", counted: the busy half of Mark read's one card. */
 const markingText = (n: number) => (n === 1 ? tr('Marking 1 chapter read…') : tr('Marking {n} chapters read…', { n }));
@@ -60,9 +81,11 @@ const fld = 'w-full rounded-lg border border-ink-700 bg-ink-900/60 px-3 py-2 tex
 
 interface CollectionRow { id: string; name: string; accent: string | null; item_count: number }
 
-/** "Add to collection" sheet: pick an existing list or create one inline. */
+/**
+ * "Add to list": pick an existing list or create one inline. The shared Modal since the UI refresh (it was a hand-rolled
+ * overlay): Escape closes it, focus starts in it and goes back to the List key, and it clears a phone's nav bar.
+ */
 function CollectionSheet({ seriesId, onClose }: { seriesId: string; onClose: () => void }) {
-  useLayer('dialog');
   const toast = useToast();
   const qc = useQueryClient();
   const [name, setName] = useState('');
@@ -82,49 +105,31 @@ function CollectionSheet({ seriesId, onClose }: { seriesId: string; onClose: () 
     try {
       const c = await api<CollectionRow>('/api/collections', { json: { name: n } });
       await add(c);
-    } catch { toast(tr('Could not create the collection'), 'error'); }
+    } catch { toast(tr('Could not create the list'), 'error'); }
   };
   return (
-    <div className="fixed inset-0 z-50 grid place-items-center bg-ink-950/70 p-4 backdrop-blur-xs" onClick={onClose}>
-      <div role="dialog" aria-modal="true" aria-label={tr('Add to collection')} className="glass w-full max-w-sm rounded-2xl border border-ink-700 p-5" onClick={(e) => e.stopPropagation()}>
-        <div className="mb-3 flex items-start justify-between gap-3">
-          <h3 className="font-display text-lg font-semibold">{tr('Add to collection')}</h3>
-          <button onClick={onClose} aria-label={tr('Close')} className="shrink-0 text-fog-500 hover:text-fog-200">✕</button>
+    <Modal title={tr('Add to list')} onClose={onClose} fieldFocus={false}>
+      {isLoading ? (
+        <div className="skeleton h-24 rounded-xl" />
+      ) : (
+        <div data-lenis-prevent className="max-h-64 space-y-1.5 overflow-y-auto">
+          {(data?.content ?? []).map((c) => (
+            <button key={c.id} onClick={() => add(c)}
+              className="flex w-full items-center gap-2.5 rounded-xl border border-ink-700 px-3 py-2.5 text-start transition hover:border-accent/50">
+              <span aria-hidden className="h-4 w-1.5 shrink-0 rounded-full" style={{ background: safeColor(c.accent, 'rgb(var(--accent))') }} />
+              <span className="min-w-0 truncate text-sm text-fog-100">{c.name}</span>
+              <span className="ms-auto shrink-0 text-[11px] text-fog-500">{c.item_count}</span>
+            </button>
+          ))}
+          {!(data?.content ?? []).length && <p className="py-2 text-center text-xs text-fog-500">{tr('No lists yet — create one below.')}</p>}
         </div>
-        {isLoading ? (
-          <div className="skeleton h-24 rounded-xl" />
-        ) : (
-          <div data-lenis-prevent className="max-h-64 space-y-1.5 overflow-y-auto">
-            {(data?.content ?? []).map((c) => (
-              <button key={c.id} onClick={() => add(c)}
-                className="flex w-full items-center gap-2.5 rounded-xl border border-ink-700 px-3 py-2.5 text-start transition hover:border-accent/50">
-                <span aria-hidden className="h-4 w-1.5 shrink-0 rounded-full" style={{ background: c.accent || 'rgb(var(--accent))' }} />
-                <span className="min-w-0 truncate text-sm text-fog-100">{c.name}</span>
-                <span className="ms-auto shrink-0 text-[11px] text-fog-500">{c.item_count}</span>
-              </button>
-            ))}
-            {!(data?.content ?? []).length && <p className="py-2 text-center text-xs text-fog-500">{tr('No collections yet — create one below.')}</p>}
-          </div>
-        )}
-        <div className="mt-3 flex gap-2 border-t border-ink-800 pt-3">
-          <input value={name} onChange={(e) => setName(e.target.value)} onKeyDown={(e) => e.key === 'Enter' && createAndAdd()}
-            placeholder={tr('New collection…')} className={`${fld} flex-1`} />
-          <button onClick={createAndAdd} disabled={!name.trim()} className="btn-accent px-3 text-xs disabled:opacity-50">{tr('Create')}</button>
-        </div>
+      )}
+      <div className="mt-3 flex gap-2 border-t border-ink-800 pt-3">
+        <input value={name} onChange={(e) => setName(e.target.value)} onKeyDown={(e) => e.key === 'Enter' && createAndAdd()}
+          placeholder={tr('New list…')} className={`${fld} flex-1`} />
+        <button onClick={createAndAdd} disabled={!name.trim()} className="btn-accent px-3 text-xs disabled:opacity-50">{tr('Create')}</button>
       </div>
-    </div>
-  );
-}
-
-function StarRating({ value, onSet }: { value: number | null; onSet: (n: number) => void }) {
-  return (
-    <div className="flex items-center gap-1">
-      {[1, 2, 3, 4, 5].map((n) => (
-        <button key={n} onClick={() => onSet(n)} className={n <= (value || 0) ? 'text-accent' : 'text-ink-600'}>
-          <IcStar width={22} height={22} fill={n <= (value || 0) ? 'currentColor' : 'none'} />
-        </button>
-      ))}
-    </div>
+    </Modal>
   );
 }
 
@@ -213,7 +218,6 @@ function RenameFolderModal({ id, folder, title, onClose, onSaved }: {
 }
 
 function ChapterEditModal({ book, onClose, onSaved }: { book: Book; onClose: () => void; onSaved: () => void }) {
-  useLayer('dialog');
   const toast = useToast();
   const [number, setNumber] = useState(String(book.number ?? ''));
   const [title, setTitle] = useState(book.metadata?.title || book.name || '');
@@ -238,27 +242,22 @@ function ChapterEditModal({ book, onClose, onSaved }: { book: Book; onClose: () 
   };
 
   return (
-    <div className="fixed inset-0 z-50 grid place-items-center bg-ink-950/70 p-4 backdrop-blur-xs" onClick={onClose}>
-      <div role="dialog" aria-modal="true" aria-label={tr('Edit chapter')} className="glass w-full max-w-sm rounded-2xl border border-ink-700 p-5" onClick={(e) => e.stopPropagation()}>
-        <div className="mb-3 flex items-start justify-between gap-3">
-          <h3 className="font-display text-lg font-semibold leading-tight">{tr('Edit chapter')}</h3>
-          <button onClick={onClose} aria-label={tr('Close')} className="shrink-0 text-fog-500 hover:text-fog-200">✕</button>
-        </div>
-        <label className="mb-1 block text-xs font-semibold uppercase tracking-wider text-fog-500">{tr('Chapter number')}</label>
-        <input value={number} onChange={(e) => setNumber(e.target.value)} inputMode="decimal" className={fld} />
-        <label className="mb-1 mt-3 block text-xs font-semibold uppercase tracking-wider text-fog-500">{tr('Title')}</label>
-        <input value={title} onChange={(e) => setTitle(e.target.value)} className={fld} />
-        {completed && (
-          <p className="mt-3 rounded-lg border border-amber-500/30 bg-amber-500/10 p-2.5 text-[11px] leading-relaxed text-amber-200">
-            {tr('You have finished this chapter. Changing its number changes what gets reported to a connected tracker. Progress never moves backwards on its own: if the new number is lower, the tracker keeps the higher one until an admin imports your list again under Admin → Import (From your tracker).')}
-          </p>
-        )}
-        <div className="mt-4 flex gap-2">
-          <button onClick={() => save(true)} disabled={busy} className="btn-ghost flex-1 py-2 text-sm disabled:opacity-50">{tr('Reset to file')}</button>
-          <button onClick={() => save()} disabled={busy} className="btn-accent flex-1 py-2 text-sm disabled:opacity-50">{tr('Save')}</button>
-        </div>
+    // The shared Modal (UI refresh), as Add to list: Escape, focus in and back, and clear of a phone's nav bar.
+    <Modal title={tr('Edit chapter')} onClose={onClose}>
+      <label className="mb-1 block text-xs font-semibold uppercase tracking-wider text-fog-500">{tr('Chapter number')}</label>
+      <input value={number} onChange={(e) => setNumber(e.target.value)} inputMode="decimal" className={fld} />
+      <label className="mb-1 mt-3 block text-xs font-semibold uppercase tracking-wider text-fog-500">{tr('Title')}</label>
+      <input value={title} onChange={(e) => setTitle(e.target.value)} className={fld} />
+      {completed && (
+        <p className="mt-3 rounded-lg border border-amber-500/30 bg-amber-500/10 p-2.5 text-[11px] leading-relaxed text-amber-200">
+          {tr('You have finished this chapter. Changing its number changes what gets reported to a connected tracker. Progress never moves backwards on its own: if the new number is lower, the tracker keeps the higher one until an admin imports your list again under Admin → Import (From your tracker).')}
+        </p>
+      )}
+      <div className="mt-4 flex gap-2">
+        <button onClick={() => save(true)} disabled={busy} className="btn-ghost flex-1 py-2 text-sm disabled:opacity-50">{tr('Reset to file')}</button>
+        <button onClick={() => save()} disabled={busy} className="btn-accent flex-1 py-2 text-sm disabled:opacity-50">{tr('Save')}</button>
       </div>
-    </div>
+    </Modal>
   );
 }
 
@@ -396,10 +395,21 @@ function ButtonsWrap({ compact, menuOpen, children }: { compact: boolean; menuOp
   return <div className={buttonsClass(menuOpen)}>{children}</div>;
 }
 
-function ChapterRow({ book, downloaded, sourceNames, primarySource, versions, onReader, onToggleDownload, onMark, onEdit, onVersions, onCopyPath, selectable, selected, onToggle, compact, lit }: {
+function ChapterRow({ book, downloaded, sourceNames, primarySource, versions, onReader, onToggleDownload, onMark, onEdit, onVersions, onReplaceFrom, onCopyPath, onHide, onRefetch, onDelete, selectable, selected, onToggle, compact, lit }: {
   book: Book;
   /** Admins only (#136): copy the chapter file's full path. Absent for everyone else and for a row with no path. */
   onCopyPath?: () => void;
+  /**
+   * Admins only (#240): hide this chapter's number from the series, for everyone -- it asks first. Nothing is deleted.
+   * Absent for everyone else, and for a file holding a range of chapters, which no number hides.
+   */
+  onHide?: () => void;
+  /**
+   * Admins only, on a file Uchiyomi downloaded (v0.62.0): the select bar's Fetch again and Delete from server, for this
+   * one chapter -- each asks first, as the bar's do. Absent for everyone else, and Delete for a file already deleted.
+   */
+  onRefetch?: () => void;
+  onDelete?: () => void;
   /** Lit for a moment: the chapter a `?ch=` link (Health's Open) came to see. */
   lit?: boolean;
   /** The opt-in compact chapter list (lib/compactChapters.ts). Off: the row is exactly as it always was. */
@@ -420,18 +430,28 @@ function ChapterRow({ book, downloaded, sourceNames, primarySource, versions, on
   onEdit?: () => void;
   /** Opens the chapter sheet with every copy of this number; absent when the sources know none. */
   onVersions?: () => void;
+  /** Admins only: compare this file with another source's copy of the same number and swap it. Absent when no other source has one. */
+  onReplaceFrom?: () => void;
 }) {
   const [busy, setBusy] = useState(false);
   const rp = book.readProgress;
-  const state = rp?.completed ? 'read' : rp ? 'reading' : 'unread';
+  // Page 0 is unread: it is what Mark unread writes (setRead), and Continue reading reads it so too (lib/continueLabel.ts).
+  // Counted as "reading", a chapter marked unread showed "page 0/19" in the accent.
+  const state = rp?.completed ? 'read' : rp && rp.page >= 1 ? 'reading' : 'unread';
   // The ⋯ button's menu, which right-click, a press-and-hold and Shift+F10 on the row now open as well (#100,
   // components/ContextMenu.tsx). It was a hand-rolled popover that clipped at the screen's edge.
   const menu = useContextMenu(() => [
-    { label: rp?.completed ? tr('Mark unread') : tr('Mark read'), onSelect: () => onMark(rp?.completed ? 'unread' : 'read') },
+    // A part-read chapter offers both (#215, klave7): finish it, or put it back to unread, its page with it.
+    ...(state !== 'read' ? [{ label: tr('Mark read'), onSelect: () => onMark('read') }] : []),
+    ...(state !== 'unread' ? [{ label: tr('Mark unread'), onSelect: () => onMark('unread') }] : []),
     { label: tr('Mark previous as read'), onSelect: () => onMark('previous') },
     ...(onVersions ? [{ label: tr('Versions'), divider: true, onSelect: onVersions }] : []),
+    ...(onReplaceFrom ? [{ label: tr('Replace from another source…'), onSelect: onReplaceFrom }] : []),
     ...(onEdit ? [{ label: tr('Edit number & title'), divider: true, onSelect: onEdit }] : []),
     ...(onCopyPath ? [{ label: tr('Copy file path'), divider: !onEdit, onSelect: onCopyPath }] : []),
+    ...(onHide ? [{ label: tr('Hide chapter {n}', { n: book.number }), divider: !onEdit && !onCopyPath, hook: 'hide-chapter', onSelect: onHide }] : []),
+    ...(onRefetch ? [{ label: tr('Fetch again'), divider: true, onSelect: onRefetch }] : []),
+    ...(onDelete ? [{ label: tr('Delete from server'), divider: !onRefetch, danger: true, onSelect: onDelete }] : []),
   ], { label: tr('Chapter actions') });
   // Only a name is shown; an id that resolves to nothing (a source since removed) shows no caption at all.
   const altSource = book.sourceId && book.sourceId !== primarySource ? (sourceNames?.[book.sourceId] ?? null) : null;
@@ -452,7 +472,8 @@ function ChapterRow({ book, downloaded, sourceNames, primarySource, versions, on
     // the desktop grid a 287-px cell (three columns at 1280) leaves the caption ≈90 px beside the thumb,
     // the dot, the date and two 36-px buttons -- exactly a group name with its avatar -- and a two-digit
     // day ("29d") took 4 of them back. Five gaps at 10 rather than 12 return ten. GhostRow matches.
-    <div id={`ch-${book.number}`} className={`border-b border-ink-800/70${lit ? ' rounded-lg bg-accent/10 ring-1 ring-inset ring-accent/50' : ''}`}>
+    // UI refresh: a pointer lights the row under it, a surface just past the row's own edges (the grid's gaps have room).
+    <div id={`ch-${book.number}`} className={`border-b border-ink-800/70 transition-colors lg:-mx-2 lg:px-2 lg:pointer-fine:hover:bg-white/[0.035]${lit ? ' rounded-lg bg-accent/10 ring-1 ring-inset ring-accent/50' : ' lg:rounded-lg'}`}>
     <div className={rowClass(!!compact)} {...(selectable ? {} : menu.bind)}>
       {/* In select mode a pruned chapter is still selectable -- Mark read and Fetch again are exactly the
           things one wants for it -- so the disable only applies to opening. */}
@@ -491,7 +512,7 @@ function ChapterRow({ book, downloaded, sourceNames, primarySource, versions, on
         // `pruned` already excludes a chapter saved on this device, so removing that copy still works --
         // which matters, because it is the only copy left.
         disabled={pruned}
-        className={`grid h-9 w-9 place-items-center rounded-full border disabled:opacity-30 ${downloaded ? 'border-accent/40 text-accent' : 'border-ink-700 text-fog-500'}`}
+        className={`grid h-9 w-9 place-items-center rounded-lg border disabled:opacity-30 ${downloaded ? 'border-accent/40 text-accent' : 'border-ink-700 text-fog-500'}`}
         // "Save offline", not "Download": the ☁ on a ghost row brings a chapter onto the server, this arrow
         // copies one to this device, and one word for both promised the wrong thing on one of them.
         aria-label={downloaded ? tr('Remove from this device') : tr('Save offline')}
@@ -500,7 +521,7 @@ function ChapterRow({ book, downloaded, sourceNames, primarySource, versions, on
       </button>}
       <div className="relative shrink-0">
         <button onClick={(e) => menu.openFrom(e.currentTarget)} aria-label={tr('Chapter actions')} aria-haspopup="menu" aria-expanded={menu.open}
-          className="grid h-9 w-9 place-items-center rounded-full border border-ink-700 text-fog-500">
+          className="grid h-9 w-9 place-items-center rounded-lg border border-ink-700 text-fog-500">
           <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><circle cx="5" cy="12" r="1.8" /><circle cx="12" cy="12" r="1.8" /><circle cx="19" cy="12" r="1.8" /></svg>
         </button>
       </div>
@@ -538,7 +559,7 @@ function SelectBubble({ selected }: { selected: boolean }) {
  * dimmed, because "this server does not have it" is still true. The mark lives in its own table and becomes
  * ordinary progress when the chapter lands (bff lib/listingProgress).
  */
-function GhostRow({ ghost, sourceNames, primarySource, selectable, selected, onToggle, onFetch, onOpen, onMark, compact, wholeHere }: {
+function GhostRow({ ghost, sourceNames, primarySource, selectable, selected, onToggle, onFetch, onOpen, onMark, onHide, compact, wholeHere }: {
   ghost: Ghost;
   /** The series holds a chapter at this ghost's whole number: what a covered row's caption says (lib/chapterRows.ts whyLabel). */
   wholeHere?: boolean;
@@ -560,14 +581,18 @@ function GhostRow({ ghost, sourceNames, primarySource, selectable, selected, onT
    * can see the page, download permission or not: a mark costs no bytes. Select mode hides it like the ☁.
    */
   onMark?: (completed: boolean) => void;
+  /** Admins only (#240): hide this number from the series, for everyone -- a source's stray. It asks first. */
+  onHide?: () => void;
 }) {
   const [busy, setBusy] = useState(false);
   const read = ghost.read === true;
-  // The one action that applies to a chapter that is not here, on the same menu as a chapter row's (#100).
-  const menu = useContextMenu(() => (onMark ? [
-    { label: read ? tr('Mark unread') : tr('Mark read'), onSelect: () => onMark(!read) },
-  ] : []), { label: tr('Chapter actions') });
-  const menuBind = onMark && !selectable ? menu.bind : {};
+  // The actions that apply to a chapter that is not here, on the same menu as a chapter row's (#100).
+  const menu = useContextMenu(() => [
+    ...(onMark ? [{ label: read ? tr('Mark unread') : tr('Mark read'), onSelect: () => onMark(!read) }] : []),
+    ...(onHide ? [{ label: tr('Hide chapter {n}', { n: ghost.number }), divider: !!onMark, hook: 'hide-chapter', onSelect: onHide }] : []),
+  ], { label: tr('Chapter actions') });
+  const hasMenu = !!onMark || !!onHide;
+  const menuBind = hasMenu && !selectable ? menu.bind : {};
   const label = whyLabel(ghost, { wholeHere });
   // The same rule as the chapter row's caption: the series' own source is the normal case, not news. The
   // listing carries the source's name, so an id the followed list no longer resolves still gets one --
@@ -623,11 +648,11 @@ function GhostRow({ ghost, sourceNames, primarySource, selectable, selected, onT
           {busy ? <span className="text-[10px] font-semibold text-accent">…</span> : <IcCloudDownload width={16} height={16} />}
         </button>
       )}
-      {/* The chapter row's ⋯, with the one action that applies to a chapter that is not here. */}
-      {onMark && !selectable && (
+      {/* The chapter row's ⋯, with the actions that apply to a chapter that is not here. */}
+      {hasMenu && !selectable && (
         <div className="relative shrink-0">
           <button type="button" onClick={(e) => menu.openFrom(e.currentTarget)} aria-label={tr('Chapter actions')} aria-haspopup="menu" aria-expanded={menu.open}
-            className="grid h-9 w-9 place-items-center rounded-full border border-ink-700 text-fog-500">
+            className="grid h-9 w-9 place-items-center rounded-lg border border-ink-700 text-fog-500">
             <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><circle cx="5" cy="12" r="1.8" /><circle cx="12" cy="12" r="1.8" /><circle cx="19" cy="12" r="1.8" /></svg>
           </button>
         </div>
@@ -657,16 +682,16 @@ function readShowGhosts(): boolean {
 function ChapterPager({ page, pages, rows, asc, total, onPage }: { page: number; pages: number; rows: readonly Row[]; asc: boolean; total: number; onPage: (p: number) => void }) {
   const range = (p: number) => pageLabel(rows, p, asc);
   return (
-    <nav aria-label={tr('Chapter pages')} className="my-2 flex items-center justify-center gap-2 text-xs">
-      <button type="button" onClick={() => onPage(0)} disabled={page === 0} className="chip px-2.5 py-1 disabled:opacity-40" aria-label={tr('First page')}>«</button>
-      <button type="button" onClick={() => onPage(page - 1)} disabled={page === 0} className="chip px-2.5 py-1 disabled:opacity-40">{tr('Previous')}</button>
+    <nav aria-label={tr('Chapter pages')} data-chapter-pager className="my-2 flex items-center justify-center gap-2 text-xs">
+      <button type="button" onClick={() => onPage(0)} disabled={page === 0} className="btn-key px-2.5" aria-label={tr('First page')}>«</button>
+      <button type="button" onClick={() => onPage(page - 1)} disabled={page === 0} className="btn-key">{tr('Previous')}</button>
       <select value={page} onChange={(e) => onPage(Number(e.target.value))} aria-label={tr('Chapter pages')}
-        className="rounded-full border border-ink-700 bg-ink-850 px-3 py-1 text-fog-100">
+        className="h-8 rounded-lg border border-ink-700 bg-ink-850 px-2.5 text-fog-100">
         {Array.from({ length: pages }, (_, p) => <option key={p} value={p}>{range(p)}</option>)}
       </select>
       <span className="text-fog-500">{tr('of {n}', { n: total })}</span>
-      <button type="button" onClick={() => onPage(page + 1)} disabled={page >= pages - 1} className="chip px-2.5 py-1 disabled:opacity-40">{tr('Next')}</button>
-      <button type="button" onClick={() => onPage(pages - 1)} disabled={page >= pages - 1} className="chip px-2.5 py-1 disabled:opacity-40" aria-label={tr('Last page')}>»</button>
+      <button type="button" onClick={() => onPage(page + 1)} disabled={page >= pages - 1} className="btn-key">{tr('Next')}</button>
+      <button type="button" onClick={() => onPage(pages - 1)} disabled={page >= pages - 1} className="btn-key px-2.5" aria-label={tr('Last page')}>»</button>
     </nav>
   );
 }
@@ -699,7 +724,7 @@ function SeriesInner() {
   const router = useRouter();
   const qc = useQueryClient();
   const toast = useToast();
-  const { isAdmin, user } = useAuth();
+  const { isAdmin, user, status: authStatus } = useAuth();
   const [editChapter, setEditChapter] = useState<Book | null>(null);
   // Edit details, open on a tab: Details from its key, Reading from the Sources sheet's language Change.
   const [editing, setEditing] = useState<EditTab | null>(null);
@@ -725,7 +750,11 @@ function SeriesInner() {
   const [pickedBooks, setPickedBooks] = useState<Set<string>>(new Set());
   const [pickedGhosts, setPickedGhosts] = useState<Set<string>>(new Set());
   const [acting, setActing] = useState(false);
-  const [confirming, setConfirming] = useState<null | 'delete' | 'refetch'>(null);
+  // What a confirm acts on: the select bar's subset, or the one chapter a row's ⋯ names (v0.62.0).
+  const [confirming, setConfirming] = useState<null | { what: 'delete' | 'refetch'; books: Book[] }>(null);
+  // #240: the chapter numbers a Hide asks about -- a row's ⋯, or the select bar's -- and More's Show hidden chapters.
+  const [hiding, setHiding] = useState<number[] | null>(null);
+  const [showHidden, setShowHidden] = useState(false);
   const [started, setStarted] = useState<StartedJob | null>(null);
   const clearPicks = () => { setPickedBooks(new Set()); setPickedGhosts(new Set()); };
   const leaveSelect = () => { setSelecting(false); clearPicks(); };
@@ -773,12 +802,10 @@ function SeriesInner() {
   };
   useEffect(() => { setSelecting(false); setPickedBooks(new Set()); setPickedGhosts(new Set()); setShowAll(false); setExpandedRuns(new Set()); setFoldedRuns(new Set()); setChapterSheet(null); }, [id, asc]);
 
-  const { data: series } = useQuery({ queryKey: ['series', id], queryFn: () => api<Series>(`/api/series/${id}`), enabled: !!id });
-  const { data: books } = useQuery({
-    queryKey: ['series-books', id],
-    queryFn: () => fetchAllBooks(id),
-    enabled: !!id,
-  });
+  // The same two queries lib/seriesPrefetch.ts asks for at the click that opens this page, so the page usually mounts on
+  // them rather than on its placeholders.
+  const { data: series } = useQuery({ ...seriesQuery(id), enabled: !!id });
+  const { data: books } = useQuery({ ...seriesBooksQuery(id), enabled: !!id });
   // What the sources list that the library lacks, as of the updater's last visit. A courtesy, never a
   // blocker: no retry, and an error renders no ghost rows rather than a message, because the chapters on
   // disk are the page and this is the margin note.
@@ -829,24 +856,35 @@ function SeriesInner() {
   // nav, the profile verb and the palette all go to the bare `/moments`. Counting bookmarks alone left a
   // series with notes and no saved pages with no door at all, and a series with neither unable to write
   // its first note: the same trap the composer's own comment says it avoids one level down.
+  // v0.60.0: the door is More's (lib/seriesActions.ts notesLabel), and the two counts are asked for once More has been
+  // opened on this series -- two requests on every visit bought a line most visits never looked at. A count already
+  // cached from an earlier look is shown at once.
+  const [askedNotes, setAskedNotes] = useState(false);
+  useEffect(() => { setAskedNotes(false); }, [id]);
   const { data: moments } = useQuery({
     queryKey: ['bookmarks', id],
     queryFn: () => api<{ content: unknown[] }>(`/api/bookmarks?seriesId=${encodeURIComponent(id)}`),
-    enabled: !!id,
+    enabled: !!id && askedNotes,
   });
   const { data: seriesNotes } = useQuery({
     queryKey: ['notes', id],
     queryFn: () => api<{ content: unknown[] }>(`/api/notes?seriesId=${encodeURIComponent(id)}`),
-    enabled: !!id,
+    enabled: !!id && askedNotes,
   });
-  const momentCount = moments?.content?.length ?? 0;
-  const noteCount = seriesNotes?.content?.length ?? 0;
+  const notesCounts = moments && seriesNotes ? { moments: moments.content?.length ?? 0, notes: seriesNotes.content?.length ?? 0 } : null;
 
   const [fav, setFav] = useState(false);
-  const [rating, setRating] = useState<number | null>(null);
+  // How many times Favourite was turned on in this visit: each one pops the heart once (components/SeriesKeys.tsx).
+  const [favPops, setFavPops] = useState(0);
   useEffect(() => {
-    if (series?.yomi) { setFav(series.yomi.favorite); setRating(series.yomi.rating); }
+    if (series?.yomi) setFav(series.yomi.favorite);
   }, [series]);
+  useEffect(() => { setFavPops(0); }, [id]);
+  // The reader's own stars are read from the series' cached payload, which a rating changes optimistically
+  // (components/RatingsPanel.tsx useSeriesRating): one copy, so the panel and a refetch never disagree. AniList's word
+  // beside them is the panel's as well -- said once (v0.60.0), where v0.58.0 said both up to three times on the page.
+  const rating = series?.yomi?.rating ?? null;
+  const rate = useSeriesRating(id);
 
   useEffect(() => {
     listDownloads().then((d) => setDownloaded(new Set(d.filter((c) => c.seriesId === id).map((c) => c.bookId))));
@@ -945,14 +983,16 @@ function SeriesInner() {
   const supplyPhone = useMemo(() => supplyLine(supplyInput, false), [supplyInput]);
   const supplyWide = useMemo(() => supplyLine(supplyInput, true), [supplyInput]);
 
-  const resumeBook = useMemo(() => {
-    const c = books?.content ?? [];
-    // A chapter the server deleted has no pages to resume into -- unless this device saved a copy, in which
-    // case that copy is the last one and resuming into it is right. Without this, "Continue" on a series
-    // whose next unread chapter was pruned opened straight onto "Chapter deleted".
+  // The reading button's one choice (lib/continueLabel.ts, v0.60.0): the chapter part-read, the next one after the
+  // highest finished, the first -- or nothing to read. It opened the lowest unfinished chapter under "Start reading"
+  // even after chapters 1 to 10 were read. A chapter the server deleted has no pages to open -- unless this device
+  // saved a copy, in which case that copy is the last one and opening it is right. Without this, "Continue" on a
+  // series whose next unread chapter was pruned opened straight onto "Chapter deleted".
+  const reading = useMemo(() => {
     const openable = (b: Book) => !b.pruned || downloaded.has(b.id);
-    return c.find((b) => !b.readProgress?.completed && openable(b)) || c.find(openable) || c[0];
+    return continueChoice(books?.content ?? [], openable);
   }, [books, downloaded]);
+  const resumeBook = reading.book;
 
   // The list a page at a time (lib/chapterPages.ts). It opens on the page holding `resumeBook`, so a reader
   // on chapter 956 lands among the 900s, and then STAYS there: the page is decided once per series, sort and
@@ -964,6 +1004,9 @@ function SeriesInner() {
   // export renders without localStorage, and the default row is the one to render until we know.
   const [compact, setCompact] = useState(false);
   useEffect(() => { setCompact(compactChaptersOn()); }, []);
+  // This device's chapter layout (#214, lib/chapterView.ts), read after mount for the same reason.
+  const [view, setView] = useState<ChapterView>('columns');
+  useEffect(() => { setView(chapterViewOn()); }, []);
   const [chapterPage, setChapterPage] = useState<number | null>(null);
   useEffect(() => { setChapterPage(null); }, [id, asc, group, showGhosts]);
   // Every row on one page when the account asked for the whole list (pageSizeFor): the pager then has one page and
@@ -1020,23 +1063,22 @@ function SeriesInner() {
     if (scroll) chaptersTop.current?.scrollIntoView({ block: 'start', behavior: 'smooth' });
   };
 
-  const inProgress = books?.content.some((b) => b.readProgress && !b.readProgress.completed);
-
   const back = () => (typeof window !== 'undefined' && window.history.length > 1 ? router.back() : router.push('/'));
 
   const toggleFav = async () => {
     const next = !fav;
     setFav(next);
+    if (next) setFavPops((n) => n + 1);
     try {
       if (next) await api('/api/favorites', { json: { seriesId: id } });
       else await api(`/api/favorites/${id}`, { method: 'DELETE' });
       qc.invalidateQueries({ queryKey: ['home'] });
-    } catch { setFav(!next); }
-  };
-
-  const setStars = async (n: number) => {
-    setRating(n);
-    try { await api(`/api/ratings/${id}`, { method: 'PUT', json: { stars: n } }); } catch {}
+      qc.invalidateQueries({ queryKey: ['library'] });
+    } catch {
+      // Put back, and say so: the heart that stayed lit over a refusal was the one feedback, and it lied.
+      setFav(!next);
+      toast(tr('Could not do that'), 'error');
+    }
   };
 
   const toggleDownload = async (bookId: string) => {
@@ -1131,6 +1173,16 @@ function SeriesInner() {
     await setRead(todo, true);
     toast(todo.length === 1 ? tr('Marked 1 chapter read') : tr('Marked {n} chapters read', { n: todo.length }), 'success', { key: 'mark-read' });
   };
+  // "Mark all unread" (More, v0.60.0): the request a series card's menu makes (components/SeriesMenu.tsx), so the two say
+  // the same. The route deletes this reader's progress on every chapter of the series, and the marks on its grey rows
+  // with it -- unread means those too -- and tells no tracker: a tracker left ahead is the safe direction.
+  const markAllUnread = async () => {
+    try {
+      await api('/api/library/bulk/read', { json: { seriesIds: [id], completed: false } });
+      toast(tr('Marked unread'), 'success');
+    } catch { toast(tr('Could not do that'), 'error'); }
+    for (const k of [['series-books', id], ['series-listing', id], ['series', id], ['home'], ['library'], ['collection']]) qc.invalidateQueries({ queryKey: k });
+  };
 
   // The one download loop, for Save all offline and for Save offline in select mode: stops at the first
   // failure, because the usual cause is a full device and every further attempt would fail the same way.
@@ -1200,6 +1252,11 @@ function SeriesInner() {
   // delete and the server would say `already_pruned` for every one of them. Reintroduce by adding
   // `b.owned &&` back: pick a /library chapter and the delete says "0 deleted" -- or nothing.
   const deletable = pickedBookList.filter((b) => !b.pruned);
+  // #240: the picked chapters' and grey rows' numbers, each once -- a hide is by number -- never a file holding a range.
+  const hideable = useMemo(() => [...new Set([
+    ...pickedBookList.filter((b) => b.numberEnd == null).map((b) => b.number),
+    ...pickedGhostList.filter((g) => g.numberEnd == null).map((g) => g.number),
+  ])].sort((a, b) => a - b), [pickedBookList, pickedGhostList]);
   const pickedCount = pickedBookList.length + pickedGhostList.length;
   // The select bar on the notices' layer stack (lib/layers.ts), measured: it wraps to three rows at 390 px,
   // and a notice has to rise above whichever height it has.
@@ -1299,24 +1356,23 @@ function SeriesInner() {
       if (job ? job.status !== 'downloading' : Date.now() - at > 5000) return job ?? null;
     }
   };
-  // "Fetch all {n}" on an older-chapters run: the same request for the run's numbers, in chunks of at most
-  // FETCH_CHUNK (the route's FILL_MAX_CHAPTERS), each posted only after the previous chunk's job has ENDED.
-  // ⚠️ `startJob` returns when a job has started, not when it is done, and the route answers 409 `busy`
-  // while the series' job runs: the first cut posted the chunks back to back, so on a run past 300 the
-  // reader saw "Fetching 300 chapters…" and then one error toast per further chunk, and the rest was never
-  // fetched. One toast for the whole run; the run stops at the first chunk that fails to start or whose job
-  // ends in error, with that message. `acting` holds for the whole run, so the chip cannot be tapped into
-  // a 409 of its own meanwhile.
-  const fetchMany = async (numbers: number[]) => {
-    const chunks = chunkNumbers(numbers);
+  // One run of requests for this series, in chunks of at most FETCH_CHUNK (the routes' FILL_MAX_CHAPTERS), each
+  // posted only after the previous chunk's job has ENDED. ⚠️ `startJob` returns when a job has started, not when it
+  // is done, and the routes answer 409 `busy` while the series' job runs: the first cut posted the chunks back to
+  // back, so on a run past 300 the reader saw "Fetching 300 chapters…" and then one error toast per further chunk,
+  // and the rest was never fetched. One toast for the whole run; the run stops at the first chunk that fails to start
+  // or whose job ends in error, with that message. `acting` holds for the whole run, so the chip cannot be tapped
+  // into a 409 of its own meanwhile.
+  const postInChunks = async <T,>(items: T[], post: (chunk: T[]) => Promise<{ folder: string; total: number }>) => {
+    const chunks = chunkNumbers(items);
     setActing(true);
     try {
       for (const [i, chunk] of chunks.entries()) {
-        const res = await api<{ folder: string; total: number }>('/api/sources/fetch', { method: 'POST', json: { seriesId: id, numbers: chunk } });
+        const res = await post(chunk);
         setStarted({ folder: res.folder, at: Date.now() });
         void kickDownloads(qc);
         if (i === 0) {
-          toast(fetchingToast(numbers.length), 'info', { busy: true });
+          toast(fetchingToast(items.length), 'info', { busy: true });
           invalidateChapters();
           leaveSelect();
         }
@@ -1329,24 +1385,52 @@ function SeriesInner() {
     }
     setActing(false);
   };
-  const bulkRefetch = () => startJob(`/api/admin/series/${id}/chapters/refetch`, { bookIds: refetchable.map((b) => b.id) });
+  // "Fetch all {n}" on an older-chapters run: the same request for the run's numbers.
+  const fetchMany = (numbers: number[]) => postInChunks(numbers, (chunk) =>
+    api<{ folder: string; total: number }>('/api/sources/fetch', { method: 'POST', json: { seriesId: id, numbers: chunk } }));
+  // The wrong-language notice's Fetch them again (v0.62.0, components/LanguageNotice.tsx): Fetch again for its chapters,
+  // each file replaced in place by the copy in the series' language.
+  const refetchMany = (bookIds: string[]) => postInChunks(bookIds, (chunk) =>
+    api<{ folder: string; total: number }>(`/api/admin/series/${id}/chapters/refetch`, { method: 'POST', json: { bookIds: chunk } }));
+  const refetchBooks = (picked: Book[]) => startJob(`/api/admin/series/${id}/chapters/refetch`, { bookIds: picked.map((b) => b.id) });
   // "Fetch" on one copy in the chapter sheet. A pick names the copy by source and the source's own id (`copySourceId`, never
   // a split on ':'), and the server takes it as an explicit choice: the group rules, blocklist included, do
   // not apply to it. On a ghost row the copy lands as the chapter; on an on-disk row the file is replaced,
   // which is asked about first below.
   const pickGhost = (number: number, copy: VersionCopy) =>
     startJob('/api/sources/fetch', { seriesId: id, picks: [{ number, source: copy.source, sourceId: copySourceId(copy) }] });
+  const [coverPicker, setCoverPicker] = useState(false);
   const [replacing, setReplacing] = useState<{ book: Book; copy: VersionCopy } | null>(null);
+  const [comparing, setComparing] = useState<Book | null>(null);
   const replaceWith = async () => {
     if (!replacing) return;
     await startJob(`/api/admin/series/${id}/chapters/refetch`, { picks: [{ bookId: replacing.book.id, source: replacing.copy.source, sourceId: copySourceId(replacing.copy) }] });
     setReplacing(null);
   };
-  const bulkDelete = async () => {
+  // Hide (#240, bff lib/hiddenChapters.ts): the numbers leave every surface for everyone, and nothing is deleted. In the
+  // route's chunks of 500, as Delete from server is.
+  const hideChapters = async (numbers: number[]) => {
+    setActing(true);
+    try {
+      for (let i = 0; i < numbers.length; i += 500) {
+        await api(`/api/admin/series/${id}/chapters/hide`, { method: 'POST', json: { numbers: numbers.slice(i, i + 500) } });
+      }
+      // What is true now: every number asked about is hidden, whether this press hid it or an earlier one did.
+      toast(numbers.length === 1 ? tr('1 chapter is hidden.') : tr('{n} chapters are hidden.', { n: numbers.length }), 'success');
+      qc.invalidateQueries({ queryKey: ['series-hidden', id] });
+      invalidateChapters();
+      leaveSelect();
+    } catch (e) {
+      toast(msgOf(e, tr('Could not hide that')), 'error');
+    }
+    setActing(false);
+    setHiding(null);
+  };
+  const deleteBooks = async (picked: Book[]) => {
     setActing(true);
     try {
       const res = await api<{ applied: number; skipped: { id: string; reason: string }[] }>(`/api/admin/series/${id}/chapters/delete`, {
-        method: 'POST', json: { bookIds: deletable.map((b) => b.id) },
+        method: 'POST', json: { bookIds: picked.map((b) => b.id) },
       });
       // Say what was skipped rather than silently deleting fewer than were selected, one line per reason
       // present: `not_owned` (the file is in a library the admin built, not one Uchiyomi fetched) and
@@ -1505,85 +1589,119 @@ function SeriesInner() {
     await archiveEnqueue([id], title);
     setActing(false);
   };
+  // ---- the reading button, the four keys and More (v0.60.0) ----------------------------------------------------
+  // Under the cover there were up to twelve stacked buttons, and on a 768-px-tall screen an admin's last ones ran past
+  // the bottom of the sticky column. Now: one button that says what it opens, how far the reader is, and four keys --
+  // Favourite, Offline, List, More. More holds the rest, grouped (lib/seriesActions.ts decides who sees what): a menu
+  // from lg up, a sheet below, where a thumb is.
+  const wide = useWideViewport();
+  const seriesHref = `/series/?id=${encodeURIComponent(id)}`;
+  const notesHref = `/moments/?series=${encodeURIComponent(id)}`;
+  const openReader = () => { if (resumeBook) router.push(`/reader/?book=${resumeBook.id}`); };
+  // While the chapters load the button waits with no words rather than guessing them; a series with none says so at once.
+  const ctaText = books || nothingYet ? continueText(reading) : { label: '', caption: '' };
+  // How far through the series: the chapters on the list once they are here (the list the button chose from), the
+  // series' own counts until then. Nothing on a series with no chapters.
+  const readCount = useMemo(() => (books
+    ? { read: books.content.filter((b) => b.readProgress?.completed).length, total: books.content.length }
+    : { read: series?.booksReadCount ?? 0, total: series?.booksCount ?? 0 }), [books, series]);
+  const readLine = readCountText(readCount.read, readCount.total);
+  // v0.61.0: what comes next -- the release radar's estimate, as an estimate (lib/radar.ts): "Next chapter ~Friday ·
+  // usually Fridays", "Next chapter due any day", "Running late · last release 12d ago"; nothing for a series that is
+  // quiet, ended, on hiatus, undated or not monitored. Before it, how long the chapters left take at this reader's own
+  // pace (lib/readingTime.ts, "Catch up in ~2 hr"), asked only when it can be said: some read, some left.
+  const unreadCount = Math.max(0, readCount.total - readCount.read);
+  const { data: pace } = useQuery({
+    queryKey: ['reading-pace', id],
+    queryFn: () => api<{ perChapterMs: number | null; from: 'series' | 'all' | null }>(`/api/series/${id}/reading-pace`),
+    enabled: !!id && readCount.read > 0 && unreadCount > 0,
+    staleTime: 300_000,
+  });
+  const outlook = [
+    catchUpText({ read: readCount.read, unread: unreadCount, perChapterMs: pace?.perChapterMs }),
+    radarText(series?.yomi?.radar, { autoUpdate: series?.autoUpdate !== false }),
+  ].filter(Boolean).join(' · ');
+  // Check for new chapters, the Sources sheet's and Edit details' own: the same notices, the same polling.
+  const { checking, checkNow } = useCheckNow(id, () => {
+    for (const k of [['series', id], ['series-books', id], ['series-listing', id], ['series-versions', id], ['home']]) qc.invalidateQueries({ queryKey: k });
+  });
+  const copyLink = async () => {
+    try {
+      await navigator.clipboard.writeText(new URL(seriesHref, window.location.href).toString());
+      toast(tr('Link copied'), 'success');
+    } catch { toast(tr('Could not copy the link'), 'error'); }
+  };
+  const moreGroups = seriesActionGroups({
+    isAdmin, mayDownload: canDownload(user), booksCount: series?.booksCount ?? 0, mayArchive,
+    autoHero: !!series?.autoHero, hasFolder: !!series?.folder, offline: authStatus === 'offline', notes: notesCounts,
+    hiddenChapters: series?.hiddenChapters ?? 0,
+    busy: { checkNew: checking, archive: acting, newBanner: busyAdmin },
+  });
+  const runAction = (a: SeriesActionId) => {
+    switch (a) {
+      case 'notes': router.push(notesHref); break;
+      case 'markAllRead': void markAllRead(); break;
+      case 'markAllUnread': void markAllUnread(); break;
+      case 'findMissing': setFindingMissing(true); break;
+      case 'hidden': setShowHidden(true); break;
+      case 'archive': void archiveSlowly(); break;
+      case 'checkNew': void checkNow(); break;
+      case 'copyLink': void copyLink(); break;
+      case 'openTab': window.open(seriesHref, '_blank', 'noopener'); break;
+      case 'edit': setEditing('details'); break;
+      // Change cover (#242): an admin's, from More -- never a key under the art, where a phone reads Continue first.
+      case 'cover': setCoverPicker(true); break;
+      case 'newBanner': void newBanner(); break;
+      case 'rename': setRenaming(true); break;
+      case 'remove': setDeleting(true); break;
+    }
+  };
+  // ⚠️ The sheet closes BEFORE its row's action runs (SeriesMoreSheet's onPick): Edit details, Rename folder, Remove's
+  // typed-title confirmation and Find missing chapters are dialogs, and a dialog opened under a Sheet cannot be tapped.
+  const [moreSheet, setMoreSheet] = useState(false);
+  useEffect(() => { setMoreSheet(false); }, [id]);
+  const more = useContextMenu(() => moreMenuItems(moreGroups, runAction), { label: title });
+  const openMore = (el: HTMLElement) => {
+    setAskedNotes(true);
+    if (wide) more.openFrom(el);
+    else setMoreSheet(true);
+  };
+  const moreOpen = wide ? more.open : moreSheet;
+  // The phone's bar (components/ContinueBar.tsx): once the button is out of view -- under the top bar, or below the
+  // band the bottom nav and the bar itself take -- a compact copy of it, the heart and More. Never in Select mode, whose
+  // bar takes the same place, and never from lg up.
+  const ctaRef = useRef<HTMLDivElement>(null);
+  // A phone's title, on the cover (UI refresh, phone): once it has scrolled under the bar, the bar turns glass and says it.
+  const heroTitleRef = useRef<HTMLHeadingElement>(null);
+  const titleOut = useOutOfView(heroTitleRef, '-72px 0px 0px 0px');
+  const ctaOut = useOutOfView(ctaRef, '-64px 0px -160px 0px');
+  const barShown = !wide && ctaOut && !selecting && !!series;
+
   const Actions = (
-    <div className="mt-4 flex flex-col gap-2">
-      <button onClick={() => resumeBook && router.push(`/reader/?book=${resumeBook.id}`)} disabled={nothingYet || !resumeBook} className="btn-accent w-full disabled:opacity-50">
-        <IcPlay width={18} height={18} /> {nothingYet ? tr('Nothing to read yet') : inProgress ? tr('Continue') : tr('Start reading')}
-      </button>
-      {/*
-        Which chapter that button opens. "Continue" on its own is a promise with no subject: on a long
-        series there is no way to tell whether it resumes the chapter you were part-way through, moves on
-        to the next unread one, or drops you at the top -- and those differ precisely when it matters.
-      */}
-      {!nothingYet && resumeBook && (
-        <p className="-mt-1 truncate text-center text-xs text-fog-500">
-          {/* The page only once there is one: "Mark unread" writes page 0, which read "page 0 of 23". */}
-          {resumeBook.readProgress && !resumeBook.readProgress.completed && resumeBook.media?.pagesCount
-            && (resumeBook.readProgress.page ?? 0) >= 1
-            ? tr('{chapter} · page {page} of {pages}', {
-                chapter: [chapterLabel(resumeBook), chapterName(resumeBook)].filter(Boolean).join(' · '),
-                page: resumeBook.readProgress.page,
-                pages: resumeBook.media.pagesCount,
-              })
-            : [chapterLabel(resumeBook), chapterName(resumeBook)].filter(Boolean).join(' · ')}
-        </p>
-      )}
-      <div className="flex gap-2">
-        <button onClick={toggleFav} className={`flex flex-1 items-center justify-center gap-2 rounded-full border py-3 text-sm ${fav ? 'border-accent/50 bg-accent-soft text-accent' : 'border-ink-700 text-fog-300'}`}>
-          <IcHeart width={18} height={18} fill={fav ? 'currentColor' : 'none'} stroke={fav ? 'none' : 'currentColor'} /> {fav ? tr('In favourites') : tr('Favourite')}
-        </button>
-        {/* "Save all offline", not "Download all": this copies to THIS DEVICE; the server side is Fetch (☁).
-            Never on Uchiyomi Desktop, where this device IS the server (lib/desktop.ts). */}
-        {!nothingYet && !isDesktop() && (
-          <button onClick={downloadAll} disabled={downloadingAll} className="flex flex-1 items-center justify-center gap-2 rounded-full border border-ink-700 py-3 text-sm text-fog-300 disabled:opacity-50">
-            <IcDownload width={18} height={18} /> {downloadingAll ? tr('Saving…') : tr('Save all offline')}
-          </button>
+    <div className="mt-4 flex flex-col gap-2.5">
+      {/* The one reading button. It names the chapter it opens -- "Continue · Ch. 12", "Next · Ch. 11" -- and the line
+          under it says what the label does not: the chapter's own name and how far into it the reader is, or which
+          chapter "Start reading" and "Read again" open. */}
+      <div ref={ctaRef}>
+        <ContinueButton label={ctaText.label} disabled={!resumeBook} onOpen={openReader} />
+      </div>
+      {ctaText.caption && <p data-continue-caption className="-mt-1 truncate text-center text-xs text-fog-500">{ctaText.caption}</p>}
+      {readLine && <ReadProgress read={readCount.read} total={readCount.total} text={readLine} />}
+      {outlook && <p data-series-outlook className="-mt-1 text-start text-[11px] leading-snug text-fog-500">{outlook}</p>}
+      {/* Four keys, or three where there is nothing to save offline. Equal widths, whatever their number. */}
+      <div data-series-keys className="mt-0.5 grid auto-cols-fr grid-flow-col gap-1.5">
+        <FavouriteKey on={fav} pops={favPops} onToggle={toggleFav} />
+        {/* "Save all offline", not "Download all": this copies to THIS DEVICE; the server side is Fetch (☁). Never on
+            Uchiyomi Desktop, where this device IS the server (lib/desktop.ts). The key's word is "Offline", its name the
+            whole action. */}
+        {offlineKeyShown({ nothingYet, desktop: isDesktop() }) && (
+          <SeriesKey icon={downloadingAll ? <ProgressRing progress="spin" size={20} /> : <IcDownload width={20} height={20} aria-hidden />}
+            label={tr('Offline')} name={downloadingAll ? tr('Saving…') : tr('Save all offline')} onClick={downloadAll} disabled={downloadingAll} />
         )}
+        <SeriesKey icon={<IcListAdd />} label={tr('List')} title={tr('Add to list')} onClick={() => setCollecting(true)}
+          attrs={{ 'aria-haspopup': 'dialog' }} />
+        <MoreKey onOpen={openMore} open={moreOpen} menu={wide} />
       </div>
-      <button onClick={() => setCollecting(true)} className="flex items-center justify-center gap-2 rounded-full border border-ink-700 py-2.5 text-sm text-fog-300">
-        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round"><path d="M4 6h16M4 12h16M4 18h10" /><path d="M19 15v6M16 18h6" /></svg>{tr('Add to collection')}</button>
-      {/* Always rendered. It is not a link to an empty page: with nothing saved yet it is the way IN to
-          writing this series' first note, which is the only thing on the other side that can be created. */}
-      <Link href={`/moments/?series=${encodeURIComponent(id)}`}
-        className="flex items-center justify-center gap-2 rounded-full border border-ink-700 py-2.5 text-sm text-fog-300">
-        <IcMoments width={16} height={16} />
-        {momentCount > 0
-          ? (momentCount === 1 ? tr('1 saved page') : tr('{n} saved pages', { n: momentCount }))
-          : noteCount > 0
-            ? (noteCount === 1 ? tr('1 note') : tr('{n} notes', { n: noteCount }))
-            : tr('Add a note')}
-      </Link>
-      <div className="mt-1 flex items-center justify-between">
-        <StarRating value={rating} onSet={setStars} />
-        <span className="text-xs text-fog-500">{rating ? `${rating}/5` : tr('Rate this')}</span>
-      </div>
-      {canDownload(user) && (series?.booksCount ?? 0) >= 3 && (
-        <button onClick={() => setFindingMissing(true)} className="mt-1 flex items-center justify-center gap-2 rounded-full border border-ink-700 py-2.5 text-sm text-fog-300">
-          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><circle cx="11" cy="11" r="7" /><path d="m20 20-3.5-3.5" /><path d="M11 8v6M8 11h6" /></svg>{tr('Find missing chapters')}</button>
-      )}
-      {mayArchive && (
-        <button type="button" onClick={archiveSlowly} disabled={acting} data-archive-slowly
-          className="btn-key mt-1 h-auto w-full py-2.5 text-sm font-normal text-fog-300">
-          <IcHourglass width={16} height={16} />{tr('Archive slowly')}</button>
-      )}
-      {isAdmin && (
-        <>
-          <button onClick={() => setEditing('details')} className="mt-1 flex items-center justify-center gap-2 rounded-full border border-ink-700 py-2.5 text-sm text-fog-300">
-            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><path d="M12 20h9" /><path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4Z" /></svg>{tr('Edit details')}</button>
-          {/* Only while the hero is an automatic one: a real banner is changed in Edit details. */}
-          {series?.autoHero && (
-            <button type="button" onClick={newBanner} disabled={busyAdmin} data-new-banner
-              className="btn-key h-auto w-full py-2.5 text-sm font-normal text-fog-300 disabled:opacity-50">
-              <IcRefresh width={16} height={16} />{tr('New banner')}</button>
-          )}
-          {series?.folder && (
-            <button onClick={() => setRenaming(true)} className="flex items-center justify-center gap-2 rounded-full border border-ink-700 py-2.5 text-sm text-fog-300">
-              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><path d="M3 7V5a2 2 0 0 1 2-2h3.9a2 2 0 0 1 1.69.9L11.7 5H19a2 2 0 0 1 2 2v2" /><path d="M3 9h18l-1.5 9a2 2 0 0 1-2 1.8H6.5a2 2 0 0 1-2-1.8Z" /></svg>{tr('Rename folder')}</button>
-          )}
-          <button onClick={() => setDeleting(true)} className="flex items-center justify-center gap-2 rounded-full border border-ink-700 py-2.5 text-sm text-fog-500 hover:border-rose-500/40 hover:text-rose-300">
-            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round"><path d="M3 6h18M8 6V4h8v2M6 6l1 14h10l1-14" /></svg>{tr('Remove from library')}</button>
-        </>
-      )}
     </div>
   );
 
@@ -1595,7 +1713,8 @@ function SeriesInner() {
     // "{n} behind" used to sit here; the supply line under the title carries that count now ("4 not here
     // yet"), with the source and the groups beside it, and one line saying it is enough.
     updatedAt ? <>{tr('Updated {ago}', { ago: relativeTime(updatedAt) })}</> : null,
-    rating ? <span className="text-accent">★ {rating}/5</span> : null,
+    // The reader's stars and AniList's score were here as well, and over the banner, and under the stars (v0.58.0):
+    // the ratings panel says them once now (components/RatingsPanel.tsx, v0.60.0).
   ].filter(Boolean);
   const Meta = (
     <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-fog-400 lg:text-sm">
@@ -1609,8 +1728,12 @@ function SeriesInner() {
   );
 
   const Genres = !!meta?.genres?.length && (
-    <div className="flex flex-wrap gap-2">
-      {meta.genres.slice(0, 8).map((g) => <span key={g} className="chip text-xs">{g}</span>)}
+    // One row a phone swipes (UI refresh, phone): wrapped, eight genres took three lines before the summary.
+    <div data-lenis-prevent-horizontal className="-mx-4 flex gap-2 overflow-x-auto px-4 [scrollbar-width:none] lg:mx-0 lg:flex-wrap lg:overflow-visible lg:px-0 [&::-webkit-scrollbar]:hidden">
+      {/* Each genre opens the Library filtered by it (UI refresh): a filter, so it keeps the filter chip's shape. */}
+      {meta.genres.slice(0, 8).map((g) => (
+        <Link key={g} href={`/library/?genres=${encodeURIComponent(g)}`} data-series-genre className="chip shrink-0 text-xs transition hover:border-accent/50 hover:text-fog-100">{g}</Link>
+      ))}
     </div>
   );
 
@@ -1626,6 +1749,8 @@ function SeriesInner() {
     <div ref={chaptersTop} className="scroll-mt-20">
       {/* How the chapters are numbered, when that needs saying (#116): above the band, which it can hold. */}
       <NumberingNotice seriesId={id} numbering={listing?.numbering} isAdmin={isAdmin} onReview={setNumberingSheet} />
+      {/* Chapters here in another language than the series' (v0.62.0): the admin's, who can fetch them again. */}
+      {isAdmin && <LanguageNotice notice={versionsData?.otherLanguage} busy={acting || !!started} onFetch={(ids) => void refetchMany(ids)} />}
       {/* What the server is fetching for this series, whoever started it (v0.49.0): above the list it fills. */}
       <SeriesServerDownloads seriesId={id} folder={series?.folder} />
       {/* The heading on its own line and ONE row of four short, text-only chips under it. Measured at
@@ -1634,24 +1759,35 @@ function SeriesInner() {
           -- a nowrap row past the viewport is the 1-pixel horizontal scroll the layout check flags. */}
       <div className="mb-2 flex flex-col gap-2 lg:flex-row lg:items-center lg:justify-between">
         <h2 className="font-display text-lg font-semibold">{tr('Chapters')}</h2>
-        <div className="flex flex-wrap items-center gap-1.5">
-          <button onClick={markAllRead} className="chip text-xs">{tr('Mark all read')}</button>
-          <button onClick={() => setAsc((a) => !a)} className="chip text-xs">{asc ? tr('Oldest') : tr('Newest')}</button>
+        {/* Keys, not chips (UI refresh, noPills.test.ts): these act on the list rather than filter it -- even Filter
+            opens a sheet -- and they sat in a row of capsules right under the squared four keys. */}
+        <div data-chapter-toolbar className="flex flex-wrap items-center gap-1.5">
+          <button onClick={markAllRead} className="btn-key">{tr('Mark all read')}</button>
+          <button onClick={() => setAsc((a) => !a)} className="btn-key">{asc ? tr('Oldest') : tr('Newest')}</button>
           {/* The group filter and the ghost switch live in a sheet; the count of active choices is a tiny
               badge on the chip, not ` · {n}` text, which is what pushed the row past 358 px. Rendered only
               when there is something to filter by. */}
           {(groupNames.length > 0 || ghosts.length > 0 || deletedGhosts.length > 0) && (
-            <button onClick={() => setFilterOpen(true)} aria-haspopup="dialog" className={`chip relative text-xs ${activeFilters > 0 ? 'chip-active' : ''}`}>
+            <button onClick={() => setFilterOpen(true)} aria-haspopup="dialog" className={`btn-key relative ${activeFilters > 0 ? 'btn-key-accent' : ''}`}>
               {tr('Filter')}
               {activeFilters > 0 && (
-                <span data-testid="filter-count" className="absolute -end-1 -top-1 grid h-4 min-w-4 place-items-center rounded-full bg-accent px-1 text-[10px] font-bold leading-none text-black">{activeFilters}</span>
+                <span data-testid="filter-count" className="absolute -end-1.5 -top-1.5 grid h-4 min-w-4 place-items-center rounded-[4px] bg-accent px-[3px] text-[10px] font-bold leading-none text-black">{activeFilters}</span>
               )}
             </button>
           )}
           {/* A mode, not a filter: the library's chip, so the two select modes are one habit. */}
-          <button onClick={() => { setSelecting((v) => !v); clearPicks(); }} className={`chip text-xs whitespace-nowrap ${selecting ? 'chip-active' : ''}`}>
+          <button onClick={() => { setSelecting((v) => !v); clearPicks(); }} className={`btn-key whitespace-nowrap ${selecting ? 'btn-key-accent' : ''}`}>
             {selecting ? tr('Done') : tr('Select')}
           </button>
+          {/* #214: the rows in columns, or one list the page's width so a long title is read whole. From lg up, where the
+              columns are; the Library's own Layout control, so the two read as one habit (lib/chapterView.ts). */}
+          <div className="ms-auto hidden lg:block" data-chapter-view={view}>
+            <Segmented square label={tr('Layout')} value={view} onChange={(v) => { setView(v); setChapterView(v); }}
+              options={[
+                { value: 'columns', label: tr('Columns'), icon: <IcGrid aria-hidden width={15} height={15} /> },
+                { value: 'list', label: tr('List'), icon: <IcRows aria-hidden width={15} height={15} /> },
+              ]} />
+          </div>
         </div>
       </div>
       {group !== ALL_GROUPS && (
@@ -1660,7 +1796,7 @@ function SeriesInner() {
         </p>
       )}
       {pages > 1 && <ChapterPager page={shownPage} pages={pages} rows={rows} asc={asc} total={filteredBooks.length + filteredGhosts.length} onPage={(p) => goPage(p, false)} />}
-      <div className="lg:grid lg:gap-x-8 lg:[grid-template-columns:repeat(auto-fill,minmax(250px,1fr))]">
+      <div className={chapterRowsClass(view)} data-chapter-rows={view}>
         {pageRows.map((r) => {
           if (r.kind === 'book') {
             const b = r.book;
@@ -1670,9 +1806,13 @@ function SeriesInner() {
                 onMark={(mode) => markChapter(b, mode)}
                 onEdit={isAdmin ? () => setEditChapter(b) : undefined}
                 onCopyPath={isAdmin && b.path ? () => void copyPath(b.path!, toast) : undefined}
+                onHide={isAdmin && b.numberEnd == null ? () => setHiding([b.number]) : undefined}
+                onRefetch={isAdmin && b.owned ? () => setConfirming({ what: 'refetch', books: [b] }) : undefined}
+                onDelete={isAdmin && b.owned && !b.pruned ? () => setConfirming({ what: 'delete', books: [b] }) : undefined}
                 selectable={selecting} selected={pickedBooks.has(b.id)} onToggle={() => togglePickBook(b.id)}
                 versions={versionsOf.get(b.number)?.length}
-                onVersions={versionsOf.has(b.number) ? () => setChapterSheet({ number: b.number, book: b }) : undefined} />
+                onVersions={versionsOf.has(b.number) ? () => setChapterSheet({ number: b.number, book: b }) : undefined}
+                onReplaceFrom={isAdmin && b.owned !== false && versionsOf.get(b.number)?.some((c) => !c.onDisk) ? () => setComparing(b) : undefined} />
             );
           }
           if (r.kind === 'ghost') {
@@ -1686,7 +1826,8 @@ function SeriesInner() {
                 onFetch={canDownload(user) && r.ghost.why !== 'blocked'
                   ? () => r.ghost.bookId ? fetchDeleted(r.ghost.bookId) : fetchOne(r.ghost.number)
                   : undefined}
-                onMark={(completed) => markGhost(r.ghost, completed)} />
+                onMark={(completed) => markGhost(r.ghost, completed)}
+                onHide={isAdmin && r.ghost.numberEnd == null ? () => setHiding([r.ghost.number]) : undefined} />
             );
           }
           if (r.kind === 'run') {
@@ -1759,22 +1900,29 @@ function SeriesInner() {
   // v0.52.0 (discussion #72): the bar is up from the moment Select is, saying what it acts on -- chapters. Its Remove
   // was a greyed "Delete from server" until something was ticked, and was read as the way to remove the SERIES (p3t3t3):
   // it reads "Remove 3 chapters" now, and with nothing ticked says how to use it and where the series' own Remove is.
+  // UI refresh: keys, as the Library's select bar has been since v0.60.0 -- they act on the picked chapters.
   const Toolbar = selecting && (
-    <div ref={toolbarRef} className="fixed inset-x-0 bottom-[calc(5.75rem+env(safe-area-inset-bottom))] z-40 border-t border-ink-700 bg-ink-950/95 px-4 pb-3 pt-3 backdrop-blur-xl lg:bottom-0 lg:pb-[max(0.75rem,env(safe-area-inset-bottom))]">
+    <div ref={toolbarRef} className="fixed inset-x-0 bottom-[calc(5.75rem+env(safe-area-inset-bottom))] z-40 border-t border-ink-700 bg-ink-950/95 px-4 pb-3 pt-3 backdrop-blur-xl lg:bottom-0 lg:start-[var(--rail-w)] lg:pb-[max(0.75rem,env(safe-area-inset-bottom))]">
       <div className="mx-auto flex max-w-3xl flex-wrap items-center gap-2">
         <span className="me-auto text-sm font-medium text-fog-100">{acting ? '…' : selectedText(pickedCount)}</span>
-        <button disabled={acting || !pickedCount} onClick={() => bulkMark(true)} className="chip text-xs disabled:opacity-50">{tr('Mark read')}</button>
-        <button disabled={acting || !pickedCount} onClick={() => bulkMark(false)} className="chip text-xs disabled:opacity-50">{tr('Mark unread')}</button>
+        <button disabled={acting || !pickedCount} onClick={() => bulkMark(true)} className="btn-key">{tr('Mark read')}</button>
+        <button disabled={acting || !pickedCount} onClick={() => bulkMark(false)} className="btn-key">{tr('Mark unread')}</button>
         {/* The two icons say which side each acts on: ⬇ this device, ☁ the server. */}
-        {!isDesktop() && <button disabled={acting || !saveable.length} onClick={bulkSave} className="chip text-xs disabled:opacity-50"><IcDownload width={14} height={14} />{tr('Save offline')}</button>}
-        {canDownload(user) && <button disabled={acting || !fetchable.length} onClick={bulkFetch} className="chip text-xs disabled:opacity-50"><IcCloudDownload width={14} height={14} />{tr('Fetch')}</button>}
-        {isAdmin && <button disabled={acting || !refetchable.length} onClick={() => setConfirming('refetch')} className="chip text-xs disabled:opacity-50"><IcCloudDownload width={14} height={14} />{tr('Fetch again')}</button>}
+        {!isDesktop() && <button disabled={acting || !saveable.length} onClick={bulkSave} className="btn-key"><IcDownload width={14} height={14} />{tr('Save offline')}</button>}
+        {canDownload(user) && <button disabled={acting || !fetchable.length} onClick={bulkFetch} className="btn-key"><IcCloudDownload width={14} height={14} />{tr('Fetch')}</button>}
+        {isAdmin && <button disabled={acting || !refetchable.length} onClick={() => setConfirming({ what: 'refetch', books: refetchable })} className="btn-key"><IcCloudDownload width={14} height={14} />{tr('Fetch again')}</button>}
+        {/* #240: hidden for everyone, nothing deleted -- beside the server keys, and never the red one, which deletes. */}
         {isAdmin && (
-          <button disabled={acting || !deletable.length} onClick={() => setConfirming('delete')} data-remove-chapters className="chip text-xs text-rose-300 disabled:opacity-50">
+          <button disabled={acting || !hideable.length} onClick={() => setHiding(hideable)} data-hide-chapters className="btn-key">
+            {hideable.length === 1 ? tr('Hide 1 chapter') : hideable.length ? tr('Hide {n} chapters', { n: hideable.length }) : tr('Hide chapters')}
+          </button>
+        )}
+        {isAdmin && (
+          <button disabled={acting || !deletable.length} onClick={() => setConfirming({ what: 'delete', books: deletable })} data-remove-chapters className="btn-key btn-key-danger text-rose-300">
             {deletable.length === 1 ? tr('Remove 1 chapter') : deletable.length ? tr('Remove {n} chapters', { n: deletable.length }) : tr('Remove chapters')}
           </button>
         )}
-        <button disabled={acting} onClick={leaveSelect} className="chip text-xs text-fog-500 disabled:opacity-50">{tr('Cancel')}</button>
+        <button disabled={acting} onClick={leaveSelect} className="btn-key text-fog-400">{tr('Cancel')}</button>
       </div>
       {/* Nothing to remove ticked: how to, and the whole series' Remove, which this bar is not. Reintroduce by dropping
           this line: "the bar says how to remove chapters, and where the series' own Remove is" in seriesPage.test.ts. */}
@@ -1789,32 +1937,66 @@ function SeriesInner() {
     </div>
   );
 
+  // The banner dims as the page scrolls away from it (UI refresh), and stays still under Reduce effects or reduced
+  // motion. Both switches read on every render, in this order (effects.test.ts).
+  const plain = useReduceEffects();
+  const still = useReducedMotion();
+  const reduced = plain || !!still;
+  const { scrollY } = useScroll();
+  const artDim = useTransform(scrollY, [0, 420], [1, 0.35]);
+  // Its art starts at the top of the window: the desktop top bar is see-through over it (lib/overArt.ts).
+  useArtUnderChrome();
+
   // Room under the last rows while the bar is up: on a phone that is the bar (three rows of chips at
   // 390 px) plus the nav it now sits on, so pb-24 left the last two chapters unreachable. SelectBarRoom, at the end.
   return (
-    <div className="min-h-screen-d">
-      {/* sticky back bar */}
-      <div className="safe-top sticky top-0 z-30 flex items-center gap-2 bg-linear-to-b from-ink-950 to-transparent px-4 pb-3 lg:static lg:bg-none lg:px-0 lg:py-4">
-        <button onClick={back} className="grid h-10 w-10 shrink-0 place-items-center rounded-full bg-ink-800/70 text-fog-100 backdrop-blur lg:bg-ink-850">
-          <IcChevronLeft width={22} height={22} />
+    <div className="relative min-h-screen-d">
+      {/* sticky back bar on a phone; on a desktop the back key floats over the art, under the top bar (UI refresh) */}
+      {/* `top` clears the top bar: the hero's `under-topbar` margin collapses through this page's root, which therefore
+          starts under the bar too. */}
+      {/* A phone's bar is clear over the cover, and glass with the title once the cover's own title has scrolled under it
+          (UI refresh, phone). It was a fade to transparent the whole way down, and the reading button scrolling under it
+          showed through, as if the two had collided. */}
+      <div data-series-bar={!wide && titleOut ? 'glass' : 'clear'}
+        className={`safe-top sticky top-0 z-30 flex items-center gap-2 px-4 pb-3 transition-[background-color,box-shadow] duration-200 lg:absolute lg:start-0 lg:top-[calc(var(--topbar-h)+1rem)] lg:z-20 lg:p-0 ${!wide && titleOut ? 'glass-strong shadow-[0_1px_0_rgb(255_255_255/0.06)]' : ''}`}>
+        <button onClick={back} aria-label={tr('Back')} className="grid h-10 w-10 shrink-0 place-items-center rounded-full bg-ink-800/70 text-fog-100 backdrop-blur lg:border lg:border-white/15 lg:bg-black/40">
+          <IcChevronLeft width={22} height={22} className="rtl:-scale-x-100" />
         </button>
-        <span className="truncate text-sm text-fog-300 lg:text-base">{title}</span>
+        <span aria-hidden={!titleOut} className={`truncate text-sm font-medium text-fog-100 transition-opacity duration-200 lg:hidden ${titleOut ? 'opacity-100' : 'opacity-0'}`}>{title}</span>
       </div>
 
       {/* banner — real art pulled from the internet (AniList), else the one the server made from the series' own pages
           (v0.51.0), genre-banner fallback. A real banner is shown sharp (v0.53.0: it was blurred like the stand-in
           cover); a series without one keeps the blurred wash of its cover. The gradients below keep the title readable. */}
-      <div className="relative -mt-[58px] h-64 overflow-hidden lg:mt-0 lg:h-[22rem] lg:rounded-3xl">
-        {series && <Backdrop seriesId={id} genres={series.metadata?.genres} version={series.artVersion} autoHero={series.autoHero} banner className="absolute inset-0" />}
-        <div className="absolute inset-0 bg-linear-to-t from-ink-950 via-ink-950/65 to-ink-950/30" />
+      {/* UI refresh: the window's whole width from its top edge, under the see-through top bar (lib/overArt.ts), the
+          automatic banner as whole strips (components/MosaicArt.tsx), dimming as the page scrolls away from it. */}
+      {/* A phone's hero is the cover itself (UI refresh, phone): a 2:3 cover the screen's width is the shape of a phone held
+          upright, so it fills the hero edge to edge with real art. The banner is 4.75:1, and a phone showed a slice of its
+          middle in a 288-px strip, with the cover and a four-line title squeezed beside it. */}
+      <div data-series-hero className="bleed-lg under-topbar relative h-[min(150vw,82svh)] overflow-hidden max-lg:-mt-[58px] lg:h-[min(56vh,34rem)]">
+        {series && <motion.div className="absolute inset-0" style={{ opacity: reduced ? 1 : artDim }}>{wide ? <HeroArt series={series} version={series.artVersion} banner className="absolute inset-0" /> : <PhoneHeroCover id={id} version={series.artVersion} still={reduced} />}</motion.div>}
+        {/* A phone's art is shown, so a short scrim under the bar and a fade at the foot for the title: the desktop's wash
+            darkened all of it. */}
+        <div className="absolute inset-x-0 top-0 h-32 bg-linear-to-b from-black/55 to-transparent lg:hidden" />
+        <div className="absolute inset-x-0 bottom-0 h-[62%] bg-linear-to-t from-ink-950 via-ink-950/55 to-transparent lg:hidden" />
+        <div className="absolute inset-0 hidden bg-linear-to-t from-ink-950 via-ink-950/65 to-ink-950/30 lg:block" />
         <div className="pointer-events-none absolute inset-0" style={{ background: 'radial-gradient(85% 95% at 22% 0%, rgb(var(--cover, 124 92 255) / 0.32), transparent 62%)' }} />
+        {/* a phone's title, on the cover's foot (UI refresh, phone) */}
+        <motion.div initial={reduced ? false : { opacity: 0, y: 14 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.5, delay: 0.08, ease: [0.22, 0.61, 0.36, 1] }}
+          className="absolute inset-x-0 bottom-0 px-4 pb-3 lg:hidden">
+          {meta?.status && (
+            <span className="mb-2 inline-block rounded-md bg-white/15 px-2 py-0.5 text-2xs font-semibold uppercase tracking-wide text-white backdrop-blur rtl:tracking-normal">{statusText(meta.status)}</span>
+          )}
+          <h1 ref={heroTitleRef} dir="auto" className="line-clamp-3 break-words font-display text-[2rem] font-bold leading-[1.05] text-white [text-shadow:0_2px_18px_rgba(0,0,0,0.75)]">{title}</h1>
+          <div className="mt-2">{Meta}</div>
+        </motion.div>
         {/* desktop title-over-art (Jellyfin style) — offset to the right of the floating poster */}
         <motion.div initial={{ opacity: 0, y: 12 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.55, delay: 0.08, ease: [0.22, 0.61, 0.36, 1] }}
-          className="pointer-events-none absolute inset-x-0 bottom-0 hidden flex-col justify-end p-8 lg:flex lg:ps-[288px]">
-          {(meta?.status || rating) && (
+          className="pointer-events-none absolute inset-x-0 bottom-0 hidden flex-col justify-end p-8 lg:flex lg:ps-[calc(var(--rail-w)+2rem+288px)]">
+          {meta?.status && (
             <div className="mb-2 flex items-center gap-2">
-              {meta?.status && <span className="chip text-[11px] capitalize">{statusText(meta.status)}</span>}
-              {rating ? <span className="chip text-[11px] text-accent">★ {rating}/5</span> : null}
+              {/* A status, so a squared tag (noPills.test.ts), not the filter chip's capsule. */}
+              <span data-series-status className="rounded-md bg-white/10 px-2 py-0.5 text-2xs font-semibold uppercase tracking-wide text-fog-100 backdrop-blur rtl:tracking-normal">{statusText(meta.status)}</span>
             </div>
           )}
           <h1 dir="auto" className="font-display text-4xl font-bold leading-tight text-white [text-shadow:0_2px_16px_rgba(0,0,0,0.6)]">{title}</h1>
@@ -1827,29 +2009,35 @@ function SeriesInner() {
       {/* content */}
       <div className="px-4 lg:grid lg:grid-cols-[260px_1fr] lg:gap-8 lg:px-0">
         {/* cover + actions */}
-        <div className="-mt-20 lg:-mt-32 lg:sticky lg:top-20 lg:self-start">
-          <div className="flex items-end gap-4 lg:block">
-            <motion.div initial={{ opacity: 0, y: 18, scale: 0.97 }} animate={{ opacity: 1, y: 0, scale: 1 }} transition={{ duration: 0.5, ease: [0.22, 0.61, 0.36, 1] }}
-              className="h-44 w-32 shrink-0 overflow-hidden rounded-2xl border border-ink-600 shadow-lift lg:h-auto lg:w-full">
-              {series && <Img src={img.seriesThumb(id, series.artVersion, 800)} alt={series.name} className="aspect-[2/3] h-full w-full" />}
-            </motion.div>
-            {/* title beside cover on mobile */}
-            <div className="min-w-0 pb-1 lg:hidden">
-              <h1 dir="auto" className="font-display text-2xl font-bold leading-tight text-white">{title}</h1>
-              {Meta}
-            </div>
-          </div>
-          {/* Under the cover and the title, full width: beside the cover a 390-px screen leaves the chips ~210 px. */}
-          {editions && <EditionChips editions={editions} onAdd={addLanguage} className="mt-3 lg:hidden" />}
-          {/* The supply line, phone form: under the title block, full width, before the actions. The desktop
-              form is the first row of the right column (the title block over the banner is
-              `pointer-events-none`, so a button cannot live there). */}
-          <div className="mt-3 lg:hidden"><SupplyLine parts={supplyPhone} loaded={supplyLoaded} wide={false} onOpen={() => setSourcesOpen(true)} /></div>
+        <div className="relative z-10 lg:-mt-48 lg:sticky lg:top-[calc(var(--topbar-h)+1rem)] lg:self-start">
+          {/* The poster, a desktop's: a phone's hero is the cover itself (UI refresh, phone). */}
+          <motion.div initial={{ opacity: 0, y: 18, scale: 0.97 }} animate={{ opacity: 1, y: 0, scale: 1 }} transition={{ duration: 0.5, ease: [0.22, 0.61, 0.36, 1] }}
+            className="hidden overflow-hidden rounded-2xl border border-ink-600 shadow-lift lg:block lg:w-full">
+            {series && wide && (isAdmin ? (
+              <button type="button" onClick={() => setCoverPicker(true)} aria-label={tr('Change cover')} title={tr('Change cover')} data-cover-button
+                className="group relative block h-full w-full focus-visible:outline-2 focus-visible:outline-accent">
+                <Img src={img.seriesThumb(id, series.artVersion, 800)} alt="" className="aspect-[2/3] h-full w-full" />
+                <span className="pointer-events-none absolute inset-x-0 bottom-0 bg-gradient-to-t from-black/80 to-transparent px-2 pb-2 pt-6 text-center text-xs font-medium text-white opacity-0 transition group-hover:opacity-100 group-focus-visible:opacity-100">{tr('Change cover')}</span>
+              </button>
+            ) : <Img src={img.seriesThumb(id, series.artVersion, 800)} alt={series.name} className="aspect-[2/3] h-full w-full" />)}
+          </motion.div>
+          {/* On a phone the reading button and the four keys come first, right under the art (UI refresh, phone); the
+              ratings, the languages and the supply line follow. A desktop's left column is the poster and these. */}
           {Actions}
+          {/* The ratings, phone form. The desktop form is the first row of the right column. */}
+          {series && <div className="mt-4 lg:hidden"><RatingsPanel anilist={series.yomi?.anilist} rating={rating} onRate={rate} /></div>}
+          {/* Full width: beside a cover a 390-px screen left the chips ~210 px. */}
+          {editions && <EditionChips editions={editions} onAdd={addLanguage} className="mt-3 lg:hidden" />}
+          {/* The supply line, phone form. The desktop form is the first row of the right column (the title block over the
+              banner is `pointer-events-none`, so a button cannot live there). */}
+          <div className="mt-3 lg:hidden"><SupplyLine parts={supplyPhone} loaded={supplyLoaded} wide={false} onOpen={() => setSourcesOpen(true)} /></div>
         </div>
 
         {/* info + chapters */}
         <div className="mt-7 flex flex-col gap-4 lg:mt-4">
+          {/* The ratings, desktop form: the top of this column, where the sticky one beside it has no room left -- and
+              no wider than its two tiles need. */}
+          {series && <div className="hidden lg:block"><RatingsPanel anilist={series.yomi?.anilist} rating={rating} onRate={rate} className="max-w-[440px]" /></div>}
           <div className="hidden lg:block"><SupplyLine parts={supplyWide} loaded={supplyLoaded} wide onOpen={() => setSourcesOpen(true)} /></div>
           {Genres}
           {Summary}
@@ -1859,7 +2047,7 @@ function SeriesInner() {
 
       {/* The sheets. One at a time (see the state above); each closes itself before anything else opens. */}
       {sourcesOpen && (
-        <SourcesSheet id={id} series={series} groups={groups} admin={adminGroups} error={groupsError} isLoading={groupsLoading} haveNumbers={liveNumbers}
+        <SourcesSheet id={id} title={title} series={series} groups={groups} admin={adminGroups} error={groupsError} isLoading={groupsLoading} haveNumbers={liveNumbers}
           checkedAt={supplyChecked}
           onSaved={() => { for (const k of [['series', id], ['series-books', id], ['home'], ['library']]) qc.invalidateQueries({ queryKey: k }); }}
           onClose={() => setSourcesOpen(false)}
@@ -1969,35 +2157,76 @@ function SeriesInner() {
           onAddEdition={addEdition ? (o) => { setFindingMissing(false); addEdition(o); } : undefined} />
       )}
       {Toolbar}
-      {confirming === 'delete' && (
+      {/* After the select bar, which takes the same place and hides this one. */}
+      <ContinueBar shown={barShown}>
+        <ContinueButton compact label={ctaText.label} disabled={!resumeBook} onOpen={openReader} />
+        <FavouriteKey compact on={fav} pops={favPops} onToggle={toggleFav} />
+        <MoreKey compact onOpen={openMore} open={moreSheet} menu={false} />
+      </ContinueBar>
+      {more.element}
+      {moreSheet && (
+        <SeriesMoreSheet title={title} groups={moreGroups} notesHref={notesHref}
+          onPick={(a) => { setMoreSheet(false); runAction(a); }} onClose={() => setMoreSheet(false)} />
+      )}
+      {confirming?.what === 'delete' && (
         <ConfirmDialog
-          title={deletable.length === 1 ? tr('Delete 1 chapter from the server?') : tr('Delete {n} chapters from the server?', { n: deletable.length })}
+          title={confirming.books.length === 1 ? tr('Delete 1 chapter from the server?') : tr('Delete {n} chapters from the server?', { n: confirming.books.length })}
           danger
           busy={acting}
           confirmLabel={tr('Delete from server')}
           body={
             <>
-              <p>{tr('The files are deleted from the server. The chapters stay listed and everyone keeps their reading history, but anyone partway through one loses their place.')}</p>
+              <p>{confirming.books.length === 1
+                ? tr('The file is deleted from the server. The chapter stays listed and everyone keeps their reading history, but anyone partway through it loses their place.')
+                : tr('The files are deleted from the server. The chapters stay listed and everyone keeps their reading history, but anyone partway through one loses their place.')}</p>
               {/* The two skips the server applies for the same reasons the scheduled cleanup does, said
                   before the click rather than only in the toast after it. */}
               <p className="mt-2">{tr('A chapter somebody has bookmarked, and a chapter in a library you assembled yourself, is skipped.')}</p>
               <p className="mt-2">{tr('Fetch again brings a chapter back.')}</p>
             </>
           }
-          onConfirm={bulkDelete}
+          onConfirm={() => deleteBooks(confirming.books)}
           onClose={() => setConfirming(null)}
         />
       )}
-      {confirming === 'refetch' && (
+      {confirming?.what === 'refetch' && (
         <ConfirmDialog
-          title={tr('Fetch {n} chapters again?', { n: refetchable.length })}
+          title={confirming.books.length === 1 ? tr('Fetch 1 chapter again?') : tr('Fetch {n} chapters again?', { n: confirming.books.length })}
           danger
           busy={acting}
           confirmLabel={tr('Fetch again')}
           body={<p>{tr('Each file is replaced with the copy the translation rules choose now. A different group’s copy may have a different page count, so reading positions inside the chapter may shift.')}</p>}
-          onConfirm={bulkRefetch}
+          onConfirm={() => refetchBooks(confirming.books)}
           onClose={() => setConfirming(null)}
         />
+      )}
+      {/* #240: a hide asks first -- it changes the series for everyone -- but it is no delete: the plain key, not the red. */}
+      {hiding && (
+        <ConfirmDialog
+          title={hiding.length === 1 ? tr('Hide chapter {n}?', { n: hiding[0] }) : tr('Hide {n} chapters?', { n: hiding.length })}
+          busy={acting}
+          confirmLabel={hiding.length === 1 ? tr('Hide chapter {n}', { n: hiding[0] }) : tr('Hide {n} chapters', { n: hiding.length })}
+          body={
+            <>
+              <p>{hiding.length === 1
+                ? tr('Hidden for everyone: it leaves the chapter list, Continue, the unread counts, Updates and Health, and it is never downloaded again. For a chapter a source lists that is not part of this series.')
+                : tr('Hidden for everyone: they leave the chapter list, Continue, the unread counts, Updates and Health, and they are never downloaded again. For chapters a source lists that are not part of this series.')}</p>
+              <p className="mt-2">{hiding.length === 1
+                ? tr('Nothing is deleted: Show hidden chapters, under More, brings it back as it was.')
+                : tr('Nothing is deleted: Show hidden chapters, under More, brings them back as they were.')}</p>
+            </>
+          }
+          onConfirm={() => void hideChapters(hiding)}
+          onClose={() => setHiding(null)}
+        />
+      )}
+      {showHidden && <HiddenChaptersDialog seriesId={id} onClose={() => setShowHidden(false)} onChanged={invalidateChapters} />}
+      {coverPicker && <CoverPickerSheet seriesId={id} artVersion={series?.artVersion} onClose={() => setCoverPicker(false)} />}
+      {comparing && (
+        <CompareCopiesDialog seriesId={id} book={comparing} copies={versionsOf.get(comparing.number) ?? []} sourceNames={sourceNames}
+          // The compare closes FIRST, then the confirm opens: the same Modal-over-Modal rule as the versions sheet.
+          onReplace={(copy) => { const b = comparing; setComparing(null); setReplacing({ book: b, copy }); }}
+          onClose={() => setComparing(null)} />
       )}
       {replacing && (
         <ConfirmDialog
@@ -2015,12 +2244,17 @@ function SeriesInner() {
         />
       )}
 
+      {/* v0.61.0: what AniList relates this series to -- sequels, prequels, side stories -- just above More like this. */}
+      <RelatedRail seriesId={id} />
       {(similar?.content?.length ?? 0) > 0 && (
         <section className="mt-10">
           <SectionTitle>{tr('More like this')}</SectionTitle>
-          <Rail>{similar!.content.map((s) => <SeriesCard key={s.id} series={s} />)}</Rail>
+          <ScrollRail label={tr('More like this')} className={CARD_RAIL}>{similar!.content.map((s) => <SeriesCard key={s.id} series={s} />)}</ScrollRail>
         </section>
       )}
+      {/* Room under the last rows for the phone's bar (ContinueBar), which can be up whenever the button has scrolled
+          away; the select bar's own room takes over while Select is on. */}
+      {!Toolbar && <div aria-hidden className="h-16 lg:hidden" />}
       {Toolbar && <SelectBarRoom />}
     </div>
   );

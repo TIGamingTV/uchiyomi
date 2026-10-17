@@ -38,11 +38,12 @@ import { assess, verdict, followable, MIN_HAVE, MIN_COVERAGE } from './fill';
 import { logAudit } from './audit';
 import type { SourceChapter } from './sources/types';
 import { normTitle } from './titleMatch';
+import { followLimit } from './followLimit';
 import { altTitlesFor, MIN_ALT_KEY } from './altTitles';
 import { languageFits, seriesLanguage } from './seriesLang';
 
-/** How many sources a series may FOLLOW, on top of its primary. */
-export const MAX_FOLLOWERS = 2;
+/** How many sources a series may FOLLOW, on top of its primary (env MAX_FOLLOWED_SOURCES, 1 to 6, default 2: lib/followLimit.ts). */
+export const MAX_FOLLOWERS = followLimit();
 /** How many of an add's candidates are asked at all; the rest are `not_tried`. */
 export const MAX_AUTO_CANDIDATES = 6;
 /**
@@ -266,7 +267,10 @@ export async function judgeCandidate(
   // every automatic path shares -- the add's auto-follow, the hunt, Find other sources and its review, borrowed
   // names. Reintroduce by dropping it: "auto-follow refuses a source in another language" in
   // languageGuard.int.test.ts asks the Spanish source for its chapters and follows it.
-  if (!languageFits(candidate.source, { lang: primary.lang, sameBaseSibling: primary.exactLang })) return { ...base, why: 'language_differs' };
+  // A source in every language is refused here too (v0.62.0, `mixed: false`): nothing says which of its copies is in
+  // the series' language. Reintroduce by dropping it: "auto-follow refuses a source in every language" in
+  // languageGuard.int.test.ts follows it.
+  if (!languageFits(candidate.source, { lang: primary.lang, sameBaseSibling: primary.exactLang }, { mixed: false })) return { ...base, why: 'language_differs' };
   const h = opts.health
     ? opts.health.get(candidate.source) ?? null
     : await one<Pick<SourceHealth, 'disabled' | 'blocked_until'>>(

@@ -54,7 +54,7 @@ export interface OfflineChapter {
    * `missing` (v0.40.0) likewise: the placeholder bytes download like any page, and the caption over them
    * is drawn from this flag, so a chapter saved short still explains itself with no network.
    */
-  pages: { number: number; width: number | null; height: number | null; junk?: boolean; missing?: true }[];
+  pages: { number: number; width: number | null; height: number | null; junk?: boolean; missing?: true; join?: 'rtl' | 'ltr' }[];
 }
 
 /**
@@ -296,7 +296,7 @@ export async function downloadChapter(
     // consults BEFORE the server for a downloaded chapter, so a flag that only lives in the manifest is a
     // flag the reader never sees. Reintroduce by dropping `missing` here: a chapter saved short, downloaded,
     // shows a blank grey page offline where online it shows the caption.
-    pages: manifest.pages.map((p) => ({ number: p.number, width: p.width, height: p.height, junk: p.junk, missing: p.missing })),
+    pages: manifest.pages.map((p) => ({ number: p.number, width: p.width, height: p.height, junk: p.junk, missing: p.missing, join: p.join })),
   };
   await d.put('chapters', meta);
   invalidateDownloadedSeries();
@@ -355,6 +355,11 @@ export interface ProgressEvent {
   page: number;
   completed: boolean;
   deviceId?: string;
+  /**
+   * v0.61.0: read under Incognito reading (lib/incognito.ts). Kept with the event and sent with it, so a page read while
+   * it was on stays out of history even when the queue flushes after it was turned off.
+   */
+  incognito?: boolean;
 }
 
 export async function queueProgress(ev: ProgressEvent): Promise<void> {
@@ -416,7 +421,7 @@ export async function flushOutbox(): Promise<number> {
     try {
       await api(`/api/books/${ev.bookId}/progress`, {
         method: 'PUT',
-        json: { page: ev.page, completed: ev.completed, seriesId: ev.seriesId, deviceId: ev.deviceId, at: ev.ts },
+        json: { page: ev.page, completed: ev.completed, seriesId: ev.seriesId, deviceId: ev.deviceId, at: ev.ts, ...(ev.incognito ? { incognito: true } : {}) },
       });
       await d.delete('outbox', ev.id);
       sent++;

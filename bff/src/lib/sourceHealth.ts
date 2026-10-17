@@ -44,7 +44,8 @@ export function classify(err: unknown, httpStatus?: number): SourceStatus | null
   const m = (err instanceof Error ? err.message : String(err ?? '')).toLowerCase();
   if (httpStatus === 429 || RATE_LIMIT_WORDS.test(m)) return 'rate_limited';
   if (httpStatus === 403 || /\b403\b|just a moment|cloudflare|challenge|cf-chl|forbidden|access denied|blocked/.test(m)) return 'blocked';
-  if (httpStatus === 503 || httpStatus === 502 || httpStatus === 504 || /timeout|timed out|econn|enotfound|fetch failed|network|\b50[234]\b/.test(m)) return 'down';
+  // "deadline exceeded": trawl 1.8.0's words for a solve that used up its budget (v0.69.1); 1.7.0 said "…-challenge-timeout".
+  if (httpStatus === 503 || httpStatus === 502 || httpStatus === 504 || /timeout|timed out|deadline exceeded|econn|enotfound|fetch failed|network|\b50[234]\b/.test(m)) return 'down';
   return null;
 }
 
@@ -147,6 +148,37 @@ export async function reportSlow(sourceId: string, ms: number): Promise<void> {
        updated_at    = now()`,
     [sourceId, `timeout after ${ms}ms`],
   ).catch(() => {});
+}
+
+/**
+ * A search answered inside our budget ends a slow streak, as a listing page that arrives in time does (reportLatest):
+ * SLOW_PATIENCE counts over-budget answers IN A ROW. A Discover search counted its timeouts here and never ended a
+ * streak, so one evening's burst of searches through a busy solver left mangaread, Manhuaus, Manhuaplus and Natomanga
+ * "slow" on Health for six days of fast searches, downloads and passing daily checks (v0.55.10). Status, cooldown and
+ * the failure counter are reportOk's and untouched here.
+ */
+export async function reportTimely(sourceId: string): Promise<void> {
+  await q('UPDATE source_health SET slow_streak = 0 WHERE source_id = $1 AND slow_streak <> 0', [sourceId]).catch(() => {});
+}
+
+/** How long a slow streak speaks for its source with nothing added to it: a day of browsing. */
+export const SLOW_FRESH_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * The slow streak as evidence now: the stored count while its newest over-budget answer is under SLOW_FRESH_MS old, else
+ * 0. "It keeps taking longer than 15 s" is about browsing today, and a streak nobody has added to in a day says nothing
+ * about the next search. Health, a Test's verdict and Discover's source list read it through here; the stored count is
+ * left as it is, so a source slow again tomorrow carries on from it. Reintroduce by reading `slow_streak` as stored:
+ * "a slow streak nobody has added to in a day is no finding" in health.int.test.ts finds the row.
+ */
+export function slowStreakNow(
+  row: { slow_streak?: number | null; last_slow_at?: string | Date | null } | null | undefined, now = Date.now(),
+): number {
+  const n = row?.slow_streak ?? 0;
+  if (n <= 0) return 0;
+  // reportSlow stamps every count; a streak with no stamp has an unknown age, and unknown is not stale.
+  if (!row?.last_slow_at) return n;
+  return now - new Date(row.last_slow_at).getTime() < SLOW_FRESH_MS ? n : 0;
 }
 
 /** Is this source currently in a cooldown (recently blocked/rate-limited)? Used to warn before adding. */

@@ -50,6 +50,8 @@ import { logAudit } from './audit';
 import { containedPath } from './fsGuard';
 import { countPages } from './pageCount';
 import { haveNumbers } from './libraryNumbers';
+import { atHiddenNumber } from './noticeChapters';
+import { numberHiddenNow } from './hiddenChapters';
 import { archiveHoles, type ArchiveHoles } from './archiveBoundaries';
 import { DL_ROOT, persistScan, setBookDates, setBookMeta } from './library';
 import { restampBook } from './partial';
@@ -62,6 +64,7 @@ import { automaticChapterAllowedFor, automaticCopiesFor, copyToChapter, seriesFo
 import { groupsOf, normGroup, type ReleasePrefs } from './releases';
 import { effectivePrefsFor, readSeriesPrefs } from './scanlatorPrefs';
 import { borrowNamesFor, NAMES_RETRY_MS } from './borrowNames';
+import { fillDetailsFromAniList, fillDetailsFromSources, fillDetailsOn, seriesLackingDetails } from './autoDetails';
 import { busyFolders } from './bulkNewest';
 import { beginRun, dismissRun, endRun, stopRequested, type RunCard } from './downloadJobs';
 import { say } from './said';
@@ -74,7 +77,8 @@ import { assess, gapsOf, splitAtFloor } from './fill';
 // The Health page's own query for "which sources blame the solver", shared rather than copied: the solver
 // step clears state only when something is really failing inside the solver, and that must be the same
 // question the page answers or the button and the page disagree about whether there is anything to do.
-import { solverBlaming, gapsAnswered, plausibleNumbers, type StoredGaps } from './health';
+import { solverBlaming, gapsAnswered, plausibleNumbers, measured, MEASURE_PER_REPORT, type StoredGaps } from './health';
+import { longStrip, type PageDim } from './longStrip';
 import { visibleToAll } from './visibility';
 import { detectDirections } from './readingDirection';
 import { withOrigin } from './downloadActivity';
@@ -82,14 +86,15 @@ import { standingsOf } from './sourceStanding';
 import { folderBusy } from './numbering';
 
 /**
- * Which of the eight steps to run. `only` on the options picks a subset; the nightly runs them all. `groups`
- * and `names` (v0.47.0) do nothing unless an admin has switched them on -- see stepGroups and stepNames.
- * `directions` (v0.48.0) only reads: it asks MangaDex and AniList which way series read (stepDirections).
+ * Which of the nine steps to run. `only` on the options picks a subset; the nightly runs them all. `groups`
+ * and `names` (v0.47.0) do nothing unless an admin has switched them on -- see stepGroups and stepNames -- and
+ * neither does `details` (v0.73.0, stepDetails). `directions` (v0.48.0) only reads: it asks MangaDex and AniList which
+ * way series read (stepDirections).
  */
-export type RepairStep = 'solver' | 'count' | 'failures' | 'short' | 'gaps' | 'groups' | 'names' | 'directions';
+export type RepairStep = 'solver' | 'count' | 'failures' | 'short' | 'gaps' | 'groups' | 'names' | 'directions' | 'details';
 
 /** In the order the run takes them, which is also the order a caller's `only` is reported in. */
-export const REPAIR_STEPS: readonly RepairStep[] = ['solver', 'count', 'failures', 'short', 'gaps', 'groups', 'names', 'directions'];
+export const REPAIR_STEPS: readonly RepairStep[] = ['solver', 'count', 'failures', 'short', 'gaps', 'groups', 'names', 'directions', 'details'];
 
 /**
  * An integer knob from the environment, clamped. Out-of-range, unparseable and absent all fall back to the
@@ -131,6 +136,12 @@ export const REPAIR_NAMES_MAX = envInt('REPAIR_NAMES_MAX', 5, 1, 100);
  * request and AniList 50, so the default is at most five and ten requests a night.
  */
 export const REPAIR_DIRECTIONS_MAX = envInt('REPAIR_DIRECTIONS_MAX', 500, 1, 5000);
+/**
+ * Series one run may ask their sources about for a missing description, genres, author or cover (stepDetails,
+ * lib/autoDetails.ts). Each is a detail lookup on its own source and on the ones it follows, for something cosmetic,
+ * so a library catches up over a few weeks of nights rather than in one. AniList's part is batched and has its own cap.
+ */
+export const REPAIR_DETAILS_MAX = envInt('REPAIR_DETAILS_MAX', 15, 1, 200);
 /**
  * The pause between two series the failures step retries, as the sweep paces itself. Tests set it to 0.
  *
@@ -189,6 +200,7 @@ export const REPAIR_LIMITS = Object.freeze({
   gapsMax: REPAIR_GAPS_MAX,
   groupsMax: REPAIR_GROUPS_MAX,
   namesMax: REPAIR_NAMES_MAX,
+  detailsMax: REPAIR_DETAILS_MAX,
   countMax: REPAIR_COUNT_MAX,
   directionsMax: REPAIR_DIRECTIONS_MAX,
   huntBudget: REPAIR_HUNT_BUDGET,
@@ -307,6 +319,12 @@ export interface RepairResult {
    * changed because of it.
    */
   directions: { asked: number; learned: number };
+  /**
+   * Details filled in (stepDetails, v0.73.0): series asked about -- of AniList, then of their sources -- and series given
+   * a description, genres, an author or a cover. `off` when the switch is off, which is the default, and then nothing was
+   * asked.
+   */
+  details: { off?: true; asked: number; filled: number };
   failures: {
     /** Ledger rows put back to zero attempts. */
     reset: number;
@@ -842,6 +860,8 @@ type ShortBook = {
   id: string; series_id: string; number: number; pages: number; root: string; file: string; source_id: string | null;
   title: string; folder: string; summary: string | null; author: string | null; genres: string[] | null;
   web: string | null; status: string | null;
+  /** The reader's and Health's page-size cache (lib_books.page_dims), read by longStrip(): null until measured. */
+  page_dims: PageDim[] | null;
 };
 
 /** The hunt verdicts that PROVE nothing else has this chapter. `cooldown` is silence, not an answer. */
@@ -863,9 +883,9 @@ const noteShort = (bookId: string, res: { why: ShortWhy; asked: number; answered
  * `detail` so the row can say it. The candidate query's own rules, in the order a person would check them.
  */
 async function whyNotShort(bookId: string): Promise<string> {
-  const b = await one<{ file: string; root: string | null; number: number; pages: number; gone: boolean; confirmed: boolean; partial: boolean; folder: string }>(
-    `SELECT b.file, b.root, b.number::float8 AS number, b.pages, b.pruned_at IS NOT NULL AS gone,
-            b.short_confirmed_at IS NOT NULL AS confirmed, b.missing_pages IS NOT NULL AS partial, s.folder
+  const b = await one<{ id: string; file: string; root: string | null; number: number; pages: number; gone: boolean; confirmed: boolean; partial: boolean; page_dims: PageDim[] | null; folder: string }>(
+    `SELECT b.id, b.file, b.root, b.number::float8 AS number, b.pages, b.pruned_at IS NOT NULL AS gone,
+            b.short_confirmed_at IS NOT NULL AS confirmed, b.missing_pages IS NOT NULL AS partial, b.page_dims, s.folder
        FROM lib_books b JOIN lib_series s ON s.id = b.series_id AND ${visibleToAll('s')}
       WHERE b.id = $1`, [bookId],
   ).catch(() => null);
@@ -875,6 +895,8 @@ async function whyNotShort(bookId: string): Promise<string> {
   if (b.partial) return 'partial';
   const n = Number(b.number);
   if (b.pages < 1 || b.pages > 2 || n !== Math.floor(n)) return 'not_short';
+  // A chapter stitched into long strips is the chapter, not a failed download (lib/longStrip.ts, v0.60.1).
+  if (longStrip(await measured(b, { left: 1 }))) return 'not_short';
   return 'not_owned';
 }
 
@@ -910,22 +932,39 @@ async function stepShort(r: RepairResult, opts: RepairOpts, budget: { left: numb
   // ⚠️ `b.file = <folder>/Chapter <n>.cbz` is chapterFileRel (lib/downloader.ts) written in SQL, which is
   // safe only because `b.number = floor(b.number)` is in the same WHERE: the cast to int is exact for a
   // whole number and nothing else. A file under any other name is somebody's own copy, not ours.
+  const cap = opts.bookId ? REPAIR_SHORT_MAX : opts.autofix ? UNCAPPED : REPAIR_SHORT_MAX;
   const rows0 = await q<ShortBook>(
-    `SELECT b.id, b.series_id, b.number::float8 AS number, b.pages, b.root, b.file, b.source_id,
+    `SELECT b.id, b.series_id, b.number::float8 AS number, b.pages, b.root, b.file, b.source_id, b.page_dims,
             s.title, s.folder, s.summary, s.author, s.genres, s.web, s.status
        FROM lib_books b JOIN lib_series s ON s.id = b.series_id AND ${visibleToAll('s')}
       WHERE b.pages BETWEEN 1 AND 2 AND b.number = floor(b.number)
         AND b.pruned_at IS NULL AND b.short_confirmed_at IS NULL AND b.missing_pages IS NULL
         AND b.root = $1 AND b.file = s.folder || '/Chapter ' || (b.number::int)::text || '.cbz'
+        AND NOT ${atHiddenNumber('b')}
         ${opts.bookId ? 'AND b.id = $3' : 'AND s.auto_update'}
       ORDER BY b.mtime DESC LIMIT $2`,
-    opts.bookId ? [DL_ROOT, REPAIR_SHORT_MAX, opts.bookId] : [DL_ROOT, opts.autofix ? UNCAPPED : REPAIR_SHORT_MAX],
+    // Ten times the cap: long strips are dropped below BEFORE the cap applies (see there).
+    opts.bookId ? [DL_ROOT, REPAIR_SHORT_MAX, opts.bookId] : [DL_ROOT, Math.min(cap * 10, UNCAPPED)],
   );
   // And then asked again in TypeScript, of the real function. The SQL above is the bound (it is what makes
   // the LIMIT mean "twenty candidates"); this is the answer. If the two ever disagree -- a rename of the
   // downloader's layout, a locale that formats a number differently -- this one wins, and it fails in the
   // safe direction: a chapter skipped, never somebody's read-library file replaced.
-  const books = rows0.filter((b) => b.file === chapterFileRel(b.folder, Number(b.number)));
+  const named = rows0.filter((b) => b.file === chapterFileRel(b.folder, Number(b.number)));
+  // ...and a chapter stitched into one or two long strips is left alone (v0.60.1, found in Squeaks72's fork): that is
+  // what the series IS, not a failed download -- the rule Health has reported by since v0.55.10 (lib/longStrip.ts), which
+  // this step never asked. So the nightly hunted other sources for intact webtoon chapters Health no longer showed, and
+  // replaced them with any copy that had more pages: a site that slices the strip, possibly another group's. Measured as
+  // Health measures (the cache, else the file, at most MEASURE_PER_REPORT reads a run; an unmeasured chapter answers no
+  // and stays a candidate), and dropped BEFORE the cap: filtered after it, long strips -- which stay candidates forever --
+  // could hold every one of the nightly's REPAIR_SHORT_MAX slots. Reintroduce by dropping the `longStrip` test: "the
+  // repair leaves a chapter stitched into long strips alone" in repair.int.test.ts finds it hunted.
+  const measuring = { left: MEASURE_PER_REPORT };
+  const books: ShortBook[] = [];
+  for (const b of named) {
+    if (books.length >= cap) break;
+    if (!longStrip(await measured(b, measuring))) books.push(b);
+  }
   planned('short', books.length);
   if (!books.length) {
     // A person pressed Fix on this one chapter and the step will not touch it: say why, or the press reads
@@ -1028,7 +1067,9 @@ async function stepShort(r: RepairResult, opts: RepairOpts, budget: { left: numb
         const ask = async (chapter: SourceChapter): Promise<number | null> => {
           const sourceId = chapter.source ?? '';
           const src = getSource(sourceId);
-          if (!src || !allowed(sourceId)) return null;
+          // The chapter's own source answers to the follow, not to the adult rule (v0.55.9, as #177's chosen copy):
+          // a clean series on an extension marked NSFW had a short chapter nobody would ever ask about again.
+          if (!src || !(sourceId === book.source_id ? !resting(sourceId) : allowed(sourceId))) return null;
           if (await isDisabled(sourceId).catch(() => false)) return null;
           if (await blockedNow(sourceId).catch(() => null)) return null;
           if (unattended && !(await seriesIsMonitored(seriesId))) return null;
@@ -1036,7 +1077,7 @@ async function stepShort(r: RepairResult, opts: RepairOpts, budget: { left: numb
           // Everything above is a cheap filter. Re-read follow, blocklist, unattended state and health in one
           // last check immediately beside the outbound page-list call; a preference/unfollow race must not
           // become an "asked but silent" source either.
-          if (await repairCopyPreflight(seriesId, chapter, unattended)()) return null;
+          if (await repairCopyPreflight(seriesId, chapter, unattended, false, book.source_id)()) return null;
           asked++;
           try {
             // Nothing is reported to source_health from here. A page list asked on our own initiative must
@@ -1148,7 +1189,7 @@ async function replaceShort(
     series: book.title, summary: book.summary ?? undefined, author: book.author ?? undefined,
     genres: book.genres ?? undefined, url: book.web ?? undefined, status: book.status ?? undefined,
   };
-  const preflight = repairCopyPreflight(book.series_id, chapter, unattended);
+  const preflight = repairCopyPreflight(book.series_id, chapter, unattended, false, book.source_id);
   let missing: number[] = [];
   try {
     if (unattended && !(await seriesIsMonitored(book.series_id))) return 'paused';
@@ -1176,7 +1217,7 @@ async function replaceShort(
       // A shortfall may itself put the source into cooldown. That must stop the next request, but it must
       // not discard the already-downloaded, useful partial; re-check every write-time authority except the
       // health consequence of this same request.
-      await hold.write(repairCopyPreflight(book.series_id, chapter, unattended, true));
+      await hold.write(repairCopyPreflight(book.series_id, chapter, unattended, true, book.source_id));
     } catch (writeError) {
       hold.drop?.();
       if (writeError instanceof DownloadPreflightError) return writeError.reason === 'paused' ? 'paused' : false;
@@ -1249,7 +1290,7 @@ async function stepGroups(r: RepairResult, opts: RepairOpts, notes: Notes, log?:
        JOIN lib_series s ON s.id = b.series_id AND s.auto_update AND ${visibleToAll('s')}
        JOIN series_listing l ON l.series_id = b.series_id AND l.number = b.number
       WHERE b.root = $1 AND b.pruned_at IS NULL AND b.missing_pages IS NULL AND b.picked_at IS NULL
-        AND b.pages > 0 AND btrim(COALESCE(b.scanlator, '')) <> ''
+        AND b.pages > 0 AND btrim(COALESCE(b.scanlator, '')) <> '' AND NOT ${atHiddenNumber('b')}
         AND (b.upgrade_tried_at IS NULL OR b.upgrade_tried_at < now() - make_interval(days => $2))
       ORDER BY b.mtime DESC LIMIT 2000`,
     [DL_ROOT, GROUP_RETRY_DAYS],
@@ -1334,9 +1375,11 @@ async function stepGroups(r: RepairResult, opts: RepairOpts, notes: Notes, log?:
         prefsOf.delete(seriesId);
         const open = listing ? await automaticCopiesFor(seriesId, listing.copies) : [];
         const copy = listing && betterCopy(book, open, await prefsFor(book), followed);
-        if (!copy || !allowed(copy.source)) { r.groups.left++; continue; }
+        // The preferred group's copy is the copy the sweep would choose, on a source the series follows (betterCopy
+        // takes `followed`): as #177's chosen copy it answers to the follow, not to the adult rule (v0.55.9).
+        if (!copy) { r.groups.left++; continue; }
         const chapter = copyToChapter(copy, { number: book.number, title: listing!.title });
-        const count = await pageCount(chapter, allowed, seriesId);
+        const count = await pageCount(chapter, (s) => s === copy.source || allowed(s), seriesId, copy.source);
         // ⚠️ Decided BEFORE the download: never a shorter copy, and silence is not a yes.
         // Reintroduce by dropping the page test: "a shorter copy never replaces a longer one" in
         // groupUpgrade.int.test.ts finds the notice written over the chapter.
@@ -1364,7 +1407,7 @@ async function stepGroups(r: RepairResult, opts: RepairOpts, notes: Notes, log?:
  * puts a source into a cooldown. An EMPTY list is silence, not zero pages (see stepShort).
  */
 async function pageCount(
-  chapter: SourceChapter, allowed: (s: string) => boolean, seriesId?: string,
+  chapter: SourceChapter, allowed: (s: string) => boolean, seriesId?: string, own: string | null = null,
 ): Promise<number | null> {
   const sourceId = chapter.source ?? '';
   const src = getSource(sourceId);
@@ -1377,7 +1420,7 @@ async function pageCount(
     if (seriesId) {
       // The checks above are early filters. This one sits beside getPageUrls so an unfollow, block or
       // auto-update toggle during the earlier awaits wins before the source sees the request.
-      const reason = await repairCopyPreflight(seriesId, chapter, true)();
+      const reason = await repairCopyPreflight(seriesId, chapter, true, false, own)();
       if (reason) return null;
     }
     const urls = await withTimeout(src.getPageUrls(chapter.sourceId), budgetFor(src, SHORT_PAGES_MS));
@@ -1396,7 +1439,7 @@ async function replaceWithGroup(
     series: book.title, summary: book.summary ?? undefined, author: book.author ?? undefined,
     genres: book.genres ?? undefined, url: book.web ?? undefined, status: book.status ?? undefined,
   };
-  const preflight = repairCopyPreflight(book.series_id, chapter, true);
+  const preflight = repairCopyPreflight(book.series_id, chapter, true, false, via);
   try {
     if (!(await seriesIsMonitored(book.series_id))) return 'paused';
     if (!(await automaticChapterAllowedFor(book.series_id, chapter))) return false;
@@ -1446,14 +1489,23 @@ function repairCopyPreflight(
   chapter: SourceChapter,
   requireMonitored: boolean,
   writing = false,
+  own: string | null = null,
 ): DownloadPreflight {
   return async () => {
     if (requireMonitored && !(await seriesIsMonitored(seriesId))) return 'paused';
     const sourceId = chapter.source ?? '';
     if (!sourceId || !getSource(sourceId) || !(await seriesFollowsSource(seriesId, sourceId))) return 'source';
-    const allowed = await sweepAllowedFor(await seriesIsAdult(seriesId).catch(() => false));
-    if (!allowed(sourceId)) return 'source';
+    // `own`: the source the chapter came from (the short step) or the group step's chosen copy -- a source the series
+    // follows, held to that and not to the adult rule (v0.55.9, as #177's chosen copy). Every other copy is one
+    // reached on the series' behalf, and keeps the rule. Reintroduce by checking it whatever `own` is: "a clean
+    // series' short chapter is replaced from the adult source it follows" in repair.int.test.ts keeps the short file.
+    if (sourceId !== own) {
+      const allowed = await sweepAllowedFor(await seriesIsAdult(seriesId).catch(() => false));
+      if (!allowed(sourceId)) return 'source';
+    }
     if (!(await automaticChapterAllowedFor(seriesId, chapter))) return 'policy';
+    // A number an admin hid from the series meanwhile (#240): its file is left exactly as it is.
+    if (await numberHiddenNow(seriesId, chapter.number).catch(() => true)) return 'hidden';
     if (await isDisabled(sourceId).catch(() => true)) return 'disabled';
     if (!writing && await blockedNow(sourceId).then(Boolean, () => true)) return 'cooldown';
     return null;
@@ -1509,6 +1561,39 @@ async function stepDirections(r: RepairResult, log?: Log): Promise<void> {
     log?.warn(`repair: reading directions: ${(e as Error)?.message || e}`);
     return { asked: 0, learned: 0 };
   });
+}
+
+/**
+ * (i) Details filled in (lib/autoDetails.ts; #257 and #245 from @Squeaks72, rebuilt): a description, genres, an author
+ * or a cover for the series that have none, into a layer of their own below the scan, so nothing a scan or an admin
+ * wrote is ever replaced. Off unless an admin switches it on. AniList first, in one batched request by id per fifty
+ * linked series; then, for at most REPAIR_DETAILS_MAX series that are kept updated, their own source and the ones they
+ * follow -- only usable ones, each lookup bounded. A series asked is stamped and left for a month. Writes no file; it
+ * stops between series for a Cancel or a shutdown.
+ */
+async function stepDetails(r: RepairResult, log?: Log): Promise<RepairResult['stopped']> {
+  if (!(await fillDetailsOn())) { r.details.off = true; return undefined; }
+  try {
+    const a = await fillDetailsFromAniList();
+    r.details.asked += a.asked;
+    r.details.filled += a.filled;
+    if (a.filled) log?.info(`repair: details from AniList for ${a.filled} of ${a.asked} series`);
+  } catch (e) {
+    // AniList down or refusing: the sources below are asked as usual, and AniList again tomorrow (nothing was stamped).
+    log?.warn(`repair: details from AniList: ${(e as Error)?.message || e}`);
+  }
+  const rows = await seriesLackingDetails(REPAIR_DETAILS_MAX).catch(() => [] as Array<{ id: string; title: string }>);
+  for (const s of rows) {
+    { const h = halted(); if (h) return h; }
+    if (!(await seriesIsMonitored(s.id))) continue;
+    const res = await fillDetailsFromSources(s.id, log);
+    r.details.asked++;
+    if (res.filled.length) {
+      r.details.filled++;
+      log?.info(`repair: "${s.title}": ${res.filled.join(', ')} from ${res.from.join(', ')}`);
+    }
+  }
+  return undefined;
 }
 
 /** What one series' gap hunt concluded, stored on lib_series.gaps_result for the Health page to read. */
@@ -1822,6 +1907,7 @@ function blank(): RepairResult {
     groups: { looked: 0, replaced: 0, left: 0 },
     names: { series: 0, named: 0 },
     directions: { asked: 0, learned: 0 },
+    details: { asked: 0, filled: 0 },
     failures: { reset: 0 },
     solver: { reset: false, unblocked: 0, expired: 0 },
   };
@@ -1835,7 +1921,8 @@ function summaryOf(r: RepairResult): string {
     + `(${r.solver.unblocked} unblocked, ${r.solver.expired} expired), groups `
     + (r.groups.off ? 'off' : `${r.groups.replaced} replaced / ${r.groups.left} left of ${r.groups.looked}`)
     + ', names ' + (r.names.off ? 'off' : `${r.names.named} named in ${r.names.series} series`)
-    + `, directions ${r.directions.learned} learned of ${r.directions.asked} asked`;
+    + `, directions ${r.directions.learned} learned of ${r.directions.asked} asked`
+    + ', details ' + (r.details.off ? 'off' : `${r.details.filled} filled of ${r.details.asked} asked`);
 }
 
 /** One pass. Exported for the tests; everything else goes through runRepair, which owns the flags. */
@@ -1888,6 +1975,7 @@ export async function repairLibrary(log?: Log, opts: RepairOpts = {}): Promise<R
     else if (step === 'groups') stopped = await stepGroups(r, opts, notes, log);
     else if (step === 'names') stopped = await stepNames(r, log);
     else if (step === 'directions') await stepDirections(r, log);
+    else if (step === 'details') stopped = await stepDetails(r, log);
     r.stepMs[step] = Date.now() - t;
     if (live) live.stepMs[step] = r.stepMs[step];
     if (activeCard) {

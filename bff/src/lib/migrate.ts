@@ -5,6 +5,7 @@ import { MANGADEX_LANGS } from './lang';
 import { typeFromGenres, SERIES_TYPE_FROM } from './seriesTypeSignals';
 import { cleanGenres } from './genres';
 import { REFILE_FAILURES_SQL } from './chapterFailures';
+import { ssoOnly } from './authMode';
 
 // NOTE: gen_random_uuid() is in Postgres core (v13+); no pgcrypto extension needed.
 // (The supabase/postgres image's event triggers reject CREATE EXTENSION under a custom role.)
@@ -84,12 +85,15 @@ CREATE TABLE IF NOT EXISTS reading_events (
 CREATE INDEX IF NOT EXISTS idx_events_recent ON reading_events(user_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_events_series ON reading_events(user_id, series_id);
 
+-- A finished chapter counts ONCE (#264): count(*) counted completed EVENTS, and one read-through writes two -- the
+-- page before the last is already the end (reachedEnd, lib/progressRules.ts) and the last page sends its own -- so the
+-- profile's chapters and the badges built on them ran ahead of the household board, which always counted distinct.
 CREATE OR REPLACE VIEW reading_stats AS
 SELECT user_id,
-       count(*) FILTER (WHERE completed)              AS chapters_completed,
-       count(DISTINCT series_id)                      AS series_touched,
-       count(*)                                       AS total_events,
-       max(created_at)                                AS last_read_at
+       count(DISTINCT book_id) FILTER (WHERE completed) AS chapters_completed,
+       count(DISTINCT series_id)                        AS series_touched,
+       count(*)                                         AS total_events,
+       max(created_at)                                  AS last_read_at
 FROM reading_events GROUP BY user_id;
 
 CREATE TABLE IF NOT EXISTS app_settings (
@@ -369,11 +373,17 @@ ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar jsonb NOT NULL DEFAULT '{}';
 
 -- account security: disable/suspend, brute-force lockout, TOTP 2FA, granular permissions
 ALTER TABLE users ADD COLUMN IF NOT EXISTS disabled            boolean     NOT NULL DEFAULT false;
+-- v0.69.1: a place kept while Incognito reading was on (lib/progress.ts). Other members' private places are not
+-- "read by the household" (Hidden gems, lib/ownedCatalog.ts). Cleared once the chapter is read in the open.
+ALTER TABLE read_progress ADD COLUMN IF NOT EXISTS incognito     boolean     NOT NULL DEFAULT false;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS failed_logins       int         NOT NULL DEFAULT 0;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS locked_until        timestamptz;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS totp_secret         text;                       -- base32; pending until totp_enabled
 ALTER TABLE users ADD COLUMN IF NOT EXISTS totp_enabled        boolean     NOT NULL DEFAULT false;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS recovery_codes      text[]      NOT NULL DEFAULT '{}'; -- sha256 of one-time codes
+-- v0.77.1: the 30-second step of the last two-factor code accepted (RFC 6238 section 5.2). A code signs in once: after
+-- it only a later step is taken (lib/auth.ts spendTotpStep). NULL before the first code, and again for a new secret.
+ALTER TABLE users ADD COLUMN IF NOT EXISTS totp_last_step      bigint;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS perms               jsonb       NOT NULL DEFAULT '{}'; -- {canDownload?}
 ALTER TABLE users ADD COLUMN IF NOT EXISTS password_changed_at timestamptz NOT NULL DEFAULT now();
 
@@ -591,7 +601,8 @@ ALTER TABLE server_settings ADD COLUMN IF NOT EXISTS auto_follow_on_failure bool
 -- so a step selecting on a zero page count alone would re-open those same files every night forever and
 -- never reach the rest of the library (30,625 of 43,253 rows were uncounted on this install, because a
 -- page count is stamped only when somebody opens the chapter). Stamped even when the answer is 0, so the
--- queue drains.
+-- queue drains. Since v0.72.0 cleared by a scan that finds the file's mtime moved (lib/library.ts persistScan): the
+-- stamp is about the bytes it counted, and a replaced file is counted again.
 ALTER TABLE lib_books ADD COLUMN IF NOT EXISTS pages_checked_at timestamptz;
 -- short_confirmed_at: this one-or-two-page chapter has been PROVEN to be what the sources hold, so the
 -- Health page stops reporting it. A proof is "every followed copy answered two pages or fewer, none of
@@ -608,6 +619,11 @@ ALTER TABLE lib_books ADD COLUMN IF NOT EXISTS short_confirmed_at timestamptz;
 -- been counted, a full index on mtime would be almost entirely rows this query never wants.
 CREATE INDEX IF NOT EXISTS lib_books_uncounted_idx ON lib_books (mtime DESC)
   WHERE pages = 0 AND pages_checked_at IS NULL AND pruned_at IS NULL;
+-- v0.72.0: the files that count found no page in -- Health's Chapter files card (lib/healthFiles.ts), on every run of
+-- the report. Partial for the same reason: it holds only those rows, none at all on a healthy library. A file whose
+-- mtime moves is counted again (lib/library.ts persistScan clears pages_checked_at).
+CREATE INDEX IF NOT EXISTS lib_books_unreadable_idx ON lib_books (series_id)
+  WHERE pages = 0 AND pages_checked_at IS NOT NULL AND pruned_at IS NULL;
 -- gaps_checked_at / gaps_result: when the repair last looked for a source that could fill this series'
 -- holes, and what it found. Stamped BEFORE the search, exactly like source_hunt_at above, so a crash
 -- mid-search never re-searches the same series every night. The result is what lets the Health page say
@@ -677,6 +693,24 @@ CREATE TABLE IF NOT EXISTS series_trackers (
   linked_by   uuid REFERENCES users(id) ON DELETE SET NULL,  -- null = matched automatically
   updated_at  timestamptz NOT NULL DEFAULT now(),
   PRIMARY KEY (series_id, provider)
+);
+
+-- Recommendations from the connected trackers (lib/trackerRecs.ts). Both tables exist to spare the services:
+-- the person's list is read at most twice a day and what readers recommend after a title is asked once per
+-- title for the whole server, for two weeks, however many people hold it.
+CREATE TABLE IF NOT EXISTS tracker_list_cache (
+  user_id    uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  provider   text NOT NULL,
+  entries    jsonb NOT NULL,
+  fetched_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (user_id, provider)
+);
+CREATE TABLE IF NOT EXISTS tracker_rec_cache (
+  provider   text NOT NULL,
+  seed_id    text NOT NULL,
+  recs       jsonb NOT NULL,
+  fetched_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (provider, seed_id)
 );
 
 -- admin-editable per-series metadata + art overrides
@@ -806,6 +840,9 @@ ALTER TABLE libraries ADD COLUMN IF NOT EXISTS age_rating int;
 -- Per-library privacy boundary for implicit AniList enrichment (#168). Existing and rollback-created libraries keep
 -- the historical behaviour; switching it off never clears art, tracker links, direction or type already learned.
 ALTER TABLE libraries ADD COLUMN IF NOT EXISTS anilist_lookup boolean NOT NULL DEFAULT true;
+
+-- Reading defaults for the whole library (mode, theme, spread, direction); null = none, the reader's own apply.
+ALTER TABLE libraries ADD COLUMN IF NOT EXISTS reader_prefs jsonb;
 
 -- Why a series is in the library it is in. The scanner already keeps an existing series where it is, so a
 -- hand-move survives a rescan by accident; this records that it was DELIBERATE, so creating or re-pathing a
@@ -1194,6 +1231,30 @@ ALTER TABLE server_settings ADD COLUMN IF NOT EXISTS borrow_names boolean NOT NU
 ALTER TABLE lib_series ADD COLUMN IF NOT EXISTS borrow_names boolean;
 ALTER TABLE lib_series ADD COLUMN IF NOT EXISTS name_donor jsonb;
 ALTER TABLE lib_books ADD COLUMN IF NOT EXISTS chapter_name_source text;
+
+-- v0.73.0: the details the server fills in for a series that has none of its own (lib/autoDetails.ts, #257 and #245
+-- from @Squeaks72), the repair's ninth step. A layer of its own, BELOW the scan: a series shows its own description,
+-- genres or author whenever its files or its source gave one (lib_series), an admin's edit beats both
+-- (series_overrides), and this is read only where both are empty (lib/autoDetailsSql.ts). A scan never writes it and
+-- an edit never does, so it never shadows better data, and switching fill_details off deletes it whole. *_from names
+-- where each came from: 'anilist' or a source id. cover is the cover it put in series_art for a series with no chapters
+-- yet, kept so switching off can take exactly that back. sources_at and anilist_at are when each was last asked, so a
+-- series nobody can describe waits a month before it is asked again. Off by default; additive: v0.72.x ignores it all.
+ALTER TABLE server_settings ADD COLUMN IF NOT EXISTS fill_details boolean NOT NULL DEFAULT false;
+CREATE TABLE IF NOT EXISTS series_auto_details (
+  series_id    text PRIMARY KEY REFERENCES lib_series(id) ON DELETE CASCADE,
+  summary      text,
+  summary_from text,
+  genres       text[],
+  genres_from  text,
+  author       text,
+  author_from  text,
+  cover        text,
+  cover_from   text,
+  sources_at   timestamptz,
+  anilist_at   timestamptz,
+  updated_at   timestamptz NOT NULL DEFAULT now()
+);
 
 -- v0.48.0: which way a series reads (lib/readingDirection.ts, #102). Until now every series answered WEBTOON,
 -- so the reader's "Series default" direction could never turn a page right to left. reading_direction is one
@@ -1635,6 +1696,141 @@ CREATE INDEX IF NOT EXISTS idx_admin_bulk_delete_items_state
 CREATE UNIQUE INDEX IF NOT EXISTS idx_admin_bulk_delete_one_running
   ON admin_bulk_delete_runs ((true)) WHERE status = 'running';
 CREATE INDEX IF NOT EXISTS idx_admin_bulk_delete_started ON admin_bulk_delete_runs (started_at DESC);
+
+-- v0.56.0: Discover shows one card per work and leaves out what the library holds (lib/discoverIdentity.ts). title_works
+-- is which work a NAME is, keyed by its nameKey (lib/onlineMatch.ts): asked of AniList, MangaDex and MangaUpdates once,
+-- in the background, and kept with every other name the answer gave. work is NULL when every service was asked and
+-- none knew the name (asked again after 30 days). server_settings.discover_lookups is Admin -> Settings "Match Discover
+-- titles online": off, nothing is sent anywhere. The two indexes find a library series by the source series a Discover
+-- item is. All additive: v0.55.11 boots on this schema and ignores it.
+CREATE TABLE IF NOT EXISTS title_works (
+  key        text PRIMARY KEY,
+  work       text,
+  via        text NOT NULL,
+  checked_at timestamptz NOT NULL DEFAULT now()
+);
+ALTER TABLE server_settings ADD COLUMN IF NOT EXISTS discover_lookups boolean NOT NULL DEFAULT true;
+CREATE INDEX IF NOT EXISTS lib_series_source_pair_idx ON lib_series (source_id, source_series_id);
+CREATE INDEX IF NOT EXISTS series_sources_source_pair_idx ON series_sources (source_id, source_series_id);
+
+-- v0.57.0: a merge keeps one copy of a chapter both series had (lib/extraCopies.ts). The other copy's row goes; its file
+-- is deleted when it is in the download folder, and anywhere else -- a library folder the server may not write to --
+-- stays on disk, named here so the scan does not index it again (lib/setAside.ts). mtime and size are the file's when
+-- it was set aside: a different file at that path is indexed as usual. kept_book_id is the copy that stayed. Additive:
+-- v0.56.0 boots on this schema and ignores it (its scan would list those files again).
+CREATE TABLE IF NOT EXISTS set_aside_files (
+  root         text NOT NULL,
+  file         text NOT NULL,
+  series_id    text,
+  number       real,
+  kept_book_id text,
+  reason       text NOT NULL,
+  mtime        bigint,
+  size         bigint,
+  created_at   timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (root, file)
+);
+
+-- v0.58.0: a series' outside rating (lib/anilistScores.ts): AniList's score out of 100 and how many people list the
+-- entry, keyed by the AniList id a series is linked to (series_trackers), so a series relinked to another entry reads
+-- that entry's row and nothing has to be invalidated. Both NULL for an entry AniList no longer answers for (asked
+-- again on the next refresh round). The Library's Most popular / Top rated sorts and Home's Most popular rail read it.
+-- Additive: v0.57.0 boots on this schema and ignores it.
+CREATE TABLE IF NOT EXISTS anilist_scores (
+  anilist_id  text PRIMARY KEY,
+  score       smallint,
+  popularity  integer,
+  fetched_at  timestamptz NOT NULL DEFAULT now()
+);
+
+-- v0.61.0: what AniList relates an entry to (lib/anilistRelated.ts): its sequels, prequels, main story, side stories,
+-- spin-offs and alternative versions (relations), and the entries its readers recommend (recs), keyed like
+-- anilist_scores by the AniList id a series is linked to. Each item keeps AniList's own adult flag and genres: the 18+
+-- rules are applied per viewer when it is read, never to this shared copy. Both empty for an entry AniList did not answer
+-- for (asked again once the row is stale). The series page's Related, the reader's Next in the story, Discover's Because
+-- you read and the held recommendations of More like this read it; nothing asks AniList when a page opens. Additive:
+-- v0.60.1 boots on this schema and ignores it.
+CREATE TABLE IF NOT EXISTS anilist_related (
+  anilist_id  text PRIMARY KEY,
+  relations   jsonb NOT NULL DEFAULT '[]'::jsonb,
+  recs        jsonb NOT NULL DEFAULT '[]'::jsonb,
+  fetched_at  timestamptz NOT NULL DEFAULT now()
+);
+
+-- v0.61.0: the release radar (lib/releaseRadar.ts) -- when a series' next chapter is likely, from when its chapters
+-- came: the dates its sources list, else when they arrived on this server (most chapters carry no source date).
+-- One row per series, rewritten whole after every listing refresh and after a check lands chapters; no row while
+-- nothing dates the series or it has no source. basis is 'source' or 'arrival' (NULL: one release, no rhythm); kind
+-- and interval_days are the cadence (lib/groupStats.ts cadenceOf); next_at and due_until bound the estimate, NULL when
+-- the rhythm is too uneven, too short, or the series ended or is on hiatus; quiet_after is when silence stops being
+-- "late"; steady means it keeps one weekday; ended its status says it is finished. Read by every series' yomi.radar,
+-- the Library's Releasing soon sort, Updates' Expected this week and the smart update checks. server_settings.
+-- update_smart is Admin -> Settings "Smart update checks": off by default, the sweep asks every series as before.
+-- Additive: v0.60.1 boots on this schema and ignores both.
+CREATE TABLE IF NOT EXISTS series_radar (
+  series_id     text PRIMARY KEY REFERENCES lib_series(id) ON DELETE CASCADE,
+  basis         text,
+  kind          text NOT NULL DEFAULT 'unknown',
+  interval_days real,
+  last_at       timestamptz,
+  next_at       timestamptz,
+  due_until     timestamptz,
+  quiet_after   timestamptz,
+  steady        boolean NOT NULL DEFAULT false,
+  ended         boolean NOT NULL DEFAULT false,
+  computed_at   timestamptz NOT NULL DEFAULT now()
+);
+ALTER TABLE server_settings ADD COLUMN IF NOT EXISTS update_smart boolean NOT NULL DEFAULT false;
+
+-- v0.61.0: smart and shared Lists (lib/lists.ts, lib/smartLists.ts). query is a smart list's Library filters and order, in
+-- the Library's own URL words ({v:1, q, read, status, genres, lib, src, anysrc, sort, dir}); NULL is a list picked by
+-- hand, and a list's kind is fixed when it is made. shared lets the household read a list (never change it); it is only
+-- listed to a member it shows at least one series to. Additive: v0.60.1 boots on this schema and shows a smart list as
+-- an empty list, and a shared one to its owner only.
+ALTER TABLE collections ADD COLUMN IF NOT EXISTS query jsonb;
+ALTER TABLE collections ADD COLUMN IF NOT EXISTS shared boolean NOT NULL DEFAULT false;
+CREATE INDEX IF NOT EXISTS collections_shared_idx ON collections (shared) WHERE shared;
+
+-- v0.61.1 (#199): the nightly backup in Admin -> Settings -> Updates & schedules (lib/backup.ts backupSettings).
+-- backup_enabled false skips the nightly run (Run now still backs up); backup_keep is how many runs to keep, NULL meaning
+-- BACKUP_KEEP (14 unless set), so an install that set the variable keeps its number until one is saved there.
+-- Additive: v0.61.0 boots on this schema and ignores both.
+ALTER TABLE server_settings ADD COLUMN IF NOT EXISTS backup_enabled boolean NOT NULL DEFAULT true;
+ALTER TABLE server_settings ADD COLUMN IF NOT EXISTS backup_keep int;
+
+-- v0.62.0: the language a chapter's file is in when that is not its source's (lib/copyLanguage.ts bookLang): set once,
+-- below, for the chapters MangaDex's English source took in another language before it stopped falling back, and
+-- cleared when the file is replaced (lib/library.ts setBookMeta, lib/partial.ts restampBook). NULL: its source's. The
+-- wrong-language notice reads it (routes/catalog.ts, GET /api/series/:id/versions). Additive: v0.61.x ignores it.
+ALTER TABLE lib_books ADD COLUMN IF NOT EXISTS lang text;
+
+-- New-member defaults (#208, item 6; Admin -> Members): what an account the server makes by itself starts with -- a
+-- sign-up, or a first sign-in through the OIDC provider with OIDC_ALLOW_SIGNUP (lib/memberDefaults.ts). Kept the way the
+-- account keeps them: new_member_libraries NULL for every library (no user_libraries rows), else exactly these library
+-- ids, none when empty; new_member_max_age_rating NULL for no limit, as users.max_age_rating; new_member_perms as
+-- users.perms, where {} allows downloads. All three unset by default, so a server that never sets them makes accounts
+-- exactly as before. Additive: v0.63.0 boots on this schema and ignores them.
+ALTER TABLE server_settings ADD COLUMN IF NOT EXISTS new_member_libraries      text[];
+ALTER TABLE server_settings ADD COLUMN IF NOT EXISTS new_member_max_age_rating int;
+ALTER TABLE server_settings ADD COLUMN IF NOT EXISTS new_member_perms          jsonb NOT NULL DEFAULT '{}'::jsonb;
+
+-- The chapter numbers an admin hid from a series (#240, rebuilt to hide only): for everyone, by the effective number (an
+-- override's when there is one). The hide fragments in lib/noticeChapters.ts leave them out of every surface, the sweep
+-- never fetches one, and nothing is deleted: a hidden chapter's file and rows stay exactly as they are, and Restore shows
+-- it again at once. On the series row, as the notice switch is (hide_notices). NULL when nothing is hidden -- never an
+-- empty array (lib/hiddenChapters.ts) -- so the column's own statistics tell the planner how few series hide anything,
+-- and the partial index finds those few: priced as every series, the hidden-chapter lookup inside Continue reading's
+-- per-series picks crossed jit_inline_above_cost and spent seconds compiling a query that runs in milliseconds.
+-- Additive: v0.71.0 boots on this schema and shows every chapter.
+ALTER TABLE lib_series ADD COLUMN IF NOT EXISTS hidden_numbers real[];
+CREATE INDEX IF NOT EXISTS lib_series_hiding_idx ON lib_series (id) WHERE hidden_numbers IS NOT NULL;
+
+-- v0.77.0 (#229): spread joining's answer for a chapter file (lib/spreadMeasure.ts SpreadAnswer): which of its pages are
+-- one double-page spread a source served as two files, with the detector's version and the file's mtime and page count
+-- when it was measured. NULL until a reader who turned Join split double pages on opens the chapter. Written for every
+-- chapter looked at, nothing found and unreadable alike, so none is measured twice; a new mtime or detector measures
+-- again. Additive: v0.76.x ignores it.
+ALTER TABLE lib_books ADD COLUMN IF NOT EXISTS spreads jsonb;
 `;
 
 // Serialises migrate() across processes. CREATE TABLE IF NOT EXISTS is not safe to run concurrently:
@@ -1674,6 +1870,12 @@ export async function runOnce(
     throw e;
   }
 }
+
+/**
+ * The chapter-date repair's id, apart because migrate.int.test.ts runs it again by name. Version-free on purpose: ids
+ * are permanent, and this one was written before its release had a number.
+ */
+export const CHAPTER_DATES_MIGRATION = 'suwayomi-chapter-dates-in-seconds';
 
 /**
  * Run-once data migrations, oldest first. Ids are permanent: renaming one re-runs it everywhere.
@@ -1865,6 +2067,118 @@ const DATA_MIGRATIONS: { id: string; run: (c: PoolClient) => Promise<void> }[] =
     },
   },
 
+
+  // v0.62.0: before MangaDex's English adapter stops falling back to another language (the next step, and
+  // lib/sources/mangadex.ts), each chapter it took in another language keeps that language on its row: once the next
+  // check lists English only, nothing else on the server says which copy the file was. The listing still holds the
+  // copy (MangaDex names a language per chapter), found by the chapter id the file was stamped with (v0.49.0). It is
+  // what tells the wrong-language notice that an English series' chapter 5 is in Spanish. Files from before the stamp
+  // cannot be matched, and keep reading as their source's: English.
+  {
+    id: 'v0.62.0-chapters-keep-their-language',
+    run: async (c) => {
+      await c.query(
+        `UPDATE lib_books b SET lang = x.lang
+           FROM (SELECT DISTINCT ON (bk.id) bk.id, cp->>'lang' AS lang
+                   FROM lib_books bk
+                   JOIN series_listing l ON l.series_id = bk.series_id
+                   CROSS JOIN LATERAL jsonb_array_elements(COALESCE(l.copies, '[]'::jsonb)) cp
+                  WHERE bk.source_id = 'mangadex' AND bk.pruned_at IS NULL AND bk.source_chapter_id IS NOT NULL
+                    AND cp->>'source' = 'mangadex' AND cp->>'sourceId' = bk.source_chapter_id
+                    AND lower(btrim(COALESCE(cp->>'lang', ''))) NOT IN ('', 'en')
+                  ORDER BY bk.id) x
+          WHERE b.id = x.id`,
+      );
+    },
+  },
+
+  // v0.62.0: MangaDex's English adapter no longer falls back to another language (lib/sources/mangadex.ts). A series
+  // that fallback filled reads as English from the adapter but is stated in its real language (the add's
+  // majorityLang, or v0.52.0's migration above), and without a move it would stop updating. So each one moves to
+  // MangaDex in its own language, the adapter that language has had since v0.52.0, and that language is switched
+  // on so the adapter registers at this same boot (server.ts loads the MangaDex languages after migrate()).
+  //
+  // Evidence, not the label alone: a series moves only when its listing CHOSE MangaDex copies in that language,
+  // which is what the fallback did. A series somebody stated as Japanese while reading English chapters stays
+  // put, and nothing switches Japanese on. The data changes are Make main's (lib/mainSource.ts switchMainSource):
+  // the new main stops being a follower, the old main's listing rows go (the next check lists the new one), and
+  // the series' failure rows are re-filed under the new main (REFILE_FAILURES_SQL). The MangaDex id is the same in
+  // every language, so source_series_id stays.
+  {
+    id: 'v0.62.0-mangadex-series-to-their-language',
+    run: async (c) => {
+      const langs = MANGADEX_LANGS.filter((l) => l.code !== 'en');
+      const moved = (await c.query<{ id: string; lang: string }>(
+        `WITH m AS (SELECT * FROM unnest($1::text[], $2::text[]) AS m(code, md))
+         UPDATE lib_series s SET source_id = 'mangadex-' || lower(s.lang)
+           FROM m
+          WHERE s.source_id = 'mangadex' AND s.lang = m.code AND s.deleted_at IS NULL AND s.merged_into IS NULL
+            AND EXISTS (SELECT 1 FROM series_listing l
+                         WHERE l.series_id = s.id AND l.source_id = 'mangadex'
+                           AND lower(l.chosen->>'lang') IN (lower(m.code), lower(m.md)))
+         RETURNING s.id, s.lang`,
+        [langs.map((l) => l.code), langs.map((l) => l.md)],
+      )).rows;
+      if (!moved.length) return;
+      const ids = moved.map((r) => r.id);
+      await c.query(
+        `DELETE FROM series_sources ss USING lib_series s
+          WHERE ss.series_id = s.id AND s.id = ANY($1::text[]) AND ss.source_id = s.source_id`, [ids]);
+      await c.query(`DELETE FROM series_listing WHERE series_id = ANY($1::text[]) AND source_id = 'mangadex'`, [ids]);
+      await c.query(REFILE_FAILURES_SQL, [ids]);
+      await c.query(
+        `UPDATE server_settings
+            SET mangadex_langs = (SELECT COALESCE(jsonb_agg(DISTINCT v), '[]'::jsonb)
+                                    FROM (SELECT jsonb_array_elements_text(mangadex_langs) AS v
+                                          UNION SELECT unnest($1::text[])) x)
+          WHERE id = 1`,
+        [[...new Set(moved.map((r) => r.lang))]],
+      );
+    },
+  },
+
+  // The engine upgrade: chapter dates the extension engine gave in SECONDS. v2.3.2243 stamps a new chapter its
+  // extension listed without a date with the current time in epoch seconds (`Instant.now().epochSecond`; measured on
+  // a throwaway engine), and the adapter read every date as milliseconds -- so they were stored as 1970-01-21. The
+  // adapter now reads both (sources/suwayomi/sources.ts uploadedAt); this puts right what it already stored, in every
+  // place a chapter's date lives: lib_books (setBookDates), series_listing's column and its `chosen` and `copies`
+  // JSON, and series_post_numbers.
+  //
+  // A stored date after the epoch and before 1973-03-04 (1e11 ms) can only be such a value: it becomes that many
+  // SECONDS after the epoch when that lands between 2000-01-01 and two days from now, and no date otherwise -- never a
+  // guess. A date at or before the epoch is left alone, as is everything after March 1973. On the owner's server
+  // (2026-10-14, read-only): 175 chapters, 174 listing rows and 366 listing copies, all from extension sources, all
+  // between 2026-10-04 and 2026-10-14; no posting-order rows.
+  {
+    id: CHAPTER_DATES_MIGRATION,
+    run: async (c) => {
+      // The real moment a seconds-valued timestamp stood for, or NULL. `ts` is SQL text, used twice.
+      const fixed = (ts: string) => `(CASE WHEN to_timestamp(extract(epoch FROM ${ts}) * 1000)
+          BETWEEN timestamptz '2000-01-01' AND now() + interval '2 days'
+          THEN to_timestamp(extract(epoch FROM ${ts}) * 1000) END)`;
+      const misread = (ts: string) => `${ts} > 'epoch' AND ${ts} < '1973-03-04'`;
+      for (const table of ['lib_books', 'series_listing', 'series_post_numbers']) {
+        await c.query(`UPDATE ${table} SET published_at = ${fixed('published_at')} WHERE ${misread('published_at')}`);
+      }
+      // The JSON keeps a date as an ISO string ("2026-10-10T07:26:49.000Z" as the adapter wrote it, "+00:00" from some
+      // APIs). Only a string that IS one is read as a timestamp: the CASE comes first, so nothing else is ever cast. A
+      // date put right is written back the adapter's way; one that was no date is dropped from its copy, as the adapter
+      // now drops it.
+      const iso = (v: string) =>
+        `(CASE WHEN ${v} ~ '^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(\\.\\d+)?(Z|[+-]\\d{2}:?\\d{2})$' THEN (${v})::timestamptz END)`;
+      const repaired = (j: string) => `(CASE WHEN ${fixed(iso(`${j}->>'publishedAt'`))} IS NULL THEN ${j} - 'publishedAt'
+          ELSE jsonb_set(${j}, '{publishedAt}', to_jsonb(to_char(${fixed(iso(`${j}->>'publishedAt'`))} AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'))) END)`;
+      const bad = (j: string) => misread(iso(`${j}->>'publishedAt'`));
+      await c.query(`UPDATE series_listing SET chosen = ${repaired('chosen')} WHERE ${bad('chosen')}`);
+      await c.query(
+        `UPDATE series_listing l
+            SET copies = (SELECT jsonb_agg(CASE WHEN ${bad('cp')} THEN ${repaired('cp')} ELSE cp END ORDER BY i)
+                            FROM jsonb_array_elements(l.copies) WITH ORDINALITY AS e(cp, i))
+          WHERE jsonb_typeof(l.copies) = 'array'
+            AND EXISTS (SELECT 1 FROM jsonb_array_elements(l.copies) cp WHERE ${bad('cp')})`,
+      );
+    },
+  },
 ];
 
 export async function migrate(): Promise<void> {
@@ -1891,9 +2205,11 @@ export async function migrate(): Promise<void> {
   }
 
   // Seed the admin from the OPTIONAL env-provided argon2 hash (plaintext never stored). If no hash is set, the
-  // users table is left empty and the first-run web setup (POST /api/setup) creates the admin instead.
+  // users table is left empty and the first-run web setup (POST /api/setup) creates the admin instead. Never in SSO-only
+  // mode (v0.63.0, #208): its first admin comes from the provider, and a password admin is exactly what it does away
+  // with (lib/authMode.ts; boot says the setting is ignored).
   const existing = await one<{ id: string }>('SELECT id FROM users LIMIT 1');
-  if (!existing && env.initialUserPasswordHash) {
+  if (!existing && env.initialUserPasswordHash && !ssoOnly()) {
     const row = await one<{ id: string }>(
       `INSERT INTO users (display_name, username, role, password_hash, auth_kind)
        VALUES ('admin', 'admin', 'admin', $1, 'password') RETURNING id`,
@@ -1907,10 +2223,21 @@ export async function migrate(): Promise<void> {
       );
     }
   } else if (existing) {
-    // pre-existing single user -> promote it to admin
+    // A pre-multi-user install's one account becomes its admin -- but only while the server has no admin at all.
+    // This ran on every boot unconditionally, so a restart undid any demotion of the oldest account made in
+    // Admin -> Members or by OIDC_ADMIN_GROUP, and promoted the next-oldest member once the oldest was deleted.
+    // Reintroduce by dropping the NOT EXISTS: adminPromotion.int.test.ts sees the demoted founder admin again.
     await pool.query(
-      `UPDATE users SET role='admin', username=COALESCE(username,'admin')
-       WHERE created_at = (SELECT min(created_at) FROM users) AND (role <> 'admin' OR username IS NULL)`,
+      `UPDATE users SET role = 'admin'
+        WHERE created_at = (SELECT min(created_at) FROM users) AND role <> 'admin'
+          AND NOT EXISTS (SELECT 1 FROM users WHERE role = 'admin')`,
+    );
+    // The same legacy account may predate usernames. Separate, and guarded, so it can never collide with
+    // uq_users_username or rename anyone once an 'admin' exists.
+    await pool.query(
+      `UPDATE users SET username = 'admin'
+        WHERE created_at = (SELECT min(created_at) FROM users) AND username IS NULL
+          AND NOT EXISTS (SELECT 1 FROM users WHERE username = 'admin')`,
     );
   }
 }

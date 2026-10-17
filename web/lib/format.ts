@@ -98,11 +98,13 @@ let languageNames: Intl.DisplayNames | null = null;
 /**
  * A source's language code as the reader's own name for it: "en" reads "English", "Englisch", "英语". The engine
  * hands out bare codes, and in Spanish or French a bare "en" or "es" reads as a word of the sentence around it
- * ("Ocultar en", "Masquer en ?"). "all" is the engine's code for a source in every language. A code Intl does not
- * know, or a runtime without Intl.DisplayNames, keeps the code.
+ * ("Ocultar en", "Masquer en ?"). "all" is the engine's code for a source in every language: "All languages, mixed"
+ * since v0.62.0 -- "All languages" read as a switch for every language, and an admin keeping to English left the one
+ * source that lists them all together on. A code Intl does not know, or a runtime without Intl.DisplayNames, keeps
+ * the code.
  */
 export function languageName(code: string): string {
-  if (code === 'all') return tr('All languages');
+  if (code === 'all') return tr('All languages, mixed');
   try {
     languageNames ??= new Intl.DisplayNames([intlTag()], { type: 'language' });
     return languageNames.of(code) || code;
@@ -137,6 +139,15 @@ export function cached<T extends Formatter>(key: string, make: () => T): T {
  * The extension catalogue counts a repository's extensions in the thousands (v0.53.0).
  */
 export const numberText = (n: number): string => cached('num', () => new Intl.NumberFormat(intlTag())).format(n);
+
+/**
+ * A big count, short, the way the reader's language shortens it (v0.58.0): "312K", "1.2M", "950" -- "312 k" in French,
+ * "31万" in Japanese, "312 тыс." in Russian; German shortens only from a million ("312.071", "1,2 Mio."). For AniList's
+ * popularity, which runs to hundreds of thousands and is read at a glance. Intl's own rounding (whole numbers from two
+ * digits up: "312K", not "312.1K"), and Western digits, as numberText's.
+ */
+export const compactText = (n: number): string =>
+  cached('compact', () => new Intl.NumberFormat(intlTag(), { notation: 'compact' })).format(n);
 
 type Unit = 'second' | 'minute' | 'hour' | 'day';
 const unitText = (unit: Unit, n: number): string =>
@@ -324,6 +335,28 @@ export function relativeTimeShort(iso?: string | null): string {
     // An old WebView without unit styles, or a date that is not one: the sentence, which is wider but right.
     return relativeTime(iso);
   }
+}
+
+/**
+ * A UTC calendar day the reader's way, for the days the stats count in (UTC days, as /api/stats buckets them): "Oct 14",
+ * "14 oct.", "10月14日", with the year when asked ("Oct 14, 2025"). Western digits, as numberText.
+ */
+export function dayText(ms: number, withYear = false): string {
+  try {
+    return cached(withYear ? 'day:y' : 'day', () => new Intl.DateTimeFormat(intlTag(), {
+      day: 'numeric', month: 'short', ...(withYear ? { year: 'numeric' as const } : {}), timeZone: 'UTC',
+    })).format(ms);
+  } catch {
+    return new Date(ms).toISOString().slice(0, 10);
+  }
+}
+
+/** The month of a UTC day, short ("Oct", "okt.", "10月"), or its year alone ("2026", "2026 г."): a heatmap's ticks. */
+export function monthText(ms: number): string {
+  try { return cached('month', () => new Intl.DateTimeFormat(intlTag(), { month: 'short', timeZone: 'UTC' })).format(ms); } catch { return new Date(ms).toISOString().slice(5, 7); }
+}
+export function yearText(ms: number): string {
+  try { return cached('year', () => new Intl.DateTimeFormat(intlTag(), { year: 'numeric', timeZone: 'UTC' })).format(ms); } catch { return String(new Date(ms).getUTCFullYear()); }
 }
 
 /** relativeTime for every language but English: the same steps, said by Intl, in either direction. */

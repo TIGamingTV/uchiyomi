@@ -50,6 +50,7 @@ test('a count of one takes its singular key, never a plural key filled with 1', 
     gaps: { series: 1, followed: 1, fetched: 1, unfillable: 0, sweep: 0 },
     groups: { looked: 2, replaced: 1, left: 1 },
     directions: { asked: 1, learned: 1 },
+    details: { asked: 1, filled: 1 },
     failures: { reset: 1, retried: { series: 1, added: 1, failed: 1 } },
     solver: { reset: true, unblocked: 1, expired: 1 },
   }));
@@ -215,7 +216,8 @@ test("Admin → Extensions → Languages and the Offline page say nothing in bar
   assert.doesNotMatch(code(offline), /label: '[A-Z]/, 'a bare English button label on the Offline page');
   // The counts beside them, one pair each (localeCoverage.test.ts holds every pair in the app to its other half).
   assert.match(read('app/library/page.tsx'), /total === 1 \? tr\('1 series'\) : tr\('\{n\} series', \{ n: total \}\)/, 'the library counts its series in English');
-  assert.match(read('app/series/page.tsx'), /momentCount === 1 \? tr\('1 saved page'\)/, '"1 saved pages" on the series page');
+  // The series page's notes door is More's since v0.60.0 (lib/seriesActions.ts notesLabel).
+  assert.match(read('lib/seriesActions.ts'), /counts\.moments === 1 \? tr\('1 saved page'\)/, '"1 saved pages" on the series page');
   assert.match(read('components/SourcePicker.tsx'), /count === 1 \? tr\('1 source'\)/, '"All sources · 1 sources" on Discover');
 });
 

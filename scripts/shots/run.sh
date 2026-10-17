@@ -6,6 +6,9 @@
 #   bash scripts/shots/run.sh --yes --site                # also refresh the marketing site's copies
 #   SHOT_NET=<net> SHOT_BASE=http://<app>:3000 bash scripts/shots/run.sh --yes --login user:pass --only admin-extensions
 #                                                         # a throwaway instance's own account; no database is touched
+#   bash scripts/shots/run.sh --yes --out web/shots-preview --compare http://yomi-web-preview --only home,series
+#                                                         # before/after: the same shots from SHOT_BASE into
+#                                                         # <out>/before and from the preview into <out>/after
 #
 # Screenshots are GENERATED, never hand-taken. See docs/SCREENSHOTS.md.
 #
@@ -17,17 +20,21 @@ set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 DB=${DB_CONTAINER:-yomi-db}
 NET=${SHOT_NET:-yomi_yomi_app}
-# The app serves its own web UI, so there is no separate nginx to point at. These defaults follow the
-# single-container layout; override them if you are shooting against the development stack, where the
-# equivalents are `http://yomi-web` and `yomi-bff:prod`.
+# The defaults are the maintainer's server: its database container, its network, and the app container on it. On
+# another install set DB_CONTAINER, SHOT_NET and SHOT_BASE; the single-container install keeps its database inside the
+# app container, so there point DB_CONTAINER at that (`uchiyomi`). Against the development stack the app is
+# `http://yomi-web` and the image `yomi-bff:prod`.
 BASE=${SHOT_BASE:-http://uchiyomi:3000}
 # Only used as a throwaway node+sharp environment for hashing a password and encoding WebP -- any image
 # with the app's dependencies will do, which is why it is the app image rather than a separate tool.
 BFF_IMAGE=${BFF_IMAGE:-ghcr.io/angelosha/uchiyomi:latest}
 SHOT_USER=shotbot
 OUT_PNG=$(mktemp -d)
+OUT_PNG2=""                 # --compare: the second pass's pictures
 OUT_WEBP="$REPO/docs/shots"
-ONLY=""; YES=0; SITE=""; RECORD=0; LOGIN=""
+ONLY=""; YES=0; SITE=""; RECORD=0; LOGIN=""; COMPARE=""
+# A reading life for the capture account (fixtures.mjs seedReading): only for the throwaway one this script creates.
+SEED=0
 SITE_DIR=${SITE_DIR:-}     # only for --site: where to ALSO publish shots (a marketing site checkout)
 
 while [ $# -gt 0 ]; do
@@ -43,30 +50,49 @@ while [ $# -gt 0 ]; do
     # with KEEP=1). Then nothing is written to any database. The fixture shots (extensions, providers) need no
     # real library, so they are taken this way; never create accounts on someone's live server for them.
     --login) LOGIN="$2"; shift 2 ;;
+    # Where the WebP files go instead of docs/shots: a preview set, which must never overwrite the committed one.
+    --out) OUT_WEBP="$(mkdir -p "$2" && cd "$2" && pwd)"; shift 2 ;;
+    # A second address to photograph the same shots from, with the same account: a preview build of the web app in
+    # front of the same server (docs/SCREENSHOTS.md, "Before and after"). <out>/before is SHOT_BASE, <out>/after this.
+    --compare) COMPARE="$2"; shift 2 ;;
     *) echo "unknown option: $1" >&2; exit 2 ;;
   esac
 done
+if [ -n "$COMPARE" ]; then
+  [ "$RECORD" = "0" ] && [ -z "$SITE" ] || { echo "--compare takes stills only: not with --record or --site" >&2; exit 2; }
+  [ "$OUT_WEBP" != "$REPO/docs/shots" ] || { echo "--compare needs --out <dir>: a before/after set never goes into docs/shots" >&2; exit 2; }
+  OUT_PNG2=$(mktemp -d)
+fi
 
 psql() { docker exec -i "$DB" psql -h 127.0.0.1 -U "${PGUSER:-yomi}" -d "${PGDATABASE:-yomi}" -tAc "$1"; }
+# The capture container writes as its own user, so hand a folder's files back before removing it.
+wipe() {
+  [ -n "$1" ] && [ -d "$1" ] || return 0
+  docker run --rm -u 0 -v "$1":/t alpine sh -c 'rm -rf /t/* /t/.[!.]* 2>/dev/null' >/dev/null 2>&1 || true
+  rm -rf "$1"
+}
 
 if [ -n "$LOGIN" ]; then
   SHOT_USER="${LOGIN%%:*}"; PW="${LOGIN#*:}"
   echo "· signing in as '$SHOT_USER' on $BASE (--login: no account is created, no database is touched)"
   SERIES_ID=${SHOT_SERIES_ID:-}; BOOK_ID=${SHOT_BOOK_ID:-}
-  cleanup() { docker run --rm -u 0 -v "$OUT_PNG":/t alpine sh -c 'rm -rf /t/* /t/.[!.]* 2>/dev/null' >/dev/null 2>&1 || true; rm -rf "$OUT_PNG"; }
+  cleanup() { wipe "$OUT_PNG"; wipe "$OUT_PNG2"; }
   trap cleanup EXIT INT TERM
 else
 cat <<EOF
 This will, against the LIVE database in container '$DB':
   • create a temporary admin account '$SHOT_USER' (random password)
+  • give it some reading progress, one rating and one favourite, so the screens show what a reader sees
   • capture screenshots from $BASE
-  • DELETE that account again, even if it fails partway
-It does not touch any existing user, series or file.
+  • DELETE that account again, even if it fails partway -- and everything it read, rated and favourited with it
+It does not touch any existing user, series or file. The audit log keeps its sign-ins, as for any account.
 EOF
 if [ "$YES" != "1" ]; then
   read -r -p "Continue? [y/N] " a; [ "$a" = "y" ] || [ "$a" = "Y" ] || exit 1
 fi
 
+# Said plainly: without this a missing container read as "a previous run did not clean up" below.
+docker inspect "$DB" >/dev/null 2>&1 || { echo "error: no database container '$DB' -- set DB_CONTAINER" >&2; exit 1; }
 if [ "$(psql "SELECT count(*) FROM users WHERE username='$SHOT_USER'")" != "0" ]; then
   echo "error: a '$SHOT_USER' account already exists — a previous run did not clean up." >&2
   echo "       remove it with: docker exec $DB psql -U yomi -d yomi -c \"DELETE FROM users WHERE username='$SHOT_USER'\"" >&2
@@ -76,9 +102,7 @@ fi
 cleanup() {
   local rc=$?
   psql "DELETE FROM users WHERE username='$SHOT_USER'" >/dev/null 2>&1 || true
-  # the capture container writes as its own user, so hand the files back before removing them
-  docker run --rm -u 0 -v "$OUT_PNG":/t alpine sh -c 'rm -rf /t/* /t/.[!.]* 2>/dev/null' >/dev/null 2>&1 || true
-  rm -rf "$OUT_PNG"
+  wipe "$OUT_PNG"; wipe "$OUT_PNG2"
   [ $rc -eq 0 ] || echo "(cleaned up after a failure)" >&2
 }
 trap cleanup EXIT INT TERM
@@ -90,23 +114,46 @@ psql "INSERT INTO users (username, display_name, password_hash, role, auth_kind)
       VALUES ('$SHOT_USER','Admin','$HASH','admin','password')" >/dev/null
 echo "· temporary admin created"
 
-# Pick real content so the shots show a real library rather than an empty state.
-SERIES_ID=${SHOT_SERIES_ID:-$(psql "SELECT s.id FROM lib_series s JOIN series_art a ON a.series_id=s.id
-  WHERE a.banner IS NOT NULL AND a.cover IS NOT NULL ORDER BY s.books_count DESC LIMIT 1" | tr -d ' ')}
+# Pick real content so the shots show a real library rather than an empty state: the most popular series with its
+# own banner and cover art and a checked AniList score (the ratings panel's tile, v0.60.0), of a size a progress bar
+# reads well at; else the biggest one with art. Never a removed or merged series, nor a deleted chapter, which has no
+# pages to photograph (lib/chapterCleanup.ts deletes chapters once read, and chapter 1 is the first to go).
+SERIES_ID=${SHOT_SERIES_ID:-$(psql "SELECT s.id FROM lib_series s
+  JOIN series_art sa ON sa.series_id = s.id AND sa.banner IS NOT NULL AND sa.cover IS NOT NULL
+  JOIN series_trackers t ON t.series_id = s.id AND t.provider = 'anilist' AND (t.linked_by IS NOT NULL OR t.checked_at IS NOT NULL)
+  JOIN anilist_scores a ON a.anilist_id = t.external_id AND a.score IS NOT NULL
+  WHERE s.deleted_at IS NULL AND s.merged_into IS NULL AND s.books_count BETWEEN 30 AND 400
+  ORDER BY a.popularity DESC NULLS LAST LIMIT 1" | tr -d ' ')}
+[ -n "$SERIES_ID" ] || SERIES_ID=$(psql "SELECT s.id FROM lib_series s JOIN series_art a ON a.series_id=s.id
+  WHERE a.banner IS NOT NULL AND a.cover IS NOT NULL AND s.deleted_at IS NULL AND s.merged_into IS NULL
+  ORDER BY s.books_count DESC LIMIT 1" | tr -d ' ')
+# Chapter 1 before any chapter 0: a "chapter 0" is a prologue or teaser, often a few panels on black, and the v0.60.1
+# re-shoot's reader landed on a nearly empty dark page because of it.
 BOOK_ID=${SHOT_BOOK_ID:-$(psql "SELECT b.id FROM lib_books b WHERE b.series_id='$SERIES_ID' AND b.pages > 3
-  ORDER BY b.number LIMIT 1" | tr -d ' ')}
-[ -n "$BOOK_ID" ] || BOOK_ID=$(psql "SELECT id FROM lib_books WHERE pages > 3 ORDER BY random() LIMIT 1" | tr -d ' ')
+  AND b.pruned_at IS NULL ORDER BY (b.number < 1), b.number LIMIT 1" | tr -d ' ')}
+[ -n "$BOOK_ID" ] || BOOK_ID=$(psql "SELECT id FROM lib_books WHERE pages > 3 AND pruned_at IS NULL ORDER BY random() LIMIT 1" | tr -d ' ')
+# crop-related (v0.61.0): the series whose AniList entry has the most related works, so the Related row is a row. The
+# shot series often has one (a sequel) and the band would be one cover and a field of black. Never an 18+ one.
+RELATED_ID=${SHOT_RELATED_ID:-$(psql "SELECT s.id FROM lib_series s
+  JOIN series_art sa ON sa.series_id = s.id AND sa.cover IS NOT NULL
+  JOIN series_trackers t ON t.series_id = s.id AND t.provider = 'anilist'
+  JOIN anilist_related r ON r.anilist_id = t.external_id
+  WHERE s.deleted_at IS NULL AND s.merged_into IS NULL
+    AND NOT EXISTS (SELECT 1 FROM jsonb_array_elements(r.relations) x WHERE (x->>'adult')::boolean)
+  ORDER BY jsonb_array_length(r.relations) DESC, s.books_count DESC LIMIT 1" 2>/dev/null | tr -d ' ')}
+SEED=1
 echo "· series $SERIES_ID · book $BOOK_ID"
 fi
 
 chmod 777 "$OUT_PNG"
+[ -z "$OUT_PNG2" ] || chmod 777 "$OUT_PNG2"
 
 if [ "$RECORD" = "1" ]; then
   # Record the tour instead of taking stills. Encoding happens on the host, which has ffmpeg with x264,
   # vp9 and animated-webp — no extra image needed.
   docker run --rm --network "$NET" -w /home/pptruser \
     -e SHOT_BASE="$BASE" -e SHOT_OUT=/out -e SHOT_USER="$SHOT_USER" -e SHOT_PASS="$PW" \
-    -e SHOT_SERIES_ID="$SERIES_ID" -e SHOT_BOOK_ID="$BOOK_ID" \
+    -e SHOT_SERIES_ID="$SERIES_ID" -e SHOT_BOOK_ID="$BOOK_ID" -e SHOT_SEED="$SEED" \
     -e SHOT_PALETTE_QUERY -e SHOT_DISCOVER_QUERY \
     -v "$OUT_PNG":/out -v "$REPO/scripts/shots":/home/pptruser/shots:ro \
     ghcr.io/puppeteer/puppeteer:latest node /home/pptruser/shots/record.mjs
@@ -129,12 +176,22 @@ if [ "$RECORD" = "1" ]; then
   exit 0
 fi
 
-docker run --rm --network "$NET" \
-  -w /home/pptruser \
-  -e SHOT_BASE="$BASE" -e SHOT_OUT=/out -e SHOT_USER="$SHOT_USER" -e SHOT_PASS="$PW" \
-  -e SHOT_ONLY="$ONLY" -e SHOT_SERIES_ID="$SERIES_ID" -e SHOT_BOOK_ID="$BOOK_ID" \
-  -v "$OUT_PNG":/out -v "$REPO/scripts/shots":/home/pptruser/shots:ro \
-  ghcr.io/puppeteer/puppeteer:latest node /home/pptruser/shots/capture.mjs
+# capture <base> <png folder> <seed>
+capture() {
+  docker run --rm --network "$NET" \
+    -w /home/pptruser \
+    -e SHOT_BASE="$1" -e SHOT_OUT=/out -e SHOT_USER="$SHOT_USER" -e SHOT_PASS="$PW" \
+    -e SHOT_ONLY="$ONLY" -e SHOT_SERIES_ID="$SERIES_ID" -e SHOT_BOOK_ID="$BOOK_ID" -e SHOT_SEED="$3" -e SHOT_RELATED_ID="${RELATED_ID:-}" \
+    -v "$2":/out -v "$REPO/scripts/shots":/home/pptruser/shots:ro \
+    ghcr.io/puppeteer/puppeteer:latest node /home/pptruser/shots/capture.mjs
+}
+
+capture "$BASE" "$OUT_PNG" "$SEED"
+if [ -n "$COMPARE" ]; then
+  # The same account and the same shots from the preview. Its reading life is already seeded: never twice.
+  echo "· and again from $COMPARE"
+  capture "$COMPARE" "$OUT_PNG2" 0
+fi
 
 mkdir -p "$OUT_WEBP"
 # Encode with the bff image's sharp — no new dependency, and it is already in every dev's cache.
@@ -148,8 +205,11 @@ if [ -n "$SITE" ] && [ -d "$SITE/assets/shots" ]; then
   SITE="$SITE/assets/shots"
 fi
 
-docker run --rm -u 0 --entrypoint node -w /app -e NODE_PATH=/app/node_modules \
-  -v "$OUT_PNG":/png -v "$OUT_WEBP":/webp ${SITE:+-v "$SITE":/site} "$BFF_IMAGE" -e '
+# encode <png folder> <webp folder>
+encode() {
+  mkdir -p "$2"
+  docker run --rm -u 0 --entrypoint node -w /app -e NODE_PATH=/app/node_modules \
+    -v "$1":/png -v "$2":/webp ${SITE:+-v "$SITE":/site} "$BFF_IMAGE" -e '
 const sharp=require("sharp"), fs=require("fs");
 (async()=>{
   const site = fs.existsSync("/site");
@@ -161,4 +221,13 @@ const sharp=require("sharp"), fs=require("fs");
     console.log("  ·", n);
   }
 })();'
-echo "✓ docs/shots/ updated${SITE:+ (and the marketing site)}"
+}
+
+if [ -n "$COMPARE" ]; then
+  encode "$OUT_PNG" "$OUT_WEBP/before"
+  encode "$OUT_PNG2" "$OUT_WEBP/after"
+  echo "✓ $OUT_WEBP/before ($BASE) and $OUT_WEBP/after ($COMPARE)"
+else
+  encode "$OUT_PNG" "$OUT_WEBP"
+  echo "✓ ${OUT_WEBP#"$REPO"/} updated${SITE:+ (and the marketing site)}"
+fi

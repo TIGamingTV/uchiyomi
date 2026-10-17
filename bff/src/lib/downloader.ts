@@ -18,6 +18,11 @@ import { pagePace, paceLevel, noteDownloaded, notePageHosts, noteRateLimited, ra
 import { drawGap } from './archivePace';
 import { pageName, placeholderPng, PARTIAL_MANIFEST, type PartialManifest } from './partial';
 import { realContainedPath } from './fsGuard';
+import { adultContentRating } from './ageRating';
+import { MAX_PAGE_BYTES } from './archiveCaps';
+import { fetchFollowingPublic, readCapped } from './safeFetch';
+import { isSwAdapterId } from './sources/suwayomi/sources';
+import { onEngineOrigin } from './sources/suwayomi/client';
 
 /**
  * A title as a folder name.
@@ -53,7 +58,7 @@ function winSafe(name: string): string {
   return out || 'untitled';
 }
 
-function comicInfo(d: { series: string; number: number; title?: string; summary?: string; author?: string; genres?: string[]; web?: string; status?: string; scanlator?: string }): string {
+function comicInfo(d: { series: string; number: number; title?: string; summary?: string; author?: string; genres?: string[]; web?: string; status?: string; scanlator?: string; contentRating?: string }): string {
   // XML_FORBIDDEN out first: a source's text is copied in verbatim, and a NUL in a description made a file
   // no XML reader should accept and one the scan could not index (#109, lib/library.ts).
   const esc = (x: any = '') => String(x ?? '').replace(XML_FORBIDDEN, '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
@@ -70,6 +75,9 @@ function comicInfo(d: { series: string; number: number; title?: string; summary?
     // rather than written empty when the source named nobody, since an empty tag reads as "no translator".
     ...(d.scanlator ? [`  <Translator>${esc(d.scanlator)}</Translator>`] : []),
     `  <Genre>${esc((d.genres || []).join(', '))}</Genre>`,
+    // A title its source rates adults-only, in the tag parseComicInfoAgeRating reads back as 18: the scan then keeps
+    // the series' age_rating from the files alone, and so does Komga or Kavita reading this folder.
+    ...(adultContentRating(d.contentRating) ? ['  <AgeRating>Adults Only 18+</AgeRating>'] : []),
     `  <Web>${esc(d.web)}</Web>`,
     `  <ty:PublishingStatusTachiyomi xmlns:ty="http://www.w3.org/2001/XMLSchema">${esc(d.status)}</ty:PublishingStatusTachiyomi>`,
     '</ComicInfo>',
@@ -112,8 +120,11 @@ export interface PartialHold {
   drop?(): void;
 }
 
-/** Why a queued automatic download was no longer allowed when its source slot finally opened. */
-export type DownloadPreflightReason = 'paused' | 'policy' | 'source' | 'disabled' | 'cooldown';
+/**
+ * Why a queued automatic download was no longer allowed when its source slot finally opened. `hidden`: an admin hid
+ * the chapter's number from its series meanwhile (#240, lib/hiddenChapters.ts), and nothing fetches a hidden number.
+ */
+export type DownloadPreflightReason = 'paused' | 'policy' | 'source' | 'disabled' | 'cooldown' | 'hidden';
 /**
  * Last-responsible-moment admission.  Returning a reason refuses the operation without blaming the source.
  * It is deliberately asynchronous: current follows, preferences and unattended state all live in the database.
@@ -255,7 +266,9 @@ async function isImage(buf: Buffer): Promise<boolean> {
  * a filesystem that was already at 87% and holds the library, every download and the only backup. Fails
  * OPEN when statfs is unavailable: a guard that cannot measure must not stop everything.
  */
-const MIN_FREE_GB = process.env.MIN_FREE_GB === undefined ? 10 : Number(process.env.MIN_FREE_GB) || 0;
+// Exported for Health's "Disk space and folders" card (lib/healthDisk.ts), which turns red at this very floor: never green
+// while a download is being refused for space.
+export const MIN_FREE_GB = process.env.MIN_FREE_GB === undefined ? 10 : Number(process.env.MIN_FREE_GB) || 0;
 async function assertFreeSpace(): Promise<void> {
   if (!(MIN_FREE_GB > 0)) return;
   const free = await freeBytes();
@@ -453,7 +466,13 @@ export async function fetchPages(src: SourceAdapter, urls: string[], indices: nu
     // capability rather than keyed off the adapter id, so the core never special-cases a particular source.
     Object.assign(headers, typeof src.imageHeaders === 'function' ? src.imageHeaders(u) : src.imageHeaders ?? {});
     try {
-      const r = await fetch(u, { headers, signal: AbortSignal.timeout(45000) });
+      // Every hop on the public internet, the page read within MAX_PAGE_BYTES (lib/safeFetch.ts). A page URL is
+      // whatever the site's HTML or API named, and this followed redirects with no check: the audit had a site's
+      // loopback URL fetched and the internal service's answer stored as a member-readable page. The engine's own page
+      // proxy URLs are private by design and are exempt on their first hop, for an engine source only.
+      const r = await fetchFollowingPublic(u, { headers, signal: AbortSignal.timeout(45000) }, {
+        exemptFirst: (t) => !!src.localImages || (isSwAdapterId(src.id) && onEngineOrigin(t)),
+      });
       if (!r.ok) {
         if (r.status >= 400) worst = Math.max(worst, r.status);
         failed.set(i, { index: i, status: r.status });
@@ -471,7 +490,7 @@ export async function fetchPages(src: SourceAdapter, urls: string[], indices: nu
       const ct = (r.headers.get('content-type') || '').toLowerCase();
       const type = ct.split(';')[0].trim();
       if (/^text\/|html|json/.test(ct)) { worst = Math.max(worst, 415); failed.set(i, { index: i, status: r.status, type }); return; } // hotlink/error page, not an image
-      const buf = Buffer.from(await r.arrayBuffer());
+      const buf = await readCapped(r, MAX_PAGE_BYTES);
       // 200 with nothing behind it -- unless the little that is there decodes as an image (see isImage).
       if (buf.length < 256 && !(await isImage(buf))) { worst = Math.max(worst, EMPTY_BODY); failed.set(i, { index: i, status: r.status, type, bytes: buf.length }); return; }
       // Content-Type first: some sources (and any source proxied through an extension server) serve pages
@@ -748,6 +767,7 @@ async function fetchChapter(
     web: input.meta?.url || input.chapter.sourceId,
     status: input.meta?.status,
     scanlator: input.chapter.scanlator,
+    contentRating: input.meta?.contentRating,
   })));
 
   // Recheck after the network work and after creating a missing parent: an existing series folder may have
@@ -820,6 +840,7 @@ function holdFor(
         web: input.meta?.url || input.chapter.sourceId,
         status: input.meta?.status,
         scanlator: input.chapter.scanlator,
+        contentRating: input.meta?.contentRating,
       })));
       if (await realContainedPath(DL_ROOT, rel) !== abs) throw new Error('unsafe download path outside the library root');
       await mkdir(dirname(abs), { recursive: true });

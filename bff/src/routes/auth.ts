@@ -1,10 +1,10 @@
 import { verify, hash } from '@node-rs/argon2';
 import QRCode from 'qrcode';
-import type { FastifyInstance } from 'fastify';
+import type { FastifyInstance, FastifyRequest } from 'fastify';
 import { z } from 'zod';
 import { env } from '../env';
-import { one, q } from '../lib/db';
-import { logAudit } from '../lib/audit';
+import { one, q, tx } from '../lib/db';
+import { logAudit, auditEvery } from '../lib/audit';
 import {
   IMG_COOKIE,
   IMG_COOKIE_TTL,
@@ -22,23 +22,26 @@ import {
   revokeAllSessions,
   revokeRefreshToken,
   revokeSessionForUser,
+  spendTotpStep,
   touchSession,
   userIdOf,
   validateRefreshToken,
   exchangeRefreshToken,
   refreshExpiresAt,
 } from '../lib/auth';
-import { generateRecoveryCodes, generateSecret, otpauthURL, sha256, verifyTotp } from '../lib/totp';
+import { generateRecoveryCodes, generateSecret, otpauthURL, recoveryCodeForm, sha256, totpStep } from '../lib/totp';
 import { oidcEnabled, oidcName, beginLogin, completeLogin, isAdminByGroup, type OidcClaims } from '../lib/oidc';
 import { randomBytes } from 'crypto';
 import { SESSION_COOKIE as KOMGA_SESSION_COOKIE } from '../lib/komgaSession';
 import { desktopFailAudit, desktopSecretMatches, isDesktop, isLoopback } from '../lib/desktop';
 import { desktopUserId, ensureDesktopUser } from '../lib/desktopUser';
+import { authMode, bootstrapSub, mayBootstrap, rescueAdmin, ssoOnly } from '../lib/authMode';
+import { applyMemberDefaults } from '../lib/memberDefaults';
 
 const loginBody = z.object({
   username: z.string().max(64).optional(),
   password: z.string().min(1),
-  code: z.string().max(16).optional(), // TOTP or recovery code
+  code: z.string().max(32).optional(), // TOTP or recovery code (xxxxx-xxxxx-xxxxx-xxxxx is 23)
   deviceId: z.string().max(128).optional(),
   deviceName: z.string().max(128).optional(),
 });
@@ -72,8 +75,8 @@ function setImgCookie(app: FastifyInstance, reply: any, userId: string) {
 }
 
 async function userPayload(userId: string) {
-  const user = await one<{ id: string; username: string | null; display_name: string; role: string; avatar: unknown; totp_enabled: boolean; perms: unknown }>(
-    'SELECT id, username, display_name, role, avatar, totp_enabled, perms FROM users WHERE id = $1',
+  const user = await one<{ id: string; username: string | null; display_name: string; role: string; avatar: unknown; totp_enabled: boolean; perms: unknown; sso: boolean }>(
+    'SELECT id, username, display_name, role, avatar, totp_enabled, perms, oidc_sub IS NOT NULL AS sso FROM users WHERE id = $1',
     [userId],
   );
   const settings = await one<{ data: unknown }>('SELECT data FROM app_settings WHERE user_id = $1', [userId]);
@@ -84,31 +87,99 @@ async function userPayload(userId: string) {
     role: user?.role ?? 'user',
     avatar: user?.avatar ?? {},
     totpEnabled: !!user?.totp_enabled,
+    // Linked to an identity at the OIDC provider (v0.63.0): Profile → Account offers Link to … until it is.
+    sso: !!user?.sso,
     perms: user?.perms ?? {},
     settings: settings?.data ?? {},
   };
 }
 
+/**
+ * Test seam: how long a new server's first admin waits between counting the accounts and being made -- an SSO-only
+ * server's first sign-in (firstAdmin) and first-run setup (/api/setup). Zero in the server. A race test holds the window
+ * open with it, so two first admins meet inside it every time rather than once in a while: with the lock they are made
+ * one after the other, without it two admins.
+ */
+let firstAdminPauseMs = 0;
+export function _setFirstAdminPause(ms: number): void { firstAdminPauseMs = ms; }
+
+/** The username an identity at the provider asks for, cleaned to what a username here may hold; '' when it names none. */
+const usernameFor = (claims: OidcClaims): string =>
+  (claims.username || claims.email?.split('@')[0] || '').replace(/[^a-zA-Z0-9._-]/g, '');
+
+/** Sign-in's per-address limit, on every route that checks a password (v0.77.1 for the three behind a session). */
+const SIGN_IN_LIMIT = { rateLimit: { max: 10, timeWindow: '5 minutes' } };
+
+const LOCKED_NOW = { error: 'locked', message: 'Account locked after too many failed attempts. Try again in 15 minutes.' };
+
+/**
+ * The current password, asked for behind a session (v0.77.1): changing it, and turning two-factor on or off. Counted
+ * and locked exactly as a sign-in's password is (recordFailedLogin), and not checked at all while the account is
+ * locked, so a session alone -- a borrowed phone, a stolen refresh cookie -- cannot guess its way to the password; the
+ * routes carry SIGN_IN_LIMIT too. A right password clears the count, as a sign-in does. Null when it is right, else the
+ * refusal to send. Reintroduce by checking the password alone: "a session cannot guess the password" in
+ * accountLock.int.test.ts is never locked.
+ */
+async function currentPasswordRefusal(req: FastifyRequest, password: string): Promise<{ status: number; body: object } | null> {
+  const uid = userIdOf(req);
+  const u = await one<{ username: string | null; password_hash: string; locked_until: string | null }>(
+    'SELECT username, password_hash, locked_until FROM users WHERE id = $1', [uid]);
+  if (!u) return { status: 401, body: { error: 'wrong_password' } };
+  const lock = lockedUntil(u);
+  if (lock) return { status: 423, body: { error: 'locked', until: lock.toISOString(), message: 'Account locked after too many attempts. Try again later.' } };
+  if (!(await verify(u.password_hash, password).catch(() => false))) {
+    const nowLocked = await recordFailedLogin(uid);
+    await logAudit('login.fail', { userId: uid, username: u.username, detail: { reason: 'bad_password', route: req.url.split('?')[0], locked: nowLocked }, req });
+    return nowLocked ? { status: 423, body: LOCKED_NOW } : { status: 401, body: { error: 'wrong_password' } };
+  }
+  await resetFailedLogins(uid);
+  return null;
+}
+
 export default async function authRoutes(app: FastifyInstance) {
+  /**
+   * v0.63.0 (#208, lib/authMode.ts): in SSO-only mode the routes that take a password are not registered at all --
+   * first-run setup, sign-up, password change, two-factor -- and sign-in only while AUTH_RESCUE_ADMIN names an admin.
+   * Not refused: absent, a 404 like any path that never existed, so there is nothing to guess at, rate-limit or watch.
+   * Read once, here, as the routes are: the mode is the environment's, and the environment does not change under a
+   * running server. Reintroduce any one of them: its line in ssoOnly.int.test.ts finds it answering.
+   */
+  const local = !ssoOnly();
+
   // ---- first-run setup: create the very first admin from the browser, no env secret needed ----
   app.get('/api/setup/status', async () => {
+    // SSO-only mode has no setup form: the first admin is whoever the provider says, at their first sign-in
+    // (resolveOidcUser), so a new server shows the sign-in screen's one button.
+    if (!local) return { needsSetup: false };
     const c = await one<{ c: number }>('SELECT count(*)::int AS c FROM users');
     return { needsSetup: (c?.c ?? 0) === 0 };
   });
 
-  app.post('/api/setup', { config: { rateLimit: { max: 5, timeWindow: '10 minutes' } } }, async (req, reply) => {
+  if (local) app.post('/api/setup', { config: { rateLimit: { max: 5, timeWindow: '10 minutes' } } }, async (req, reply) => {
     const b = z.object({ username: z.string().min(2).max(64).regex(/^[a-zA-Z0-9._-]+$/), password: z.string() }).safeParse(req.body);
     if (!b.success) return reply.code(400).send({ error: 'bad_request', message: 'Username: letters, numbers, . _ - (2–64 chars).' });
+    const closed = () => reply.code(403).send({ error: 'already_configured', message: 'This server is already set up.' });
     // once any user exists, setup is closed forever
-    if (await one('SELECT id FROM users LIMIT 1')) return reply.code(403).send({ error: 'already_configured', message: 'This server is already set up.' });
+    if (await one('SELECT id FROM users LIMIT 1')) return closed();
     const pwErr = passwordError(b.data.password);
     if (pwErr) return reply.code(400).send({ error: 'weak_password', message: pwErr });
-    const row = await one<{ id: string }>(
-      `INSERT INTO users (display_name, username, role, password_hash, auth_kind) VALUES ($1, $2, 'admin', $3, 'password') RETURNING id`,
-      [b.data.username, b.data.username, await hash(b.data.password)],
-    );
-    if (!row) return reply.code(500).send({ error: 'setup_failed' });
-    await q(`INSERT INTO app_settings (user_id, data) VALUES ($1, '{}'::jsonb) ON CONFLICT (user_id) DO NOTHING`, [row.id]);
+    // Hashed before the lock is taken, so the lock is held for two short statements and not for argon2.
+    const passwordHash = await hash(b.data.password);
+    // Counted again and made under firstAdmin's lock (v0.77.1), as an SSO-only server's first sign-in makes its admin:
+    // two setups at once make one admin, and the other is told the server is set up. Reintroduce by checking outside
+    // the lock: "two setups at once make one admin" in setupRace.int.test.ts finds two.
+    const row = await tx(async (qq) => {
+      await qq('SELECT pg_advisory_xact_lock(6301)');
+      if ((await qq('SELECT 1 FROM users LIMIT 1')).length) return null;
+      if (firstAdminPauseMs) await new Promise((go) => setTimeout(go, firstAdminPauseMs));
+      const [made] = await qq<{ id: string }>(
+        `INSERT INTO users (display_name, username, role, password_hash, auth_kind) VALUES ($1, $2, 'admin', $3, 'password') RETURNING id`,
+        [b.data.username, b.data.username, passwordHash],
+      );
+      await qq(`INSERT INTO app_settings (user_id, data) VALUES ($1, '{}'::jsonb) ON CONFLICT (user_id) DO NOTHING`, [made.id]);
+      return made;
+    });
+    if (!row) return closed();
     await logAudit('setup.complete', { userId: row.id, username: b.data.username, req });
     const refresh = await issueRefreshToken(row.id, { ip: clientIp(req), userAgent: (req.headers['user-agent'] as string) || null });
     reply.setCookie(REFRESH_COOKIE, refresh, cookieOptions());
@@ -116,7 +187,7 @@ export default async function authRoutes(app: FastifyInstance) {
     return reply.send({ ...signAccess(app, row.id, 'admin'), user: await userPayload(row.id), refreshExpiresAt: refreshExpiresAt() });
   });
 
-  app.post('/auth/login', { config: { rateLimit: { max: 10, timeWindow: '5 minutes' } } }, async (req, reply) => {
+  if (local || rescueAdmin()) app.post('/auth/login', { config: SIGN_IN_LIMIT }, async (req, reply) => {
     const parsed = loginBody.safeParse(req.body);
     if (!parsed.success) return reply.code(400).send({ error: 'bad_request' });
     const { password, code, deviceId, deviceName } = parsed.data;
@@ -124,7 +195,16 @@ export default async function authRoutes(app: FastifyInstance) {
     const ip = clientIp(req);
     const ua = (req.headers['user-agent'] as string) || null;
 
+    // SSO-only mode's way back in (lib/authMode.ts rescueAdmin): this route answers only while AUTH_RESCUE_ADMIN names
+    // an admin, and then for that account alone. Any other name, or a rescue name that is no admin, is refused exactly
+    // as a wrong password is, so the answer says nothing about who exists. Reintroduce by dropping the check: "the
+    // rescue opens one admin's password sign-in and nobody else's" in ssoRescue.int.test.ts signs a member in.
+    const rescue = local ? null : rescueAdmin();
     const user = await one<FullUser>(`SELECT ${USER_AUTH_COLS} FROM users WHERE username = $1`, [username]);
+    if (!local && (username !== rescue || user?.role !== 'admin')) {
+      await logAudit('login.fail', { userId: user?.id, username, detail: { reason: 'sso_only' }, req });
+      return reply.code(401).send({ error: 'invalid_credentials' });
+    }
     if (!user) {
       await logAudit('login.fail', { username, detail: { reason: 'no_user' }, req });
       return reply.code(401).send({ error: 'invalid_credentials' });
@@ -141,7 +221,7 @@ export default async function authRoutes(app: FastifyInstance) {
     if (!ok) {
       const nowLocked = await recordFailedLogin(user.id);
       await logAudit('login.fail', { userId: user.id, username, detail: { reason: 'bad_password', locked: nowLocked }, req });
-      if (nowLocked) return reply.code(423).send({ error: 'locked', message: 'Account locked after too many failed attempts. Try again in 15 minutes.' });
+      if (nowLocked) return reply.code(423).send(LOCKED_NOW);
       return reply.code(401).send({ error: 'invalid_credentials' });
     }
 
@@ -149,16 +229,22 @@ export default async function authRoutes(app: FastifyInstance) {
     if (user.totp_enabled) {
       if (!code) return reply.code(401).send({ error: 'totp_required' });
       const clean = code.trim();
-      let pass = user.totp_secret ? verifyTotp(user.totp_secret, clean) : false;
-      if (!pass && /^[0-9a-f]{4}-[0-9a-f]{6}$/i.test(clean)) {
-        const h = sha256(clean.toLowerCase());
-        if (user.recovery_codes.includes(h)) {
-          pass = true;
-          await q('UPDATE users SET recovery_codes = array_remove(recovery_codes, $2) WHERE id = $1', [user.id, h]);
-        }
+      // A code is good once: its step is spent in the statement that checks it is later than the last (spendTotpStep).
+      const step = user.totp_secret ? totpStep(user.totp_secret, clean) : null;
+      let pass = step !== null && (await spendTotpStep(user.id, step));
+      const recovery = recoveryCodeForm(clean);
+      if (!pass && recovery) {
+        // Used up in the same statement that finds it, so two sign-ins racing with one code get one session.
+        const h = sha256(recovery);
+        pass = !!(await one('UPDATE users SET recovery_codes = array_remove(recovery_codes, $2) WHERE id = $1 AND $2 = ANY(recovery_codes) RETURNING id', [user.id, h]));
       }
       if (!pass) {
-        await logAudit('login.totp_fail', { userId: user.id, username, req });
+        // A wrong code counts toward the lock exactly as a wrong password does (v0.77.1), so six digits cannot be tried
+        // for as long as the address limit allows. Reintroduce by only writing it down: "wrong second-step codes lock the
+        // account" in accountLock.int.test.ts is never locked.
+        const nowLocked = await recordFailedLogin(user.id);
+        await logAudit('login.totp_fail', { userId: user.id, username, detail: { locked: nowLocked }, req });
+        if (nowLocked) return reply.code(423).send(LOCKED_NOW);
         return reply.code(401).send({ error: 'totp_invalid', message: 'Incorrect authentication code.' });
       }
     }
@@ -167,7 +253,9 @@ export default async function authRoutes(app: FastifyInstance) {
     const refresh = await issueRefreshToken(user.id, { deviceId, deviceName, ip, userAgent: ua });
     reply.setCookie(REFRESH_COOKIE, refresh, cookieOptions());
     setImgCookie(app, reply, user.id);
-    await logAudit('login.ok', { userId: user.id, username, req });
+    // A rescue sign-in is said in the log as well as written down: it is the door SSO-only mode exists to keep shut.
+    if (rescue) app.log.warn(`[auth] rescue sign-in by the admin "${username}" (AUTH_RESCUE_ADMIN)`);
+    await logAudit(rescue ? 'login.rescue' : 'login.ok', { userId: user.id, username, req });
     return reply.send({ ...signAccess(app, user.id, user.role), user: await userPayload(user.id), refreshExpiresAt: refreshExpiresAt() });
   });
 
@@ -176,9 +264,14 @@ export default async function authRoutes(app: FastifyInstance) {
     const s = await one<{ server_name: string; allow_registration: boolean }>('SELECT server_name, allow_registration FROM server_settings WHERE id = 1');
     return {
       serverName: s?.server_name || 'Uchiyomi',
-      // Desktop has one person and no sign-up form, whatever a restored server database says.
-      allowRegistration: !isDesktop() && !!s?.allow_registration,
+      // Desktop has one person and no sign-up form, whatever a restored server database says; SSO-only mode (v0.63.0)
+      // has no sign-up route at all.
+      allowRegistration: !isDesktop() && local && !!s?.allow_registration,
       oidc: oidcEnabled() ? { enabled: true, name: oidcName() } : { enabled: false, name: '' },
+      // v0.63.0 (#208): `oidc-only` is a sign-in screen with the provider's button alone, and `rescue` the password form
+      // beside it while AUTH_RESCUE_ADMIN reopens it for one admin (components/LoginScreen.tsx).
+      mode: authMode(),
+      ...(rescueAdmin() ? { rescue: true as const } : {}),
       // What a browser tab pointed at the desktop app's port sees instead of a sign-in form (LoginScreen.tsx).
       ...(isDesktop() ? { desktop: true as const } : {}),
     };
@@ -244,8 +337,30 @@ export default async function authRoutes(app: FastifyInstance) {
   // untouched, and the callback finishes by minting exactly the session a password login would.
   const OIDC_COOKIE = 'yomi_oidc';
 
-  app.get('/auth/oidc/start', async (req, reply) => {
-    if (!oidcEnabled()) return reply.code(404).send({ error: 'not_configured' });
+  /**
+   * The unauthenticated OIDC routes (v0.69.1). They declared no rate limit and did unconditional work per request: every
+   * refusal at the callback wrote an audit row holding the caller's own ?error= text (17 KB of table each), and the
+   * login ticket was good for any number of callbacks, each one a token-endpoint POST with this server's client
+   * credentials. The limit is a speed bump only -- its key is req.ip -- so the rows are throttled (auditEvery) and the
+   * ticket is spent once. Reintroduce any one: oidcCallbackBounds.int.test.ts counts the rows or the token POSTs.
+   */
+  const oidcLimit = { config: { rateLimit: { max: 30, timeWindow: '5 minutes' } } };
+  /** Refusals that come before any identity is proven: from anyone on the network, so throttled per kind. */
+  const PRE_IDENTITY = new Set(['missing_code', 'expired', 'state_mismatch', 'exchange_failed']);
+  /** Ticket ids already used, until their ten minutes are up. One process, so memory is enough. */
+  const spent = new Map<string, number>();
+  const spend = (jti: string | undefined): boolean => {
+    const now = Date.now();
+    // Added in expiry order, so the expired ones are at the front: stop at the first live one rather than visiting
+    // every spent id on every callback.
+    for (const [k, exp] of spent) { if (exp >= now) break; spent.delete(k); }
+    if (!jti || spent.has(jti)) return false;
+    spent.set(jti, now + 600_000);
+    return true;
+  };
+
+  /** Off to the provider: `link` names the account signed in here that the identity it answers with is linked to. */
+  const toProvider = async (reply: any, link?: string) => {
     let start;
     try {
       start = await beginLogin();
@@ -256,22 +371,47 @@ export default async function authRoutes(app: FastifyInstance) {
     // The PKCE verifier and nonce must survive the round trip but must not be readable by scripts, and
     // must not outlive the login attempt.
     const ticket = app.jwt.sign(
-      { typ: 'oidc', state: start.state, nonce: start.nonce, verifier: start.verifier },
+      { typ: 'oidc', jti: randomBytes(12).toString('base64url'), state: start.state, nonce: start.nonce, verifier: start.verifier, ...(link ? { link } : {}) },
       { expiresIn: 600 },
     );
     reply.setCookie(OIDC_COOKIE, ticket, {
       httpOnly: true, secure: 'auto', sameSite: 'lax', path: '/auth/oidc', maxAge: 600,
     });
     return reply.redirect(start.url);
+  };
+
+  app.get('/auth/oidc/start', oidcLimit, async (_req, reply) => {
+    if (!oidcEnabled()) return reply.code(404).send({ error: 'not_configured' });
+    return toProvider(reply);
   });
 
-  app.get('/auth/oidc/callback', async (req, reply) => {
+  /**
+   * Link the account signed in on this browser to an identity at the provider (v0.63.0, #208): Profile → Account's
+   * Link to …. How an install moves accounts that already exist to SSO before it turns SSO-only mode on, and how the
+   * rescue admin links theirs. A top-level navigation, so the account is the one whose session cookie comes with it,
+   * never one a request names; the provider's answer lands on the callback below, which links rather than signs in.
+   * A browser with no session goes to the sign-in screen. Reintroduce by taking the account from the query: "a link
+   * names the account signed in on this browser, never another" in ssoLink.int.test.ts links the wrong one.
+   */
+  app.get('/auth/oidc/link', oidcLimit, async (req, reply) => {
     if (!oidcEnabled()) return reply.code(404).send({ error: 'not_configured' });
-    const fail = async (reason: string, detail?: string) => {
-      await logAudit('login.oidc_fail', { detail: { reason, detail }, req });
+    const token = req.cookies?.[REFRESH_COOKIE];
+    const cur = token ? await validateRefreshToken(token) : null;
+    if (!cur) return reply.redirect(`${env.PUBLIC_ORIGIN.replace(/\/$/, '')}/login`);
+    return toProvider(reply, cur.userId);
+  });
+
+  app.get('/auth/oidc/callback', oidcLimit, async (req, reply) => {
+    if (!oidcEnabled()) return reply.code(404).send({ error: 'not_configured' });
+    const fail = async (reason: string, detail?: string, identityProven = false) => {
+      // Before an identity is proven the caller is anyone on the network: one row a minute per kind, counting the
+      // attempts it stands for, and never more of the caller's own text than a short token.
+      const shown = String(reason).slice(0, 64);
+      const attempts = identityProven ? 1 : auditEvery(`login.oidc_fail:${PRE_IDENTITY.has(reason) ? reason : 'provider_error'}`);
+      if (attempts !== null) await logAudit('login.oidc_fail', { detail: { reason: shown, detail: detail?.slice(0, 200), attempts }, req });
       reply.clearCookie(OIDC_COOKIE, { path: '/auth/oidc' });
       const origin = env.PUBLIC_ORIGIN.replace(/\/$/, '');
-      return reply.redirect(`${origin}/login?sso_error=${encodeURIComponent(reason)}`);
+      return reply.redirect(`${origin}/login?sso_error=${encodeURIComponent(shown)}`);
     };
 
     const { code, state, error } = req.query as { code?: string; state?: string; error?: string };
@@ -280,13 +420,15 @@ export default async function authRoutes(app: FastifyInstance) {
 
     const raw = (req.cookies as Record<string, string | undefined>)[OIDC_COOKIE];
     if (!raw) return fail('expired');
-    let ticket: { typ?: string; state?: string; nonce?: string; verifier?: string };
+    let ticket: { typ?: string; jti?: string; state?: string; nonce?: string; verifier?: string; link?: string };
     try {
       ticket = app.jwt.verify(raw);
     } catch {
       return fail('expired');
     }
     if (ticket.typ !== 'oidc' || !ticket.state || ticket.state !== state) return fail('state_mismatch');
+    // One callback per ticket: a replay never reaches the provider's token endpoint.
+    if (!spend(ticket.jti)) return fail('expired');
 
     let claims: OidcClaims;
     try {
@@ -297,17 +439,38 @@ export default async function authRoutes(app: FastifyInstance) {
     }
     reply.clearCookie(OIDC_COOKIE, { path: '/auth/oidc' });
 
+    // A link from Profile → Account (above): the identity joins the account that asked, and nobody is signed in --
+    // that browser already is. Back to the profile, saying how it went.
+    if (ticket.link) {
+      const back = (result: string) => reply.redirect(`${env.PUBLIC_ORIGIN.replace(/\/$/, '')}/profile/?tab=Account&sso_link=${result}`);
+      const taken = await one<{ id: string }>('SELECT id FROM users WHERE oidc_issuer = $1 AND oidc_sub = $2', [claims.issuer, claims.sub]);
+      // Never two accounts for one identity: it would sign in as whichever the lookup found first.
+      if (taken && taken.id !== ticket.link) {
+        await logAudit('login.oidc_fail', { userId: ticket.link, detail: { reason: 'link_taken' }, req });
+        return back('taken');
+      }
+      const u = await one<{ username: string | null; disabled: boolean }>('SELECT username, disabled FROM users WHERE id = $1', [ticket.link]);
+      if (!u || u.disabled) return back('failed');
+      await q('UPDATE users SET oidc_issuer = $2, oidc_sub = $3 WHERE id = $1', [ticket.link, claims.issuer, claims.sub]);
+      await logAudit('user.oidc_linked', { userId: ticket.link, username: u.username ?? undefined, detail: { issuer: claims.issuer, via: 'profile' }, req });
+      return back('ok');
+    }
+
     let userId: string;
     try {
       userId = await resolveOidcUser(claims);
     } catch (e) {
-      return fail((e as Error).message);
+      const reason = (e as Error).message;
+      // A new SSO-only server refusing a first sign-in says whose (v0.63.0): the subject to copy into
+      // OIDC_BOOTSTRAP_ADMIN_SUB is in the log, where only the operator reads it.
+      if (reason === 'not_set_up') app.log.warn(`[auth] a first sign-in, by the subject "${claims.sub}", is not this server's first admin (OIDC_BOOTSTRAP_ADMIN_SUB, OIDC_ADMIN_GROUP)`);
+      return fail(reason, undefined, true);
     }
 
     const row = await one<{ role: string; disabled: boolean; username: string | null }>(
       'SELECT role, disabled, username FROM users WHERE id = $1', [userId],
     );
-    if (!row || row.disabled) return fail('disabled');
+    if (!row || row.disabled) return fail('disabled', undefined, true);
 
     const refresh = await issueRefreshToken(userId, {
       deviceName: 'SSO', ip: clientIp(req), userAgent: (req.headers['user-agent'] as string) || null,
@@ -321,29 +484,57 @@ export default async function authRoutes(app: FastifyInstance) {
 
   /** Map an OIDC identity to a local account, creating or adopting one only where configured to. */
   async function resolveOidcUser(claims: OidcClaims): Promise<string> {
-    const existing = await one<{ id: string }>(
-      'SELECT id FROM users WHERE oidc_issuer = $1 AND oidc_sub = $2', [claims.issuer, claims.sub],
+    const existing = await one<{ id: string; role: string }>(
+      'SELECT id, role FROM users WHERE oidc_issuer = $1 AND oidc_sub = $2', [claims.issuer, claims.sub],
     );
     if (existing) {
       // keep the role in step with the IdP when group mapping is configured
       if (env.OIDC_ADMIN_GROUP) {
-        await q('UPDATE users SET role = $2 WHERE id = $1', [existing.id, isAdminByGroup(claims) ? 'admin' : 'user']);
+        let role = isAdminByGroup(claims) ? 'admin' : 'user';
+        // ...but never the server's last admin out of being one (v0.63.0): an SSO-only server's first admin may come
+        // from OIDC_BOOTSTRAP_ADMIN_SUB and be in no group, and with no password to fall back on, demoting them would
+        // leave nobody able to run the server. Admin → Members refuses the same (last_admin). Reintroduce by dropping
+        // it: "the first admin stays one while nobody else is" in ssoOnly.int.test.ts reads user.
+        if (role === 'user' && existing.role === 'admin') {
+          const others = await one<{ c: number }>(
+            `SELECT count(*)::int AS c FROM users WHERE role = 'admin' AND NOT disabled AND id <> $1`, [existing.id]);
+          if ((others?.c ?? 0) === 0) {
+            role = 'admin';
+            app.log.warn(`[auth] the provider puts the last admin outside ${env.OIDC_ADMIN_GROUP}: kept as admin`);
+          }
+        }
+        await q('UPDATE users SET role = $2 WHERE id = $1', [existing.id, role]);
       }
       return existing.id;
     }
 
-    const wanted = (claims.username || claims.email?.split('@')[0] || '').replace(/[^a-zA-Z0-9._-]/g, '');
+    // SSO-only mode (v0.63.0, #208): a new server's first account is its first admin, made here rather than by a setup
+    // form (firstAdmin, below). Past it, an unknown identity is a sign-up like any other.
+    if (!local) {
+      const first = await firstAdmin(claims);
+      if (first) return first;
+    }
+
+    const wanted = usernameFor(claims);
     if (!wanted) throw new Error('no_username');
 
     if (env.OIDC_LINK_BY_USERNAME) {
-      const local = await one<{ id: string; oidc_sub: string | null }>(
-        'SELECT id, oidc_sub FROM users WHERE username = $1', [wanted],
-      );
+      // Adopt only by the username the provider itself reports, exactly -- what the setting promises (env.ts). `wanted`
+      // is a name for a NEW account: it falls back to the email's local part (email_verified unread, the domain
+      // dropped) and strips characters, so adopting by it handed an existing account, an admin's included, to any
+      // identity whose email or cleaned name happened to match (v0.69.1). Reintroduce by looking up `wanted`:
+      // oidcLinkByUsername.int.test.ts adopts 'admin' for an identity that reports no username at all.
+      const reported = claims.username;
+      const local = reported
+        ? await one<{ id: string; oidc_sub: string | null }>('SELECT id, oidc_sub FROM users WHERE username = $1', [reported])
+        : null;
       // Never steal an account already bound to a different SSO identity.
       if (local && !local.oidc_sub) {
         await q('UPDATE users SET oidc_issuer = $2, oidc_sub = $3 WHERE id = $1', [local.id, claims.issuer, claims.sub]);
-        await logAudit('user.oidc_linked', { userId: local.id, username: wanted, detail: { issuer: claims.issuer } });
-        return local.id;
+        await logAudit('user.oidc_linked', { userId: local.id, username: reported, detail: { issuer: claims.issuer } });
+        // Linked now, so the linked account's path runs: OIDC_ADMIN_GROUP sets the role from this first sign-in on,
+        // where adoption used to keep whatever role the account had (an admin outside the group stayed one).
+        return resolveOidcUser(claims);
       }
       if (local) throw new Error('username_taken');
     }
@@ -354,35 +545,110 @@ export default async function authRoutes(app: FastifyInstance) {
     const placeholder = await hash(randomBytes(32).toString('base64url'));
     let username = wanted;
     for (let i = 2; await one('SELECT 1 FROM users WHERE username = $1', [username]); i++) username = `${wanted}${i}`;
-    const rows = await q<{ id: string }>(
-      `INSERT INTO users (display_name, username, role, password_hash, auth_kind, oidc_issuer, oidc_sub)
-       VALUES ($1,$2,$3,$4,'oidc',$5,$6) RETURNING id`,
-      [claims.displayName || username, username, isAdminByGroup(claims) ? 'admin' : 'user',
-       placeholder, claims.issuer, claims.sub],
-    );
-    await logAudit('user.oidc_created', { userId: rows[0].id, username, detail: { issuer: claims.issuer } });
-    return rows[0].id;
+    const role = isAdminByGroup(claims) ? 'admin' : 'user';
+    // A sign-up like /auth/register's: it starts with what Admin → Members → When someone signs up says
+    // (lib/memberDefaults.ts), written with the account so its first request already has it -- an admin by the group
+    // too, for the day the group sync makes it a member. Reintroduce by dropping the call, or by making it for members
+    // only: "a first sign-in through the provider starts with the defaults" in memberDefaults.int.test.ts finds every
+    // library open.
+    const id = await tx(async (qq) => {
+      const [row] = await qq<{ id: string }>(
+        `INSERT INTO users (display_name, username, role, password_hash, auth_kind, oidc_issuer, oidc_sub)
+         VALUES ($1,$2,$3,$4,'oidc',$5,$6) RETURNING id`,
+        [claims.displayName || username, username, role, placeholder, claims.issuer, claims.sub],
+      );
+      await applyMemberDefaults(qq, row.id);
+      return row.id;
+    });
+    await logAudit('user.oidc_created', { userId: id, username, detail: { issuer: claims.issuer } });
+    return id;
+  }
+
+  /**
+   * A new SSO-only server's first admin, from this sign-in -- or null when the server has an account already. The
+   * subject OIDC_BOOTSTRAP_ADMIN_SUB names, else anyone in OIDC_ADMIN_GROUP (lib/authMode.ts mayBootstrap), whatever
+   * OIDC_ALLOW_SIGNUP says: this is the server's admin, not a sign-up. Anyone else before them is told the server is
+   * not set up yet (`not_set_up`), and gets no account. One lock and one count, so two first sign-ins at once make one
+   * admin. Reintroduce by checking outside the lock: "two first sign-ins at once make one admin" in
+   * ssoOnly.int.test.ts finds two.
+   */
+  async function firstAdmin(claims: OidcClaims): Promise<string | null> {
+    // An unusable password, hashed before the lock: the account is reached through the provider alone.
+    const placeholder = await hash(randomBytes(32).toString('base64url'));
+    const username = usernameFor(claims) || 'admin';
+    const id = await tx(async (qq) => {
+      await qq('SELECT pg_advisory_xact_lock(6301)');
+      if ((await qq('SELECT 1 FROM users LIMIT 1')).length) return null;
+      if (!mayBootstrap(claims, { bootstrapSub: bootstrapSub(), adminGroup: env.OIDC_ADMIN_GROUP })) throw new Error('not_set_up');
+      if (firstAdminPauseMs) await new Promise((go) => setTimeout(go, firstAdminPauseMs));
+      const [row] = await qq<{ id: string }>(
+        `INSERT INTO users (display_name, username, role, password_hash, auth_kind, oidc_issuer, oidc_sub)
+         VALUES ($1, $2, 'admin', $3, 'oidc', $4, $5) RETURNING id`,
+        [claims.displayName || username, username, placeholder, claims.issuer, claims.sub],
+      );
+      await qq(`INSERT INTO app_settings (user_id, data) VALUES ($1, '{}'::jsonb) ON CONFLICT (user_id) DO NOTHING`, [row.id]);
+      return row.id;
+    });
+    if (id) await logAudit('setup.complete', { userId: id, username, detail: { via: 'oidc', issuer: claims.issuer } });
+    return id;
   }
 
   // self-registration (only when the admin enabled it) → creates a plain user + logs in
-  app.post('/auth/register', { config: { rateLimit: { max: 5, timeWindow: '10 minutes' } } }, async (req, reply) => {
+  //
+  // v0.61.0: the sign-in screen has a form for this at last (web/components/LoginScreen.tsx -- Open registration in
+  // Admin → Settings did nothing visible before), so it answers like a sign-in in three more ways:
+  //  * the device names itself, as at /auth/login, so the new session reads as this phone in the sessions list;
+  //  * a name that differs from an existing one only in case is taken. uq_users_username is case-sensitive, so a
+  //    stranger could sign up as `Admin` beside `admin` and be told apart only by a capital letter. Reintroduce by
+  //    comparing `username = $1`: "a lookalike of an existing name is taken" in register.int.test.ts gets a 200;
+  //  * check and insert run under one advisory lock on the lower-cased name, so sign-ups racing for `bob` and `Bob`
+  //    end in one account and 409s; and a unique violation from any other writer (an admin creating the same name
+  //    that instant) is a 409 too, never a 500. Reintroduce by dropping the lock: "sign-ups racing for one name in
+  //    different cases end in one account" in register.int.test.ts sees several; drop the 23505 mapping: "a unique
+  //    violation from another writer is a 409, not a 500" sees a 500.
+  if (local) app.post('/auth/register', { config: { rateLimit: { max: 5, timeWindow: '10 minutes' } } }, async (req, reply) => {
     const s = await one<{ allow_registration: boolean }>('SELECT allow_registration FROM server_settings WHERE id = 1');
     if (!s?.allow_registration) return reply.code(403).send({ error: 'registration_disabled', message: 'Registration is disabled.' });
-    const b = z.object({ username: z.string().min(2).max(64).regex(/^[a-zA-Z0-9._-]+$/), password: z.string(), displayName: z.string().max(64).optional() }).safeParse(req.body);
+    const b = z.object({
+      username: z.string().min(2).max(64).regex(/^[a-zA-Z0-9._-]+$/),
+      password: z.string(),
+      displayName: z.string().max(64).optional(),
+      deviceId: z.string().max(128).optional(),
+      deviceName: z.string().max(128).optional(),
+    }).safeParse(req.body);
     if (!b.success) return reply.code(400).send({ error: 'bad_request' });
     const pwErr = passwordError(b.data.password);
     if (pwErr) return reply.code(400).send({ error: 'weak_password', message: pwErr });
-    if (await one('SELECT id FROM users WHERE username = $1', [b.data.username])) return reply.code(409).send({ error: 'username_taken' });
-    const row = await one<{ id: string }>(
-      `INSERT INTO users (display_name, username, role, password_hash, auth_kind) VALUES ($1, $2, 'user', $3, 'password') RETURNING id`,
-      [b.data.displayName || b.data.username, b.data.username, await hash(b.data.password)],
-    );
-    if (row) await q(`INSERT INTO app_settings (user_id, data) VALUES ($1, '{}'::jsonb) ON CONFLICT (user_id) DO NOTHING`, [row.id]);
-    await logAudit('user.register', { userId: row?.id, username: b.data.username, req });
-    const refresh = await issueRefreshToken(row!.id, { ip: clientIp(req), userAgent: (req.headers['user-agent'] as string) || null });
+    const { username, deviceId, deviceName } = b.data;
+    const taken = () => reply.code(409).send({ error: 'username_taken', message: 'That username is taken.' });
+    // Hashed before the lock is taken, so the lock is held for two short statements and not for argon2.
+    const passwordHash = await hash(b.data.password);
+    let row: { id: string } | null;
+    try {
+      row = await tx(async (qq) => {
+        await qq('SELECT pg_advisory_xact_lock(hashtextextended(lower($1), 6100))', [username]);
+        if ((await qq('SELECT 1 FROM users WHERE lower(username) = lower($1)', [username])).length) return null;
+        const [made] = await qq<{ id: string }>(
+          `INSERT INTO users (display_name, username, role, password_hash, auth_kind) VALUES ($1, $2, 'user', $3, 'password') RETURNING id`,
+          [b.data.displayName || username, username, passwordHash],
+        );
+        await qq(`INSERT INTO app_settings (user_id, data) VALUES ($1, '{}'::jsonb) ON CONFLICT (user_id) DO NOTHING`, [made.id]);
+        // What Admin → Members → When someone signs up says a member starts with (lib/memberDefaults.ts), in this
+        // transaction, so the session answered below already has it. Reintroduce by dropping the call: "a sign-up
+        // starts with the defaults" in memberDefaults.int.test.ts finds every library open.
+        await applyMemberDefaults(qq, made.id);
+        return made;
+      });
+    } catch (e) {
+      if ((e as { code?: string })?.code === '23505') return taken();
+      throw e;
+    }
+    if (!row) return taken();
+    await logAudit('user.register', { userId: row.id, username, req });
+    const refresh = await issueRefreshToken(row.id, { deviceId, deviceName, ip: clientIp(req), userAgent: (req.headers['user-agent'] as string) || null });
     reply.setCookie(REFRESH_COOKIE, refresh, cookieOptions());
-    setImgCookie(app, reply, row!.id);
-    return reply.send({ ...signAccess(app, row!.id, 'user'), user: await userPayload(row!.id), refreshExpiresAt: refreshExpiresAt() });
+    setImgCookie(app, reply, row.id);
+    return reply.send({ ...signAccess(app, row.id, 'user'), user: await userPayload(row.id), refreshExpiresAt: refreshExpiresAt() });
   });
 
   app.post('/auth/refresh', async (req, reply) => {
@@ -451,12 +717,12 @@ export default async function authRoutes(app: FastifyInstance) {
   });
 
   // ---- change own password ----
-  app.post('/auth/password', { preHandler: [authenticate] }, async (req, reply) => {
+  if (local) app.post('/auth/password', { preHandler: [authenticate], config: SIGN_IN_LIMIT }, async (req, reply) => {
     const body = z.object({ current: z.string(), next: z.string() }).safeParse(req.body);
     if (!body.success) return reply.code(400).send({ error: 'bad_request' });
     const uid = userIdOf(req);
-    const u = await one<{ password_hash: string }>('SELECT password_hash FROM users WHERE id = $1', [uid]);
-    if (!u || !(await verify(u.password_hash, body.data.current).catch(() => false))) return reply.code(401).send({ error: 'wrong_password' });
+    const refused = await currentPasswordRefusal(req, body.data.current);
+    if (refused) return reply.code(refused.status).send(refused.body);
     const pwErr = passwordError(body.data.next);
     if (pwErr) return reply.code(400).send({ error: 'weak_password', message: pwErr });
     const token = req.cookies?.[REFRESH_COOKIE];
@@ -468,7 +734,7 @@ export default async function authRoutes(app: FastifyInstance) {
   });
 
   // ---- TOTP 2FA ----
-  app.post('/auth/totp/setup', { preHandler: [authenticate] }, async (req, reply) => {
+  if (local) app.post('/auth/totp/setup', { preHandler: [authenticate] }, async (req, reply) => {
     const uid = userIdOf(req);
     const u = await one<{ username: string | null; totp_enabled: boolean }>('SELECT username, totp_enabled FROM users WHERE id = $1', [uid]);
     // ⚠️ Setup is for an account WITHOUT a second step. With 2FA on, the secret in the row is the one the
@@ -482,32 +748,47 @@ export default async function authRoutes(app: FastifyInstance) {
     const secret = generateSecret();
     // The write carries the same condition, so an enable that lands between the SELECT and this UPDATE
     // (two tabs) still cannot have its live secret replaced; a row it did not touch is the same refusal.
-    const wrote = await q<{ id: string }>('UPDATE users SET totp_secret = $2 WHERE id = $1 AND NOT totp_enabled RETURNING id', [uid, secret]); // pending until enabled
+    // A new secret has used no step yet (lib/auth.ts spendTotpStep), so the last one goes with the old secret.
+    const wrote = await q<{ id: string }>('UPDATE users SET totp_secret = $2, totp_last_step = NULL WHERE id = $1 AND NOT totp_enabled RETURNING id', [uid, secret]); // pending until enabled
     if (!wrote.length) return refuse();
     const uri = otpauthURL(secret, u.username || 'user');
     const qr = await QRCode.toDataURL(uri, { margin: 1, width: 240 }).catch(() => '');
     return { secret, otpauth: uri, qr };
   });
 
-  app.post('/auth/totp/enable', { preHandler: [authenticate] }, async (req, reply) => {
-    const body = z.object({ code: z.string() }).safeParse(req.body);
+  if (local) app.post('/auth/totp/enable', { preHandler: [authenticate], config: SIGN_IN_LIMIT }, async (req, reply) => {
+    const body = z.object({ code: z.string(), password: z.string() }).safeParse(req.body);
     if (!body.success) return reply.code(400).send({ error: 'bad_request' });
     const uid = userIdOf(req);
+    // The password first (v0.77.1), as turning two-factor off asks for it: a session alone must not be able to put its
+    // own authenticator on the account and leave the owner's next sign-in asking for a code they cannot give.
+    // Reintroduce by dropping the check: "turning two-factor on asks for the password" in accountLock.int.test.ts
+    // enables it with a wrong one.
+    const refused = await currentPasswordRefusal(req, body.data.password);
+    if (refused) return reply.code(refused.status).send(refused.body);
+    const invalid = () => reply.code(400).send({ error: 'totp_invalid', message: 'Incorrect code — try again.' });
     const u = await one<{ totp_secret: string | null }>('SELECT totp_secret FROM users WHERE id = $1', [uid]);
-    if (!u?.totp_secret || !verifyTotp(u.totp_secret, body.data.code)) return reply.code(400).send({ error: 'totp_invalid', message: 'Incorrect code — try again.' });
+    const step = u?.totp_secret ? totpStep(u.totp_secret, body.data.code) : null;
+    if (step === null) return invalid();
     const codes = generateRecoveryCodes();
-    await q('UPDATE users SET totp_enabled = true, recovery_codes = $2 WHERE id = $1', [uid, codes.map((c) => sha256(c))]);
+    // The code that turns it on is spent like a sign-in's (spendTotpStep), in the write, and only against the secret it
+    // was checked with: a setup in another tab between the two statements changes nothing.
+    const done = await one(
+      `UPDATE users SET totp_enabled = true, recovery_codes = $2, totp_last_step = $3
+        WHERE id = $1 AND totp_secret = $4 AND (totp_last_step IS NULL OR totp_last_step < $3) RETURNING id`,
+      [uid, codes.map((c) => sha256(c)), step, u!.totp_secret]);
+    if (!done) return invalid();
     await logAudit('totp.enable', { userId: uid, req });
     return reply.send({ ok: true, recoveryCodes: codes });
   });
 
-  app.post('/auth/totp/disable', { preHandler: [authenticate] }, async (req, reply) => {
+  if (local) app.post('/auth/totp/disable', { preHandler: [authenticate], config: SIGN_IN_LIMIT }, async (req, reply) => {
     const body = z.object({ password: z.string() }).safeParse(req.body);
     if (!body.success) return reply.code(400).send({ error: 'bad_request' });
     const uid = userIdOf(req);
-    const u = await one<{ password_hash: string }>('SELECT password_hash FROM users WHERE id = $1', [uid]);
-    if (!u || !(await verify(u.password_hash, body.data.password).catch(() => false))) return reply.code(401).send({ error: 'wrong_password' });
-    await q("UPDATE users SET totp_enabled = false, totp_secret = NULL, recovery_codes = '{}' WHERE id = $1", [uid]);
+    const refused = await currentPasswordRefusal(req, body.data.password);
+    if (refused) return reply.code(refused.status).send(refused.body);
+    await q("UPDATE users SET totp_enabled = false, totp_secret = NULL, recovery_codes = '{}', totp_last_step = NULL WHERE id = $1", [uid]);
     await logAudit('totp.disable', { userId: uid, req });
     return reply.send({ ok: true });
   });

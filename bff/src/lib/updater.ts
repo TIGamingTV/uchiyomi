@@ -21,14 +21,18 @@ import { downloadWithFallback, type FallbackOutcome } from './chapterFallback';
 import { huntSource, seriesIsAdult, sweepAllowedFor, HUNT_MAX_PER_SWEEP } from './sourceHunt';
 import { completePartial, PARTIAL_COMPLETE_MAX } from './partial';
 import { effectiveSourcePriority, rankSources } from './sourcePrefs';
+import { languageRulesFor } from './copyLanguage';
 import { beginRun, endRun, stopRequested, type RunCard } from './downloadJobs';
 import { say } from './said';
 import { withOrigin } from './downloadActivity';
 import { decideNumbering, folderBusy, numberedChapters, renumberRunning, resumeRenumber, settleNumbering, NUMBERING_COLUMNS, type Settled } from './numbering';
 import { aliasParts, partRulesApply } from './partAlias';
-import { isListedNotice } from './noticeChapters';
+import { atHiddenNumber, isListedNotice } from './noticeChapters';
+import { hiddenNumbersOf } from './hiddenChapters';
+import { numKey } from './postingOrder';
 import { seriesHidesNotices } from './noticeSettings';
 import { heldBy, rangeEnd, rawRangeEnd } from './chapterRanges';
+import { isDue, refreshRadar } from './releaseRadar';
 
 /**
  * Why a series produced nothing this run.
@@ -421,7 +425,14 @@ async function visitSeries(seriesId: string, maxNew: number, opts: UpdateOpts): 
   // Reintroduce by going back to the follow order alone: "a new chapter comes from the higher-ranked source"
   // in sourceOrder.int.test.ts takes it from the primary.
   const priority = await effectiveSourcePriority(s.source_prefs).catch(() => null);
-  const chooseOpts = { sourceRank: rankSources(priority, followed.map((f) => f.source)) };
+  // v0.62.0: the series' language (lib/copyLanguage.ts). A copy known to be in another language is left out, and a
+  // copy of unknown language keeps to the group of the series' latest chapters. The rules are the stored listing's
+  // too (lib/seriesListing.ts decisionAfterSeries), so what the sweep downloads and what the listing calls the
+  // server's pick agree. A read that fails is no rule: the sweep goes on as it did before v0.62.0.
+  // Reintroduce by dropping the spread: "an English series never downloads the Spanish copy" in
+  // copyLanguage.int.test.ts downloads it.
+  const language = await languageRulesFor(seriesId, followed.map((f) => f.source)).catch(() => ({}));
+  const chooseOpts = { sourceRank: rankSources(priority, followed.map((f) => f.source)), ...language };
   // Chapter parts that sources number or split differently (lib/partAlias.ts): another site's N.1 / N.6 for the N /
   // N.5 on disk is renumbered onto them (R1), and another site's split of a chapter already here (R2), or of a new one
   // whose first-ranked source splits it another way (R3), is `covered` --
@@ -471,7 +482,15 @@ async function visitSeries(seriesId: string, maxNew: number, opts: UpdateOpts): 
     for (const c of tagged) { const l = pagesOf.get(c.number); if (l) l.push(c.pages); else pagesOf.set(c.number, [c.pages]); }
   }
   const notice = (n: number) => hidesNotice && isListedNotice(n, pagesOf.get(n) ?? []);
-  const wanted = releases.filter((c) => c.number >= floor && !notice(c.number));
+  // And the numbers an admin hid by hand (#240, lib/hiddenChapters.ts), the same way: not fetched, not "behind", not in
+  // the count of what the sources list, and kept in the listing, so Restore shows the grey row again at once and the
+  // next sweep fetches it. Read here, after the sources answered, so a hide made while they did is already in force; one
+  // made after still never downloads (lib/chapterFallback.ts reads them again at the source's door). By the number's
+  // key: a source's 7.0200005 is the 7.02 hidden. Reintroduce by dropping `hidden`: "the sweep never fetches a hidden
+  // number" in hiddenChapters.int.test.ts finds it asked for.
+  const hiddenNums = await hiddenNumbersOf(seriesId);
+  const hidden = (n: number) => notice(n) || hiddenNums.has(numKey(n));
+  const wanted = releases.filter((c) => c.number >= floor && !hidden(c.number));
   // What is on disk is never replaced, whoever released it: a copy from a better-ranked group appearing
   // later is not a missing chapter. (A deliberate "replace with the preferred group" would be its own path.)
   // "On disk" includes the tombstones the library keeps on purpose -- a chapter the read-chapter cleanup
@@ -497,7 +516,7 @@ async function visitSeries(seriesId: string, maxNew: number, opts: UpdateOpts): 
   const live = heldBy(heldRows.filter((r) => r.pruned_at == null));
   // A covered number is another site's split of a chapter (R2, R3): not this sweep's to fetch, and not "behind" either.
   const missing = wanted.filter((c) => !have.has(c.number) && !covered.has(c.number)).sort((a, b) => a.number - b.number);
-  await stampChecked(seriesId, releases.filter((c) => !notice(c.number)).length, missing.length);
+  await stampChecked(seriesId, releases.filter((c) => !hidden(c.number)).length, missing.length);
   // The ledger for this series, read once: which chapters have already failed CHAPTER_RETRY_CAP times and
   // are not attempted again by the sweep, and which have been REFUSED twice by the very source that still
   // lists them. The second set is `persistent` for the fallback helper (lib/chapterFallback.ts): a refusal
@@ -553,7 +572,7 @@ async function visitSeries(seriesId: string, maxNew: number, opts: UpdateOpts): 
     // the source that ranks first (R3, whose own parts are the ones to fetch). Reintroduce by taking the top of every
     // release: "Fetch newest takes the newest chapter, not another site's part of one" in updater.int.test.ts finds
     // 78.9 queued for download.
-    const top = releases.filter((c) => !covered.has(c.number) && !notice(c.number))
+    const top = releases.filter((c) => !covered.has(c.number) && !hidden(c.number))
       .reduce<SourceChapter | null>((best, c) => (best && best.number >= c.number ? best : c), null);
     const via = top ? (top.source ?? (s.source_id as string)) : '';
     if (!top) newest = { number: null, state: 'unlisted' };
@@ -606,17 +625,26 @@ async function visitSeries(seriesId: string, maxNew: number, opts: UpdateOpts): 
   const refusing = new Set<string>();
   // Which sources the sweep may reach on this series' behalf, for the alternates and the hunt: never an
   // adult source on a clean series (lib/sourceHunt.ts sweepAllowedFor), and never past the viewer's own
-  // cap when a viewer drove the run. The chosen copy itself is not gated -- a person followed that source.
+  // cap when a viewer drove the run. The chosen copy itself is not held to the adult rule -- a person followed
+  // that source -- only to the viewer's cap and the rest (`chosenVia` below).
+  // ⚠️ v0.55.8 checked the chosen copy against the adult rule at the download's preflight: every new chapter of a
+  // clean series on an extension marked NSFW was listed and never fetched (asked by nobody, so not even a failure),
+  // while a manual download still worked. Reintroduce by dropping `chosenVia`: "the sweep downloads a clean series'
+  // new chapters from the adult source it follows" in updater.int.test.ts lands nothing.
   // Asked only when there is something to download: a listing refresh (maxNew 0) costs no extra query.
   const adult = queue.length > 0 && maxNew > 0 ? await seriesIsAdult(seriesId) : false;
   const sweepRule = await sweepAllowedFor(adult);
   const allowed = (id: string) => sweepRule(id) && (opts.sourceAllowed?.(id) ?? true) && !opts.resting?.(id);
-  const sourceAllowedNow = async (candidate: SourceChapter): Promise<boolean> => {
+  // Per chapter, for the fallback helper: its chosen copy's source passes the adult rule. The helper never takes an
+  // alternate or a hunted copy from that same source, so this opens the chosen copy and nothing else.
+  const allowedBeside = (chosenVia: string) => (id: string) =>
+    (id === chosenVia || sweepRule(id)) && (opts.sourceAllowed?.(id) ?? true) && !opts.resting?.(id);
+  const sourceAllowedNowBeside = (chosenVia: string) => async (candidate: SourceChapter): Promise<boolean> => {
     const id = candidate.source ?? '';
     if (!id || !(await seriesFollowsSource(seriesId, id))) return false;
     // Library adult state and the server's automatic-source policy can change while a chapter waits on its
     // source gate. Rebuild the rule at that boundary; the closure above remains only a cheap early filter.
-    const current = await sweepAllowedFor(await seriesIsAdult(seriesId));
+    const current = id === chosenVia ? () => true : await sweepAllowedFor(await seriesIsAdult(seriesId));
     return current(id) && (opts.sourceAllowed?.(id) ?? true) && !opts.resting?.(id);
   };
   // No hunt under posting order: a source found for the purpose numbers these posts its own way.
@@ -652,7 +680,7 @@ async function visitSeries(seriesId: string, maxNew: number, opts: UpdateOpts): 
           for (const c of candidates) if (await automaticChapterAllowedFor(seriesId, c)) open.push(c);
           return open;
         },
-        refusing, allowed,
+        refusing, allowed: allowedBeside(via),
         hunt: huntBudget ? async () => {
           if (opts.unattended && !(await seriesIsMonitored(seriesId))) return null;
           return (await huntSource(seriesId, ch.number, {
@@ -662,7 +690,7 @@ async function visitSeries(seriesId: string, maxNew: number, opts: UpdateOpts): 
         } : undefined,
         ...(opts.unattended ? { admit: () => seriesIsMonitored(seriesId) } : {}),
         automaticAllowed: (candidate) => automaticChapterAllowedFor(seriesId, candidate),
-        sourceAllowedNow,
+        sourceAllowedNow: sourceAllowedNowBeside(via),
         // Twice refused by the source this very copy is on (the ledger read above): the hunt may run on a
         // third refusal. A refusal from some other source is not this copy's history.
         persistent: persistentVia.get(ch.number) === via,
@@ -687,8 +715,9 @@ async function visitSeries(seriesId: string, maxNew: number, opts: UpdateOpts): 
       // newest" scans the folder and reports the chapter as already here rather than as a failed fetch.
       if (out.why === 'on_disk' && newest && newest.number === ch.number) newest = { ...newest, state: 'on_disk' };
       // Never asked -- its source is refusing and nothing else lists it -- is the old loop's `continue`:
-      // not an attempt, not a failure, and no ledger row towards the retry cap for a chapter nobody tried.
-      if (out.why === 'refusing') attempts--;
+      // not an attempt, not a failure, and no ledger row towards the retry cap for a chapter nobody tried. Nor is a
+      // number hidden while the queue waited (#240).
+      if (out.why === 'refusing' || out.why === 'hidden') attempts--;
     } else {
       failed++; // a failed chapter shouldn't abort the rest, but it must not vanish either
       await noteChapterFailure({ seriesId, title: s.title, number: ch.number, sourceId: out.via, err: out.err });
@@ -731,6 +760,13 @@ export async function runUpdateAll(opts: {
   onlyFavorites?: boolean; maxNew?: number; sweepMax?: number;
   /** The run's card (lib/downloadJobs.ts): progress written to it as the sweep goes, and its cancel flag obeyed. */
   card?: RunCard;
+  /**
+   * v0.61.0, the smart update checks (Admin -> Settings, server_settings.update_smart, off by default): only the
+   * series that are due by lib/releaseRadar.ts isDue are visited, `hoursMs` being the update interval. Passed by the
+   * scheduled tick alone (server.ts) and only while the switch is on: Run now, Check now, Fetch newest, the repair, Fix
+   * everything and the slow archive ask every series they mean to, as before.
+   */
+  smart?: { hoursMs: number };
 } = {}): Promise<{
   series: number; visited: number; added: number; failed: number; chapterFailures: number; capped: number;
   outcomes: Record<UpdateOutcome | 'threw' | 'skipped', number>; healthy: boolean; stopped?: SweepStop;
@@ -741,6 +777,11 @@ export async function runUpdateAll(opts: {
   /** Every series this sweep landed chapters for, with its title and how many: the digest's material
    *  (lib/notify, #70). Optional so a test's stand-in sweep need not invent one. */
   newChapters?: DigestSeries[];
+  /**
+   * v0.61.0: monitored series the smart checks left for a later sweep, quiet and not due (`smart`); 0 without it.
+   * Not in `series`, which counts what this sweep set out to visit, nor in `outcomes.skipped`.
+   */
+  rested: number;
 }> {
   const sweepMax = opts.sweepMax ?? SWEEP_MAX;
   // Rows never checked sort first, so the first sweep after this change visits in the old order.
@@ -748,10 +789,37 @@ export async function runUpdateAll(opts: {
   // What each series is asked through, for its queue below: its followers in follow order, and its numbering.
   const routing = `ARRAY(SELECT ss.source_id FROM series_sources ss WHERE ss.series_id = s.id ORDER BY ss.created_at, ss.source_id) AS extra,
     s.numbering, s.numbering_source`;
-  type SweepRow = { id: string; source_id: string | null; title: string; folder: string; extra: string[] | null; numbering: string | null; numbering_source: string | null };
-  const rows = opts.onlyFavorites
-      ? await q<SweepRow>(`SELECT DISTINCT s.id, s.source_id, s.title, s.folder, s.source_checked_at, s.latest_mtime, ${routing} FROM favorites f JOIN lib_series s ON s.id = f.series_id WHERE s.auto_update AND ${visibleToAll('s')} ${order}`)
-      : await q<SweepRow>(`SELECT s.id, s.source_id, s.title, s.folder, ${routing} FROM lib_series s WHERE s.auto_update AND ${visibleToAll('s')} ${order}`);
+  // What the smart checks read (lib/releaseRadar.ts DueInput): selected only for a smart sweep, so every other sweep's
+  // query is the one it always was.
+  const dueCols = opts.smart
+    ? `, s.source_checked_at AS checked_at, s.source_missing, s.latest_mtime AS latest_ms, s.created_at,
+       (SELECT r.next_at FROM series_radar r WHERE r.series_id = s.id) AS next_at,
+       (SELECT r.due_until FROM series_radar r WHERE r.series_id = s.id) AS due_until,
+       (SELECT r.last_at FROM series_radar r WHERE r.series_id = s.id) AS last_at`
+    : '';
+  type SweepRow = {
+    id: string; source_id: string | null; title: string; folder: string; extra: string[] | null; numbering: string | null; numbering_source: string | null;
+    checked_at?: Date | null; source_missing?: number | null; latest_ms?: number | string | null; created_at?: Date | null;
+    next_at?: Date | null; due_until?: Date | null; last_at?: Date | null;
+  };
+  let rows = opts.onlyFavorites
+      ? await q<SweepRow>(`SELECT DISTINCT s.id, s.source_id, s.title, s.folder, s.source_checked_at, s.latest_mtime, ${routing}${dueCols} FROM favorites f JOIN lib_series s ON s.id = f.series_id WHERE s.auto_update AND ${visibleToAll('s')} ${order}`)
+      : await q<SweepRow>(`SELECT s.id, s.source_id, s.title, s.folder, ${routing}${dueCols} FROM lib_series s WHERE s.auto_update AND ${visibleToAll('s')} ${order}`);
+  // v0.61.0: the smart checks rest the series that are not due BEFORE the per-source queues are built, so a rested
+  // series costs its source nothing, takes no turn and no pause, and is not counted on the run's card. Reintroduce by
+  // filtering nothing: "a smart sweep rests the quiet series that are not due, and asks the rest" in smartSweep.int.test.ts
+  // finds the quiet one asked.
+  let rested = 0;
+  if (opts.smart) {
+    const now = Date.now();
+    const t = (v: Date | null | undefined) => (v ? new Date(v).getTime() : null);
+    const due = rows.filter((r) => isDue({
+      checkedAt: t(r.checked_at), sourceMissing: r.source_missing ?? null, nextAt: t(r.next_at), dueUntil: t(r.due_until),
+      lastAt: t(r.last_at), latestMtime: Number(r.latest_ms) || null, createdAt: t(r.created_at),
+    }, now, opts.smart!.hoursMs));
+    rested = rows.length - due.length;
+    rows = due;
+  }
   const card = opts.card;
   const titles = new Map(rows.map((r) => [r.id, r.title] as const));
   const folders = new Map(rows.map((r) => [r.id, r.folder] as const));
@@ -794,7 +862,7 @@ export async function runUpdateAll(opts: {
   // catching it into `{ added: 0 }` is what made "the database went away mid-sweep" read as "nothing new".
   // `skipped` is what the budget, a parked source or a hold (below) left unvisited: not a failure, and not nothing either.
   const outcomes: Record<UpdateOutcome | 'threw' | 'skipped', number> = { ok: 0, busy: 0, gone: 0, unrouted: 0, blocked: 0, source_error: 0, renumber_pending: 0, off: 0, paused: 0, threw: 0, skipped: 0 };
-  const dated: { folder: string; chapters: SourceChapter[]; landed: Landed[] }[] = [];
+  const dated: { id: string; folder: string; chapters: SourceChapter[]; landed: Landed[] }[] = [];
   const newChapters: DigestSeries[] = [];
 
   sweep: while (queues.size) {
@@ -836,7 +904,7 @@ export async function runUpdateAll(opts: {
       partial += r.partial ?? 0;
       spent += r.added + (r.failed ?? 0);
       outcomes[r.outcome] = (outcomes[r.outcome] ?? 0) + 1;
-      if (r.added && r.folder && r.chapters?.length) dated.push({ folder: r.folder, chapters: r.chapters, landed: r.landed });
+      if (r.added && r.folder && r.chapters?.length) dated.push({ id, folder: r.folder, chapters: r.chapters, landed: r.landed });
       // The throw fallback above has `added: 0` and no title, so it can never reach the digest.
       if (r.added && (r as { title?: string }).title) newChapters.push({ id, title: (r as { title: string }).title, added: r.added });
       if (card) { card.done = visited; card.fetched = added; card.failed = chapterFailures; }
@@ -867,6 +935,8 @@ export async function runUpdateAll(opts: {
         WHERE b.missing_pages IS NOT NULL AND b.pruned_at IS NULL AND b.root = $1 AND ${visibleToAll('s')}
           -- An unmonitored series (auto_update off) gets nothing unattended, its missing pages included.
           AND s.auto_update
+          -- Nor a chapter at a number an admin hid (#240): its file is left exactly as it is.
+          AND NOT ${atHiddenNumber('b')}
         ORDER BY b.updated_at ASC LIMIT $2`, [DL_ROOT, PARTIAL_COMPLETE_MAX],
     ).catch(() => []);
     for (const b of partials) {
@@ -876,7 +946,15 @@ export async function runUpdateAll(opts: {
       if (!(await seriesIsMonitored(b.series_id))) continue;
       spent++;
       try {
-        const allowed = await sweepAllowedFor(await seriesIsAdult(b.series_id));
+        const adultRule = await sweepAllowedFor(await seriesIsAdult(b.series_id));
+        // The partial's own copy is on the source the series took the chapter from: as the sweep's chosen copy
+        // (#177), it is held to the adult rule no more than a person who follows that source is. The rule stays
+        // for what is reached on the series' behalf -- the alternates (listingAlternates leaves the own source
+        // out) and the hunt. Before, a clean series on an extension marked NSFW never had its holes filled.
+        // Reintroduce by passing adultRule as `allowed`: "a clean series' partial is completed from the adult
+        // source it follows" in partialComplete.int.test.ts leaves the hole.
+        const own = b.source_id ?? '';
+        const allowed = (id: string) => (own !== '' && id === own) || adultRule(id);
         const r = await completePartial(
           { ...b, number: Number(b.number) },
           {
@@ -886,7 +964,7 @@ export async function runUpdateAll(opts: {
             allowed,
             hunt: async () => (await seriesIsMonitored(b.series_id))
               ? (await huntSource(b.series_id, Number(b.number), {
-                allowed, budget: huntBudget, admit: () => seriesIsMonitored(b.series_id),
+                allowed: adultRule, budget: huntBudget, admit: () => seriesIsMonitored(b.series_id),
               })).chapter
               : null,
             admit: () => seriesIsMonitored(b.series_id),
@@ -895,7 +973,7 @@ export async function runUpdateAll(opts: {
             sourceAllowedNow: async (chapter) => {
               const id = chapter.source ?? '';
               if (!id || !(await seriesFollowsSource(b.series_id, id))) return false;
-              const current = await sweepAllowedFor(await seriesIsAdult(b.series_id));
+              const current = id === own ? () => true : await sweepAllowedFor(await seriesIsAdult(b.series_id));
               return current(id);
             },
           },
@@ -913,12 +991,16 @@ export async function runUpdateAll(opts: {
   for (const d of dated) { // stamp the books the scan just created
     await setBookDates(d.folder, d.chapters).catch(() => {});
     await setBookMeta(d.folder, d.landed).catch(() => {});
+    // v0.61.0: the chapters that just arrived are the radar's newest evidence (lib/releaseRadar.ts), and the listing
+    // refresh inside updateSeries ran before they were downloaded. Reintroduce by dropping it: "a sweep that lands a
+    // chapter dates the radar from it" in releaseRadar.int.test.ts keeps the radar of before the chapter came.
+    await refreshRadar(d.id).catch(() => null);
   }
   // `healthy` is the question the admin panel should have been asking all along: was this a quiet night, or
   // did nothing work? A run where every source failed now looks nothing like one where nothing was new.
   const broken = outcomes.source_error + outcomes.threw;
   return {
-    series: rows.length, visited, added, failed: broken, chapterFailures, capped, outcomes, stopped, switched, partial, completed,
+    series: rows.length, visited, added, failed: broken, chapterFailures, capped, outcomes, stopped, switched, partial, completed, rested,
     healthy: broken === 0 && chapterFailures === 0 && stopped !== 'disk' && stopped !== 'shutdown',
     newChapters,
   };
@@ -998,11 +1080,15 @@ export function runSweep(opts: SweepOpts & { by?: string | null }, log: SweepLog
         series: r.series, visited: r.visited, added: r.added, failed: r.failed,
         chapterFailures: r.chapterFailures, switched: r.switched, partial: r.partial,
         completed: r.completed, healthy: r.healthy, stopped: r.stopped,
+        // v0.61.0: the series the smart checks left for a later sweep (Admin -> Tasks: "184 quiet series not due").
+        rested: r.rested ?? 0,
       };
       // A sweep that added nothing because nothing was new, and one that added nothing because every source
       // was down, used to print the identical line. They no longer do. Nor does a sweep that finished look
       // like one the budget or the disk cut short.
-      const scope = `visited ${r.visited} of ${r.series} series${r.stopped ? ` (stopped: ${r.stopped})` : ''}`;
+      // v0.61.0: and how many quiet series the smart checks left for a later sweep, when the switch rested any.
+      const scope = `visited ${r.visited} of ${r.series} series${r.stopped ? ` (stopped: ${r.stopped})` : ''}`
+        + (r.rested ? ` (${r.rested} quiet series not due)` : '');
       // What the fallback chain did, when it did anything: a chapter taken from another followed source,
       // one saved with placeholder pages, a partial from an earlier night made whole. Silent when zero,
       // so a quiet night's line is the line it always was.

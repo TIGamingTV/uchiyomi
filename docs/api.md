@@ -112,7 +112,7 @@ Two steps: find it, then add the result. Adding takes a source and that source's
 URL.
 
 ```bash
-# 1. find it — searches your enabled sources in order and returns {source, sourceId, title, ...}
+# 1. find it — searches your enabled sources in order (six at a time since v0.59.0) and returns {source, sourceId, title, ...}
 curl -H "Authorization: Bearer $TOK" "https://your-server/api/sources/find?q=solo+leveling"
 
 # 2. add it
@@ -170,7 +170,8 @@ show them as one provider. A chapter's `lang` on a MangaDex copy is the app code
 `status` is `ok`, `disabled`, or, while a cooldown is running, one of `rate_limited` / `blocked` / `down`.
 It is also `quiet`, which means the source answers without error and returns nothing: a listing that has
 stopped parsing never throws, so it never earns a cooldown, and before this existed such a source kept
-reporting `ok` and kept being fetched first.
+reporting `ok` and kept being fetched first. Since v0.59.0 a source that is only slow stays `ok` (its `note` still
+says it has been slow): `quiet` sends a source to the back of Discover's order, and a slow one still answers.
 
 `note` is one sentence saying what is wrong, or `null` when nothing is. It is written for readers, so it
 never contains a hostname, a component name or any part of the recorded error. The operator-facing half of
@@ -210,6 +211,7 @@ the scheduled source check also read the source's slow streak, so `diagnosis.cod
 (*This source answers, but takes longer than the time it is given.*; before v0.49.1 *…but more slowly than it is
 given.*) from both, not only from Discover's health view;
 its `fix` names the configured `SOURCE_LATEST_TIMEOUT_MS` budget in seconds (*longer than 8s*).
+Since v0.55.10 a streak counts there only while its last over-budget answer is under a day old.
 Since v0.49.1 `diagnosis.code` can be `site_offline` (*The site says it is offline (its own page)*; fix *Wait for
 the site to come back, or find other sources for its series.*): a site engine (Madara, Manganato) that finds
 nothing on a page checks whether the page is the site's own offline or maintenance notice -- small (under 8 KB),
@@ -257,9 +259,23 @@ extension (`done: switched_off`; the extension stays installed), and only turns 
 turned_off`). It answers `{ok, done, followsDropped}`, audited `source.retire`. `DELETE /api/admin/sources/custom/:id`
 answers the same **409** `in_use` while the site is some series' main source.
 
-`PATCH /api/admin/sources/custom/:id` (admin) changes a custom site's `base` address and nothing else. The
-source id is derived from its name and the library is keyed on that id, so editing in place is the only way
-to follow a site to a new domain without orphaning every series that came from it.
+`PUT /api/admin/sources/:id/age-rating {ageRating: 18 | null}` (admin, since v0.73.0) rates a whole source **Adult
+only**, or takes the rating off so its extension's own flag decides again. Adult only is a permission: an account
+limited below 18 is refused the source everywhere — `latest`, `popular`, `detail`, `add` and `preview` by id too — as
+it is refused one whose extension declares itself adult, and while a request does not carry `adult=1` the source leaves
+Discover, search and the latest and popular lists. Nothing rates a source below its extension's flag. The rating is
+the settings' `adultSources` list (one list, two ways to write it); `GET /api/admin/sources/overview` reports it as
+`ageRating` (18 or null) beside `defaultAgeRating` (18 for an extension that declares itself adult). The id need not be
+loaded now. **400** for anything but 18 or null, **409** `too_many` past 200 rated sources (`messageSaid`
+`rating.tooMany`). Audited `source.age_rating`.
+
+`PATCH /api/admin/sources/custom/:id` (admin) changes a custom site's `base` address, its `lang`, or both, and
+nothing else. The source id is derived from its name and the library is keyed on that id, so editing in place is
+the only way to follow a site to a new domain without orphaning every series that came from it. A new `lang`
+(v0.62.0; one code, else **400** `unknown_language`) re-picks the chapters of every series that uses the site:
+a series in another language never follows the site automatically and never takes its chapters. Adding a site
+stores the language its homepage says (`<html lang>`, else `og:locale`), except English, which WordPress writes
+for a site left at its default; the add answers it as `lang`, null for the unstated language.
 
 `POST /api/sources/add` answers as soon as the outcome is decided and downloads afterwards. It used to hold
 the request until the first chapter had been fetched, measured at 15 to 59 seconds on a real install.
@@ -297,8 +313,8 @@ must agree **both ways** — at least 90% of the primary's numbers listed by the
 of the candidate's listed by the primary — else `numbering_differs`, so a sequel that continues past the
 primary ("Tokyo Ghoul:re" 1..60 for "Tokyo Ghoul" 1..20) is refused although it lists every number, while
 "(Official)" 1..22 for 1..20 (20 of 22 = 0.91) follows. The `coverage` reported for a two-way judgement is
-the lower of the two shares. At most two sources are followed per series, in the order given; a follower
-this path wrote has no author and reads `auto: true` on the series' sources. The results are not in the
+the lower of the two shares. At most `MAX_FOLLOWED_SOURCES` (default two) sources are followed per series, in the order
+given; a follower this path wrote has no author and reads `auto: true` on the series' sources. The results are not in the
 add's answer: they land on the series' job card (below), which a `none` add gets minted for the purpose.
 
 One response is deliberately gone: the **429** `blocked` for a source refusing downloads. That can only be
@@ -455,10 +471,57 @@ log a console error in every visitor's browser. Either answer is cached, so a so
 one lookup rather than one per page load.
 
 `GET /api/sources/latest?source=<id>&page=<n>` is bounded at `SOURCE_LATEST_TIMEOUT_MS` (default 8000) per
-source and cached server-side for ten minutes per source and page, with concurrent requests for the same page
-collapsed into one outbound fetch. A source that times out is recorded against its health and earns a
-cooldown, so it stops being picked first.
+source — `SOURCE_LATEST_SOLVER_TIMEOUT_MS` (default 45000) since v0.59.0 for a source behind the Cloudflare solver —
+and cached server-side for ten minutes per source and page, with concurrent requests for the same page
+collapsed into one outbound fetch. A source that times out on page 1 is recorded as slow (later pages are not
+evidence, since v0.59.0), and a run of slow answers earns a short fixed breather. During a breather earned by
+slowness alone, a page with nothing cached is still asked for (since v0.59.0); during a failure's cooldown the
+cached page, or nothing, is served. `GET /api/sources/popular` follows the same rules.
 
+Since v0.56.0 every item of `latest`, `popular` and `search` (and every card of `search-all`) carries:
+
+* `work`: the key a client folds cards by. `lib:<id>` when the library holds the work, `al:<id>` / `md:<id>` /
+  `mu:<id>` when AniList, MangaDex or MangaUpdates said which work the name is, else `n:<key>` (the name, folded).
+  It is never empty: a name that folds to nothing is `s:<source>:<sourceId>`.
+* `owned`: the library holds the work in any language, by the source series it came from or follows, any name it
+  goes by (a followed source's own name included), or its AniList link. The app leaves these out of Newest,
+  Popular and Trending, and marks them in search.
+
+`inLibrary`, `librarySeriesId`, `libraryLangs` and `lang` keep their per-language meaning.
+
+`search-all` folds its cards by `work`, so one card may carry providers whose titles differ.
+
+`GET /api/discover/works?keys=<k1>,<k2>,...` takes up to 200 work keys and answers what each is now:
+`{works: {<key>: {work, owned}}, pending}`. An `n:` key whose name has been placed with a work since comes back as
+that work. `pending` is how many of the keys are still being looked up.
+
+Admin settings carry `discover_lookups` (`PATCH` takes `discoverLookups`). It is Admin → Settings *Match Discover
+titles online*.
+
+**Trending and Because you read** (since v0.61.0). `GET /api/discover/trending?country=KR|JP|CN` (KR, manhwa, when
+absent; anything else is **400**) answers AniList's trending titles of that country of origin -- never 18+ on AniList,
+never a light novel, never one the server holds -- each country cached six hours; with Show 18+ off, a title carrying a
+genre the admin named as adult is left out of the answer. `GET /api/discover/because` answers `{seed: {id, title} |
+null, content}`, `content` in the trending shape: what AniList's readers recommend after the caller's most recently read
+series with a finished chapter (that they may list, in a library with AniList lookups on and a checked link), less what
+the server holds and what is 18+ for them -- the first of their last five such series that leaves at least four. Both
+sit behind the `canDownload` gate below; neither asks AniList for anything about the library.
+
+**Recommended for you** (since v0.71.0). `GET /api/discover/recommendations` answers `{content, sources, pending}` from
+the trackers the caller has connected (AniList and MyAnimeList seed it; any other connected list only adds to what is
+left out). It sits behind the same `canDownload` rule as the rest of Discover: **403** for an account that may not add
+series, before anything reads its trackers.
+`content` is ranked, at most 40, and each entry carries `title`, `altTitles`, `cover`, `score` and `sources` -- the
+services that suggested it and, for each, the series of the caller's own it came from (`because`). `sources` says, per
+connected service, how many titles are on the list and how many of them seeded. Left out: everything on any connected
+list under any status, what the library holds (by name, as Discover's index knows it), light novels, and what is 18+
+for the caller as every Discover rail judges it -- an adults-only title past their age cap, and while they hide 18+ one
+in a genre the admin named adult -- with a title no service rated failing closed for a caller hiding 18+ or capped below
+it. The series named in `because` are judged the same way, and a series of the library counts only when the caller may
+browse it, in a library with AniList lookups on, through a checked link. It is answered from two caches
+(`tracker_list_cache`: the list, read at most every 12 hours; `tracker_rec_cache`: what readers recommend after a title,
+once per server per 14 days) and waits up to 8 seconds for a first refresh; `pending: true` says one is still running.
+An account with nothing connected gets an empty `content`, and nothing is asked of any service. `Cache-Control: no-store`.
 Responses worth handling: **200** with `message: "already in library"` if you have that exact series already,
 and **409** `duplicate` if a series with the same title came from a *different* source — retry with
 `"force": true` to add the second copy anyway.
@@ -504,6 +567,7 @@ Cloudflare) and asked through a pool of `SEARCH_CONCURRENCY` (default: `SCAN_CON
 slot count) at a time, one lane for solver-fronted sources and one for the rest; a source that outruns its
 budget is recorded as slow (never as a failure), one that throws is recorded against its health, and one that
 is disabled or in a cooldown is skipped rather than asked — exactly as the newest listing treats them.
+`sources=a,b,c` (at most 200 ids) asks only those, narrowing exactly as `source=` does: never past the sources the caller may reach.
 
 `&source=<id>` asks only that one source, which is what Discover sends while it is filtered to a source. It
 narrows the set described above and never widens it: an adult source without `adult=1`, one above your age
@@ -552,10 +616,22 @@ an item flagged `info` is listed for reference (a source you turned off, a sourc
 already confirmed short, a gap the nightly repair has already searched for) and never decides the verdict.
 Useful as a nightly cron that emails you only when `status` isn't `ok`.
 
+Since v0.72.0 three more checks: `disk` (the downloads disk's free space -- `problem` below `MIN_FREE_GB`, where new
+downloads stop, `warn` below the slow archive's floor while it has a series queued, else one `info` row -- and a
+library or download folder that cannot be opened or is empty while chapters are recorded in it; only its first
+entry is read), `trackers` (each member's tracker connection the tracker refused, whose last sync failed, or whose
+sign-in ended or ends within 14 days; within 30 days `info`) and `files` (per series, the chapter files the nightly
+page count found no page in, from its stamps alone, with `bookIds`/`numbers` of the ones Uchiyomi downloaded itself
+and the `refetch` action: POST /api/admin/series/{id}/chapters/refetch with those `bookIds`). All three can be ignored;
+none deletes anything. `GET /api/admin/health?view=series` adds `bySeries`: every series with a finding on a card
+about one series at a time (a duplicate pair aside), grouped from each card's whole list rather than the 50 rows a
+card carries, as `[{seriesId, title, status, findings: [{check, item}]}]`, worst first.
+
 `POST /api/admin/health/ignore` (since v0.48.3) takes `{check, key, ignored}` and ignores one finding, or stops
 ignoring it: the finding is then reported greyed (`ignored`, `info`), stays quiet while what it is about (a gap's
-missing runs, a folder's files) is part of what was ignored, and its ignore is forgotten once it has been gone
-for a week. Short chapters use confirm-short, which already records the same judgement.
+missing runs, a folder's files, since v0.72.0 how bad a disk finding was and what was wrong with a tracker sign-in)
+is part of what was ignored, and its ignore is forgotten once it has been gone for a week. Short chapters use
+confirm-short, which already records the same judgement.
 
 **Fix everything** (since v0.55.0). `POST /api/admin/health/autofix` (`{}`) starts one background run that drives
 every Health card it can to green -- 202 `{ok, runId}`, or 409 `{error: 'busy', running}` beside another run
@@ -588,7 +664,7 @@ impossible chapter numbers deleted, with the delete route's guards) and `recheck
 `GET /api/admin/health/autofix` answers `{run, last}` -- the live run and the newest finished one -- and
 `GET /api/admin/health/autofix/:runId` one run; `POST /api/admin/health/autofix/stop` stops it at its next safe point
 (`{ok, stopping}`), never inside a merge, a delete or a renumber. A run is `{id, status, startedAt, finishedAt?, by,
-phase, phaseIndex, stopping?, current?, summary?, log?}` (`stopping` from Stop until its safe point, for every
+origin, phase, phaseIndex, stopping?, current?, summary?, log?}` (`origin`, since v0.70.0: `nightly` or `manual`) (`stopping` from Stop until its safe point, for every
 viewer), every sentence a `Said` (`autofix.*` codes): `summary` is `{green, again, done, clears, needsYou}` -- `green`
 when nothing but Needs you is left, `again` when something a run could still change is left (what this one did not
 get to: stopped, or out of time, searches, Tests or installs -- `clears` says "the next Fix everything continues"),
@@ -632,8 +708,11 @@ Since v0.41.0 an item also carries what can be **done** about it, so the same fi
 script: `actions` is an ordered list of `fix_short`, `confirm_short`, `delete`, `fill`, `retry`, `test`,
 `unblock`, `disable`, `merge`, `solver_reset` and, since v0.49.0, `engine_solver`, `renumber` and `keep_numbers`
 (below); `bookId`, `bookIds`, `seriesId`, `seriesIds`, `sourceId` and
-`keep` (the copy a duplicate pair should keep: most live chapters, then most readers, then the older row)
-are the ids those actions need; `number`/`numbers` are the chapters it is about (a gap item carries at most
+`keep` (the copy a duplicate pair should keep: since v0.57.0 one in a work, then the one whose main source still
+works — usable or cooling down — then most live chapters, most readers, the older row) are the ids those actions
+need, and since v0.57.0 a duplicates row carries `copies`, in `seriesIds` order, `{id, chapters, source: {id, name,
+standing} | null}`, `standing` one of `usable`, `cooling`, `failing`, `off`, `not_loaded`: what the merge dialog shows
+of each copy; `number`/`numbers` are the chapters it is about (a gap item carries at most
 100 numbers, an impossible-number item at most 20 ids); and `fixed` `{at, what}` says what has already been
 decided or found — `confirmed short at the source`, or what the repair's gap search concluded — which is
 what greys the row. Since v0.49.0 an item may also carry `outcome` — what the last attempt found, from
@@ -860,8 +939,10 @@ their pages -- and neither the updater nor the slow archive downloads a fraction
 them. A file holding a range of chapters is never a notice either way. *What is a notice* below is the rule while it
 is on.
 
-A series' type is `seriesType` on `GET /api/series/:id` for admins (`unknown` when nothing is known), with
-`detectedType {type, from}` naming the evidence. Most trusted first, the evidence is:
+A series' type is `seriesType` on `GET /api/series/:id` (`unknown` when nothing is known): the admin's override, else
+the evidence's. Since v0.61.0 every viewer gets it -- the reader's *Pick the mode for each series* opens a manhwa or a
+webtoon as a long strip and a manga page by page -- while `detectedType {type, from}`, naming the evidence, stays an
+admin's. Most trusted first, the evidence is:
 
 1. `genre`: a genre naming one origin. A genre list naming several (a site's whole genre menu) is no evidence,
    and neither is `Manga` alone, which many sites file everything under.
@@ -895,7 +976,9 @@ the next check downloads what it no longer hides.
 
 ## Rate limiting
 
-The API isn't rate-limited for authenticated users; the limits are on getting in. `POST /auth/login` takes
+The API isn't rate-limited for authenticated users, but for the two Test routes that ask someone else's service
+(`POST /api/trackers/:provider/test` six per account per minute, since v0.61.0; a notification target's Test five);
+the limits are on getting in. `POST /auth/login` takes
 ten attempts per address per five minutes, `POST /api/setup` and `POST /auth/register` five per ten minutes,
 and the Komga-compatible routes count failed credentials on the login budget — ten per address per five
 minutes, then **429** `too_many_requests` `{message}` with `Retry-After` for every further request from that
@@ -934,15 +1017,41 @@ GET    /auth/sessions             DELETE /auth/sessions/:id
 POST   /auth/totp/setup           POST   /auth/totp/enable
 POST   /auth/totp/disable
 GET    /auth/oidc/start             GET    /auth/oidc/callback
+GET    /auth/oidc/link
 ```
 
+**SSO-only mode** (since v0.63.0, `AUTH_MODE=oidc-only`): `/api/setup`, `/auth/login`, `/auth/register`,
+`/auth/password` and `/auth/totp/*` are not registered at all (**404**), `GET /api/setup/status` answers
+`{needsSetup: false}`, and `GET /auth/config` says `mode: 'oidc-only'`. `POST /api/admin/users`, and a
+`PATCH /api/admin/users/:id` that sets a password, are **403** `sso_only`. `GET /auth/oidc/link` links the account
+signed in on that browser to an identity at the provider. The whole mode is under
+[Single sign-on (OIDC)](#single-sign-on-oidc), below.
+
+**Signing up** (the form since v0.61.0). `POST /auth/register` `{username, password, displayName?, deviceId?,
+deviceName?}` works only while **Admin → Settings → Open registration** is on — `GET /auth/config` says so as
+`allowRegistration`, which the sign-in screen reads to offer *Create an account*, and which is always false on
+Uchiyomi Desktop — and is otherwise **403** `registration_disabled`. It makes a member (role `user`), with the
+new-member defaults (`newMemberDefaults` under [Admin](#admin)), and signs them in exactly as `/auth/login` does: the same body, cookies and session, named by `deviceId`/`deviceName` like a sign-in's.
+A name that differs from an existing one only in case is taken (**409** `username_taken`, as is the name itself),
+and two sign-ups racing for one name end in one account and a 409, never a 500. **400** is `bad_request` (a name
+outside letters, numbers, `.`, `_`, `-`, 2–64 long) or `weak_password`.
+
 **Two-factor enrolment is one way.** `POST /auth/totp/setup` writes a *pending* secret and answers
-`{secret, otpauth, qr}`; nothing is enforced until `POST /auth/totp/enable` `{code}` confirms a code from
-the app and answers the recovery codes once. While two-factor is already on, setup is **409**
+`{secret, otpauth, qr}`; nothing is enforced until `POST /auth/totp/enable` `{code, password}` confirms a code from
+the app with the account's password (asked for since v0.77.1; **401** `wrong_password`, **400** `totp_invalid` for the
+code) and answers the recovery codes once. While two-factor is already on, setup is **409**
 `{error: 'totp_enabled', message}` and the row is not touched (since v0.39.0): the secret in the row is
 the one the authenticator holds, and rotating it from a stale *Set up 2FA* button left the flag on and the
 app's codes wrong. `POST /auth/totp/disable` `{password}` is the way back (**401** `wrong_password`), and
-setup works again after it.
+setup works again after it. A code is good once (since v0.77.1): after one is accepted, by enable or at sign-in, only a
+code for a later 30-second step is. The sign-in body's `code` is a code from the app or a recovery code
+(`xxxxx-xxxxx-xxxxx-xxxxx`, with or without its dashes, since v0.77.1), each recovery code once.
+
+**The account lock.** Five failures in a row lock an account for 15 minutes: a wrong password or a wrong second-step
+code at `/auth/login`, and since v0.77.1 a wrong current password at `/auth/password`, `/auth/totp/enable` and
+`/auth/totp/disable`. A success clears the count. While the lock lasts these answer **423** `locked` without checking
+anything, and the first failure after it runs out counts as one. The four routes also take at most 10 requests in 5
+minutes from one address (**429**), as `/auth/login` always has.
 
 ### Library and reading
 ```
@@ -952,9 +1061,11 @@ GET    /api/random                GET    /api/genres
 GET    /api/genres/overview       GET    /api/libraries
 GET    /api/library/sources       GET    /api/adult-filter
 GET    /api/updates               POST   /api/updates/seen
+GET    /api/updates/expected
 POST   /api/refresh               GET    /api/refresh
 GET    /api/series/:id            GET    /api/series/:id/books
 GET    /api/series/:id/similar    GET    /api/series/:id/color
+GET    /api/series/:id/related
 POST   /api/series/search         GET    /api/leaderboard
 GET    /api/books/:id             POST   /api/books/:id/refetch
 GET    /api/books/:id/pages
@@ -962,9 +1073,22 @@ GET    /api/books/:id/next        PUT    /api/books/:id/progress
 PUT    /api/books/:id/pages/:n/junk
 GET    /api/offline/plan             GET    /api/series/:id/listing
 GET    /api/series/:id/groups        GET    /api/series/:id/versions
+GET    /api/series/:id/gaps
 POST   /api/series/:id/listing-progress
 DELETE /api/series/:id/listing-progress
 ```
+
+**Related works and More like this** (since v0.61.0). `GET /api/series/:id/related` answers `{lookups, content:
+[{relation, series?, outside?}]}`: what AniList relates the series to -- `relation` is `SEQUEL`, `PREQUEL`, `PARENT` (the
+main story), `SIDE_STORY`, `SPIN_OFF` or `ALTERNATIVE`, in that order. A work the server holds is `series` (enriched like
+every rail) when the caller may list it, and is left out, never named, when they may not; one it does not hold is
+`outside: {anilistId, title, cover, format, status, score}`, unless it is 18+ for the caller. `lookups` is false, with
+nothing else, for a series whose library has its AniList lookups off or that has no checked AniList link. `GET
+/api/series/:id/similar` now leads with the library series AniList's readers recommend after this one, then the genre
+matches, eighteen in all. Both read a copy the server keeps (`anilist_related`, keyed by AniList id), refreshed in the
+background in the same six-hourly round as the outside ratings: missing entries first, then the most recently read, ten
+per request, a row asked again after a week -- never for a library whose AniList lookups are off, and never when a page
+opens.
 
 **Filtering the library by source** (since v0.49.2; the filters are @TIGamingTV's, PR #124). On the owned
 backend, `POST /api/series/search` accepts two more conditions: `mainSource` (the source a series was added from,
@@ -1001,7 +1125,13 @@ merge or a forget — dissolves. The Komga-compatible API and OPDS keep every ed
 title it with its code, "Blue Lock (ES-419)", while a sibling is in the caller's sight; a tracker push never
 goes below what another series on the same tracker entry has sent. Since v0.55.0 `POST /api/admin/series/:id/merge`
 carries the absorbed series' main source to the survivor as a source it follows, when that source still works, is in
-the survivor's language and fits under the follower cap (`carried` names it, or is null).
+the survivor's language and fits under the follower cap (`carried` names it, or is null). Since v0.57.0 it keeps a
+chapter both series had once — a number each held exactly once; the survivor's copy stays unless it has placeholder
+pages and the other is whole — moving what was read of the other copy onto it and taking that copy off the list: its
+file is deleted from the download folder, or left on disk and set aside where the server does not delete. A
+bookmarked copy stays. The answer's `duplicates` counts the copies removed and `keptBoth` the numbers still held twice
+(audit `series.extra_copies`). The merges made before v0.57.0 are cleaned the same way once, a few minutes after the
+first boot of v0.57.0 (audited `series.extra_copies` with `via: 'merge_leftovers'`).
 
 **Mark caught up** (since v0.52.0, from discussion #72). `PATCH /api/admin/series/:id {chapterFloor:
 'caught_up'}` floors a series just above the newest chapter its sources list or the library holds, as a
@@ -1062,6 +1192,15 @@ missing placeholder. `GET /api/books/:id/download-manifest` copies the same opti
 each affected entry in `pages`, so offline readers preserve the evidence. A complete chapter has
 `missingPages: null` and no page-level `missing` keys.
 
+Since v0.77.0 `GET /api/books/:id/pages?spreads=1` (#229, what the reader asks with *Join split double pages* on) adds
+`join: 'rtl' | 'ltr'` to a page that is, with the page after it, one double-page spread the source served as two files,
+and says which side that next page sits on (`rtl`: on its left, as a right-to-left book runs). The request never
+measures anything: the answer is the chapter's own (`lib_books.spreads`), found in the background, one chapter at a
+time, the first time a reader asks. The response header `x-spreads` says `done` (looked at; any joins are on the
+pages), `pending` (queued just now, ask again shortly) or `none` (nothing to look at: fewer than two pages, a deleted
+file, a Komga-backed library). Without the parameter the list is exactly what it was, and nothing is queued. The
+download manifest's `pages` carry the same `join` once one has been found; a download never queues a look.
+
 Since v0.55.2 every chapter object carries `numberEnd: number | null`: the last chapter of a file that holds
 several, read from a name like `Batman 01-07 (1987).cbz` (USAGE, *How a chapter's number is read*), null for one
 chapter. `number` and `metadata.numberSort` stay the start, 1 there, which is where the book sorts, and
@@ -1106,6 +1245,13 @@ listing number by its *override-aware* number (an admin's correction wins over t
 renumbered from 0 to 105 is no longer also a ghost at 105; and `read: true` is present on a ghost the caller
 marked read (below) — absent, never `false`, for everyone else.
 
+**The chapters a series is missing** (since v0.74.0, #236). `GET /api/series/:id/gaps` answers `{gaps: [{lo, hi}]}`,
+lowest first: the runs of whole numbers between the chapters the series holds, by the Health page's *Chapter gaps* rule --
+every number a range file holds counts as held, and so do a chapter deleted on purpose (the cleanup, *Delete files*) and a
+post its source deleted under posting-order numbering; an impossible number is left out; holes below a Latest-N start are
+included -- less the runs an admin ignored on that card. The reader names the runs between the chapter it leaves and the
+next one ("Chapters 44–99 are missing here"). **404** for a series the caller cannot open.
+
 **Marking chapters you don't have read** (since v0.43.0). `POST /api/series/:id/listing-progress {numbers}`
 marks chapter numbers read for the caller, and `DELETE` on the same path with the same body marks them unread
 (1–500 numbers, each 0–1,000,000; **400** otherwise, **404** for a series the caller cannot open). Each number
@@ -1149,14 +1295,17 @@ and this is read from those copies plus the file stamps — never from the sourc
 `checkedAt` is how old the answer is. Any account that can open the series may read it; ranking and blocking
 is the admin route below.
 
-**Chapter versions.** `GET /api/series/:id/versions` answers `{checkedAt, content: [{number, copies: [Copy]}]}`
-for every listed number, `Copy = {key, source, sourceName, groups, scanlator, lang, pages, publishedAt,
+**Chapter versions.** `GET /api/series/:id/versions` answers `{checkedAt, otherLanguage, content: [{number, copies: [Copy]}]}`
+for every listed number, `Copy = {key, source, sourceName, groups, scanlator, lang, otherLanguage, pages, publishedAt,
 chosen, blocked, onDisk}` — `key` is `<source>:<sourceId>`; `chosen` marks the copy the release rules picked
 at the last check; `blocked` means every group on the copy is blocked by the effective preferences (a copy
 with no groups is never blocked); `onDisk` is best effort — a live chapter for the number came from the same
 source with the same group stamp, or, for a file with no stamp, this is the chosen copy. A `source` and
 `sourceId` from here make a *pick* (below). A number listed before v0.33.0 has `copies: []` until its next
-check.
+check. Since v0.62.0 a copy's `otherLanguage` is its language when it is known to be another than the series'
+(a copy the release rules never take), and the answer's `otherLanguage` is `{series, langs, bookIds}`: the
+chapters on the server in another language that a listed copy in the series' language can replace, for the
+admin refetch below, or null.
 
 ### Sources
 ```
@@ -1165,6 +1314,8 @@ GET    /api/sources/detail        GET    /api/sources/search
 GET    /api/sources/search-all    GET    /api/sources/latest
 GET    /api/sources/jobs          POST   /api/sources/add
 GET    /api/discover/trending     POST   /api/sources/fill/scan
+GET    /api/discover/works        GET    /api/discover/because
+GET    /api/discover/recommendations
 GET    /api/sources/fill/scan/:id POST   /api/sources/fill
 POST   /api/sources/fetch
 GET    /api/sources/archive       POST   /api/sources/archive
@@ -1220,7 +1371,8 @@ unblock the group and check again. A manual fetch resets the chapter's retry cap
 v0.48.3) `numbers` are whole chapters: 12 takes every listed chapter from 12 up to 13, so 12 and 12.5 — the
 numbers the fill scan reports, which is what the Find missing chapters dialog sends. The answer is
 `{ok, started, folder, total, skipped: [{number, reason}]}` with `reason` one of `not_listed` (run
-**Check for new chapters** first), `blocked_group`, `already_here` (a live chapter, not a tombstone),
+**Check for new chapters** first), `blocked_group`, `other_language` (since v0.62.0: every copy of the number is in
+another language than the series' -- a pick takes one anyway), `already_here` (a live chapter, not a tombstone),
 `source_unavailable` (adapter not loaded or disabled, or a source the series no longer follows), `cooldown`,
 `over_cap` (with `floored`, a chapter past the 300 the expansion reached — press again for the rest);
 **409** `nothing_to_fetch` (with `skipped`) when nothing is fetchable, **409** `busy` while a download for
@@ -1326,6 +1478,8 @@ between series; the rest read `skipped` *The server is shutting down.*
 GET    /api/favorites             POST   /api/favorites
 DELETE /api/favorites/:seriesId   GET    /api/history
 GET    /api/stats                 GET    /api/wrapped
+GET    /api/stats/time            GET    /api/series/:id/reading-pace
+GET    /api/stats/insights
 GET    /api/settings              PUT    /api/settings
 GET    /api/collections           POST   /api/collections
 GET    /api/collections/:id       PATCH  /api/collections/:id
@@ -1343,6 +1497,7 @@ GET    /api/opds/token            DELETE /api/opds/token
 PATCH  /api/opds/token
 GET    /api/trackers              POST   /api/trackers/anilist
 POST   /api/trackers/:provider/connect
+POST   /api/trackers/:provider/test
 POST   /api/trackers/anilist/backfill
 POST   /api/trackers/:provider/resync/:seriesId
 DELETE /api/trackers/:provider
@@ -1352,17 +1507,99 @@ POST   /api/push/unsubscribe
 
 **Account settings.** `GET /api/settings` answers the caller's whole forwards-compatible object; `PUT /api/settings`
 takes top-level keys directly and merges them into that object (an object value is replaced whole). Unknown keys stay
-accepted and retained for compatibility. v0.55.8 validates three public keys:
+accepted and retained for compatibility. v0.55.8 validates three public keys, and v0.60.0 a fourth:
 
-- `librarySort: 'updated' | 'new' | 'az' | 'unread'`, the Library's saved default. A valid URL sort wins for that
+- `librarySort: 'updated' | 'new' | 'az' | 'unread'` (since v0.58.0 also `'popular' | 'score' | 'rating' | 'chapters'
+  | 'read'`, since v0.61.0 `'soon'`, Releasing soon), the Library's saved default. A valid URL sort wins for that
   visit; the web writes this key only from a direct sort-control click, so opening a shared URL does not change it.
-- `homeCollections: string[]`, ordered, de-duplicated, at most three collection ids owned by the caller. Missing means
-  the legacy first three nonempty Lists; `[]` explicitly means no Home List rails. A selected empty List keeps its
-  slot. Home ignores an already-stored stale/unowned id and the web app omits it on the next edit; the API refuses a
-  request that tries to add one.
-- `showAllChapters: boolean`, the account-wide unpaged chapter-list switch.
+- `librarySortDir: 'asc' | 'desc' | null` (since v0.60.0), the Library's saved sort order (High to low is `desc`); null
+  goes back to the sort's own direction. A valid `dir` in the Library URL wins for that visit.
 
-The earlier `reader` object (including `coverEdges`) and `listSorts` map remain additive keys on the same object.
+**Outside ratings and the new sorts** (since v0.58.0). Every series the library routes enrich (the Library search,
+Home's rails, the series page) carries `yomi.anilist: {id, score, popularity} | null` (`id`, the AniList entry's id,
+since v0.60.0: `https://anilist.co/manga/<id>`) — AniList's score out of 100 and how
+many AniList users list the entry, read through the series' checked AniList link — beside the caller's own
+`yomi.rating`, and `yomi.lastReadAt` (when the caller last read in it). The server refreshes them in the background
+(`anilist_scores`, keyed by AniList id): a few minutes after boot and every six hours, only entries with no row or one
+older than three days, fifty per request; never for a library whose AniList lookups are off. `POST /api/series/search`
+sorts by `popularity`, `score`, `rating`, `chapters` and `lastRead` (see the OpenAPI), and `GET /api/home` carries
+`popular`, Home's "Most popular in your library".
+- `homeCollections: string[]`, ordered, de-duplicated, at most three collection ids owned by the caller -- or, since
+  v0.61.0, shared with the household by another member. Missing means the legacy first three nonempty Lists; `[]`
+  explicitly means no Home List rails. A selected empty List keeps its slot. Home ignores an already-stored stale or
+  unreadable id and the web app omits it on the next edit; the API refuses a request that tries to add one (another
+  member's private List, a malformed id).
+- `showAllChapters: boolean`, the account-wide unpaged chapter-list switch.
+- `incognito: boolean` (since v0.61.0), **Incognito reading**, for the whole account and enforced by the server: progress
+  is still written, so Keep reading and every resume work, but no reading event is recorded -- history, streaks,
+  Wrapped, the leaderboard, the household's Top 10 and member activity never see it -- and nothing is pushed to a
+  tracker automatically, whichever client wrote the progress (the app, Mihon's read-progress PUT, a listing's marks, a
+  bulk Mark read). The deliberate *Push everything finished* and resync still push. `PUT /api/books/:id/progress`
+  also takes `incognito: true` for a chapter read while it was on and sent after it went off (the offline outbox).
+  When a series is next pushed with it off, the tracker is told the series' real highest chapter and catches up.
+
+The earlier `reader` object (including `coverEdges`) and `listSorts` map remain additive keys on the same object, and so
+do two of v0.66.0's, kept as written and read by the web app alone: `homeRails: {order: string[], hidden: string[]} | null`,
+Home's rails as the reader arranged them (keys such as `continue`, `newEpisodes`, `lists`, `top10`; missing or null is
+the default order, and the app puts a rail it does not find in `order` where the default puts it), and `tone: 'oled' |
+'graphite' | 'midnight'`, the background (anything else is OLED black, the default).
+
+**Reading time** (since v0.61.0). `GET /api/stats/time?days=90&tz=Asia/Kolkata` answers the signed-in reader's own
+reading time, worked out from their page turns (`reading_events`; nothing new is recorded): `{tz, days, week: {ms,
+chapters}, month: {ms, chapters}, year: {year, ms, chapters}, window: {ms, chapters, perChapterMs, byHour, byDevice}}`.
+Every device goes into one timeline, so two devices at once never count twice and a replayed turn adds nothing; the gap
+to the next turn counts in full within the page's allowance (five minutes, stretched for a tall strip by its
+height-to-width ratio over four, at most thirty), a longer gap is a break that counts nothing, and each sitting adds one
+typical page (the window's median counted gap, 5–90 s, 20 s when there is none) for the page it opened on, which the
+reader never reports. `week` and `month` are rolling 7 and 30 days, `year` the UTC calendar year `/api/wrapped` counts,
+`window` the last `days` (7–400) with `perChapterMs` (the median time of the chapters finished in it; null under three),
+`byHour` (24 values in `tz`, an IANA name; UTC when it is not one) and `byDevice` (`{name, ms}`, named by the reader's
+own sessions). `GET /api/series/:id/reading-pace` answers `{perChapterMs, from: 'series' | 'all' | null}` for the series
+page's "Catch up in": the series' own median over a year when three or more of its chapters were finished, else the
+reader's 90-day median; 404 for a series they may not open. `GET /api/wrapped` takes `tz` too and adds `tz`, `ms` (the
+same figure as the Studio's year), `perChapterMs` and `byHour`. The leaderboard and the admin's member stats stay
+counts of chapters.
+
+**Finished chapters count once** (since v0.70.0, [#264](https://github.com/AngeloSha/uchiyomi/issues/264)). One
+read-through writes two completed reading events (the page before the last already counts as the end, and the last page
+sends its own), so every count of finished chapters is a count of distinct chapters, as `/api/leaderboard` always was:
+`/api/stats`' `chapters_completed` (and the badges on it), `weekChapters`, each `byDay` entry (a chapter finished twice in
+a day is one; read again on another day it counts on that day too, as the streak does) and `windowChapters`, new, the
+`days` window's chapters each once; `/api/wrapped`, whose months, weekdays, days and top series count each chapter on
+the day it was first finished that year; `/api/stats/time`'s `chapters`; and `/api/admin/stats`' member `total` and `week`.
+They are counted from reading events, never from a chapter's read mark, so marking a chapter read from a list does not
+count and reading it afterwards does.
+
+**All time and Insights** (since v0.75.0). `GET /api/stats?days=all` ([#265](https://github.com/AngeloSha/uchiyomi/issues/265))
+answers every UTC day from the reader's first read to today, dense as the other windows (at least 7 days, at most 3660,
+about ten years), with `days` saying how many that was; any other `days` is still clamped to 7–400.
+`GET /api/stats/insights` is the raw material of **Profile → Insights**, the reader's own history from `reading_events` (so
+an Incognito read is in none of it), each finished chapter once: `{now, bestDay: {day, chapters} | null, bestWeek: {start,
+chapters} | null, series}`. `bestWeek` is a Monday-to-Sunday UTC week and `start` its Monday. `series` has one row per
+series the reader has a recorded read in, `{id, title, source, genres, total, read, lastReadAt, recent, thisMonth,
+prevMonth}`: its chapters (hidden notice chapters left out), how many they have finished, when they last read it, and the
+chapters of it they finished in the last 28 days, this UTC month and the month before. It is listed by the rule every rail
+follows (18+ follows the Show 18+ switch, a series the reader may not open is absent). The app works the backlog, the
+completion funnel, the genre and source mix and "at this pace, finished by" out from it.
+
+**Release radar** (since v0.61.0). Every enriched series also carries `yomi.radar: {nextAt, dueUntil, quietAfter,
+lastAt, every, kind, steady, ended, basis} | null` — the server's estimate of when its next chapter comes (`series_radar`,
+one row per series, ISO times). The evidence is the dates its sources list for the chosen copies of what it may take
+(`basis: 'source'`; a blocked number and a hidden notice never count), or, where those date too little or have gone
+stale, when its chapters arrived on this server (`'arrival'`: a chapter counts only if its number is above every one
+that came before it, so a re-download, a filled gap or the slow archive's back catalogue is never a release). Both are
+clustered into releases as the scanlation-group cadence is (uploads under twelve hours apart are one). `kind` and
+`every` (the median gap in days) are that cadence; `nextAt` and `dueUntil` are null unless there are four releases or
+more, mostly evenly spaced, shipping daily, weekly or monthly, from a series not ended or on hiatus. `steady` is a
+series that keeps one weekday (the estimate sits on it). From `nextAt` to `dueUntil` the next chapter is due any day,
+after that it is late, and from `quietAfter` (three intervals, a fortnight at least, or 45 days with no rhythm) the
+series is quiet. The row is rewritten after every listing refresh (the sweep, Check now, the add) and after a sweep or a
+Check now lands chapters, and once at boot for a series that has a source and none. `null` for a series with no
+source or nothing dated. `POST /api/series/search` sorts by `releasing` (Releasing soon: soonest first, a series with
+no estimate in force after the rest), and `GET /api/updates/expected` answers `{content: Series[]}`, the caller's
+Expected this week: their favourites and the series they read in the last 90 days whose `nextAt` is before seven days
+from now and that are not yet quiet, monitored series only, soonest first, at most 30, each as a listing shows it to
+them (libraries, age cap, 18+ switch).
 
 **Lists** (collections; the app's *Lists*). `GET /api/collections/:id` answers `{id, name, accent, sort_order, items}`:
 the list's series in its own order (`position`, which `PUT /api/collections/:id/items {seriesIds}` rewrites; since
@@ -1380,10 +1617,55 @@ is not stored. The reader's defaults are the settings' `reader` object, and sinc
 `homeCollections` controls which zero to three Lists also appear on Home and in what order. Home shows up to twelve
 series per selected rail; an empty selected List reserves its position and appears once it has a series.
 
+**Smart and shared Lists** (since v0.61.0). `POST /api/collections {name, accent?, query?, shared?}`: a `query` makes a
+*smart* list, a saved Library search in the Library URL's own words -- `{v: 1, q?, read?: 'UNREAD' | 'IN_PROGRESS' |
+'READ', status?, genres?, lib?, src?, anysrc?, sort, dir?: 'asc' | 'desc'}`, `src: '-'` being *No source* and `sort`
+one of `updated`, `read`, `new`, `popular`, `score`, `rating`, `chapters`, `unread`, `az` -- answered with the
+Library's own search, one card per work, for whoever opens it; an unknown key or an oversized value is **400**. A
+list's kind is fixed when it is made: `PATCH /api/collections/:id {query}` replaces a smart list's search and is
+**400** `not_smart` on a hand-picked one; the item routes on a smart list are **409** `smart_list`. `shared: true`
+(on create or PATCH) lets the rest of the household read the list -- never change it: PATCH, DELETE and the item
+routes are the owner's, and someone else's list answers **404** (the item routes answered `{ok: false}` before).
+`GET /api/collections/:id` answers the owner's lists and shared ones, with `kind`, `shared`, `mine`, `owner`
+(`{id, name, avatar}`, someone else's list), `query` (to the owner alone) and `total`, the series it shows this caller
+in all; `?limit=1..200` caps the items (a Home rail asks for twelve), and a smart list is capped at 200 without it.
+What a list shows is always the caller's view of it: their libraries, age cap and 18+ switch, and their own reading
+for `read`. `GET /api/collections` with no `scope` is unchanged -- the caller's hand-picked lists with the stored count
+-- and `?scope=all` adds their smart lists and the household's shared ones, counted for the caller, a shared list that
+shows them nothing left out. Each of those carries `preview`: the ids of its first series the caller may see, at most
+four, in the list's own order -- the covers on its card in Lists.
+
+**Pick back up and Hidden gems** (since v0.61.0). `GET /api/home` carries `pickUp`, up to twenty books shaped like
+`onDeck` with `stoppedAt`: the chapter to resume each series last read 90 days to two years ago in which the caller
+finished at least one chapter -- never one `onDeck` holds -- most recent first; and `gems`, up to twenty series with an
+AniList score of at least 75 that nobody on the server has read in any language edition, one per work, best score
+first (empty on a Komga backend).
+
 **Progress trackers.** `GET /api/trackers` is the caller's own connections, every provider listed connected
 or not; `POST /api/trackers/:provider/connect` takes a pasted token and `DELETE /api/trackers/:provider`
-drops it. A push goes out for the caller alone when they finish a chapter of a linked series, never below
-the floor `tracker_progress` holds for them (see the reviewable import under Admin, `/run`). Only a **401**
+drops it. Since v0.61.0 ([#190](https://github.com/AngeloSha/uchiyomi/issues/190)) AniList's entry carries
+`authorizeUrl` — `https://anilist.co/api/v2/oauth/authorize?client_id=53603&response_type=token`, the project's
+public AniList client: open it, approve, and AniList's own pin page shows the token to paste (an implicit grant;
+nothing comes back to this server and no secret is involved). MyAnimeList and Kitsu have no such page;
+[USAGE.md](USAGE.md#getting-a-myanimelist-token) has the commands that get theirs, and since v0.71.0 (#244) for
+MangaUpdates, whose login API answers a session token the person pastes like the others (`provider` `mangaupdates`;
+there is no sign-in through this server, so a password never passes through it). Every MangaUpdates call waits its
+turn at one a second, shared with Discover's name lookups. Connect checks the token with
+the service first, and only the service's verdict on it is a **400** `rejected`: no answer at all (a timeout, DNS, a
+refused connection) is a **502** `tracker_unreachable`, and an answer that turned the request down for another
+reason (Cloudflare's 403 in front of AniList, a 429, a 5xx) is a **502** `tracker_refused` `{status}` — neither
+means the token is bad. `POST /api/trackers/:provider/test` asks the service whether the saved token still works
+and answers **200** `{ok, verdict, account?, status?}` with `verdict` one of `connected`, `rejected`,
+`unreachable`, `refused`, `expired` or `not_connected`; it writes nothing (not even `last_error`), sends no token
+past its `expires_at`, and allows six tests a minute per account (**429** after). A push goes out for the caller alone when they finish a chapter of a linked series, never below
+the floor `tracker_progress` holds for them (see the reviewable import under Admin, `/run`). Since v0.61.2
+([#201](https://github.com/AngeloSha/uchiyomi/issues/201)) a push first reads the series and the caller's entry from
+the service and sends nothing when the entry is already at or past that chapter. The status it sends comes from what it
+read: *completed* only when the service says the series has ended (AniList `FINISHED`/`CANCELLED`, MyAnimeList
+`finished`/`discontinued`, Kitsu `finished`, MangaUpdates `completed`) and gives a chapter count the push reaches; a re-read stays one (AniList
+`REPEATING`, MyAnimeList `is_rereading`, Kitsu `reconsuming`; MangaUpdates has no such flag); an entry completed on a series that has ended stays
+completed; anything else is *reading*. Before, every chapter on this server read meant *completed*, a series still
+coming out included. Pushes in one account's lane to one service are 2.4 s apart (a read and a write each). Only a **401**
 from the service — or AniList's "Invalid token" **400** — is a verdict on the token, and disables the
 connection with `last_error` = `the tracker rejected the saved token -- reconnect to resume syncing`; a
 **403** (Cloudflare in front of AniList, MyAnimeList's request block, a forbidden Kitsu action) is recorded
@@ -1391,7 +1673,8 @@ as a plain sync error and retried on the next chapter, the connection kept. A to
 is not sent: `last_error` reads `the access token has expired -- reconnect to resume syncing`, connection
 kept. `POST /api/trackers/:provider/resync/:seriesId` is the one deliberate way **down**: it deletes the
 caller's floor for that series on **that provider** only (`anilist`, `myanimelist` or `kitsu` — any other
-name is **404** `unknown_provider`) and pushes the current local count at once, lower or not. No web
+name is **404** `unknown_provider`) and pushes the current local count at once, lower or not, even below what the
+service's own entry holds (since v0.61.2 every other push leaves such an entry alone). No web
 control calls it; the app's own repair for a floor the tracker has since corrected is to read the list
 again. A local count that drops below a number this app already sent is refused with `last_error` =
 `not syncing: this series now works out to chapter N, below the M already sent. Import your list again under
@@ -1426,10 +1709,12 @@ GET    /api/sources/popular      GET    /img/sources/icon/:id
 DELETE /api/sources/jobs/:folder  POST   /api/sources/jobs/:folder/cancel
 GET    /api/sources/preview       GET    /api/sources/preview/pages
 GET    /img/sources/preview
+GET    /img/series/:id/copy-page
 POST   /api/sources/runs/:kind/cancel
 DELETE /api/sources/runs/:kind
 GET    /api/admin/sources         POST   /api/admin/sources/:id/:action
 POST   /api/admin/sources/:id/test
+PUT    /api/admin/sources/:id/age-rating
 POST   /api/admin/sources/:id/retire GET    /api/admin/sources/overview
 POST   /api/admin/sources/check   GET    /api/admin/sources/check
 POST   /api/admin/sources/find    GET    /api/admin/sources/find
@@ -1453,6 +1738,7 @@ POST   /api/admin/series/bulk/chapters/delete/cancel
 GET    /api/admin/series/:id/scanlators GET    /api/admin/scanlators
 POST   /api/admin/series/:id/sources DELETE /api/admin/series/:id/sources/:sourceId
 POST   /api/admin/series/:id/main-source
+POST   /api/admin/series/:id/attach-source
 GET    /api/admin/series/:id/alt-titles POST   /api/admin/series/:id/alt-titles
 DELETE /api/admin/series/:id/alt-titles/:norm
 GET    /api/admin/libraries       POST   /api/admin/libraries
@@ -1466,6 +1752,9 @@ POST   /api/admin/series/:id/delete-files
 POST   /api/admin/series/:id/forget
 POST   /api/admin/series/:id/rename-folder
 POST   /api/admin/series/:id/chapters/delete POST   /api/admin/series/:id/chapters/refetch
+POST   /api/admin/series/:id/chapters/hide POST   /api/admin/series/:id/chapters/unhide
+GET    /api/admin/series/:id/chapters/hidden
+GET    /api/admin/series/:id/copy-pages
 PUT    /api/admin/books/:id/meta POST   /api/admin/books/:id/confirm-short
 POST   /api/admin/series/:id/restore
 POST   /api/admin/series/:id/merge
@@ -1474,6 +1763,7 @@ POST   /api/admin/series/:id/check
 GET    /api/admin/series/:id/check
 GET    /api/admin/series/:id/numbering POST   /api/admin/series/:id/numbering
 GET    /api/admin/art/overview    GET    /api/admin/art/candidates/:id
+GET    /api/admin/series/:id/cover-candidates
 POST   /api/admin/art/backfill    GET    /api/admin/art/backfill/status
 POST   /api/admin/trackers/relink GET    /api/admin/trackers/relink/status
 POST   /api/admin/import          POST   /api/admin/import/parse
@@ -1486,7 +1776,9 @@ PATCH  /api/admin/import/candidates/:cid
 ```
 
 **Overview.** `GET /api/admin/stats` is what the admin header and Overview show: `libraries`, `seriesTotal`,
-`members`, `cacheBytes`, `lastScan`, `backlog` {chapters, series}, `database` (`embedded` or `external`) and each
+`booksTotal` (since v0.61.2, [#204](https://github.com/AngeloSha/uchiyomi/issues/204): every chapter across those
+series, as each series' `booksCount` counts them), `members`, `cacheBytes`, `lastScan`, `backlog` {chapters, series},
+`database` (`embedded` or `external`) and each
 member's recent reading (`activity`). Since v0.55.4 ([#150](https://github.com/AngeloSha/uchiyomi/issues/150)) it also
 answers `version`, the running version as the server's own package.json says it, or null when that cannot be read; the
 foot of the admin menu prints it. Whether a newer one exists is Health's `update` check (`GET /api/admin/health`), which
@@ -1511,6 +1803,12 @@ series, sample}` (the series an admin can see, and up to 20 of their titles), an
 holds; with `&id=` it is an edit of that library, counting what would leave it as well as what would come in. A folder
 is matched by its name: `_` and `%` in it are not wildcards.
 
+A library can carry reading defaults: `readerPrefs {mode?, spread?, pagedDirection?}` on `POST` and `PATCH
+/api/admin/libraries` (null clears them), returned as `reader_prefs` on each row of `GET /api/admin/libraries`, and
+as `libraryReader` on `GET /api/series/{id}` (for an admin also `library {id, name}`, the library the series is in).
+The reader layers them under the source's and the series' own choices. There is no theme: that stays each reader's own,
+and an unknown key (a theme among them) is dropped.
+
 Since v0.55.8 ([#168](https://github.com/AngeloSha/uchiyomi/discussions/168)), `anilistLookup` defaults true and
 `GET /api/admin/libraries` returns it as `anilist_lookup` on every row, including the default library. False prevents
 automatic art lookup, title/id matching, reading-direction/type repair, the startup match check and scheduled
@@ -1523,8 +1821,8 @@ they are manual actions; clients should say that those actions may contact AniLi
 `updater_hours`, `extension_hours`, `extension_auto_update`, `update_check`, `install_ping`, `install_ping_last`,
 `cleanup_read`, `cleanup_read_days`, `backup_hour`, `scanlator_prefs`, `auto_follow_on_failure`,
 `repair_enabled`, `source_prefs`, `group_upgrade`, `borrow_names`, `mangadex_langs`, `unstated_lang`,
-`deleted_as_ghosts`, plus
-`extensions_configured` and `mangadex_available` (computed). `auto_follow_on_failure` defaults to true and
+`deleted_as_ghosts`, `update_smart` (since v0.61.0), `backup_enabled` and `backup_keep` (since v0.61.1),
+`newMemberDefaults` (below), plus `extensions_configured` and `mangadex_available` (computed). `auto_follow_on_failure` defaults to true and
 controls the bounded once-per-series-per-day source hunt after an ordinary scheduled-download failure; it
 never makes an interactive Add/Fetch hunt and never runs after a refusal. `PATCH
 /api/admin/settings` takes any subset of `serverName` (1–64 chars), `allowRegistration`, `updaterHours`
@@ -1532,11 +1830,20 @@ never makes an interactive Add/Fetch hunt and never runs after a refusal. `PATCH
 `cleanupReadDays` (0–3650; 0 is a value, "at the next run"), `backupHour` (0–23, the local hour of the nightly
 backup — the pending timer is re-armed at once, so the change applies to the next run rather than the one
 after; `GET /api/admin/tasks` shows the backup's `schedule` as `daily at HH:00` from the same column),
+`backupEnabled` (since v0.61.1, the nightly backup, on by default: off skips the nightly run, the Tasks row says
+`switched off · on demand`, and Run now still backs up), `backupKeep` (since v0.61.1, 1–365, how many backup runs are
+kept; saving deletes nothing, the oldest beyond it go after the next backup; `backup_keep` reads `BACKUP_KEEP`, 14
+unless set, until a number is saved),
 `scanlatorPrefs` and `sourcePrefs` (both below), `groupUpgrade` (the repair's group upgrades, off by default),
 `borrowNames` (chapter names from another source, off by default; switching it off clears the names it wrote),
 `hideNoticeTypes` (notice chapters, below),
 `deletedAsGhosts` (deliberate tombstones as ghosts, off by default; missing/rescan-missing evidence is excluded),
-`autoFollowOnFailure`, and `repairEnabled` (the nightly library repair, on by
+`autoFollowOnFailure`, `updateSmart` (since v0.61.0, Smart update checks, off by default: the SCHEDULED sweep
+asks a series that has been quiet a long time less often — a seventh of its silence, never less than every three days,
+or the update interval when that is longer — and every series at the usual interval while its next chapter is due by
+its release radar or its sources list chapters this server lacks; Run now, Check now and everything else a person
+starts ask at once, and the sweep's result and the Tasks row's `lastResult` gain `rested`, the series left for a
+later sweep), and `repairEnabled` (the nightly library repair, on by
 default — switching it off stops the schedule only, since nothing it does deletes, merges or renumbers
 anything). Since v0.52.0 it also takes `mangadexLangs` and `unstatedLang`: `mangadexLangs` is the MangaDex
 languages besides English to switch on, replaced whole, as app codes from `mangadex_available` (every language
@@ -1551,6 +1858,20 @@ normalised (`pt-br` is `pt-BR`); `all`, `other` or an empty string is a **400** 
 written on its own, an out-of-range value is a **400** and nothing is written, and
 the audit row `settings.update` carries the body. The admin console's Settings tab sends one
 row per PATCH as each row is changed (the read-chapter confirmation carries the day count with the switch).
+
+**New-member defaults** ([#208](https://github.com/AngeloSha/uchiyomi/issues/208); **Admin → Members → When someone
+signs up**) are what an account the server makes by itself starts with: a sign-up (`POST /auth/register`), or a first
+sign-in through the provider with `OIDC_ALLOW_SIGNUP`, in SSO-only mode too. `PATCH /api/admin/settings
+{newMemberDefaults}` takes a member's own fields from `PATCH /api/admin/users/:id`, with their meanings, each on its own:
+`libraries` (`null`, the default: every library, including ones added later; a list: exactly these; `[]`: none),
+`maxAgeRating` (0–18; `null`, the default: no limit) and `perms` (`{canDownload: false}` denies downloads; `{}`, the
+default, allows them). A library id no library has is dropped, and a library removed later leaves the list: a list left
+empty means none, never every library. GET answers the same object. The account is made with them, in the transaction
+that makes it, and a default that cannot be read makes no account. They are not for the accounts an admin chooses: the
+first admin (`POST /api/setup`, or SSO-only mode's first sign-in), one made by `POST /api/admin/users`, and the desktop
+app's own all start with everything. An account the provider makes an admin (`OIDC_ADMIN_GROUP`) carries them too:
+unrestricted while it is an admin, it has them the day the group sync makes it a member. Saving them changes no account
+that exists.
 
 **Notification targets** (since v0.43.0, Admin → Settings → Notifications) are where notices go besides web
 push: `webhook` (a JSON POST `{event, title, message, count, series: [{id, title, added}]}`, optional
@@ -1755,6 +2076,30 @@ it: a bookmark names a page inside the file. A chapter whose file *and* folder a
 chapter. It answers `{ok, applied, bytes, skipped: [{id, reason}]}` with `reason` one of `not_found`,
 `not_owned`, `already_pruned`, `bookmarked`, `outside_root`, `unlink_failed`, or **409** `refused` (with
 `message` and `fix`) when the download directory is not writable.
+
+**Hiding a chapter number from a series** (since v0.76.0, #240 rebuilt to hide only). For a chapter a source lists that is
+not part of the work -- a stray 0.5 from an unrelated title -- which no source-side action takes away.
+`POST /api/admin/series/:id/chapters/hide {numbers[]}` (1–500, effective numbers, as the series page shows them) hides
+them from the series for every viewer: left out of the chapter list and its missing-chapter rows, next and previous,
+Continue reading, the unread counts, Updates, history, OPDS, the Komga-compatible API and what the trackers are told;
+neither held nor missing for Health, the repair and Find missing chapters; and never downloaded -- not by the sweep,
+Check for new chapters, Fetch newest or the slow archive, and `POST /api/sources/fetch` skips one as `hidden`. A download
+queued before the hide stops before it asks the source. **Nothing is deleted**: no file, no chapter row and no reading
+progress, and the read-chapter cleanup and Fix everything leave such a chapter's file alone. A file holding a range of
+chapters is never hidden by one number. It answers `{ok, hidden}`, the numbers this call hid (one hidden already is
+not hidden twice), or **409** `merged` for a series merged into another. `GET /api/admin/series/:id/chapters/hidden`
+lists `{content: [{number, onServer, listed, title}]}`, and `POST /api/admin/series/:id/chapters/unhide {numbers[]}` or
+`{all: true}` shows them again at once (`{ok, restored}`). A merge carries the absorbed series' hidden numbers to the
+survivor; a renumber moves each with its post, as read marks move. The series DTO carries `hiddenChapters`, the count,
+for an admin. Audit lines `series.chapters_hide` and `series.chapters_unhide`.
+
+`GET /api/admin/series/:id/copy-pages?source=&chapter=` answers `{count}`, the number of pages one copy of a chapter has on
+its source, and `GET /img/series/:id/copy-page?source=&chapter=&i=` is one page of it, by index (original bytes,
+`cache-control: private, no-store`): the side-by-side compare before a *Replace* (since v0.71.0, #241). Both are an
+admin's by the API's rule -- the image route takes a signed-in session or an API token with the admin scope, never an
+OPDS token or an admin's read token (**403**). The copy is named by its source and the source's own chapter id and must
+be one this series' listing holds (**404** `not_listed` otherwise), so a made-up id never reaches a source, of a series
+the admin may see (a hidden or merged series is **404**); a disabled source is **403**, one in a cooldown **429**.
 `POST /api/admin/series/:id/chapters/refetch {bookIds?[], picks?[]}` (at least one, at most 300 combined)
 downloads the chapters again as the copy the release rules choose *now* — after a change of priority, or a follow, that may be another group's —
 onto the **same rows**, so progress stays attached. Only a row under the download folder (`not_owned`
@@ -1763,7 +2108,7 @@ way back but a hand copy) at exactly the path the downloader writes (`Chapter <n
 folder; `not_ours` otherwise) is eligible, because only that path lands back on the same row. This is also
 the only path back for a tombstoned chapter below a series' `chapter_floor`, which the sweep never wants
 and *Fetch newest* takes only if it is the newest listed. The listing is refreshed first, as for `POST /api/sources/fetch`, so the copy is the
-one the rules choose *now*, with the same `not_listed` / `blocked_group` / `source_unavailable` (including
+one the rules choose *now*, with the same `not_listed` / `blocked_group` / `other_language` / `source_unavailable` (including
 a source the series no longer follows) / `cooldown` skips; the old file is set aside until
 the new one lands and put back if the download fails, so a failed re-download never costs the chapter that
 was there. A chapter the cleanup deleted is eligible: this is how it comes back. Answers
@@ -2012,8 +2357,8 @@ library*, and the *Fix* / *Fill now* / *Retry now* keys and the *Reset the solve
 `{ok: true, started: true}` (since v0.49.0 with the run's id, below); a full run's counts land on `GET
 /api/admin/tasks` as the `repair` entry's `lastResult`.
 It is the only task that takes a **body**: `{only?: ('solver' | 'count' | 'failures' | 'short' | 'gaps' |
-'groups' | 'names' | 'directions')[], seriesId?, bookId?, sourceId?, now?}`. With no body it runs all eight steps over
-the whole library, in that order. `directions` (since v0.48.0) asks MangaDex (the original language of every
+'groups' | 'names' | 'directions' | 'details')[], seriesId?, bookId?, sourceId?, now?}`. With no body it runs all nine
+steps over the whole library, in that order. `directions` (since v0.48.0) asks MangaDex (the original language of every
 series that follows it) and AniList (the country of origin of every linked series) about the series whose
 reading direction nothing has said yet — at most `REPAIR_DIRECTIONS_MAX` (500) series per service a night, 100
 ids per MangaDex request and 50 per AniList request — and reports `directions: {asked, learned}`.
@@ -2023,7 +2368,13 @@ makes is audited as `book.group_upgraded`. `names` (also v0.47.0) borrows chapte
 and likewise does nothing unless `borrowNames` is on for the server or for a series (`borrow_names` on the
 settings GET, `borrowNames` on `PATCH /api/admin/series/:id`, where `null` follows the server); it writes
 `lib_books.chapter_name` only, marked with the donor in `chapter_name_source`, and switching it off clears
-exactly those.
+exactly those. `details` (since v0.73.0) fills in a description, genres or an author for the series that have none of
+their own, and a cover for one with no chapters yet — from AniList in one batched request by id (series linked there,
+in libraries whose AniList lookups are on, in English), then from a series' own source and the ones it follows, for at
+most `REPAIR_DETAILS_MAX` (15) series a night that are kept updated. It does nothing unless `fillDetails` is on
+(`fill_details` on the settings GET, off by default), and reports `details: {asked, filled}` (`{off: true, …}` while
+off). What it fills in sits below the series' own details and an admin's edit (`series_auto_details`), and switching
+it off deletes it.
 Each target belongs to exactly one step — `seriesId` to `gaps` (that series, ignoring the 24-hour re-check
 cooldown), `bookId` to `short` (that chapter), `sourceId` to `failures` (that source's failed chapters,
 whatever their age) — and a target sent **without** `only: ["<its step>"]` is a **400** `bad_request` with a
@@ -2140,6 +2491,26 @@ alone. A series whose every source is switched off is not asked at all: the swee
 failure), stamps nothing and leaves its listing standing. The sweep's queues follow the source each series is
 asked through -- the first it follows that is loaded and not switched off -- so a dead main source's cooldown no
 longer parks series that update from their followers.
+
+**Attaching a source by hand.** `POST /api/admin/series/:id/attach-source {source, sourceSeriesId, as, old?, force?}`
+attaches a source a person picked (`as`: `follower` or `main`) without the chapter-overlap gates, so a series with one
+chapter or none (which the fill scan and Find other sources cannot judge: they need 3 chapters to line up) can take a
+source. The person has searched and compared the numbers, and that is the judgement of them. The pair itself is still
+checked: the server asks the source for the title (under its usual time budget), and its own title must be the series'
+title or one of its other names, else **409** `title_differs` with `theirTitle` until the request says `force: true`;
+what the source calls it is what is stored, and a title the source rates adults-only is refused to an age-limited
+account and makes the series 18+. What is not a matter of opinion stays: the source must be loaded, switched on, out of
+any cooldown (`cooling`) and within the admin's age reach, and must say what the title is (`unreachable`); the language
+guard (`language_differs` + `edition`), posting-order numbering, a pending renumber and a run inside the series refuse,
+and a follower is still capped (`cap`). `as: main` hands the checked pair to the main-source switch, which writes it in
+its own transaction (`old` as for `main-source`, default `drop`), so a refused move changes nothing; a series with no
+main source takes the pick as its main whichever is asked. It answers `{ok, as, from?, old?, theirTitle, sources}` and
+starts a listing refresh, or **409** `{error, message, messageSaid}` (`is_main`, `posting_order`, `renumber_pending`,
+`busy`, `source_unavailable`, `cooling`, `unreachable`, `cap`, `moved`, `title_differs`, `language_differs`), **404** for
+a series the admin cannot see; audited as `series.attach_source`. `DELETE /api/admin/series/:id/sources/:sourceId` on the
+**main** source detaches it: a follower takes over (the old main is dropped; `{ok, promoted, sources}`), or, with none,
+the series is left with no source (audited as `series.detach_main`); a series numbered by posting order refuses, since
+nothing could attach a new main to it afterwards. Files, progress and the folder never move either way.
 
 **Making a follower the main source** (since v0.54.0). `POST /api/admin/series/:id/main-source {sourceId, old?}`
 makes a source the series already follows its main source -- only a followed one: its follow is the "same series?"
@@ -2377,6 +2748,18 @@ asked, never by itself -- answering `{ ok, enabled, wiring }`, or **400** `not_c
 has no `FLARESOLVERR_URL` to share) / `unsupported`, or **502** `unreachable`; it is audited as
 `extension.solver` with the solver's host only.
 
+**The engine's version, and an engine that does not match (the engine upgrade).** The status also carries `buildType`
+(`Stable` or `Preview`), `tested` and `oldest` -- the engine version this Uchiyomi was tested with and the oldest it
+works with -- `standing`, how the running engine's version stands against them (`same`, `older`, `tooOld`, `newer` or
+`unknown`), and `refused`: the operations the engine refused, `[{ op, message, at }]`, by their name in Uchiyomi's
+registry of GraphQL documents and in the engine's own words. An engine that refuses Uchiyomi's queries (an older or
+newer one) has answered, so it is `reachable`; Health's *Extension engine* row says *Not compatible* and quotes it,
+with the step that changes the engine's version on each platform, and a source failing that way is diagnosed
+`engine_incompatible`. A refusal is forgotten once that operation succeeds again, or the engine reports another
+version. Since the same release, a repository is the engine's own *extension store*: `GET /api/admin/extensions/repos`
+lists the stores by the engine's spelling of each address (the `repo.json` beside a pasted `index.min.json`), and the
+add and remove answer as before.
+
 ```
 GET    /api/admin/extensions/status      GET    /api/admin/extensions/catalog
 POST   /api/admin/extensions/catalog/:pkgName
@@ -2474,6 +2857,14 @@ them:
 `<updated>` is honest: a series carries its newest chapter's time, a chapter its own, and a feed the newest
 of its entries. It used to be "now" on every fetch, which defeated readers' change detection.
 
+**Personal shelves** (since v0.61.0). The root is the reader's own: *Keep reading* (`/opds/continue`: the chapter
+Home's Keep reading offers for each series they are reading, newest read first, each a CBZ and a page stream with
+`pse:lastRead`), the three series feeds, *Favourites* (`/opds/favorites`, newest favourite first, sixty to a page),
+then one entry per List they may read -- their own, and those other members share with the household that show them
+at least one series, titled "List · Owner" -- each `/opds/lists/:id`, sixty to a page with a `next` link (a smart list
+answered for this reader, in its saved order). Another member's private List, or a malformed id, is **404**. Every
+shelf goes through the token's viewer, so its 18+ switch and the account's libraries and age cap apply.
+
 **The cover proxy.** `GET /img/sources/cover?u=<url>&source=<id>&w=400|800|1600` fetches a remote cover
 same-origin, resized to WebP, so a Discover tile never loads a third-party image in the browser. `u` is
 caller-supplied and is fetched through the SSRF guard: a value that is not an `http(s)` URL, or that
@@ -2528,6 +2919,16 @@ its cover for good: the series payload's `overrides.cover` reads `'first_page'` 
 nothing found online is shown or looked up for it -- its banner is made from its pages unless an admin set one -- and
 `mode: 'reset'` takes it back to the automatic art, which the choice never changed; `kind: 'banner'` with it is a
 **400**. `GET /api/admin/art/overview` marks such a series `first_page: true`.
+
+**Choosing a cover from a source** (series page, admin). `GET /api/admin/series/:id/cover-candidates` answers
+`{content: [{sourceId, name, primary, coverUrl}]}`: one entry for every source the series uses that answered, from the
+source's own record of the series. Only a usable source is asked -- one switched off, not loaded, cooling down or
+failing is left out without a request -- each under its own time budget (a solver-fronted source gets the solver's), all
+at once; a source with no picture, or that did not answer in time, is left out too. `PUT /api/admin/series/:id/art
+{kind: 'cover', mode: 'source', source}` takes that source's cover: only the source's id comes from the caller (**400**
+`bad_source` when the series does not use it, **409** `source_unavailable` when it is not usable now, **404**
+`no_cover`, **502** `unavailable`), the server fetches the picture itself through the guarded cover fetch and keeps its
+own copy as an upload, so the cover survives the source changing or going away.
 ```
 GET    /img/series/:id/thumb      GET    /img/series/:id/backdrop
 GET    /img/series/:id/hero
@@ -2539,7 +2940,15 @@ GET    /opds                      GET    /opds/series
 GET    /opds/series/:id           GET    /opds/search
 GET    /opds/opensearch.xml       GET    /opds/book/:id/file
 GET    /opds/book/:id/page/:n
+GET    /opds/continue             GET    /opds/favorites
+GET    /opds/lists/:id
 ```
+`GET /img/books/:id/page/:n?fit=<64..2000>` (and `/img/lib/books/:id/page/:n?fit=`, since v0.74.0, #234) is a page for a
+screen that shows it that wide: at most `fit` pixels wide at quality 85, as WebP (or JPEG for a strip too tall for WebP),
+or exactly as it is -- its own type and bytes -- when it is already that narrow, animated, unreadable, or no smaller once
+re-encoded. The web reader asks for it only under *Fit pages to my screen* (Reader settings, this device, off by default),
+at the width each page is shown at in device pixels rounded up to 720, 1080, 1440 or 2000, and for the page as it is above
+that. `?w=` is the thumbnails' resize, as before.
 
 ### Komga-compatible API (Mihon's Komga extension and tracker)
 ```
@@ -2647,7 +3056,9 @@ accepted and ignored), the same bytes and cache as `/img/lib/books/:id/page/:n`;
 same bytes as their `/img/lib/…/thumb` twins (`?w=800|1600` on the series cover). Every image is served
 `Cache-Control: private` — the whole image cache is, since this release, because those bytes are authorised
 per viewer and `public` told a shared proxy they were the same for everyone. `GET /api/v1/books` (the
-extension's Books search type) is always an empty page: there is no chapter-level search. `genres` and
+extension's Books type) lists every chapter the credential may list, a page at a time, by series title then number,
+with `search` (a chapter's or its series' name), `library_id` and `media_status=READY` (since v0.61.2, #204; it was
+always an empty page): its `totalElements` is the library's chapter count, which Homepage's Komga widget shows. `genres` and
 `authors` (each `{name, role: 'writer'}`) are real over the browsable series; `tags` and `publishers` are
 `[]`; `collections`, `collections/:id/series` and `readlists` are **empty pages** on purpose — a collection
 would name series this credential's cap or grants hide, and an id is a disclosure — and `readlists/:id` and
@@ -2760,8 +3171,9 @@ the web app, OPDS and the offline manifest list what is on disk exactly as befor
 Uchiyomi can sign people in through an identity provider you already run: Authentik, Authelia, Keycloak,
 Pocket ID, Zitadel, or any other OpenID Connect provider.
 
-SSO is **additional**, never a replacement. Local accounts, 2FA, lockout and session revocation all keep
-working exactly as before, so you are not locked out if the identity provider is down.
+SSO is **additional** unless you choose otherwise. Local accounts, 2FA, lockout and session revocation all keep
+working exactly as before, so you are not locked out if the identity provider is down. A server on the internet that
+signs everyone in through its provider can make it the **only** way in: see [SSO-only mode](#sso-only-mode) below.
 
 ## Setting it up
 
@@ -2797,6 +3209,10 @@ here, which is the safe default but means nobody can get in yet. Pick one of the
   OIDC_ALLOW_SIGNUP: "true"       # create an account the first time someone signs in
 ```
 
+An account made this way starts with **Admin → Members → When someone signs up**: which libraries it can open, an age
+limit and downloads, set before anyone signs in (`newMemberDefaults`, under [Admin](#admin)). Left unset, it opens every
+library.
+
 `OIDC_LINK_BY_USERNAME` is what you usually want on a server whose users already exist. The first time
 someone signs in through SSO, their existing account is adopted: same account, same reading progress,
 favorites and history, now reachable through the identity provider as well as their password. An account
@@ -2810,6 +3226,52 @@ Optionally map admin rights from a group:
 
 When set, roles follow the identity provider on every sign-in: in the group means admin here, out of it means
 an ordinary user. Leave it unset to keep managing roles in the admin panel.
+
+## Linking an account that already exists
+
+*Link to …* in **Profile → Account**, under *Single sign-on* (since v0.63.0), sends the person to the provider and links the
+identity they sign in with to the account signed in on that browser: same account, same reading history, now
+reachable through the provider too. One identity is never linked to two accounts (*already linked to another account
+here*). This is how an install moves its existing accounts to SSO before turning on SSO-only mode, without
+`OIDC_LINK_BY_USERNAME`'s trust in usernames.
+
+## SSO-only mode
+
+For a server reachable from the internet, the provider can be the only way in (since v0.63.0):
+
+```yaml
+  AUTH_MODE: oidc-only
+  OIDC_BOOTSTRAP_ADMIN_SUB: 0e6f2a52-…   # a new server's first admin: their subject (`sub`) at the provider
+```
+
+- **No passwords at all.** First-run setup, password sign-in, sign-up, password change and two-factor are not served —
+  not refused, absent — so there is nothing to guess at, rate-limit or watch. The sign-in screen shows the provider's
+  button alone. Two-factor, lockout and password rules are the provider's job.
+- **The first admin comes from the provider.** On a server with no account, the first sign-in of the subject
+  `OIDC_BOOTSTRAP_ADMIN_SUB` names becomes its admin; without it, the first sign-in from someone in
+  `OIDC_ADMIN_GROUP` does. Anyone else first is told the server is not set up yet. There is no "first visitor
+  becomes admin" window.
+- **Accounts come from the provider.** With `OIDC_ALLOW_SIGNUP: "true"`, anyone the provider lets in gets an account
+  the first time they sign in, so decide who in the provider (restrict the application to a group). Each one starts
+  with what **Admin → Members → New accounts** sets: libraries, an age limit and downloads. Without it, only accounts
+  already linked can sign in. **Admin → Members** makes no account and resets no password in this mode.
+- **An account is its provider identity alone.** `OIDC_LINK_BY_USERNAME` is refused at startup.
+- **Existing installs.** At every start the log lists the accounts that have no link and so can no longer sign in.
+  Link them first, in the default mode (above), or let each person sign in through the provider for a new account.
+- **Roles.** With `OIDC_ADMIN_GROUP` set, roles follow the provider at every sign-in, but never take the server's
+  last admin away from being one.
+- **Locked out?** If the provider is down or misconfigured, set `AUTH_RESCUE_ADMIN` to the username of an admin
+  account with a password and restart: password sign-in reopens for that one account, and the sign-in screen says so.
+  It is logged at every start and at every rescue sign-in. Remove it once SSO works again. Its 2FA, if it has one,
+  is still asked for.
+
+The server refuses to start in a configuration that cannot work — a typo in `AUTH_MODE`, no provider, linking by
+username, or a new server with no way to make its first admin — and says which in its log. Sessions already
+signed in keep working; Uchiyomi Desktop ignores the mode.
+
+Not sure of your subject? Start the server with `OIDC_ADMIN_GROUP` alone, or sign in once: a new server that refuses a
+first sign-in logs the subject it came with, ready to copy into `OIDC_BOOTSTRAP_ADMIN_SUB`. (In Authentik, the
+provider's *Subject mode* decides what that subject is.)
 
 ## Notes
 

@@ -1,5 +1,7 @@
 # Uchiyomi Desktop (beta)
 
+> 🌐 Downloads and a tour: [uchiyomi.com/download](https://uchiyomi.com/download).
+
 Uchiyomi Desktop is Uchiyomi as a program for **Windows** and **Mac**. The first time you open it, it asks how
 you want to use it:
 
@@ -168,8 +170,9 @@ them:
       the engine off there.
 
    If the download fails, *The extension engine could not be installed.* shows the reason and **Try again**.
-   From then on the engine starts with Uchiyomi. It listens only on this computer, with a random password,
-   and uses about 750 MB of memory while it runs (731 MiB measured on a server with 22 extensions installed).
+   From then on the engine starts with Uchiyomi. It listens only on this computer, with a random password that
+   only the app knows and that changes every time Uchiyomi starts, and uses about 750 MB of memory while it runs
+   (731 MiB measured on a server with 22 extensions installed).
 
 ⚠️ **Extensions that need an in-app web view do not work in the desktop app.** The extension engine can
 download a browser of its own (KCEF, about 230 MB more) for the few extensions that need one; the desktop app
@@ -398,6 +401,14 @@ The same in both modes:
 
 A new version may need **Open Anyway** once more on a Mac ([section 2](#macos-15-sequoia-and-newer)).
 
+**The extension engine updates with the app.** When a new version of Uchiyomi moves to a newer extension engine (as
+v0.69.0 did, to v2.4.2366), a computer that had the engine fetches the new one by itself (about 200 MB) the next
+time Uchiyomi starts: *Downloading the extension engine…* shows at the top of **Admin → Sources** meanwhile. Before
+the new engine first opens its data it upgrades that data for good, so Uchiyomi first keeps a copy of the engine's
+database in `engine-snapshots/` ([section 7](#7-where-your-files-live); going back:
+[extensions.md](extensions.md#uchiyomi-desktop)). If it cannot — a full disk — the new engine is not started, and the
+card says why.
+
 ## 6. Backups and restoring them
 
 *On this computer only* — a server backs itself up, as described in the [user guide](USAGE.md#12-backups--restore).
@@ -412,6 +423,10 @@ under **Admin → Settings → Updates & schedules**, 03:00 by default. A comput
 - After the computer wakes from sleep, the next backup is re-aimed within about a minute, so a night that was
   slept through catches up straight away.
 - A failed run counts as a run: it is not retried in a loop.
+
+**Nightly backup** and **Backups to keep** sit beside the hour (since v0.61.1): switched off, nothing runs at night and
+nothing catches up, while **Run now** under Tasks still makes one; the oldest runs beyond the number kept (14 by default)
+are deleted after each backup. The `before-restore-…` safety copies below are never counted or deleted.
 
 **Admin → Tasks** has **Open backups folder** and **Restore a backup…**; the icon's menu has **Restore a
 backup…** too. Restoring:
@@ -440,12 +455,13 @@ The data folder holds:
 - `db/pg16/` — the database (a bundled PostgreSQL 16, the same major version as the Docker image);
 - `cache/`, `sources/`, and `library/` (an empty read library; see *Hidden settings* below);
 - `engine/` — the extension engine's own data, kept for good (its series ids live here); `engine-runtime/` and
-  `engine-tmp/` — the engine itself;
+  `engine-tmp/` — the engine itself; `engine-snapshots/` — a copy of the engine's database from before each of the
+  last two engine updates;
 - `logs/` — `desktop.log`, `bff.log` (the server), `postgres.log`, `engine.log`;
 - `electron/` — the window's own browser profile: in server mode, your sign-in and offline chapters for each
   server;
 - `state.json` (the mode, the server's address, the trusted certificates, ports, the library folder, the hidden
-  settings below) and `secrets.json` (the database and engine passwords).
+  settings below) and `secrets.json` (the database password).
 
 In server mode only `logs/`, `electron/` and `state.json` are used; the rest appears once you use the app on this
 computer.

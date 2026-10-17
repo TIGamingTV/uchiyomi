@@ -79,7 +79,17 @@ export function runAsync(cmd, args, { timeoutMs = 15 * 60_000, env, cwd } = {}) 
     c.stderr.on('data', (b) => { if (out.length < 1e6) out += b; });
     const t = setTimeout(() => c.kill(), timeoutMs);
     c.on('error', (e) => { clearTimeout(t); resolve({ code: null, out: out + String(e), ms: Date.now() - t0 }); });
-    c.on('exit', (code) => { clearTimeout(t); resolve({ code, out, ms: Date.now() - t0 }); });
+    c.on('exit', (code) => {
+      clearTimeout(t);
+      // ⚠️ The pipes are not ours to wait for once the child has exited. The app's postgres.exe, started through
+      // pg_ctl, inherits every inheritable handle -- these two pipes included -- and outlives an app that was killed
+      // before its ordered stop, so the pipes never see EOF and would keep THIS script alive after its last line:
+      // smoke.mjs (release run 37964433491, attempt 2) recorded its FAIL at 10:00, then sat 25 minutes until the
+      // step was cancelled.
+      c.stdout.unref();
+      c.stderr.unref();
+      resolve({ code, out, ms: Date.now() - t0 });
+    });
   });
 }
 
@@ -243,14 +253,26 @@ export async function smoke(exe, root, extra = [], { timeoutMs = 10 * 60_000, en
 export function smokeDigest(s) {
   const c = s.result?.checks || {};
   return {
-    exit: s.exit, ok: !!s.result?.ok, ms: s.ms,
+    // wroteResult false = the app never wrote its result (it crashed, or froze until smoke()'s timeout killed it):
+    // every field below is then missing, and `error` is the tail of its output.
+    exit: s.exit, ok: !!s.result?.ok, ms: s.ms, wroteResult: !!s.result,
     healthz: c.healthz?.status, desktop: c.desktopMode?.desktop, signIn: c.signIn, solver: c.solver?.msg, engine: c.engine, restore: c.restore,
     bffBackup: c.bffBackup ? { pass: c.bffBackup.pass, files: c.bffBackup.files, tables: c.bffBackup.tables, error: c.bffBackup.error || c.bffBackup.task?.lastResult?.error } : null,
     shellDump: c.shellDump ? { bytes: c.shellDump.bytes, usersTable: c.shellDump.hasUsersTable, tables: c.shellDump.tables } : null,
     listen: c.listen ? { exposedBeyondLoopback: c.listen.exposedBeyondLoopback } : null,
     stop: s.result?.stop, fallback: s.result?.fallback, staleRecovery: s.result?.staleRecovery,
-    timeline: s.result?.timeline, error: s.result?.error?.slice(0, 1500) || (s.result ? undefined : s.out.slice(-1500)),
+    timeline: s.result?.timeline,
+    // The smoke's own error; else the first uncaught exception or unhandled rejection of its main process, each of
+    // which fails it (main.js, src/uncaught.js) -- so every row that prints `error` names it; else, when the app wrote
+    // no result at all, the tail of its output.
+    error: s.result?.error?.slice(0, 1500) || uncaughtLines(s.result)?.[0] || (s.result ? undefined : s.out.slice(-1500)),
+    uncaught: uncaughtLines(s.result),
   };
+}
+
+/** A smoke result's uncaught exceptions and unhandled rejections, one line each; undefined when there is no result. */
+function uncaughtLines(r) {
+  return r?.uncaught?.map((u) => `${u.kind}: ${u.stack}`.slice(0, 1500));
 }
 
 /** Serve one file on loopback (the engine pack for --engine-pack-url). @returns {Promise<{ url: string, close: () => void }>} */

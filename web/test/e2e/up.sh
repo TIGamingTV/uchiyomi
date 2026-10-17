@@ -68,7 +68,7 @@ case ",${E2E_FAKE_EXTRA:-}," in *,v55,*) OWNER=1 ;; esac
 # listener 22000-22999. It was FAKE_B_PORT + 1 -- the next app port's fake-a port -- so an instance with the engine
 # stopped the one started on PORT+1 from binding its first fake source.
 ENGINE_PORT=${E2E_ENGINE_PORT:-$((23000 + PORT % 1000))}
-# v0.55.3, E2E_SOLVERS=1: two fake Cloudflare solvers (fakeSolver.mjs) -- the main greeting as trawl 1.7.0, the backup
+# v0.55.3, E2E_SOLVERS=1: two fake Cloudflare solvers (fakeSolver.mjs) -- the main greeting as trawl 1.8.0, the backup
 # as FlareSolverr 3.5.2 -- as the app's FLARESOLVERR_URL and FLARESOLVERR_FALLBACK_URL, and fake-b behind a fake
 # Cloudflare: its stub answers only a request carrying a solver's cf_clearance (fakeSource.mjs --cloudflare yes), and the
 # app asks it through the solvers (FAKE_SOURCE_CLOUDFLARE). For walk49's solver phase (solverWalk.mjs). Their control
@@ -142,7 +142,9 @@ if [ "$SOLVERS" = "1" ]; then
 else
   CLOUDFLARE_B="no"
 fi
-if [ "$ANILIST" = "1" ]; then APP_ENV+=(-e "ANILIST_API_URL=http://$ANILIST_C:$ANILIST_PORT/"); fi
+# v0.56.0: Discover's name lookups ask MangaDex and MangaUpdates after AniList; the fake answers both with nothing, so a
+# walk never asks the real ones about its made-up titles.
+if [ "$ANILIST" = "1" ]; then APP_ENV+=(-e "ANILIST_API_URL=http://$ANILIST_C:$ANILIST_PORT/" -e "MANGADEX_API_URL=http://$ANILIST_C:$ANILIST_PORT/md" -e "MANGAUPDATES_API_URL=http://$ANILIST_C:$ANILIST_PORT/mu"); fi
 
 cleanup() {
   [ "${KEEP:-0}" = "1" ] && { echo "kept: $NET on :$PORT, fake sources on :$FAKE_A_PORT/:$FAKE_B_PORT${ENGINE:+, fake engine on :$ENGINE_PORT}$([ "$OWNER" = "1" ] && echo ", fake-c/fake-d on :$FAKE_C_PORT/:$FAKE_D_PORT")$([ "$SOLVERS" = "1" ] && echo ", solvers on :$SOLVER_MAIN_PORT/:$SOLVER_BACKUP_PORT")$([ "$ANILIST" = "1" ] && echo ", fake AniList on :$ANILIST_PORT") (library $LIB, data $DATA)"; return; }
@@ -185,7 +187,7 @@ if [ "$SOLVERS" = "1" ]; then
   echo "· and two Cloudflare solvers: the main (trawl), the backup (FlareSolverr)"
   docker run -d --name "$SOLVER_MAIN" --network "$NET" -p "127.0.0.1:$SOLVER_MAIN_PORT:8191" \
     -v "$REPO:/repo:ro" -w /repo node:24-alpine \
-    node web/test/e2e/fakeSolver.mjs --name main --port 8191 --greeting trawl --version 1.7.0 >/dev/null
+    node web/test/e2e/fakeSolver.mjs --name main --port 8191 --greeting trawl --version 1.8.0 >/dev/null
   docker run -d --name "$SOLVER_BACKUP" --network "$NET" -p "127.0.0.1:$SOLVER_BACKUP_PORT:8191" \
     -v "$REPO:/repo:ro" -w /repo node:24-alpine \
     node web/test/e2e/fakeSolver.mjs --name backup --port 8191 --greeting flaresolverr --version 3.5.2 >/dev/null

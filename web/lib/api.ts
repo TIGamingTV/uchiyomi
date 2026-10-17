@@ -171,6 +171,17 @@ export async function api<T = any>(path: string, opts: Opts = {}): Promise<T> {
   return (ct.includes('application/json') ? await res.json() : await res.text()) as T;
 }
 
+/**
+ * `api`, with the answer's headers beside its body: for a route that says something about its answer in a header, as the
+ * page list's `x-spreads` (#229) -- the list stays the plain array every other caller reads.
+ */
+export async function apiWithHeaders<T = any>(path: string, opts: Opts = {}): Promise<{ data: T; headers: Headers }> {
+  const res = await raw(path, opts, true);
+  if (!res.ok) throw new ApiError(res.status, await res.text().catch(() => ''));
+  const ct = res.headers.get('content-type') || '';
+  return { data: (ct.includes('application/json') ? await res.json() : await res.text()) as T, headers: res.headers };
+}
+
 // ---- image URLs (authorized by the httpOnly yomi_img cookie) ----
 export const img = {
   // ?v bump = one-time cache-bust so clients pinned to the old immutable panel thumbnails refetch the real covers
@@ -183,4 +194,7 @@ export const img = {
   bookThumb: (id: string) => (id ? `/img/books/${encodeURIComponent(id)}/thumb` : ''),
   page: (bookId: string, n: number, w?: number) =>
     `/img/books/${encodeURIComponent(bookId)}/page/${n}${w ? `?w=${w}` : ''}`,
+  /** A page for a screen that shows it `fit` px wide (#234, lib/readerFit.ts); 0 is the page as scanned. */
+  pageFit: (bookId: string, n: number, fit: number) =>
+    `/img/books/${encodeURIComponent(bookId)}/page/${n}${fit ? `?fit=${fit}` : ''}`,
 };

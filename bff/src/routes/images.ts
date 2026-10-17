@@ -1,6 +1,6 @@
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import sharp from 'sharp';
-import { IMG_COOKIE, API_TOKEN_PREFIX, resolveApiToken, resolveOpdsBasic } from '../lib/auth';
+import { IMG_COOKIE, API_TOKEN_PREFIX, resolveApiToken, resolveOpdsBasic, accountActive } from '../lib/auth';
 import { komga, komgaImage } from '../lib/komga';
 import { serveImage, getOrFetch } from '../lib/imageCache';
 import { dominantHex } from '../lib/color';
@@ -11,19 +11,20 @@ import { automaticAniListAllowed, withAniListMutation } from '../lib/anilistPoli
 import { noticeBook, noticeShown } from '../lib/noticeChapters';
 import { linkSeriesWith } from '../lib/trackers';
 import { LIBRARY_ROOT, cbzPageAt } from '../lib/library';
-import { cfSession } from '../lib/sources/flaresolverr';
+import { cfSession, withSolverDeadline } from '../lib/sources/flaresolverr';
 import { solverMayVisit } from '../lib/sources/imageHosts';
 import { getSource, isSwAdapterId } from '../lib/sources';
 import type { SourceAdapter, SourceChapter } from '../lib/sources/types';
 import { fetchPages } from '../lib/downloader';
-import { previewPageList, isRefusal } from './sources';
+import { previewPageList, copyPageList, isRefusal } from './sources';
 import { assertPublicHost, isBlockedHost, BlockedAddress } from '../lib/ssrfGuard';
-import { suwayomiUrl, suwayomiBase, suwayomiImageHeaders } from '../lib/sources/suwayomi/client';
+import { suwayomiUrl, suwayomiBase, suwayomiImageHeaders, onEngineOrigin } from '../lib/sources/suwayomi/client';
+import { fetchPublic, readCapped, withoutCredentials, MAX_COVER_BYTES, MAX_ICON_BYTES, MAX_HTML_BYTES } from '../lib/safeFetch';
 import { env } from '../env';
 import { join } from 'path';
 import { readFile } from 'fs/promises';
 import { q, one } from '../lib/db';
-import { viewCtxFor, visibleBookFile, seriesVisible, SYSTEM_CTX, type ViewCtx } from '../lib/visibility';
+import { viewCtxFor, visibleBookFile, seriesVisible, sourceAllowedFor, SYSTEM_CTX, type ViewCtx } from '../lib/visibility';
 import { artFile, FIRST_PAGE } from '../lib/seriesArt';
 import { namesOf } from '../lib/altTitles';
 import { HERO_FRAMES, backdropLook, heroFit, type HeroAr } from '../lib/heroFrame';
@@ -183,7 +184,7 @@ export async function fetchCoverImage(u: string, source?: string, opts: { caller
     const r = await fetch(engineTarget, { headers: suwayomiImageHeaders(), redirect: 'error', signal: AbortSignal.timeout(20000) })
       .catch(() => { throw Object.assign(new Error('cover'), { statusCode: 502 }); });
     if (!r.ok) throw Object.assign(new Error('cover'), { statusCode: 502 });
-    return Buffer.from(await r.arrayBuffer());
+    return readCapped(r, MAX_COVER_BYTES).catch(() => { throw Object.assign(new Error('cover'), { statusCode: 502 }); });
   }
 
   // Before anything else, and before any network call: everything below assumes a real http(s) URL.
@@ -202,70 +203,95 @@ export async function fetchCoverImage(u: string, source?: string, opts: { caller
   }
   const src = source ? getSource(source) : null;
   const staticReferer = typeof src?.imageReferer === 'string' ? src.imageReferer : undefined;
-  const headers: Record<string, string> = {
+  const extras = typeof src?.imageHeaders === 'function' ? src.imageHeaders(u) : src?.imageHeaders ?? {};
+  const sourceHeaders: Record<string, string> = {
     'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36',
     accept: 'image/avif,image/webp,image/apng,image/*,*/*;q=0.8',
     'accept-language': 'en-US,en;q=0.9',
     'sec-fetch-dest': 'image', 'sec-fetch-mode': 'no-cors', 'sec-fetch-site': 'cross-site',
     referer: staticReferer ?? `${parsed.origin}/`,
-    ...(typeof src?.imageHeaders === 'function' ? src.imageHeaders(u) : src?.imageHeaders ?? {}),
+    ...extras,
   };
   // A caller-supplied URL reaches the solver only on a host this source vouched for -- its own site, or one it
   // has served covers from (imageHosts.ts). The solver follows redirects and runs page scripts, so a public page
   // the caller controls could otherwise walk it into the network. Library covers come from series_art, not
-  // from a caller, and keep the solver unconditionally: Aqua's CDN answers 403 without clearance.
-  if (src?.requiresCloudflare && (!opts.callerSupplied || solverMayVisit(src, parsed.hostname))) {
-    // Best-effort: many sources host covers on a separate CDN that ISN'T Cloudflare-protected, where
-    // FlareSolverr fails to "solve a challenge". Don't let that abort the cover — the Referer alone is
-    // usually enough. Attach cf cookies when we can; otherwise fall through to a plain fetch.
+  // from a caller: Aqua's CDN answers 403 without clearance.
+  const mayClear = !!src?.requiresCloudflare && (!opts.callerSupplied || solverMayVisit(src, parsed.hostname));
+  const fetchFollowing = async (): Promise<Response> => {
+    // Redirects are followed BY HAND so every hop is checked. `redirect: 'follow'` would let a public URL
+    // bounce to 169.254.169.254 or yomi-db with no second look, which makes any check on the original URL
+    // alone decorative.
+    let target = parsed;
+    let r: Response;
+    for (let hop = 0; ; hop++) {
+      try {
+        await assertPublicHost(target.hostname);
+      } catch (e) {
+        // Not fetchable, ever -- the same class as a bare source id, so it takes the same placeholder path.
+        // Deliberately indistinguishable from any other unfetchable value: a distinct status here would be
+        // the internal-service oracle this guard exists to remove.
+        if (e instanceof BlockedAddress) throw new UnfetchableCoverUrl(u);
+        throw e;
+      }
+      // Credentials go to the cover's own origin only, as fetchFollowingPublic sends them (lib/safeFetch.ts): a hop
+      // anywhere else drops the cookie and authorization -- the solver's clearance after a solve among them -- and
+      // the source's own extra headers. Reintroduce by sending `sourceHeaders` on every hop: "a redirect to another
+      // origin carries none of the first one's credentials" in coverRedirectHeaders.test.ts sees them arrive.
+      const headers = target.origin === parsed.origin ? sourceHeaders : withoutCredentials(sourceHeaders, Object.keys(extras));
+      r = await fetch(target, { headers, redirect: 'manual', signal: AbortSignal.timeout(20000) });
+      if (r.status < 300 || r.status > 399) break;
+      const loc = r.headers.get('location');
+      if (!loc || hop >= 4) throw new UnfetchableCoverUrl(u);
+      let next: URL;
+      try { next = new URL(loc, target); } catch { throw new UnfetchableCoverUrl(u); }
+      if (next.protocol !== 'http:' && next.protocol !== 'https:') throw new UnfetchableCoverUrl(u);
+      target = next;
+    }
+    return r;
+  };
+
+  // PLAIN FIRST (v0.59.0). Every cover of a source behind Cloudflare used to ask the solver for clearance BEFORE the
+  // fetch -- and a cover CDN is no page: on the owner's install about 89 such solves for one CDN all failed, each
+  // holding one of the solver's four slots for up to a minute, while the plain fetch served every one of those covers
+  // with a 200. The solves starved Discover's own listings into timeouts. Now the referer-only fetch goes first, and only
+  // a Cloudflare refusal (403, 503 or `cf-mitigated`) asks for clearance -- the CDN's origin alone for a caller's
+  // cover, never the image URL itself -- capped hard, then one retry with the cookies. Reintroduce the solve-first
+  // order: "a cover the CDN serves never asks the solver" in coverSolverGuard.test.ts sees the solver asked.
+  let r = await fetchFollowing();
+  if (mayClear && refusedByCloudflare(r)) {
     try {
       // Capped hard. cfSession is built for solving a real challenge on a page load and will sit there for
-      // up to 95 seconds; behind an <img> that is a tile that never resolves. The cookies are an optimisation
-      // here -- the plain referer-only fetch below usually works -- so waiting more than a moment for them is
-      // strictly worse than going without.
+      // up to 95 seconds; behind an <img> that is a tile that never resolves. The deadline also drops the solve from
+      // the solver's queue if no slot frees in time (withSolverDeadline).
       let timer: NodeJS.Timeout | undefined;
       const s = await Promise.race([
-        cfSession(u),
+        withSolverDeadline(CF_IMAGE_TIMEOUT_MS, () => cfSession(u, { solveUrl: !opts.callerSupplied })),
         new Promise<never>((_, rej) => {
           timer = setTimeout(() => rej(new Error('cf timeout')), CF_IMAGE_TIMEOUT_MS);
         }),
       ]).finally(() => clearTimeout(timer)); // or the loser holds the event loop open for 5s
-      headers.cookie = s.cookie;
-      headers['user-agent'] = s.userAgent;
+      if (s.cookie) {
+        await r.body?.cancel().catch(() => {});
+        sourceHeaders.cookie = s.cookie;
+        sourceHeaders['user-agent'] = s.userAgent;
+        r = await fetchFollowing();
+      }
     } catch {
-      /* image host isn't behind Cloudflare, or took too long — proceed with the referer-only headers */
+      /* no clearance in time: the refusal stands */
     }
-  }
-  // Redirects are followed BY HAND so every hop is checked. `redirect: 'follow'` would let a public URL
-  // bounce to 169.254.169.254 or yomi-db with no second look, which makes any check on the original URL
-  // alone decorative.
-  let target = parsed;
-  let r: Response;
-  for (let hop = 0; ; hop++) {
-    try {
-      await assertPublicHost(target.hostname);
-    } catch (e) {
-      // Not fetchable, ever -- the same class as a bare source id, so it takes the same placeholder path.
-      // Deliberately indistinguishable from any other unfetchable value: a distinct status here would be
-      // the internal-service oracle this guard exists to remove.
-      if (e instanceof BlockedAddress) throw new UnfetchableCoverUrl(u);
-      throw e;
-    }
-    r = await fetch(target, { headers, redirect: 'manual', signal: AbortSignal.timeout(20000) });
-    if (r.status < 300 || r.status > 399) break;
-    const loc = r.headers.get('location');
-    if (!loc || hop >= 4) throw new UnfetchableCoverUrl(u);
-    let next: URL;
-    try { next = new URL(loc, target); } catch { throw new UnfetchableCoverUrl(u); }
-    if (next.protocol !== 'http:' && next.protocol !== 'https:') throw new UnfetchableCoverUrl(u);
-    target = next;
   }
   // A flat 502, never the upstream status. Reflecting it turned this route into a port and path scanner:
   // 404 meant an open HTTP service, a hang meant a filtered port. `Img` only needs SOME error to fall back
   // to its direct-URL retry, and 502 is the honest one -- the failure was upstream, not in this request.
   if (!r.ok) throw Object.assign(new Error('cover'), { statusCode: 502 });
-  return Buffer.from(await r.arrayBuffer());
+  // Counted as it decodes and refused past the cap (lib/safeFetch.ts): the caller names this URL, and a 49 KB gzip
+  // response decoded into a 48 MiB buffer before anything looked at it.
+  return readCapped(r, MAX_COVER_BYTES).catch(() => { throw Object.assign(new Error('cover'), { statusCode: 502 }); });
 }
+
+/** A Cloudflare refusal: what clearance cookies could get past (v0.59.0). */
+const refusedByCloudflare = (r: Response): boolean =>
+  r.status === 403 || r.status === 503 || r.headers.get('cf-mitigated') === 'challenge';
 
 /**
  * The cover route's fetch. `u` is whatever the caller put in the query string, so the Cloudflare solver is held
@@ -533,7 +559,12 @@ export async function authorizeImageRequest(
       // (routes/auth.ts) and nothing else is. Reintroduce by dropping the typ condition: "an access token in
       // the yomi_img cookie does not open images" in komgaCompat.int.test.ts sees 200.
       if (claims.typ === 'img') {
+        // The cookie lives for a week and nothing revokes it, so the account behind it is checked on every use: a
+        // disabled or deleted owner gets the 401 every other credential gets. Reintroduce by dropping this line:
+        // "the image cookie stops working..." in imageBearer.int.test.ts sees a disabled member's page (200).
+        if (!(await accountActive(claims.sub))) return reply.code(401).send({ error: 'unauthorized' });
         (req as any).viewCtx = await viewCtxFor(claims.sub ?? null);
+        (req as any).imgCredential = { kind: 'session' } satisfies ImgCredential;
         return;
       }
     } catch { /* fall through to OPDS auth */ }
@@ -552,14 +583,40 @@ export async function authorizeImageRequest(
     const raw = auth.slice(7).trim();
     if (raw.startsWith(API_TOKEN_PREFIX)) {
       const tok = await resolveApiToken(raw);
-      if (tok) { (req as any).viewCtx = await viewCtxFor(tok.userId, tok.role); return; }
+      if (tok) {
+        (req as any).viewCtx = await viewCtxFor(tok.userId, tok.role);
+        (req as any).imgCredential = { kind: 'token', scopes: [...tok.scopes] } satisfies ImgCredential;
+        return;
+      }
       return reply.code(401).send({ error: 'unauthorized' });
     }
   }
   // OPDS readers load covers/pages with the same HTTP Basic token as the feed
   const who = await resolveOpdsBasic(req.headers.authorization);
-  if (who) { (req as any).viewCtx = await viewCtxFor(who.userId); return; }
+  if (who) { (req as any).viewCtx = await viewCtxFor(who.userId); (req as any).imgCredential = { kind: 'opds' } satisfies ImgCredential; return; }
   return reply.code(401).send({ error: 'unauthorized' });
+}
+
+/**
+ * Which credential let an image request in (authorizeImageRequest): the image cookie of a signed-in session, an API token
+ * with its scopes, or an OPDS reader's Basic token. Every image route but one only needs to know WHO; the compare view's
+ * page (#241) is an admin's, and `requireAdmin`'s rule is that an admin's token must also carry the admin scope.
+ */
+export type ImgCredential = { kind: 'session' } | { kind: 'token'; scopes: string[] } | { kind: 'opds' };
+
+/**
+ * The admin rule for an image route, as requireAdmin (lib/auth.ts) holds it for the API: the account is an admin now (read
+ * from the database: the image cookie carries no role), and the credential is a session or an API token carrying the
+ * admin scope -- never an OPDS reader's token, nor a read token an admin minted for a script.
+ * Reintroduce by checking the role alone: "a read-scope token of an admin is refused" in copyPages.int.test.ts sees 200.
+ */
+async function adminImageRequest(req: FastifyRequest): Promise<boolean> {
+  const ctx = (req as any).viewCtx as ViewCtx | undefined;
+  const cred = (req as any).imgCredential as ImgCredential | undefined;
+  if (!ctx?.userId || !cred || cred.kind === 'opds') return false;
+  if (cred.kind === 'token' && !cred.scopes.includes('admin')) return false;
+  const me = await one<{ role: string }>('SELECT role FROM users WHERE id = $1', [ctx.userId]).catch(() => null);
+  return me?.role === 'admin';
 }
 
 // ---- owned library image helpers: serve thumbnails + pages straight from the CBZ files ----
@@ -611,7 +668,7 @@ export const serveLibSeriesThumb = async (req: FastifyRequest, reply: FastifyRep
       else if (ovr.cover === FIRST_PAGE) input = await firstPageInput(id, vc(req));
       else { try { input = await fetchCoverImage(ovr.cover!); } catch { input = await firstPageInput(id, vc(req)); } }
       storeColor(id, input);
-      const buffer = await sharp(input).resize({ width: w, withoutEnlargement: true }).webp({ quality: 80 }).toBuffer();
+      const buffer = await thumbWebp(input, w, 80);
       return { buffer, contentType: 'image/webp' };
     });
   }
@@ -624,17 +681,85 @@ export const serveLibSeriesThumb = async (req: FastifyRequest, reply: FastifyRep
       try { input = await fetchCoverImage(art.cover!, art.source_id || undefined); }
       catch { input = await firstPageInput(id, vc(req)); }
       storeColor(id, input);
-      const buffer = await sharp(input).resize({ width: w, withoutEnlargement: true }).webp({ quality: 80 }).toBuffer();
+      const buffer = await thumbWebp(input, w, 80);
       return { buffer, contentType: 'image/webp' };
     });
   }
   return serveImage(req, reply, `lib-sthumb:${id}:p${wk}`, async () => {
     const input = await firstPageInput(id, vc(req));
     storeColor(id, input);
-    const buffer = await sharp(input).resize({ width: w, withoutEnlargement: true }).webp({ quality: 72 }).toBuffer();
+    const buffer = await thumbWebp(input, w, 72);
     return { buffer, contentType: 'image/webp' };
   });
 };
+/** WebP holds no image taller (or wider) than this; JPEG holds 65,535. */
+const WEBP_MAX_SIDE = 16383;
+const JPEG_MAX_SIDE = 65535;
+
+/** The size `input` comes out at `w` wide, never enlarged; null when sharp cannot read it. */
+async function sizeAt(input: Buffer, w: number): Promise<{ width: number; height: number; format?: string } | null> {
+  const m = await sharp(input).metadata().catch(() => null);
+  if (!m?.width || !m.height) return null;
+  const k = Math.min(1, w / m.width);
+  return { width: Math.round(m.width * k), height: Math.round(m.height * k), format: m.format };
+}
+
+/**
+ * A thumbnail `w` wide, as WebP. One that would come out taller than WebP holds -- a chapter stitched into long strips
+ * (lib/longStrip.ts: Eleceed 215 on the live server is two 689 x 54,000 images, 31,350 px tall at 400 wide) -- is cut to
+ * its top four widths: sharp's WebP encoder threw on it, and the chapter's thumbnail, or a series cover drawn from such a
+ * first page, answered 500 (v0.60.1, from Squeaks72's fork). Every other image comes out exactly as before.
+ * Reintroduce by encoding the whole strip: "a long strip's thumbnail is its top" in tallStrip.int.test.ts sees a 500.
+ */
+export async function thumbWebp(input: Buffer, w: number, quality: number): Promise<Buffer> {
+  const size = await sizeAt(input, w);
+  let img = sharp(input).resize({ width: w, withoutEnlargement: true });
+  if (size && size.height > WEBP_MAX_SIDE) img = img.extract({ left: 0, top: 0, width: size.width, height: size.width * 4 });
+  return img.webp({ quality }).toBuffer();
+}
+
+/**
+ * A page `w` wide, as WebP -- or as JPEG when that would be taller than WebP holds (the same strips: the page grid and the
+ * strip thumbnails ask for them at 400 and 200 wide), and as it is when even JPEG cannot hold it (v0.60.1). Every other
+ * page comes out exactly as before. Reintroduce by always encoding WebP: "a long strip's page comes at any width" in
+ * tallStrip.int.test.ts sees a 500.
+ */
+export async function pageAtWidth(input: Buffer, w: number, quality: number): Promise<{ buffer: Buffer; contentType: string }> {
+  const size = await sizeAt(input, w);
+  const img = sharp(input).resize({ width: w, withoutEnlargement: true });
+  if (!size || size.height <= WEBP_MAX_SIDE) return { buffer: await img.webp({ quality }).toBuffer(), contentType: 'image/webp' };
+  if (size.height <= JPEG_MAX_SIDE) {
+    return { buffer: await img.flatten({ background: '#ffffff' }).jpeg({ quality: 82, mozjpeg: true }).toBuffer(), contentType: 'image/jpeg' };
+  }
+  return { buffer: input, contentType: `image/${size.format === 'jpg' || !size.format ? 'jpeg' : size.format}` };
+}
+
+/**
+ * The quality a page is re-encoded at for READING (#234, Reader → Fit pages to my screen): above the thumbnails' 72/74,
+ * since this copy is the page itself. Measured on real pages at 1,080 wide: 44 dB PSNR against the plain resize at 85,
+ * 41.5 at 74, for about a third more bytes -- still a fraction of a 4,000 px scan.
+ */
+export const READ_QUALITY = 85;
+
+/**
+ * A page for a screen that shows it `w` pixels wide (#234): pageAtWidth at READ_QUALITY -- WebP, JPEG for a strip too
+ * tall for WebP -- or the page exactly as it is whenever a copy could only be worse: already that narrow (re-encoding a
+ * page that fits only costs it quality), animated (sharp would keep one frame), unreadable, or no smaller once
+ * re-encoded. Only the reader's opt-in asks (`?fit=`); thumbnails keep `?w=`, as they were.
+ */
+export async function pageForScreen(input: Buffer, type: string, w: number): Promise<{ buffer: Buffer; contentType: string }> {
+  const keep = { buffer: input, contentType: type };
+  const m = await sharp(input).metadata().catch(() => null);
+  if (!m?.width || !m.height || m.width <= w || (m.pages ?? 1) > 1) return keep;
+  const out = await pageAtWidth(input, w, READ_QUALITY).catch(() => null);
+  return out && out.buffer.length < input.length ? out : keep;
+}
+/** `?fit=` as the reader sends it: the widths a page is fitted to, else nothing (the page as it is). */
+const fitOf = (v: unknown): number => {
+  const n = Number(v);
+  return Number.isInteger(n) && n >= 64 && n <= 2000 ? n : 0;
+};
+
 // A chapter file that is not on disk -- deleted by the read-chapter cleanup or an admin (the row stays as
 // a tombstone), or a library not mounted right now -- is a 404, not a 500. Every chapter row used to ask
 // for its thumbnail regardless, and the ENOENT from the zip reader surfaced as a server error in the log
@@ -661,20 +786,29 @@ export const serveLibBookThumb = async (req: FastifyRequest, reply: FastifyReply
     const first = await pageOrGone(abs, 0);
     if (!first) throw Object.assign(new Error('empty'), { statusCode: 404 });
     q('UPDATE lib_books SET pages=$1 WHERE id=$2 AND pages<>$1', [first.total, id]).catch(() => {});
-    const buffer = await sharp(first.bytes).resize({ width: 400, withoutEnlargement: true }).webp({ quality: 72 }).toBuffer();
+    const buffer = await thumbWebp(first.bytes, 400, 72);
     return { buffer, contentType: 'image/webp' };
   });
 };
-/** One page of a chapter, 1-based. `w` in 64..2000 answers a webp downscale; anything else the original bytes. */
-export const serveLibBookPage = async (req: FastifyRequest, reply: FastifyReply, id: string, pageNo: number, w: number) => {
+/**
+ * One page of a chapter, 1-based. `w` in 64..2000 answers a webp downscale; `fit` in 64..2000 the page for a screen that
+ * shows it that wide (pageForScreen, #234); anything else the original bytes.
+ */
+export const serveLibBookPage = async (req: FastifyRequest, reply: FastifyReply, id: string, pageNo: number, w: number, fit = 0) => {
   const abs = await bookFileAbs(id, vc(req));
   if (!abs) return reply.code(404).send({ error: 'no_book' });
+  if (fit && !w) {
+    return serveImage(req, reply, `lib-page:${id}:${pageNo}:fit${fit}`, async () => {
+      const page = await pageOrGone(abs, pageNo - 1);
+      if (!page) throw Object.assign(new Error('no page'), { statusCode: 404 });
+      return pageForScreen(page.bytes, libCt(page.name), fit);
+    });
+  }
   if (w && Number.isInteger(w) && w >= 64 && w <= 2000) {
     return serveImage(req, reply, `lib-page:${id}:${pageNo}:w${w}`, async () => {
       const page = await pageOrGone(abs, pageNo - 1);
       if (!page) throw Object.assign(new Error('no page'), { statusCode: 404 });
-      const buffer = await sharp(page.bytes).resize({ width: w, withoutEnlargement: true }).webp({ quality: 74 }).toBuffer();
-      return { buffer, contentType: 'image/webp' };
+      return pageAtWidth(page.bytes, w, 74);
     });
   }
   return serveImage(req, reply, `lib-page:${id}:${pageNo}`, async () => {
@@ -772,7 +906,7 @@ export default async function imageRoutes(app: FastifyInstance) {
           ),
         )
         .catch(() => {});
-      const buffer = await sharp(input).resize({ width: w, withoutEnlargement: true }).webp({ quality: 72 }).toBuffer();
+      const buffer = await thumbWebp(input, w, 72);
       return { buffer, contentType: 'image/webp' };
     });
   });
@@ -783,25 +917,33 @@ export default async function imageRoutes(app: FastifyInstance) {
     if (id.startsWith('b_')) return serveLibBookThumb(req, reply, id);
     return serveImage(req, reply, `book-thumb:${id}:webp:400`, async () => {
       const input = await fetchUpstream(komga.bookThumbPath(id));
-      const buffer = await sharp(input).resize({ width: 400, withoutEnlargement: true }).webp({ quality: 72 }).toBuffer();
+      const buffer = await thumbWebp(input, 400, 72);
       return { buffer, contentType: 'image/webp' };
     });
   });
 
   // Full page image. Default: pass-through original bytes (already-optimized JPEGs).
-  // Optional ?w=<px> downscales to webp for lightweight previews.
+  // Optional ?w=<px> downscales to webp for lightweight previews; ?fit=<px> is the reader's page for a screen that shows it
+  // that wide, and the original wherever a copy would not be better (pageForScreen, #234).
   app.get('/img/books/:id/page/:n', async (req, reply) => {
     const { id, n } = req.params as { id: string; n: string };
     const pageNo = Number(n);
     if (!Number.isInteger(pageNo) || pageNo < 1) return reply.code(400).send({ error: 'bad_page' });
     const w = Number((req.query as Record<string, string>).w);
-    if (id.startsWith('b_')) return serveLibBookPage(req, reply, id, pageNo, w);
+    const fit = fitOf((req.query as Record<string, string>).fit);
+    if (id.startsWith('b_')) return serveLibBookPage(req, reply, id, pageNo, w, fit);
+
+    if (fit && !w) {
+      return serveImage(req, reply, `page:${id}:${pageNo}:fit${fit}`, async () => {
+        const up = await fetchUpstreamWithType(komga.bookPagePath(id, pageNo));
+        return pageForScreen(up.buffer, up.contentType, fit);
+      });
+    }
 
     if (w && Number.isInteger(w) && w >= 64 && w <= 2000) {
       return serveImage(req, reply, `page:${id}:${pageNo}:w${w}`, async () => {
         const input = await fetchUpstream(komga.bookPagePath(id, pageNo));
-        const buffer = await sharp(input).resize({ width: w, withoutEnlargement: true }).webp({ quality: 74 }).toBuffer();
-        return { buffer, contentType: 'image/webp' };
+        return pageAtWidth(input, w, 74);
       });
     }
 
@@ -852,7 +994,8 @@ export default async function imageRoutes(app: FastifyInstance) {
     const { id, n } = req.params as { id: string; n: string };
     const pageNo = Number(n);
     if (!Number.isInteger(pageNo) || pageNo < 1) return reply.code(400).send({ error: 'bad_page' });
-    return serveLibBookPage(req, reply, id, pageNo, Number((req.query as Record<string, string>).w));
+    const query = req.query as Record<string, string>;
+    return serveLibBookPage(req, reply, id, pageNo, Number(query.w), fitOf(query.fit));
   });
 
   // Proxy a remote source cover (for search results); handles Cloudflare sites via FlareSolverr cookies.
@@ -869,7 +1012,7 @@ export default async function imageRoutes(app: FastifyInstance) {
         signal: AbortSignal.timeout(15000),
       });
       if (!r.ok) throw new Error(`extension icon ${r.status}`);
-      const buffer = await sharp(Buffer.from(await r.arrayBuffer()))
+      const buffer = await sharp(await readCapped(r, MAX_ICON_BYTES))
         .resize({ width: 96, withoutEnlargement: true })
         .webp({ quality: 80 })
         .toBuffer();
@@ -898,6 +1041,13 @@ export default async function imageRoutes(app: FastifyInstance) {
     if (!/^[A-Za-z0-9:._-]{1,120}$/.test(id)) return reply.code(400).send({ error: 'bad' });
     const src = getSource(id);
     if (!src) return reply.code(404).send({ error: 'not_found' });
+    // The age cap every by-id source route applies (sourceAllowedFor): an adult source's own icon is not served to an
+    // account capped below it. Its lettered tile is -- the series pages that name the source still paint a tile, and
+    // nothing is fetched -- under its own cache key, never the real icon's. Reintroduce by removing this:
+    // "a capped account gets the tile, not an adult source's icon" in visibilityGaps.int.test.ts sees the icon's pixels.
+    if (!sourceAllowedFor(src, vc(req).maxAgeRating)) {
+      return serveImage(req, reply, `srcicon-tile:${id}`, async () => ({ buffer: await letterTile(src.name || src.id), contentType: 'image/webp' }));
+    }
 
     return serveImage(req, reply, `srcicon:${id}`, async () => {
       const raw = await sourceIconBytes(src).catch(() => null);
@@ -928,6 +1078,26 @@ export default async function imageRoutes(app: FastifyInstance) {
     const ctx = vc(req);
     if (!(await mayDownload(ctx.userId))) return reply.code(403).send({ error: 'forbidden' });
     const r = await previewPageList(ctx, source, sourceId, number);
+    if (isRefusal(r)) return reply.code(r.code).send({ error: r.error });
+    const idx = Number(i);
+    if (!Number.isInteger(idx) || idx < 0 || idx >= r.urls.length) return reply.code(404).send({ error: 'not_found' });
+    const buf = await previewGate(r.src.id, () => previewPageBytes(r.src, r.chapter, r.urls, idx)).catch(() => null);
+    const type = buf && buf.length <= PREVIEW_MAX_BYTES ? sniffImage(buf) : null;
+    if (!buf || !type) return reply.code(502).send({ error: 'unavailable' });
+    reply.header('cache-control', 'private, no-store');
+    reply.header('x-content-type-options', 'nosniff');
+    reply.type(type);
+    return reply.send(buf);
+  });
+
+  // One page of one named copy of a chapter of this series, for the compare view (#241). Admin only, like the replace it
+  // leads to, and by the API's rule (adminImageRequest); the copy must be one the series' listing holds, of a series the
+  // admin may see (copyPageList).
+  app.get('/img/series/:id/copy-page', async (req, reply) => {
+    const { id } = req.params as { id: string };
+    const { source, chapter, i } = req.query as { source?: string; chapter?: string; i?: string };
+    if (!(await adminImageRequest(req))) return reply.code(403).send({ error: 'forbidden' });
+    const r = await copyPageList(id, source, chapter, vc(req));
     if (isRefusal(r)) return reply.code(r.code).send({ error: r.error });
     const idx = Number(i);
     if (!Number.isInteger(idx) || idx < 0 || idx >= r.urls.length) return reply.code(404).send({ error: 'not_found' });
@@ -988,21 +1158,32 @@ const ICON_UA = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like
  * site that refuses a plain request simply gets a lettered tile.
  */
 async function sourceIconBytes(src: { id: string; iconUrl?: string; base?: string }): Promise<Buffer | null> {
-  const grab = async (url: string, headers: Record<string, string> = {}): Promise<Buffer | null> => {
-    try {
-      const r = await fetch(url, { headers: { 'user-agent': ICON_UA, ...headers }, signal: AbortSignal.timeout(8000) });
-      if (!r.ok) return null;
-      const buf = Buffer.from(await r.arrayBuffer());
-      // A 0-byte body, or an HTML "not found" page wearing an image's URL, is not an icon.
-      return buf.length > 64 && !/^\s*<(?:!doctype|html)/i.test(buf.subarray(0, 40).toString('latin1')) ? buf : null;
-    } catch { return null; }
+  const isIcon = (buf: Buffer | null | undefined): buf is Buffer =>
+    // A 0-byte body, or an HTML "not found" page wearing an image's URL, is not an icon.
+    !!buf && buf.length > 64 && !/^\s*<(?:!doctype|html)/i.test(buf.subarray(0, 40).toString('latin1'));
+  // Every URL here is one a source or its homepage named, so it gets the public-host rule on every hop and a byte cap
+  // (lib/safeFetch.ts). These used to follow redirects with no check: a favicon redirect or a homepage <link rel=icon>
+  // walked the server into the internal network and the answer was served back as the icon. Reintroduce by going back
+  // to fetch(): sourceIconGuard in outboundGuard.test.ts sees the internal server asked.
+  const grab = async (url: string): Promise<Buffer | null> => {
+    const r = await fetchPublic(url, { headers: { 'user-agent': ICON_UA }, timeoutMs: 8000, maxBytes: MAX_ICON_BYTES });
+    return r && r.status >= 200 && r.status < 300 && isIcon(r.body) ? r.body : null;
   };
 
-  // 1. The extension names its own icon. It lives on the extension server, which a browser cannot reach.
+  // 1. The extension names its own icon. It lives on the extension server, which a browser cannot reach: fetched there,
+  //    with the engine's login, only when it really is the engine's URL; any other URL is a public one like the rest.
   if (src.iconUrl) {
     const abs = /^https?:/i.test(src.iconUrl) ? src.iconUrl : suwayomiUrl(src.iconUrl);
-    const hit = await grab(abs, suwayomiImageHeaders());
-    if (hit) return hit;
+    if (onEngineOrigin(abs)) {
+      try {
+        const r = await fetch(abs, { headers: { 'user-agent': ICON_UA, ...suwayomiImageHeaders() }, redirect: 'error', signal: AbortSignal.timeout(8000) });
+        const buf = r.ok ? await readCapped(r, MAX_ICON_BYTES) : null;
+        if (isIcon(buf)) return buf;
+      } catch { /* fall through to the site's own icon */ }
+    } else {
+      const hit = await grab(abs);
+      if (hit) return hit;
+    }
   }
   if (!src.base) return null;
 
@@ -1014,9 +1195,9 @@ async function sourceIconBytes(src: { id: string; iconUrl?: string; base?: strin
 
   // 3. Whatever the homepage declares. Takes the last <link rel=icon>, which is conventionally the largest.
   try {
-    const r = await fetch(origin, { headers: { 'user-agent': ICON_UA }, signal: AbortSignal.timeout(8000) });
-    if (!r.ok) return null;
-    const html = (await r.text()).slice(0, 60000);
+    const r = await fetchPublic(origin, { headers: { 'user-agent': ICON_UA }, timeoutMs: 8000, maxBytes: MAX_HTML_BYTES });
+    if (!r || r.status < 200 || r.status >= 300) return null;
+    const html = r.body.toString('utf8').slice(0, 60000);
     const hrefs = [...html.matchAll(/<link[^>]+rel="[^"]*icon[^"]*"[^>]*>/gi)]
       .map((m) => (m[0].match(/href="([^"]+)"/i) || [])[1])
       .filter(Boolean) as string[];

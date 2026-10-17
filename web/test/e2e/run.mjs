@@ -440,12 +440,24 @@ try {
       else {
         ok(`downloaded ${saved.length} chapters`);
         let cutApi = true;
+        // ⚠️ Past the service worker, or the cut is not a cut: request interception sees only what the PAGE sends to the
+        // network, and a page the worker controls hands its /api calls to the worker, whose own fetches go out untouched
+        // -- the chapter list came back live, from the real server. That had always made this section test nothing on a
+        // run where the worker took control in time; since v0.61.0's webtoon column appends the next chapter while it is
+        // within six screens of the end, it also showed the series' real end card, "You finished" (all three chapters are
+        // here), and failed on main's CI for v0.61.0. Reintroduce by dropping this line: on a run where the worker
+        // controls the reader, "offline reader claims the series is finished" can fail again.
+        await page.setBypassServiceWorker(true);
+        // The cut is now real, so its aborted /api requests reach the console: they are this section's condition, held
+        // in the walk's cut window like the whole-network cuts (networkCut.mjs) -- noted, not counted.
+        cuts.asking();
         await page.setRequestInterception(true);
         const cut = (r) => {
           if (cutApi && new URL(r.url()).pathname.startsWith('/api/')) r.abort('internetdisconnected').catch(() => {});
           else r.continue().catch(() => {});
         };
         page.on('request', cut);
+        cuts.cut();
         try {
           await page.goto(BASE + saved[Math.floor(saved.length / 2)], { waitUntil: 'domcontentloaded', timeout: 60000 }).catch(() => {});
           await sleep(9000);
@@ -492,6 +504,8 @@ try {
           cutApi = false;
           page.off('request', cut);
           await page.setRequestInterception(false).catch(() => {});
+          await page.setBypassServiceWorker(false).catch(() => {});
+          cuts.back();
         }
       }
     }
@@ -741,13 +755,41 @@ try {
     }
   }
 
+  // The phone hero's slow drift (components/PhoneHeroCover.tsx): two reads of the cover's transform two seconds apart
+  // differ, and under reduced motion they do not. As framer keyframes it never ran from v0.67.0 on -- a page loaded
+  // directly mounts under the page transition's AnimatePresence initial={false}, which starts them at their last
+  // keyframe -- while every source pin passed. Reintroduce the motion.div: "the hero cover does not drift" fails.
+  if (seriesHref) {
+    const drifting = async () => {
+      await page.goto(BASE + seriesHref, { waitUntil: 'networkidle2', timeout: 60000 }).catch(() => {});
+      await sleep(1500);
+      return page.evaluate(async () => {
+        const el = document.querySelector('[data-phone-hero-cover]');
+        if (!el) return null;
+        const before = getComputedStyle(el).transform;
+        await new Promise((r) => setTimeout(r, 2000));
+        return getComputedStyle(el).transform !== before;
+      });
+    };
+    const moves = await drifting();
+    if (moves === null) bad('phone series page: no hero cover');
+    else moves ? ok('phone series page: the hero cover drifts') : bad('phone series page: the hero cover does not drift');
+    await page.emulateMediaFeatures([{ name: 'prefers-reduced-motion', value: 'reduce' }]);
+    const reducedMoves = await drifting();
+    await page.emulateMediaFeatures();
+    reducedMoves === false
+      ? ok('phone series page: the cover holds still under reduced motion')
+      : bad(`phone series page: under reduced motion the cover ${reducedMoves === null ? 'is missing' : 'still drifts'}`);
+  }
+
   // ------------------------------------------------- the library's filters, on a phone and on a laptop
   //
   // The library used to carry three horizontally-scrolling chip rails in its header -- one of them seven
   // chips wide, mixing sorts with filters with a select mode -- and a hand-rolled copy of the Sheet
   // component that had no `role="dialog"` and no Escape handler. Both presentations of the one panel are
   // driven here, because the source scan in test/library.test.ts can only see that the right component is
-  // imported, not that it opens.
+  // imported, not that it opens. v0.60.0: the panel holds the filters only; the order is the toolbar's Sort key, a
+  // sheet on a phone and a menu from lg up, driven here too.
   await page.goto(`${BASE}/library`, { waitUntil: 'networkidle2', timeout: 60000 }).catch(() => {});
   await sleep(2000);
   {
@@ -766,10 +808,13 @@ try {
       if (!opened) bad('phone library: the Filters button opened no dialog');
       else {
         opened.modal === 'true' ? ok('phone library: the filter sheet is a real dialog') : bad('phone library: the filter sheet is not aria-modal');
-        // The sections are the whole point of the redesign: one labelled group each, not a chip pile.
-        const missing = ['Sort by', 'Read state', 'Status', 'Genres'].filter((h) => !opened.text.includes(h));
+        // The sections are the whole point of the redesign: one labelled group each, not a chip pile. The orders are
+        // the toolbar's since v0.60.0, so the filter sheet has none.
+        const missing = ['Read state', 'Status', 'Genres'].filter((h) => !opened.text.includes(h));
         missing.length ? bad(`phone library: the filter sheet is missing ${missing.join(', ')}`)
                        : ok('phone library: the filter sheet is grouped into labelled sections');
+        opened.text.includes('Sort by') ? bad('phone library: the filter sheet still holds the orders')
+                                        : ok('phone library: the filter sheet holds filters only');
         await shot('phone-library-filters');
         // ⚠️ The copy this replaced could not do this. Reintroduce the hand-rolled overlay and it fails.
         await page.keyboard.press('Escape');
@@ -778,6 +823,33 @@ try {
         still ? bad('phone library: Escape did not close the filter sheet') : ok('phone library: Escape closes the filter sheet');
       }
     }
+    // The order on a phone: the toolbar's Sort key opens a sheet with the nine orders and the two directions.
+    const sorted = await page.evaluate(() => {
+      const key = document.querySelector('[data-library-sort]');
+      if (!key || !key.getBoundingClientRect().width) return null;
+      key.click();
+      return key.getAttribute('data-library-sort');
+    });
+    if (!sorted) bad('phone library: no Sort key in the toolbar');
+    else {
+      await sleep(700);
+      const sheet = await page.evaluate(() => {
+        const d = document.querySelector('[role=dialog] [data-library-sort-sheet]');
+        // The two directions are the sheet's pinned footer, a radio group.
+        const order = document.querySelector('[role=dialog] [data-library-sort-order]');
+        return d ? { orders: d.querySelectorAll('[data-sort-option^="sort-"]').length, dirs: order ? order.querySelectorAll('[role=radio]').length : 0,
+          on: [...d.querySelectorAll('[aria-pressed="true"]')].map((b) => b.getAttribute('data-sort-option')) } : null;
+      });
+      // v0.61.0: ten orders -- Releasing soon (the release radar) joined the nine (lib/librarySort.ts SORTS).
+      !sheet ? bad('phone library: the Sort key opened no sheet')
+        : sheet.orders === 10 && sheet.dirs === 2 && sheet.on.includes(`sort-${sorted}`)
+          ? ok(`phone library: the Sort sheet lists 10 orders and 2 directions, ${sorted} ticked`)
+          : bad(`phone library: the Sort sheet is wrong: ${JSON.stringify(sheet)}`);
+      await page.keyboard.press('Escape');
+      await sleep(500);
+    }
+    const sideways = await page.evaluate(() => document.documentElement.scrollWidth - innerWidth);
+    sideways > 1 ? bad(`phone library: the toolbar pushes the page ${sideways}px sideways`) : ok('phone library: no sideways scroll with the toolbar');
   }
 
   await setViewportSettled(page, { width: 1440, height: 900 });
@@ -807,9 +879,35 @@ try {
       // Two copies of the same panel on one screen would be the obvious way to get this wrong.
       side.filtersChipVisible ? bad('library @1440: the Filters button is still shown beside an open sidebar')
                               : ok('library @1440: no redundant Filters button');
-      const missing = ['Sort by', 'Read state'].filter((h) => !side.text.includes(h));
+      const missing = ['Read state', 'Status'].filter((h) => !side.text.includes(h));
       missing.length ? bad(`library @1440: the sidebar is missing ${missing.join(', ')}`)
                      : ok('library @1440: the sidebar carries its labelled sections');
+      // v0.60.0: filters only -- the orders are the toolbar's Sort menu.
+      /sort by/i.test(side.text) ? bad('library @1440: the sidebar still holds the orders') : ok('library @1440: the sidebar holds filters only');
+    }
+
+    // The order from lg up: the toolbar's Sort key opens a menu -- four groups, each order a ticked choice, then the two
+    // directions. Looked at, not picked from: a pick saves the account's default, which later walks start from
+    // (v558Walk.mjs drives the picks, and puts the default back).
+    const menu = await page.evaluate(() => {
+      const key = document.querySelector('[data-library-sort]');
+      if (!key) return null;
+      key.click();
+      return true;
+    });
+    if (!menu) bad('library @1440: no Sort key in the toolbar');
+    else {
+      await sleep(500);
+      const items = await page.evaluate(() => {
+        const m = document.querySelector('[role=menu]');
+        return m ? { radios: m.querySelectorAll('[role=menuitemradio]').length, checked: m.querySelectorAll('[aria-checked="true"]').length } : null;
+      });
+      // v0.61.0: ten orders and two directions (Releasing soon joined the nine).
+      items && items.radios === 12 && items.checked === 2
+        ? ok('library @1440: the Sort menu has 10 orders and 2 directions, one of each ticked')
+        : bad(`library @1440: the Sort menu is wrong: ${JSON.stringify(items)}`);
+      await page.keyboard.press('Escape');
+      await sleep(300);
     }
 
     // Picking a genre must actually filter, and say so in the url -- the panel is a pure component over the
@@ -987,6 +1085,97 @@ try {
     }
   }
 
+  // ---------------------------------------------------------------- look settings (UI refresh, phase 3)
+  //
+  // Customize Home: a rail hidden and another moved to the top show at once and again after a reload, because the
+  // account holds them; Reset puts the owner's order back. The background tone: Midnight puts <html data-tone>, the page
+  // colour and the browser bar's colour in place, and keeps them through a reload and a click to another page; OLED takes
+  // all three back to black. Everything is put back at the end, for the checks after this one.
+  console.log('\n  look settings');
+  {
+    const titles = () => page.evaluate(() => [...document.querySelectorAll('section h2')].map((h) => (h.textContent || '').trim()));
+    const settings = async () => {
+      const tok = await login(USER, PASS);
+      return tok ? (await fetch(`${BASE}/api/settings`, { headers: { authorization: `Bearer ${tok}` } })).json() : {};
+    };
+    await page.goto(`${BASE}/`, { waitUntil: 'networkidle2', timeout: 60000 }).catch(() => {});
+    await sleep(2500);
+    if (await ensureSignedIn(page, 'look settings')) {
+      // Compared by what was asked rather than to a whole earlier list: a rail with a request of its own (For you) may
+      // arrive between two readings.
+      const arranged = (t) => t[0] === 'Recently added' && !t.includes('New episodes');
+      if (!(await page.$('[data-home-customize]'))) bad('Home has no Customize key');
+      else {
+        await page.click('[data-home-customize]');
+        await page.waitForSelector('[data-home-rails]', { timeout: 5000 }).catch(() => {});
+        const rows = await page.$$eval('[data-home-rail]', (els) => els.map((e) => e.getAttribute('data-home-rail')));
+        rows.length === 11 ? ok('Customize lists the eleven rails') : bad(`Customize lists ${rows.length} rail(s): ${rows.join(', ')}`);
+        await page.click('[data-home-rail="newEpisodes"] [role="switch"]');
+        for (let i = 0; i < 12 && (await page.$('[data-home-rail="recentlyAdded"] [data-home-rail-up]:not([disabled])')); i++) {
+          await page.click('[data-home-rail="recentlyAdded"] [data-home-rail-up]');
+          await sleep(120);
+        }
+        await sleep(1800);
+        await shot('home-customize');
+        const live = await titles();
+        const saved = (await settings()).homeRails;
+        if (!arranged(live)) bad(`Home did not follow the sheet: ${live.join(' | ')}`);
+        else ok('a hidden rail goes and a moved rail leads, at once');
+        if (!saved || saved.order?.[0] !== 'recentlyAdded' || !saved.hidden?.includes('newEpisodes')) bad(`the account holds ${JSON.stringify(saved)}`);
+        else ok('the account holds the arrangement');
+        await page.keyboard.press('Escape');
+        await page.reload({ waitUntil: 'networkidle2', timeout: 60000 }).catch(() => {});
+        await sleep(2500);
+        const again = await titles();
+        arranged(again) ? ok('the arrangement survives a reload') : bad(`after a reload Home reads ${again.join(' | ')}`);
+        await page.click('[data-home-customize]');
+        await page.waitForSelector('[data-home-rails-reset]', { timeout: 5000 }).catch(() => {});
+        await page.click('[data-home-rails-reset]');
+        await sleep(1500);
+        await page.keyboard.press('Escape');
+        await sleep(800);
+        const reset = await titles();
+        const cleared = (await settings()).homeRails;
+        reset.includes('New episodes') && reset.indexOf('New episodes') < reset.indexOf('Recently added') && cleared == null
+          ? ok('Reset puts the owner\'s order back and stores nothing')
+          : bad(`after Reset: ${reset.join(' | ')} (stored ${JSON.stringify(cleared)})`);
+      }
+
+      const look = () => page.evaluate(() => ({
+        tone: document.documentElement.getAttribute('data-tone'),
+        body: getComputedStyle(document.body).backgroundColor,
+        html: getComputedStyle(document.documentElement).backgroundColor,
+        bar: [...document.querySelectorAll('meta[name="theme-color"]')].map((m) => m.getAttribute('content')).join(),
+      }));
+      const want = (w, tone, rgb, bar) => w.tone === tone && w.body === rgb && w.html === rgb && w.bar === bar;
+      await page.goto(`${BASE}/profile/?tab=Settings`, { waitUntil: 'networkidle2', timeout: 60000 }).catch(() => {});
+      await sleep(2500);
+      if (!(await page.$('[data-tone-choice="midnight"]'))) bad('Appearance has no Midnight tone');
+      else {
+        await page.click('[data-tone-choice="midnight"]');
+        await sleep(1500);
+        await shot('tone-midnight');
+        const m = await look();
+        want(m, 'midnight', 'rgb(9, 13, 24)', '#090d18') ? ok('Midnight colours the page and the browser bar') : bad(`Midnight: ${JSON.stringify(m)}`);
+        (await settings()).tone === 'midnight' ? ok('the account holds the tone') : bad('the tone was not saved');
+        await page.reload({ waitUntil: 'networkidle2', timeout: 60000 }).catch(() => {});
+        await sleep(2500);
+        const r = await look();
+        want(r, 'midnight', 'rgb(9, 13, 24)', '#090d18') ? ok('it survives a reload') : bad(`after a reload: ${JSON.stringify(r)}`);
+        await page.evaluate(() => document.querySelector('a[href="/"]')?.click());
+        await sleep(2500);
+        const n = await look();
+        want(n, 'midnight', 'rgb(9, 13, 24)', '#090d18') ? ok('and a click to Home') : bad(`after a click to Home: ${JSON.stringify(n)}`);
+        await page.goto(`${BASE}/profile/?tab=Settings`, { waitUntil: 'networkidle2', timeout: 60000 }).catch(() => {});
+        await sleep(2500);
+        await page.click('[data-tone-choice="oled"]');
+        await sleep(1500);
+        const o = await look();
+        want(o, null, 'rgb(0, 0, 0)', '#000000') ? ok('OLED black takes it all back') : bad(`back to OLED: ${JSON.stringify(o)}`);
+      }
+    }
+  }
+
   // ---------------------------------------------------------------- clicking, not typing URLs
   //
   // Every check above navigates with page.goto, which is a fresh load with an empty react-query cache. A
@@ -1010,6 +1199,83 @@ try {
     /client-side exception|Application error/i.test(t)
       ? bad(`clicking through to ${href} crashed the app`)
       : ok(`${href} survives being clicked into`);
+  }
+
+  // ---------------------------------------------------------------- the page that leaves is the one that fades out
+  //
+  // (2026-10-15) Since the fade was written, a click showed the NEXT page at once inside the outgoing fade, faded it away
+  // and faded it in again, and built it twice (components/PageTransition.tsx says why). Sampled every frame from a click
+  // on a cover: while the page is fading out it must still be the Library, and the series must arrive fading in. Reintroduce
+  // by rendering `{children}` without FrozenRoute: the series hero shows inside the outgoing fade within a frame or two.
+  {
+    await page.goto(`${BASE}/library`, { waitUntil: 'networkidle2', timeout: 60000 }).catch(() => {});
+    await sleep(3000);
+    const frames = await page.evaluate(() => new Promise((resolve) => {
+      if (document.documentElement.classList.contains('reduce-effects')) { resolve('reduced'); return; }
+      const a = document.querySelector('main [data-library-grid] a[href*="/series/"]');
+      if (!a) { resolve(null); return; }
+      const t0 = performance.now(); const seen = [];
+      a.click();
+      const tick = () => {
+        const w = document.querySelector('main > div');
+        seen.push({ t: Math.round(performance.now() - t0), op: w ? +getComputedStyle(w).opacity : 1,
+          library: !!w?.querySelector('[data-library-grid]'), series: !!w?.querySelector('[data-series-hero]') });
+        if (performance.now() - t0 > 1200) resolve(seen); else requestAnimationFrame(tick);
+      };
+      requestAnimationFrame(tick);
+    })).catch(() => null);
+    if (frames === 'reduced') console.log('    [ -- ] Reduce effects is on for this account: no fade to check');
+    else if (!Array.isArray(frames)) bad('the page fade: no cover to click in the Library');
+    else {
+      // The fade-out is every frame up to the darkest one; the fade-in, every frame after it.
+      const low = frames.reduce((m, f, i) => (f.op < frames[m].op ? i : m), 0);
+      const out = frames.slice(0, low).filter((f) => f.op < 1);
+      const wrong = out.find((f) => f.series || !f.library);
+      const landed = frames.slice(low).some((f) => f.series && f.op === 1);
+      if (!out.length) bad(`the page fade: no fade-out was seen at all (${JSON.stringify(frames.slice(0, 6))})`);
+      else if (wrong) bad(`the page fade: ${wrong.t} ms after the click, the page fading out is ${wrong.series ? 'the series it is going to' : 'not the Library'} (opacity ${wrong.op.toFixed(2)})`);
+      else if (!landed) bad('the page fade: the series never finished fading in');
+      else ok(`the page fade: the Library fades out as itself (${out.length} frames), then the series fades in`);
+    }
+  }
+
+  // ---------------------------------------------------------------- Back puts a page back where it was left
+  //
+  // (2026-10-15) With the fade fixed, the page Back returns to arrives only after the fade, and the browser had put the
+  // scroll back onto the page still fading out: a Library left 2000 px down came back 145 px down. lib/scrollMemory.ts puts
+  // it back once the page is there. Reintroduce by dropping its putBack() from PageTransition: Home comes back near its top.
+  {
+    await page.goto(BASE, { waitUntil: 'networkidle2', timeout: 60000 }).catch(() => {});
+    await sleep(3000);
+    const max = await page.evaluate(() => document.documentElement.scrollHeight - innerHeight);
+    if (max < 300) console.log(`    [ -- ] Home is only ${max} px taller than the window here: nothing to come back to`);
+    else {
+      await page.evaluate((y) => window.scrollTo(0, y), Math.min(700, max - 100));
+      await sleep(900);
+      const left = await page.evaluate(() => Math.round(scrollY));
+      const clicked = await page.evaluate(() => {
+        const a = [...document.querySelectorAll('main a[href*="/series/"]')].find((x) => {
+          const r = x.getBoundingClientRect();
+          return r.top > 80 && r.bottom < innerHeight - 80;
+        });
+        if (!a) return false;
+        a.click();
+        return true;
+      });
+      if (!clicked) bad(`Back: no series on screen to open from Home ${left} px down`);
+      else {
+        await sleep(1500);
+        const opened = await page.evaluate(() => ({ path: location.pathname, y: Math.round(scrollY) }));
+        await page.goBack().catch(() => {});
+        await sleep(2000);
+        const back = await page.evaluate(() => ({ path: location.pathname, y: Math.round(scrollY) }));
+        if (!opened.path.startsWith('/series')) bad(`Back: the click did not open a series (${JSON.stringify(opened)})`);
+        else if (opened.y > 4) bad(`Back: a series opened from a scrolled Home opened ${opened.y} px down, not at its top`);
+        else if (back.path !== '/') bad(`Back: did not return to Home (${JSON.stringify(back)})`);
+        else if (Math.abs(back.y - left) > 4) bad(`Back: Home was left ${left} px down and came back ${back.y} px down`);
+        else ok(`Back: Home was left ${left} px down and came back there; the series opened at its top`);
+      }
+    }
   }
 
   // ---------------------------------------------------------------- 18+ libraries stay off the shelf
@@ -1444,6 +1710,90 @@ try {
           await page.keyboard.press('Enter');
           await sleep(3500);
         }
+      }
+    }
+  }
+
+  // ---------------------------------------------------------------- signing up (v0.61.0)
+  //
+  // Admin → Settings → Open registration had no form behind it on the sign-in screen until v0.61.0. With it on, a
+  // stranger's browser sees "Create an account" under the sign-in form, signs up and lands in the app; the same name in
+  // capitals is then taken (the server refuses lookalikes); with it off again the link is gone. All in a fresh browser
+  // context, so the admin's session in `page` is never touched, and the account and the switch are put back after.
+  // Two sign-ups: the route allows five per address per ten minutes. Reintroduce the form-less screen (drop the link in
+  // components/LoginScreen.tsx): "the sign-in form offers Create an account" fails.
+  console.log('\n  signing up');
+  {
+    const SIGNUP = { username: `e2e-signup-${Date.now().toString(36)}`, password: 'e2e-signup-passw0rd-1' };
+    const tok = await login(USER, PASS);
+    const adminApi = (path, init = {}) => fetch(`${BASE}${path}`, {
+      ...init, headers: { 'content-type': 'application/json', authorization: `Bearer ${tok}`, ...(init.headers || {}) },
+    });
+    const setOpen = (on) => adminApi('/api/admin/settings', { method: 'PATCH', body: JSON.stringify({ allowRegistration: on }) });
+    let was = false;
+    let ctx = null;
+    try {
+      if (!tok) throw new Error('could not sign in over HTTP to open registration');
+      was = (await (await adminApi('/api/admin/settings')).json().catch(() => ({}))).allow_registration === true;
+      if (!(await setOpen(true)).ok) throw new Error('could not turn Open registration on');
+      ctx = await browser.createBrowserContext();
+      const p2 = await ctx.newPage();
+      await p2.setViewport({ width: 1440, height: 900 });
+      const createLink = () => p2.$('[data-create-account]');
+      /** Open the sign-up form from a fresh sign-in screen, fill it in and send it. False when there was no form. */
+      const signUp = async (name) => {
+        await p2.goto(BASE, { waitUntil: 'networkidle2', timeout: 60000 });
+        await p2.waitForSelector('[data-create-account]', { timeout: 15000 }).catch(() => {});
+        const link = await createLink();
+        if (!link) return false;
+        await link.click();
+        await p2.waitForFunction(() => document.querySelectorAll('form input[type=password]').length === 2, { timeout: 10000 }).catch(() => {});
+        const fields = await p2.$$('form input');
+        if (fields.length !== 3) return false;
+        await fields[0].type(name);
+        await fields[1].type(SIGNUP.password);
+        await fields[2].type(SIGNUP.password);
+        await p2.keyboard.press('Enter');
+        return true;
+      };
+
+      if (!(await signUp(SIGNUP.username))) bad('the sign-in form offers Create an account while Open registration is on -- it does not, or its form has no name and two password fields');
+      else {
+        await sleep(4000);
+        const after = await p2.evaluate(() => ({ form: !!document.querySelector('input[type=password]'), nav: !!document.querySelector('nav a') }));
+        await p2.screenshot({ path: `${OUT}/${String(++step).padStart(2, '0')}-signed-up.png` });
+        after.form || !after.nav ? bad('still on a form after signing up') : ok('signed up from the sign-in screen and landed in the app');
+
+        // A real sign-out: the refresh cookie is HttpOnly, so only /auth/logout drops it.
+        await p2.evaluate(() => fetch('/auth/logout', { method: 'POST', credentials: 'include' }).catch(() => {}));
+        await p2.evaluate(() => { localStorage.clear(); sessionStorage.clear(); });
+        await p2.deleteCookie(...(await p2.cookies()));
+        if (!(await signUp(SIGNUP.username.toUpperCase()))) bad('after signing out, the sign-up form could not be filled in again');
+        else {
+          await sleep(2500);
+          const said = await p2.evaluate(() => document.body.innerText || '');
+          /That username is taken\./.test(said)
+            ? ok('the same name in capitals is taken')
+            : bad(`a lookalike name was not refused: ${said.slice(0, 160).replace(/\s+/g, ' ')}`);
+        }
+      }
+
+      // Off again: the link goes.
+      await setOpen(false);
+      await p2.goto(BASE, { waitUntil: 'networkidle2', timeout: 60000 });
+      await p2.waitForSelector('input[type=password]', { timeout: 30000 }).catch(() => {});
+      await sleep(1500);
+      (await createLink()) ? bad('Open registration is off, but the sign-in form still offers Create an account') : ok('with Open registration off, the link is gone');
+    } catch (e) {
+      bad(`signing up: ${e.message}`);
+    } finally {
+      await ctx?.close().catch(() => {});
+      if (tok) {
+        const users = await (await adminApi('/api/admin/users')).json().catch(() => ({ content: [] }));
+        for (const u of users.content ?? []) {
+          if (String(u.username ?? '').toLowerCase() === SIGNUP.username) await adminApi(`/api/admin/users/${u.id}`, { method: 'DELETE' });
+        }
+        await setOpen(was);
       }
     }
   }

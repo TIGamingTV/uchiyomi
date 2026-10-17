@@ -7,6 +7,7 @@ import os from 'node:os';
 import path from 'node:path';
 import http from 'node:http';
 import { EventEmitter } from 'node:events';
+import { PassThrough } from 'node:stream';
 import { createRequire } from 'node:module';
 
 const require = createRequire(import.meta.url);
@@ -16,8 +17,8 @@ const { CONTRACT } = require('../src/env.js');
 
 const quiet = { info() {}, warn() {}, error() {} };
 
-function fakes(order, { installed = false, silentPort = false } = {}) {
-  const opts = { silentPort };
+function fakes(order, { installed = false, silentPort = false, lateOutput = false, had = [] } = {}) {
+  const opts = { silentPort, lateOutput };
   const pg = {
     port: 0, password: '', binDir: '/pg/bin', pgdata: '/pg/data',
     prepare: async () => { order.push('pg.prepare'); return { fallback: null }; },
@@ -32,6 +33,9 @@ function fakes(order, { installed = false, silentPort = false } = {}) {
   };
   const engine = Object.assign(new EventEmitter(), {
     installed: () => installed,
+    // `had`: the versions an app update that moved the pin leaves installed beside the pinned one.
+    otherRuntimes: () => had,
+    install: async () => { order.push('engine.install'); },
     start: async () => { order.push('engine.start'); },
     stop: async () => { order.push('engine.stop'); return 'exited:0'; },
     status: () => ({ state: installed ? 'running' : 'absent' }),
@@ -40,12 +44,20 @@ function fakes(order, { installed = false, silentPort = false } = {}) {
   const utilityProcess = {
     fork: (_entry, _args, o) => {
       order.push('bff.fork');
-      const child = Object.assign(new EventEmitter(), { pid: 4242, stdout: null, stderr: null, env: o.env, messages: [] });
+      const out = opts.lateOutput ? { stdout: new PassThrough(), stderr: new PassThrough() } : { stdout: null, stderr: null };
+      const child = Object.assign(new EventEmitter(), { pid: 4242, ...out, env: o.env, messages: [] });
       const srv = http.createServer((req, res) => { res.writeHead(200); res.end('{"ok":true}'); });
       // Like bff-entry.cjs: our own child says which port it bound -- unless the test plays a squatted port.
       srv.once('listening', () => { if (!opts.silentPort) child.emit('message', { type: 'listening', port: srv.address().port, address: '127.0.0.1' }); });
       srv.listen(Number(o.env.PORT), '127.0.0.1');
-      child.postMessage = (m) => { child.messages.push(m); order.push(`bff.message:${JSON.stringify(m)}`); srv.close(() => setImmediate(() => child.emit('exit', 0))); };
+      // lateOutput: like Electron 44.5.1's utilityProcess, the line the bff wrote last is delivered after 'exit'.
+      const exit = () => {
+        child.stdout?.write('{"msg":"SIGTERM: finishing the current chapter, then stopping"}\n');
+        child.emit('exit', 0);
+        child.stdout?.end('{"reqId":"req-4","msg":"request completed"}\n');
+        child.stderr?.end();
+      };
+      child.postMessage = (m) => { child.messages.push(m); order.push(`bff.message:${JSON.stringify(m)}`); srv.close(() => setImmediate(exit)); };
       child.kill = () => { srv.close(() => child.emit('exit', 1)); };
       setImmediate(() => child.emit('spawn'));
       forks.push(child);
@@ -80,9 +92,9 @@ test('start order, the env the bff gets, and the ordered stop', async () => {
     for (const k of CONTRACT.filter((x) => x !== 'LIBRARY_ROOT')) assert.ok(env[k] !== undefined && env[k] !== '', `${k} missing from the bff env`);
     assert.equal(env.FLARESOLVERR_URL, 'http://127.0.0.1:1/solvertoken0123456789');
     assert.equal(env.SUWAYOMI_URL, `http://127.0.0.1:${sup.state.enginePort}`);
-    // Secrets persisted 0600, ports persisted (chosen once).
+    // The database password persisted 0600 (the engine's pair never is: the next test), ports persisted (chosen once).
     const secrets = JSON.parse(fs.readFileSync(sup.L.secrets, 'utf8'));
-    assert.ok(secrets.pgPassword && secrets.engineUser && secrets.enginePass);
+    assert.ok(secrets.pgPassword);
     if (process.platform !== 'win32') assert.equal(fs.statSync(sup.L.secrets).mode & 0o777, 0o600);
     const st = JSON.parse(fs.readFileSync(sup.L.state, 'utf8'));
     assert.ok(st.uiPort && st.pgPort && st.enginePort);
@@ -98,6 +110,73 @@ test('start order, the env the bff gets, and the ordered stop', async () => {
     assert.equal(after.mainPid, undefined);
     assert.equal(after.uiPort, st.uiPort);
     assert.equal(await sup.stop('again'), r, 'a second stop joins the first');
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test("the engine's pair is new at every launch, and only the app holds it", async () => {
+  // v0.73.0. Until then the engine's basic-auth pair was made once and kept in secrets.json. Now each launch makes its
+  // own, hands it to the engine and the bff, and writes it nowhere. Reintroduce the stored pair (made once in start(),
+  // saved with the database password): the second launch's pair equals the first's, and secrets.json holds it.
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'uchi-sup-'));
+  try {
+    const launch = async () => {
+      const f = fakes([], { installed: true });
+      /** @type {any} */
+      let engineOpts = null;
+      const sup = make(tmp, f, { makeEngine: (/** @type {any} */ o) => { engineOpts = o; return f.engine; } });
+      await sup.start();
+      const env = f.forks[0].env;
+      const creds = engineOpts.creds();
+      await sup.stop('test');
+      return { env, creds };
+    };
+    // A data folder from before: secrets.json carries the old, permanent pair.
+    fs.mkdirSync(path.join(tmp, 'data'), { recursive: true });
+    const L = layout(path.join(tmp, 'data'));
+    fs.writeFileSync(L.secrets, JSON.stringify({ pgPassword: 'kept', engineUser: 'uchiyomi-old', enginePass: 'old-pass' }));
+    const one = await launch();
+    const two = await launch();
+    for (const r of [one, two]) {
+      assert.match(String(r.env.SUWAYOMI_USERNAME), /^uchiyomi-[0-9a-f]{12}$/);
+      assert.match(String(r.env.SUWAYOMI_PASSWORD), /^[0-9a-f]{48}$/);
+      assert.notEqual(r.env.SUWAYOMI_PASSWORD, 'old-pass', 'the pair kept from before is still in use');
+    }
+    assert.notEqual(two.env.SUWAYOMI_PASSWORD, one.env.SUWAYOMI_PASSWORD, 'a second launch reused the first one\'s password');
+    assert.notEqual(two.env.SUWAYOMI_USERNAME, one.env.SUWAYOMI_USERNAME);
+    // The engine is started with the same pair the bff is given.
+    for (const r of [one, two]) assert.deepEqual(r.creds, { user: r.env.SUWAYOMI_USERNAME, pass: r.env.SUWAYOMI_PASSWORD });
+    const stored = fs.readFileSync(L.secrets, 'utf8');
+    assert.deepEqual(JSON.parse(stored), { pgPassword: 'kept' }, 'secrets.json holds more than the database password');
+    assert.ok(!stored.includes(two.env.SUWAYOMI_PASSWORD), "this launch's engine password was written to disk");
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test("the bff's last line, delivered after its 'exit', lands in bff.log -- and does not take the shell down", async () => {
+  // The S2-ii hang (v0.55.8 PR, v0.55.9 and v0.55.10 release runs): bff.log was ended on 'exit' while the bff's
+  // SIGTERM line was still being written, then its last line arrived (Electron 44.5.1 delivers it; 44.4.5 dropped
+  // it). That write after end was an uncaught exception -> Electron's modal error box -> the stop never finished.
+  // Reintroduce by ending the file on 'exit' in forkBff: an uncaught ERR_STREAM_WRITE_AFTER_END fails this test.
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'uchi-sup-'));
+  const order = [];
+  const f = fakes(order, { lateOutput: true });
+  const sup = make(tmp, f);
+  try {
+    await sup.start();
+    const r = await sup.stop('test');
+    assert.equal(r.bff, 'exited:0');
+    assert.deepEqual(order.slice(-4), ['bff.message:{"type":"shutdown"}', 'engine.stop', 'solver.close', 'pg.stop'], 'the ordered stop did not finish');
+    const file = path.join(sup.L.logs, 'bff.log');
+    let log = '';
+    for (let i = 0; i < 100 && !/request completed/.test(log); i++) {
+      await new Promise((res) => setTimeout(res, 20));
+      log = fs.readFileSync(file, 'utf8');
+    }
+    assert.match(log, /SIGTERM: finishing/);
+    assert.match(log, /request completed/, "the bff's last line was lost");
   } finally {
     fs.rmSync(tmp, { recursive: true, force: true });
   }
@@ -155,6 +234,7 @@ test('a freshly installed engine restarts the bff exactly once (contract 5), wit
   try {
     await sup.start();
     assert.ok(!order.includes('engine.start'), 'not installed: not started');
+    assert.ok(!order.includes('engine.install'), 'downloaded unasked, on a computer that never had the engine');
     const restarted = new Promise((r) => sup.once('bff-restarted', r));
     f.engine.emit('installed');
     await restarted;
@@ -163,6 +243,22 @@ test('a freshly installed engine restarts the bff exactly once (contract 5), wit
     assert.equal(sup.crashes.length, 0);
     await new Promise((r) => setTimeout(r, 1300)); // longer than the first crash backoff: no third fork
     assert.equal(f.forks.length, 2);
+  } finally {
+    await sup.stop('test');
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test('an update that moved the engine pin fetches the new engine by itself where the old one was in use', async () => {
+  // The runtime is per version, so after such an update the pinned engine is not installed and extensions stop.
+  // Reintroduce by dropping the otherRuntimes() branch in Supervisor.start(): "the new engine is not fetched" fails.
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'uchi-sup-'));
+  const order = [];
+  const sup = make(tmp, fakes(order, { had: ['v2.3.2243'] }));
+  try {
+    await sup.start();
+    assert.ok(order.includes('engine.install'), 'the new engine is not fetched');
+    assert.ok(!order.includes('engine.start'), 'install() starts it; nothing else does');
   } finally {
     await sup.stop('test');
     fs.rmSync(tmp, { recursive: true, force: true });

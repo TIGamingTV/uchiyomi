@@ -20,7 +20,7 @@ import type { SourceAdapter, SourceSeries } from './sources/types';
 import { budgetFor } from './sources/budget';
 import { SOLVER_CONCURRENCY } from './sources/flaresolverr';
 import { scanOrder } from './scanOrder';
-import { classify, noteStage, reportFail, reportSlow, type SourceHealth } from './sourceHealth';
+import { classify, noteStage, reportFail, reportSlow, reportTimely, type SourceHealth } from './sourceHealth';
 import { canonLang } from './lang';
 
 /** An env knob: a finite number at or above `min`, else the default. An empty string is unset. */
@@ -169,8 +169,11 @@ function cancelEntry(entry: Entry): void {
   wake(entry);
 }
 
-/** Ask one source, under a slot, and write what it said into the entry. Never throws: the state is the report. */
-async function askOne(entry: Entry, src: SourceAdapter, term: string): Promise<void> {
+/**
+ * Ask one source, under a slot, and write what it said into the entry. Never throws: the state is the report. `slow`:
+ * the health read this search made shows the source on a slow streak, which an answer inside the budget ends.
+ */
+async function askOne(entry: Entry, src: SourceAdapter, term: string, slow = false): Promise<void> {
   const cell = entry.per.get(src.id)!;
   const lane = laneFor(src);
   if (!(await lane.take(entry))) return;
@@ -185,6 +188,10 @@ async function askOne(entry: Entry, src: SourceAdapter, term: string): Promise<v
     Object.assign(cell, { state: items.length ? 'ok' : 'empty', items, ms: Date.now() - t0, settledAt: Date.now() });
     // #115: a search that found something is evidence the search stage works (non-escalating, throttled).
     if (items.length) void noteStage(src.id, 'search', 'ok');
+    // v0.55.10: in time, found or not, so a slow streak ends here (lib/sourceHealth.ts reportTimely) -- asked only of a
+    // source on one, since for every other source the write would change nothing. Reintroduce by dropping it: "a search
+    // answered in time ends the slow streak" in searchAll.int.test.ts reads the streak still counting.
+    if (slow) void reportTimely(src.id);
   } catch (e) {
     // Two different facts, recorded two different ways, exactly as the newest listing records them (see
     // routes/sources.ts latestPage): outrunning OUR budget is counted and at worst earns a short fixed
@@ -260,7 +267,7 @@ export async function searchAll(
     if (h?.disabled) { skipped.set(id, 'disabled'); continue; }
     if (h?.blocked_until && new Date(h.blocked_until).getTime() > callStart) { skipped.set(id, 'cooldown'); continue; }
     entry.per.set(id, { state: 'pending', items: [] });
-    void askOne(entry, byId.get(id)!, term);
+    void askOne(entry, byId.get(id)!, term, (h?.slow_streak ?? 0) > 0);
   }
 
   // Wait for the earliest of: everything mine settled, my own wait, or the grace after the first source
@@ -331,6 +338,16 @@ export type Rating = 'adult' | 'safe';
 export type Judged = Rating | 'flagged';
 /** What a search shows: everything, everything not known to be 18+ (`safe`), or only what is (`adult`). */
 export type RatingFilter = 'all' | 'safe' | 'adult';
+/**
+ * The ids of a `sources` query value (comma-separated), or null when it names none -- the search then asks every source.
+ * At most 200 ids, so a hostile value costs nothing; the caller still intersects it with the sources the viewer may reach.
+ */
+export function narrowTo(raw: unknown): Set<string> | null {
+  if (typeof raw !== 'string') return null;
+  const ids = raw.split(',').map((s) => s.trim()).filter(Boolean).slice(0, 200);
+  return ids.length ? new Set(ids) : null;
+}
+
 /** The admin's 18+ filter lists (lib/visibility.ts adultFilter): genres as typed, source ids lowercased. */
 export interface AdultLists { genres: readonly string[]; sources: readonly string[] }
 
@@ -390,29 +407,41 @@ const shows = (want: RatingFilter, r: Rating | undefined): boolean => (want === 
  * own flag says so (v0.55.5, Judged), which the card weighs less.
  */
 export interface Provider { source: string; name: string; sourceId: string; coverUrl?: string; title: string; lang: string | null; rating?: Rating }
-/** `rating` (v0.55.4; weighed by cardRating since v0.55.5): 18+, safe, or absent when nothing says. */
-export interface TitleGroup { title: string; coverUrl?: string; updatedAt?: string; providers: Provider[]; rating?: Rating }
+/**
+ * `rating` (v0.55.4; weighed by cardRating since v0.55.5): 18+, safe, or absent when nothing says. `work` (v0.56.0): the
+ * key the card was folded by, when the caller gave one (groupByTitle's keyOf).
+ */
+export interface TitleGroup { title: string; coverUrl?: string; updatedAt?: string; providers: Provider[]; rating?: Rating; work?: string }
 export interface SourceRail { source: string; name: string; lang: string | null; results: Array<SourceSeries & { name: string; rating?: Rating }> }
 
 /**
- * One card per normalised title carrying every provider that has it; most providers first, at most `max`.
+ * One card per normalised title (or per `keyOf`, v0.56.0) carrying every provider that has it; most providers first, at
+ * most `max`.
  *
  * With `rated`, each provider and card says what it is known to be, and the cards the viewer does not want are left out
  * BEFORE the cap: filtered after it, "18+ only" was what happened to be among the thirty, often nothing. A card's rating
  * is cardRating's: 18+ when any provider is known to be by the title, or when only self-declared adult sites carry it.
  * Reintroduce the filter after the slice: "filtered before the cap" in searchAll.int.test.ts finds fewer cards.
  */
-export function groupByTitle(per: SearchAnswer['per'], order: SourceAdapter[], max = 30, rated?: Rated): TitleGroup[] {
+export function groupByTitle(
+  per: SearchAnswer['per'], order: SourceAdapter[], max = 30, rated?: Rated, keyOf?: (item: SourceSeries, src: SourceAdapter) => string,
+): TitleGroup[] {
   const groups = new Map<string, TitleGroup>();
   // Each card's providers as ratingOf judged them, `flagged` kept apart: what is answered folds it into `adult`.
   const judged = new Map<TitleGroup, Array<Judged | undefined>>();
   for (const src of order) {
     for (const r of per.get(src.id)?.items ?? []) {
       if (!r.sourceId || !r.title) continue;
-      const key = normTerm(r.title);
+      // v0.56.0: the caller's key -- Discover's work (lib/discoverIdentity.ts workOf), under which two sites naming one series
+      // differently are one card -- else the normalised title, as every caller before it. A work key is never empty, so a
+      // title in another script is a card of its own, where the ASCII key dropped it.
+      const key = keyOf ? keyOf(r, src) : normTerm(r.title);
       if (!key) continue;
       let g = groups.get(key);
-      if (!g) { g = { title: r.title, coverUrl: r.coverUrl, updatedAt: r.updatedAt, providers: [] }; groups.set(key, g); judged.set(g, []); }
+      if (!g) {
+        g = { title: r.title, coverUrl: r.coverUrl, updatedAt: r.updatedAt, providers: [], ...(keyOf ? { work: key } : {}) };
+        groups.set(key, g); judged.set(g, []);
+      }
       if (!g.coverUrl && r.coverUrl) g.coverUrl = r.coverUrl;
       if (!g.updatedAt && r.updatedAt) g.updatedAt = r.updatedAt;
       if (!g.providers.some((p) => p.source === r.source)) {
@@ -427,9 +456,16 @@ export function groupByTitle(per: SearchAnswer['per'], order: SourceAdapter[], m
     }
   }
   const all = [...groups.values()];
+  // v0.62.0: a source in every language (Suwayomi's "all") goes after the sources that are one language, in every card.
+  // Its chapter list mixes every translation of each number, and the first provider is the add dialog's default pick,
+  // so a title an English extension carries is added from it rather than from the same extension's every-language
+  // variant. A stable sort: the order is otherwise the caller's. Reintroduce by dropping it: "a source in every
+  // language comes last in its card" in searchCards.test.ts finds it first.
+  const mixed = new Set(order.filter((src) => !!src.lang?.trim() && canonLang(src.lang) === null).map((src) => src.id));
   for (const g of all) {
     const rating = cardRating(judged.get(g) ?? []);
     if (rating) g.rating = rating;
+    if (mixed.size) g.providers.sort((x, y) => Number(mixed.has(x.source)) - Number(mixed.has(y.source)));
   }
   return (rated ? all.filter((g) => shows(rated.want, g.rating)) : all).sort((a, b) => b.providers.length - a.providers.length).slice(0, max);
 }

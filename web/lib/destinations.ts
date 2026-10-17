@@ -23,9 +23,10 @@ const LABELS = keys(
   'Source order', 'Notice chapters',
   // Settings people ask for by name.
   'Check for updates', 'Open registration', 'Backup time', 'Delete read chapters', 'Show missing chapters in Mihon',
-  'Slow archive', 'Cloudflare solver', 'Version', 'Import a list', 'Rescan everything',
+  'Slow archive', 'Cloudflare solver', 'Version', 'Import a list', 'Rescan everything', 'Smart update checks',
+  'Backups to keep',
   // The profile: its tabs, its cards and its settings by name.
-  'You', 'Connections', 'Account', 'Badges', 'Reading studio', 'Appearance', 'Language', 'Reduce effects', 'Reading',
+  'You', 'Insights', 'Connections', 'Account', 'Badges', 'Reading studio', 'Appearance', 'Language', 'Reduce effects', 'Reading',
   'Weekly goal', 'Reading direction', 'Offline downloads', 'This device', 'New-chapter alerts', 'Progress tracking',
   'External readers (OPDS)', 'API tokens', 'Change password', 'Two-factor authentication', 'Active sessions',
   // Where each one is.
@@ -105,6 +106,12 @@ export const DESTINATIONS: readonly Destination[] = [
     keywords: ['sign up', 'signup', 'register'] },
   { key: 'backup-time', label: 'Backup time', where: ADMIN_SETTINGS, href: settings('schedules'), admin: true,
     keywords: ['backup', 'database backup', 'dump'] },
+  // v0.61.1 (#199): looked for and not found while it was only BACKUP_KEEP. The nightly's switch is the row above it.
+  { key: 'backups-keep', label: 'Backups to keep', where: ADMIN_SETTINGS, href: settings('schedules'), admin: true,
+    keywords: ['backup limit', 'retention', 'old backups', 'nightly backup', 'turn off backups'] },
+  // v0.61.0: the release radar's schedule switch, beside the update interval it bends.
+  { key: 'smart-checks', label: 'Smart update checks', where: ADMIN_SETTINGS, href: settings('schedules'), admin: true,
+    keywords: ['smart', 'quiet series', 'check less often', 'release radar', 'sweep'] },
   { key: 'delete-read', label: 'Delete read chapters', where: ADMIN_SETTINGS, href: settings('housekeeping'), admin: true,
     keywords: ['cleanup', 'free space', 'disk space'] },
   { key: 'mihon-missing', label: 'Show missing chapters in Mihon', where: ADMIN_SETTINGS, href: settings('housekeeping'), admin: true,
@@ -123,7 +130,7 @@ export const DESTINATIONS: readonly Destination[] = [
 
   // ---- The import (app/admin/import/page.tsx) ----
   { key: 'import', label: 'Import a list', where: ADMIN, href: '/admin/import/', admin: true,
-    keywords: ['import', 'mihon', 'tachiyomi', 'tachibk', 'backup', 'mangadex', 'anilist', 'myanimelist', 'mal', 'kitsu',
+    keywords: ['import', 'mihon', 'tachiyomi', 'tachibk', 'backup', 'mangadex', 'anilist', 'myanimelist', 'mal', 'kitsu', 'mangaupdates',
       'migrate', 'move my library', 'paste titles'] },
 
   // ---- The profile's tabs (app/profile/page.tsx), cards and settings ----
@@ -131,6 +138,8 @@ export const DESTINATIONS: readonly Destination[] = [
   { key: 'profile-badges', label: 'Badges', where: PROFILE, href: '/profile/?section=badges', keywords: ['achievements'] },
   { key: 'profile-studio', label: 'Reading studio', where: PROFILE, href: '/profile/?section=reading-studio',
     keywords: ['stats', 'statistics', 'heatmap', 'calendar'] },
+  { key: 'profile-insights', label: 'Insights', where: PROFILE, href: '/profile/?tab=Insights',
+    keywords: ['my stats', 'backlog', 'unread', 'best day', 'genres', 'finish date', 'dropped'] },
   { key: 'profile-settings', label: 'Settings', where: PROFILE, href: '/profile/?tab=Settings', keywords: ['my settings', 'preferences', 'options'] },
   { key: 'appearance', label: 'Appearance', where: PROFILE_SETTINGS, href: '/profile/?tab=Settings&section=appearance',
     keywords: ['theme', 'accent', 'colour', 'color', 'avatar'] },
@@ -151,7 +160,7 @@ export const DESTINATIONS: readonly Destination[] = [
     desktopHidden: true, keywords: ['push', 'notifications'] },
   { key: 'profile-connections', label: 'Connections', where: PROFILE, href: '/profile/?tab=Connections', keywords: ['integrations'] },
   { key: 'progress-tracking', label: 'Progress tracking', where: PROFILE_CONNECTIONS, href: '/profile/?tab=Connections&section=progress-tracking',
-    keywords: ['anilist', 'myanimelist', 'mal', 'kitsu', 'tracker', 'sync'] },
+    keywords: ['anilist', 'myanimelist', 'mal', 'kitsu', 'mangaupdates', 'tracker', 'sync'] },
   { key: 'opds', label: 'External readers (OPDS)', where: PROFILE_CONNECTIONS, href: '/profile/?tab=Connections&section=opds',
     desktopHidden: true, keywords: ['opds', 'koreader', 'panels', 'chunky', 'e-reader'] },
   { key: 'api-tokens', label: 'API tokens', where: PROFILE_CONNECTIONS, href: '/profile/?tab=Connections&section=api-tokens',

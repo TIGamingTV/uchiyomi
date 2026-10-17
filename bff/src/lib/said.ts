@@ -71,6 +71,8 @@ export function solverVersionLabel(version?: string | null, kind?: string | null
 }
 /** The engine's version as its Health row says it: " (v2.3.2243)". */
 const engineVersion = (v?: string | null) => (v ? ` (v${v.replace(/^v/i, '')})` : '');
+/** An engine version inside a sentence: "v2.3.2243", whether or not it came with its "v". */
+const ver = (v: string) => `v${v.replace(/^v/i, '')}`;
 /**
  * A language code as English names it ("es-419" is "Latin American Spanish"), the name the web's languageName gives in
  * English; the code itself where Intl cannot. The web says it in the reader's language.
@@ -199,6 +201,8 @@ const EN = {
     `${n} chapters; its source ${source} can’t be reached because the extension engine isn’t answering`,
   'frozen.engineOff': ({ n, source }: { n: number; source: string }) =>
     `${n} chapters; its source ${source} can’t be reached because the extension engine is off`,
+  'frozen.engineIncompatible': ({ n, source }: { n: number; source: string }) =>
+    `${n} chapters; its source ${source} can’t be reached because the extension engine does not match this Uchiyomi`,
   'frozen.switchedOff': ({ n, source }: { n: number; source: string }) => `${n} chapters; its source ${source} is switched off`,
   // Enabled yet unregistered: dropped by SUWAYOMI_MAX_SOURCES, which the cap check names but a series page cannot see.
   'frozen.overLimit': ({ n, source }: { n: number; source: string }) =>
@@ -484,6 +488,37 @@ const EN = {
   'engine.readySolverQuiet': ({ version }: { version: string | null }) => `Ready${engineVersion(version)}; its Cloudflare helper is not answering`,
   'engine.solverQuietDetail': () =>
     'It is connected to Uchiyomi’s own Cloudflare helper, which is not answering (the Cloudflare solver row says what to do). Extension sources on Cloudflare-protected sites fail until it answers again.',
+  // The engine's version against the one this Uchiyomi was tested with, and an engine that refuses what Uchiyomi asks
+  // (the engine upgrade, lib/sources/suwayomi/enginePin.ts). The image, the command, the service and the path are
+  // parameters, never words: what someone copies must survive any translation.
+  'engine.incompatible': ({ version }: { version: string | null }) => `Not compatible${engineVersion(version)}`,
+  'engine.incompatibleTitle': () => 'Not compatible with this Uchiyomi',
+  'engine.incompatibleNote': () => 'It answers, but its extensions are unavailable until the engine and Uchiyomi match. Restarting it does not help.',
+  'engine.refused': ({ error }: { error: string }) => `It refused what Uchiyomi asked: ${error}`,
+  'engine.updateEngine': ({ tested }: { tested: string }) => `Update the engine to ${ver(tested)}, the version this Uchiyomi was tested with.`,
+  'engine.updateUchiyomi': ({ tested }: { tested: string }) =>
+    `The engine is newer than this Uchiyomi. Update Uchiyomi; until a release supports this engine, ${ver(tested)} is the version that works.`,
+  'engine.matchEngine': ({ tested }: { tested: string }) => `Run the version this Uchiyomi was tested with, ${ver(tested)}.`,
+  'engine.backupFirst': () =>
+    'Back up the engine’s data first: the engine upgrades its database when it starts, and an older engine cannot read it again.',
+  'engine.stepCompose': ({ image, file, command }: { image: string; file: string; command: string }) =>
+    `In ${file}, set the engine’s image to ${image}, then run ${command}.`,
+  'engine.stepUnraid': ({ image, service, path }: { image: string; service: string; path: string }) =>
+    `On the Docker tab, edit ${service}, set its Repository to ${image} and apply. Its data stays in ${path}.`,
+  'engine.stepCasaos': ({ image, service, path }: { image: string; service: string; path: string }) =>
+    `In CasaOS, edit the ${service} app, set its image to ${image} and save. Its data stays in ${path}.`,
+  'engine.stepDesktop': () =>
+    'Quit and reopen Uchiyomi. If Admin → Sources then offers to download the extension engine, download it: that is the version this Uchiyomi was tested with.',
+  'engine.stepOther': ({ image }: { image: string }) => `Run ${image} in place of the engine you have, on the same data.`,
+  'engine.versionTitle': () => 'Engine version',
+  'engine.versionNewer': ({ version, tested }: { version: string; tested: string }) =>
+    `${ver(version)} is newer than the version this Uchiyomi was tested with (${ver(tested)}).`,
+  'engine.versionOlder': ({ version, tested }: { version: string; tested: string }) =>
+    `${ver(version)} is older than the version this Uchiyomi was tested with (${ver(tested)}). It works; updating it is recommended.`,
+  'engine.versionTooOld': ({ version, oldest }: { version: string; oldest: string }) =>
+    `${ver(version)} is older than the oldest version this Uchiyomi works with (${ver(oldest)}).`,
+  'engine.goBackWithBackup': ({ tested }: { tested: string }) =>
+    `To go back to ${ver(tested)}, restore a backup of the engine’s data from before the update: an older engine cannot read what a newer one wrote.`,
 
   // ---- A download job's reason (Library → Downloads, the series band, Discover). `source` is a source's name.
   'job.noSpace': ({ error }: { error: string }) => `Not enough free space: ${error}`,
@@ -557,8 +592,20 @@ const EN = {
   'main.renumberPending': () => 'This series’ chapters are waiting to be renumbered. Review that on the series page first.',
   'main.unavailable': () => 'That source cannot be used right now: it is not installed, it is switched off, or it is not available on this account.',
   'main.moved': () => 'This series’ main source changed meanwhile. Look again.',
+  // ---- Attaching a source by hand refused (#243, lib/manualAttach.ts): the rest say what Make main says. `title` is what
+  // the source calls the pick, which the web isolates in right-to-left text.
+  'attach.titleDiffers': ({ name, title }: { name: string; title: string }) =>
+    `${name} calls it “${title}”, which is not this series’ title or one of its other names. If the cover and the chapters show it is the same work, attach it anyway.`,
+  'attach.unreachable': ({ name }: { name: string }) => `${name} did not say what that title is. Try again in a minute.`,
+  'attach.cooling': ({ name }: { name: string }) => `${name} is cooling down after errors, so it is not asked anything right now. Try again later.`,
+  'attach.cap': ({ n }: { n: number }) => (n === 1
+    ? 'This series already follows 1 other source, as many as it may. Remove one first, or move the series to this source.'
+    : `This series already follows ${n} other sources, as many as it may. Remove one first, or move the series to this source.`),
+  'detach.noMain': () => 'This series has no main source to detach.',
   // A source retired, or a site removed, while some series still has it as its main source (v0.54.0, lib/retireSource.ts).
   'retire.inUse': ({ n }: { n: number }) => `It is the main source of ${n} series. Replace it first.`,
+  // Rating a source Adult only past the list's limit (v0.73.0, lib/visibility.ts MAX_ADULT_SOURCES).
+  'rating.tooMany': ({ limit }: { limit: number }) => `At most ${limit} sources can be rated Adult only.`,
 
   // ---- Fix everything (v0.55.0, lib/autofix.ts): what the run is on now, what it did, what clears by itself and what
   // only a person can do. `name` is a source's or an extension's name; `title`, `a`, `b`, `from` and `into` are series
@@ -666,6 +713,11 @@ const EN = {
   'autofix.needs.scan': ({ n }: { n: number }) => `The library scan could not read ${n} folder${s(n, '', 's')}`,
   'autofix.needs.downloadsMissing': ({ n }: { n: number }) => `${n} downloaded chapter${s(n, '', 's')} ${s(n, 'is', 'are')} where the library scan never looks`,
   'autofix.needs.noRoom': ({ name }: { name: string }) => `${name} may carry your series, but the source limit is full: free a slot`,
+  // v0.72.0: the cards no run changes -- a disk to free or a share to mount, a member's tracker sign-in, a chapter file
+  // to fetch again by hand (lib/healthDisk.ts, lib/healthTrackers.ts, lib/healthFiles.ts).
+  'autofix.needs.disk': ({ n }: { n: number }) => `${n} disk${s(n, '', 's')} or folder${s(n, '', 's')} ${s(n, 'needs', 'need')} a look`,
+  'autofix.needs.trackers': ({ n }: { n: number }) => `${n} tracker connection${s(n, '', 's')} ${s(n, 'needs', 'need')} a look`,
+  'autofix.needs.files': ({ n }: { n: number }) => `${n} chapter file${s(n, '', 's')} cannot be read`,
 
   // What clears by itself (summary.clears), with when where there is a time.
   'autofix.clears.cooldown': ({ name }: { name: string }) => `${name} is cooling down`,
@@ -679,6 +731,53 @@ const EN = {
   // helper and never a backup, so neither is ever said there.
   'autofix.clears.mainSolverDown': () => 'The main Cloudflare solver is not answering, and the backup is solving meanwhile',
   'autofix.clears.backupSolverDown': () => 'The backup Cloudflare solver is not answering, and the main one is solving',
+
+  // ---- Disk space and folders (v0.72.0, lib/healthDisk.ts, from @Squeaks72's #253). Sizes in GB of 2^30 bytes, one
+  // decimal, as Admin → Settings → Downloads says them; `floor` is the downloader's MIN_FREE_GB or the archive's floor.
+  'disk.title': () => 'Downloads disk',
+  'disk.free': ({ free, total }: { free: number; total: number }) => `${free} GB free of ${total} GB`,
+  'disk.full': ({ free, total, floor }: { free: number; total: number; floor: number }) =>
+    `${free} GB free of ${total} GB: new downloads stop under ${floor} GB`,
+  'disk.archiveWaits': ({ free, total, floor }: { free: number; total: number; floor: number }) =>
+    `${free} GB free of ${total} GB: the slow archive waits until ${floor} GB are free`,
+  'disk.empty': ({ n }: { n: number }) => `Empty, but the library records ${n} chapter${s(n, '', 's')} in it: is the share mounted?`,
+  'disk.live': ({ n }: { n: number }) => `${n} disk${s(n, '', 's')} or folder${s(n, '', 's')} ${s(n, 'needs', 'need')} a look`,
+  'disk.fine': ({ free }: { free: number }) => `${free} GB free for downloads`,
+  'disk.unmeasured': () => 'Free space could not be measured here',
+  'disk.noteFloor': ({ floor }: { floor: number }) => `New downloads stop when the downloads disk has less than ${floor} GB free.`,
+  'disk.noteNoFloor': () => 'Downloads are never stopped for free space here (MIN_FREE_GB is 0).',
+  'disk.noteArchive': ({ floor }: { floor: number }) => `The slow archive waits below ${floor} GB (Admin → Settings → Downloads).`,
+  'disk.noteFolders': () =>
+    'A library or download folder that cannot be read, or that is empty while the library records chapters in it, is ' +
+    'usually a share that is not mounted; nothing is marked missing because of it. Only the top of each folder is read ' +
+    'here: Verify chapter files (Admin → Tasks) checks every file.',
+
+  // ---- Tracker sync (v0.72.0, lib/healthTrackers.ts, @Squeaks72's card from #253). `error` is the tracker's own.
+  'trackers.refused': () => 'The tracker refused the saved sign-in',
+  'trackers.failed': ({ error }: { error: string }) => `The last sync failed: ${error}`,
+  'trackers.ended': ({ at }: { at: string }) => `The sign-in ended ${day(at)}`,
+  'trackers.ending': ({ at }: { at: string }) => `The sign-in ends ${day(at)}`,
+  'trackers.live': ({ n }: { n: number }) => `${n} tracker connection${s(n, '', 's')} ${s(n, 'needs', 'need')} a look`,
+  'trackers.fine': ({ n }: { n: number }) => (n === 1 ? 'The one tracker connection is syncing' : `All ${n} tracker connections are syncing`),
+  'trackers.none': () => 'Nobody has connected a tracker',
+  'trackers.note': () =>
+    'Only the person can sign in again, under Profile → Connections; a sign-in the tracker refused stays off until they ' +
+    'do. A sign-in ending within 14 days is a finding, and within 30 days is listed for reference.',
+
+  // ---- Chapter files (v0.72.0, lib/healthFiles.ts, rebuilt from @Squeaks72's #252). `numbers` the first five, `more`
+  // how many besides.
+  'files.detail': ({ n, numbers, more }: { n: number; numbers: number[]; more: number }) =>
+    `${n} chapter file${s(n, '', 's')} with no page that can be read: ${numbers.join(', ')}${more > 0 ? ` and ${more} more` : ''}`,
+  'files.notOurs': ({ n }: { n: number }) =>
+    `${n} of them ${s(n, 'is', 'are')} in a library you built: replace ${s(n, 'it', 'them')} by hand`,
+  'files.live': ({ n, m }: { n: number; m: number }) =>
+    `${n} chapter file${s(n, '', 's')}${m > 1 ? ` in ${m} series` : ''} ${s(n, 'has', 'have')} no page that can be read`,
+  'files.none': () => 'Every chapter file the nightly count opened has pages',
+  'files.note': () =>
+    'The nightly repair opens each chapter file once to count its pages, and these are the files it found no page in: ' +
+    'empty, cut short by a download, damaged, or gone. Fetch again downloads a new copy of a file Uchiyomi fetched ' +
+    'itself and keeps the old one until the new copy lands; a file in a library you built is yours to replace. Nothing ' +
+    'here deletes a file, and Fix everything leaves these to you.',
 };
 
 /** Why Fix everything passed a part of its run over (`autofix.item.skipped`). */

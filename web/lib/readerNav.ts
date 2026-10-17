@@ -27,3 +27,26 @@ export function pagesAfter(flow: ReadonlyArray<{ ci: number }>, current: number)
   for (let i = current + 1; i < flow.length && flow[i].ci === ci; i++) n++;
   return n;
 }
+
+/** A run of chapter numbers a series is missing: GET /api/series/:id/gaps, the Health card's own rule (bff lib/seriesGaps.ts). */
+export interface GapRun { lo: number; hi: number }
+
+/**
+ * The missing runs the reader skips going from the chapter numbered `from` to the one numbered `to` (#236): the series'
+ * runs, cut to the numbers strictly between the two. The runs are the server's, never counted here from the reader's own
+ * chapter list: a file holding 1 to 7, a run the cleanup deleted after everyone read it, a gap an admin ignored on Health
+ * and a post its source deleted are not missing, and the list cannot tell any of them apart. Nothing when either number is
+ * unknown or the order does not run forward (an edition's copy of the same number, a special placed out of order).
+ */
+export function gapsBetween(gaps: readonly GapRun[], from: number | undefined | null, to: number | undefined | null): GapRun[] {
+  if (from == null || to == null || !Number.isFinite(from) || !Number.isFinite(to) || to <= from) return [];
+  const lo = Math.floor(from) + 1;
+  const hi = Math.ceil(to) - 1;
+  const out: GapRun[] = [];
+  for (const g of gaps) {
+    const a = Math.max(g.lo, lo);
+    const b = Math.min(g.hi, hi);
+    if (a <= b) out.push({ lo: a, hi: b });
+  }
+  return out;
+}

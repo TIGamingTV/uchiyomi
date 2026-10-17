@@ -109,6 +109,9 @@ const ROUTES: Array<{ method: 'GET' | 'POST' | 'DELETE'; url: string; payload?: 
   { method: 'GET', url: `/api/sources/detail?source=${CLEAN}&sourceId=${CLEAN}-1` },
   { method: 'GET', url: '/api/sources/jobs' },
   { method: 'GET', url: '/api/discover/trending' },
+  // v0.61.0: Discover's other AniList rails -- the trending manga and manhua, and Because you read.
+  { method: 'GET', url: '/api/discover/trending?country=CN' },
+  { method: 'GET', url: '/api/discover/because' },
   { method: 'POST', url: '/api/sources/add', payload: { source: CLEAN, sourceId: `${CLEAN}-1` } },
   // The fill pair. They belong in this table for the same reason everything else here does: the permission
   // is a preHandler on the whole plugin, so the only way to know a new route is covered is to name it.
@@ -330,10 +333,11 @@ test('sources: who may reach them, and how long they get', { skip }, async (t) =
 
       // ...but it must not keep being asked first forever. That was the real point of the old assertion
       // here, and it still holds -- just after a few chances rather than instantly, and via a short fixed
-      // breather rather than a half-hour block.
+      // breather rather than a half-hour block. Page 1 each time: since v0.59.0 only page 1 is evidence of
+      // slowness (discoverSources.int.test.ts), as only page 1 is evidence of an empty listing.
       for (let i = 0; i < 3; i++) {
         await Promise.race([
-          app.inject({ method: 'GET', url: `/api/sources/latest?source=${SLOW}&page=${i + 2}`, headers: tok(ids.plain) }),
+          app.inject({ method: 'GET', url: `/api/sources/latest?source=${SLOW}&page=1`, headers: tok(ids.plain) }),
           new Promise<null>((res) => setTimeout(() => res(null), 3000)),
         ]);
       }

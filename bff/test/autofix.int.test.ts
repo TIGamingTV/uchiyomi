@@ -111,7 +111,7 @@ const S = {
   twicePartial: 's_af_twicepartial', held: 's_af_held', limit: 's_af_limit', err: 's_af_err', nato: 's_af_nato',
   dupA: 's_af_dupa', dupB: 's_af_dupb', dupC: 's_af_dupc', dupD: 's_af_dupd', edA: 's_af_eda', edB: 's_af_edb',
   numClean: 's_af_numclean', numTracker: 's_af_numtracker', paused: 's_af_paused', cf: 's_af_cf',
-  againA: 's_af_againa', againB: 's_af_againb', againOdd: 's_af_againodd',
+  againA: 's_af_againa', againB: 's_af_againb', againOdd: 's_af_againodd', unread: 's_af_unread',
 };
 const ALL = Object.values(S);
 const T: Record<keyof typeof S, string> = {
@@ -120,7 +120,7 @@ const T: Record<keyof typeof S, string> = {
   twicePartial: 'Fix Twice Partial', held: 'Fix Held', limit: 'Fix Limit', err: 'Fix Err', nato: 'Fix Nato',
   dupA: 'Fix Twin', dupB: 'Fix Twin', dupC: 'Fix Alpha', dupD: 'Totally Unrelated', edA: 'Fix Edition', edB: 'Fix Edicion',
   numClean: 'Istrevelia', numTracker: 'Istrevelia', paused: 'Fix Paused', cf: 'Fix Cloudflare',
-  againA: 'Fix Again', againB: 'Fix Again', againOdd: 'Fix Again Odd',
+  againA: 'Fix Again', againB: 'Fix Again', againOdd: 'Fix Again Odd', unread: 'Fix Unreadable',
 };
 const folderOf = (k: keyof typeof S) => `T!af/${k}`;
 
@@ -346,6 +346,11 @@ test('Fix everything: one run over a library with something wrong on every card'
   // A paused series with a gap: nothing but a person fetches it.
   await seedSeries('paused', { source: MAIN, auto: false });
   for (const n of [1, 3]) await seedBook('paused', n);
+  // v0.72.0: a chapter file the count opened and found no page in (Health's Chapter files): Fetch again is a person's
+  // key, never the run's, which deletes and replaces nothing new.
+  await seedSeries('unread', { source: MAIN, auto: false });
+  await seedBook('unread', 1);
+  await seedBook('unread', 2, { pages: 0 });
 
   // ---- the run
   const started = autofix.startAutofix(adminId, { origin: 'manual' });
@@ -358,6 +363,10 @@ test('Fix everything: one run over a library with something wrong on every card'
     const row = (await q(`SELECT kind, origin, status, by_user, step_ms, result FROM repair_runs WHERE id = $1`, [run.id]))[0];
     assert.equal(row.kind, 'autofix');
     assert.equal(row.origin, 'manual');
+    // v0.70.0: the run says how it began, for Health's "Last nightly Fix everything" line, which `by` cannot (a deleted
+    // admin's run reads `by: null` too). Reintroduce by dropping r.origin from autofixState's SELECT: undefined here.
+    assert.equal(run.origin, 'manual', 'the run says how it began');
+    assert.equal((await autofix.autofixState()).last?.origin, 'manual', 'and so does the state Health polls');
     assert.equal(row.by_user, adminId);
     assert.ok(row.step_ms.recheck >= 0, 'each phase timed');
     assert.equal(run.by, 'af-admin');
@@ -516,6 +525,21 @@ test('Fix everything: one run over a library with something wrong on every card'
       const named = [l.params.a, l.params.b, l.params.from, l.params.into, l.params.title].filter((x) => typeof x === 'string').sort();
       assert.deepEqual((ids as string[]).map((id) => titleOf.get(id)).sort(), named, `${l.code}: its ids are not the series its titles name`);
     }
+  });
+
+  await t.test('the cards no run changes are under Needs you, last, and the run touched nothing of theirs', async () => {
+    // v0.72.0. Reintroduce by leaving the Chapter files card out of summarise: the end reads no line for it.
+    const checks: string[] = run.summary.needsYou.map((n: any) => n.check);
+    assert.ok(checks.includes('files'), `the unreadable file is Needs you: ${checks.join(', ')}`);
+    const LAST = new Set(['files', 'disk', 'trackers']);
+    const first = checks.findIndex((c) => LAST.has(c));
+    assert.ok(checks.slice(first).every((c) => LAST.has(c)), `after what a person decides: ${checks.join(', ')}`);
+    const files = run.summary.needsYou.find((n: any) => n.check === 'files');
+    assert.deepEqual(files.said, { code: 'autofix.needs.files', params: { n: 1 } });
+    assert.deepEqual(files.action, { kind: 'health', check: 'files' });
+    const b = await book(`b_${S.unread}_2`);
+    assert.equal(b.pruned_at, null, 'not marked');
+    assert.ok(existsSync(join(DL, `${folderOf('unread')}/Chapter 2.cbz`)), 'and its file is where it was');
   });
 
   await t.test('what is left reaches Needs you, each with its key, and nothing is ignored', async () => {
@@ -944,4 +968,25 @@ test('the nightly runs Fix everything when Settings chose it, and the safe repai
   assert.match(tick, /nightly_mode === 'autofix'[\s\S]*startAutofix\(null, \{ origin: 'nightly'/, 'and starts Fix everything, as nobody, when it is chosen');
   assert.match(tick, /runRepair\(app\.log\)/, 'the safe repair otherwise, as before');
   assert.ok(tick.indexOf("repair_enabled === false") < tick.indexOf("nightly_mode === 'autofix'"), 'the nightly switch still turns either off');
+});
+
+test('a nightly Fix everything runs the repair steps it does not drive itself (v0.60.1)', { skip }, async () => {
+  // The plain nightly runs all nine repair steps; Fix everything drives five of them, so a nightly set to Fix everything
+  // never ran the opt-in group upgrades, the borrowed names or the reading directions (found in Squeaks72's fork) -- nor,
+  // since v0.73.0, the missing details.
+  // Reintroduce by dropping the follow-up runRepair from server.ts's repair tick: the last assertion fails. Adding a
+  // repairForAutofix step without listing it in AUTOFIX_REPAIR_STEPS fails the second.
+  const { readFileSync } = await import('node:fs');
+  const { REPAIR_STEPS } = await import('../src/lib/repair');
+  const { AUTOFIX_REPAIR_STEPS, AFTER_NIGHTLY_AUTOFIX } = await import('../src/lib/autofix');
+  assert.deepEqual([...AFTER_NIGHTLY_AUTOFIX], ['groups', 'names', 'directions', 'details']);
+  const auto = readFileSync(join(__dirname, '..', 'src', 'lib', 'autofix.ts'), 'utf8');
+  const driven = [...auto.matchAll(/repairForAutofix\([^,]+,\s*\{\s*only:\s*\[([^\]]*)\]/g)]
+    .flatMap((m) => [...m[1].matchAll(/'([a-z]+)'/g)].map((x) => x[1]));
+  assert.deepEqual([...new Set(driven)].sort(), [...AUTOFIX_REPAIR_STEPS].sort(), 'every step a run drives is listed, and only those');
+  assert.deepEqual([...AUTOFIX_REPAIR_STEPS, ...AFTER_NIGHTLY_AUTOFIX].sort(), [...REPAIR_STEPS].sort(), 'between them, every step');
+  const src = readFileSync(join(__dirname, '..', 'src', 'server.ts'), 'utf8');
+  const tick = src.slice(src.indexOf('SELECT repair_enabled, nightly_mode FROM server_settings'), src.indexOf('setRepairNext(Date.now() + next)'));
+  assert.match(tick, /await autofixSettled\(\);\s*(\/\/[^\n]*\n\s*)*const rest = runRepair\(app\.log, \{ only: \[\.\.\.AFTER_NIGHTLY_AUTOFIX\] \}\);\s*if \(rest\) await rest;/,
+    'after the nightly Fix everything settles, the rest of the repair runs');
 });

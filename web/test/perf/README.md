@@ -156,3 +156,90 @@ read 12.3 / 9 and 8.9 / 8.7 / 11.7).
 | `will-change: transform` on the mesh | **7.8** | – |
 
 None bought a frame, so the default was left exactly as v0.42.0 drew it.
+
+## The webtoon column (v0.61.0): `reader.mjs`
+
+`reader.mjs` scrolls the reader's column at a steady fling (60 px a frame, 12 s, 390 × 844 at 2×) through the comfort
+library's chapter of long strips and its chapter of 120 slices (`seed.py <lib> --comfort`), and prints frame times,
+long tasks, the most full-size page images decoded at once and the pixels they hold, and the JS heap. It drives
+Playwright's Chromium, like walk180.mjs (`PLAYWRIGHT_FROM=<a folder with playwright installed>` if it is not in web/).
+
+Measured 2026-10-12 against both builds, one after the other on the same machine:
+
+| build | chapter | fps | decoded at once | pixels decoded |
+|---|---|---|---|---|
+| v0.60.1 | 2 strips of 689 × 20,000, then slices | 60 | 9 | 33 Mpx |
+| v0.61.0 | same | 60 | 12 | 28 Mpx |
+| v0.60.1 | 120 slices of 720 × 1,000 | 60 | 9 | 6 Mpx |
+| v0.61.0 | same | 60 | 12 | 9 Mpx |
+
+Frame times are the same headless: the images are cheap to draw. What changed is what is held: v0.61.0 keeps the
+pages within a few SCREENS (1.5 behind, 4 ahead, at most 40 pages) where v0.60 kept 2 pages behind and 6 ahead,
+whatever their size -- so more of the small slices, fewer of the strips. On this library a chapter holds only two
+strips; a run of strip chapters (Eleceed 215 on the live server, two 689 × 54,000 strips, and its neighbours) put up
+to nine strips in v0.60's window, about 1.3 GB decoded, and holds at most three now -- the browser walk
+(test/e2e/v610Walk-reader.mjs, "mid-strip, at most three full-size images are decoded") counts seven on v0.60.1 at
+1280 wide on this library.
+
+## Idle work (v0.67.2): `profile.mjs`
+
+"The app feels a bit clanky", on computers and phones (2026-10-15). `scroll.mjs` read what it read for v0.43.0 (the
+Library at 38 fps at 4x), so the frame rate was not where to look. `profile.mjs` traces each scenario and sums what the
+renderer's main thread did, and an idle Library was re-layering (`Layerize`) the whole page on every frame.
+`document.getAnimations()` named the cause: 158 `.skeleton::after` shimmers running, every one off the screen -- the
+placeholders of the lazy covers below the fold -- and each of their frames restyled, pre-painted and re-layered the
+whole page. `content-visibility: auto` on `.skeleton` skips them (the Library's layers: 177 → 57, none animated; Home's:
+85 → 37). In the same release a phone stopped running Lenis's frame loop, and the page fade stopped rendering the next
+page inside the outgoing one (components/PageTransition.tsx).
+
+Main-thread busy time, CPU throttled 4x, the profiler's own cost (`V8.InvokeApiInterruptCallbacks`) subtracted; the
+v0.67.1 and v0.67.2 web builds in front of the same instance; the navigation rows are medians of three runs.
+
+| scenario | v0.67.1 | v0.67.2 |
+| --- | --- | --- |
+| Library idle, 1440 (2.5 s) | 1131 ms | 598 ms (−47%) |
+| Library scroll, 1440 | 2959 ms | 2299 ms (−22%) |
+| Home idle, 1440 | 677 ms | 364 ms (−46%) |
+| Home idle, 390 | 584 ms | 301 ms (−49%) |
+| Home scroll, 390 | 752 ms | 399 ms (−47%) |
+| pointer swept across the Library's covers | 5760 ms | 2815 ms (−51%) |
+| Home → Library | 1734 ms | 1178 ms (−32%) |
+| a series → back | 1339 ms | 633 ms (−53%) |
+| Library → a series | 349 ms | 411 ms (+18%: the Library now really fades out) |
+
+- ⚠️ **The frame rate barely moved** (the Library with the shimmer forced off: 37.4 → 38.2 fps). Headless Chrome composites
+  in software, so its frames wait on the compositor's blends and blurs; a machine with a GPU waits on the main thread,
+  which is what this table measures.
+- ⚠️ **"The same look" was checked, not assumed:** six views at 1440 and 390, both builds, reduced motion forced so every
+  animation has finished, differ by 0 pixels. What can differ is when a shimmer starts: a skipped placeholder starts
+  sweeping as it comes within about half a screen, where it used to start when its page mounted.
+- The pointer sweep (`tilt1440`) is where the card tilt's cost turned out to be the shimmers' too: 2821 ms of `Layerize`
+  with their layers, 66 ms without them. A rewrite of the tilt to skip React was planned and dropped as unneeded.
+
+## Fast scrolling (v0.67.3): `fast.mjs`
+
+"Scrolling down or up fast lags a bit" on a computer: choppy, in Chrome. `fast.mjs` flicks the wheel down and back up and
+prices one effect at a time with `CSS=`. On Home and the Library at 1440, unthrottled, one effect was the whole story:
+
+| a fast flick (fps, frames over 33 ms) | Home | Library |
+| --- | --- | --- |
+| as it was (v0.67.2) | 49–55 (36–52) | 38–41 (109–222) |
+| − film grain | **60 (0)** | **60 (0–2)** |
+| − the top bar's glass | 57–58 | 46–47 |
+| − the mesh | 55 | 40–44 |
+| − the badges' blur | 55–56 | 40–41 |
+| − the vignette | 54–55 | 39–40 |
+| − the covers' sharpen-in | 51–54 | 40 |
+
+The grain's `mix-blend-mode: overlay` makes the compositor draw everything under it into a surface of its own and blend
+the two, on every frame the content moves. The owner chose to pause it while the page moves: `display: none` under
+Lenis's `lenis-scrolling`, back over 0.3 s from `@starting-style` (Home 53–58, Library 56; at rest 0 pixels differ).
+
+- ⚠️ **`opacity: 0` is not a pause** — the blend is still prepared and the Library stayed at 48–50. `visibility: hidden`
+  spared Home's four start-of-scroll layer rebuilds but left the Library at 50–52; `display: none` is the better trade.
+- ⚠️ **Never read `scrollY` in a scroll handler.** It makes the browser finish its style and layout on the spot, once a
+  frame while a wheel scrolls. v0.67.2's scroll memory and the top bar's "scrolled past" both did: 211 ms of the run's
+  script, 50 ms after (the memory files a position once the scrolling pauses; the bar watches a 1-px mark with an
+  IntersectionObserver). `idleWork.test.ts` holds every window scroll listener to that.
+- Compare builds with a warmed server and alternate their order: the first run makes the cover thumbnails, so a later run
+  has more covers arriving mid-scroll, and the build that always went second looked worse than it was.

@@ -284,15 +284,15 @@ test('/admin and /profile read and write ?tab=, without a history entry or a sna
   assert.equal(withTab('http://x/profile/', 'Connections', 'You'), '/profile/?tab=Connections', 'withTab does not add the tab to a bare address');
 });
 
-test('the profile has four tabs and no leftover cards', () => {
-  // You · Settings · Connections · Account. The old second tab, Reading, was device settings plus one chart
+test('the profile has five tabs and no leftover cards', () => {
+  // You · Insights · Settings · Connections · Account (Insights since v0.75.0, from #249). The old second tab, Reading, was device settings plus one chart
   // plus one integration; the old Account tab held eight cards including the admin door and a sign-out card
   // that repeated the rail. Everything that is a setting now lives in its tab's component; the page keeps
   // the hero, the rail and the You board. Reintroduce by adding 'Reading' to `keys(...)`: "the profile
   // still has a Reading tab" fails; by importing `SecurityPanel` on the page: "a retired card is back on
   // the page" fails.
   const src = code(read('app/profile/page.tsx'));
-  assert.match(src, /keys\('You', 'Settings', 'Connections', 'Account'\)/, 'the profile tabs are not You · Settings · Connections · Account');
+  assert.match(src, /keys\('You', 'Insights', 'Settings', 'Connections', 'Account'\)/, 'the profile tabs are not You · Insights · Settings · Connections · Account');
   assert.doesNotMatch(src, /keys\([^)]*'Reading'/, 'the profile still has a Reading tab');
   assert.doesNotMatch(src, /AdminCard|SignOutCard|SettingsCard|SecurityPanel/, 'a retired card is back on the page');
   // The two files behind the Manage layer are gone, not merely unimported: a file nobody imports still
@@ -481,18 +481,23 @@ test('a dialog and the phone group sheet give focus back to what opened them', (
   assert.match(sheet, /<div ref=\{ref\} className="glass[^"]*"\s*role="dialog" aria-modal="true"/, 'the ref is not on the dialog panel');
 });
 
-test('the phone pill row marks the current tab, and the rail chevrons mirror under RTL', () => {
-  // On a phone the pill row is the only tab navigation; the fill alone says nothing to a screen reader
-  // (the desktop rail already set aria-current). And the Admin/Support rows on the desktop rail, plus the
-  // You tab's "See all", kept a right-pointing chevron in Arabic while every LinkRow mirrored its own.
-  // Reintroduce by dropping `aria-current` from the pill: "the active pill is not announced" fails; by
-  // dropping `rtl:-scale-x-100` from `chev`: "the rail chevron does not mirror" fails.
+test('the underlined tab row marks the current tab, Profile is one strip of tabs with keys, and See all mirrors', () => {
+  // On a phone the tab row is the only tab navigation (and on Profile, a strip at every width since the UI refresh);
+  // the underline alone says nothing to a screen reader. Profile's Admin / Support / Sign out are keys at the row's
+  // end, not rail rows with a chevron. And the You tab's "See all" kept a right-pointing chevron in Arabic while
+  // every LinkRow mirrored its own.
+  // Reintroduce by dropping `aria-current` from the tab: "the active tab is not announced" fails; by dropping the
+  // underline: "the active tab is not underlined" fails; by taking `strip` off Profile's ConsoleNav: "Profile is not
+  // a tab strip" fails; by dropping `rtl:-scale-x-100` from See all: "the See all chevron does not mirror" fails.
   const nav = code(read('components/ConsoleNav.tsx'));
-  const pills = nav.slice(nav.indexOf('{group.tabs.map((t) => ('), nav.indexOf('{footer && flat &&'));
-  assert.ok(pills.length > 0, 'the phone pill row is not where this test looks');
-  assert.match(pills, /<button key=\{t\} onClick=\{\(\) => onTab\(t\)\}\s*aria-current=\{tab === t \? 'page' : undefined\}/, 'the active pill is not announced');
+  const tabs = nav.slice(nav.indexOf('{group.tabs.map((t) => ('), nav.indexOf('{footer && flat &&'));
+  assert.ok(tabs.length > 0, 'the tab row is not where this test looks');
+  assert.match(tabs, /<button key=\{t\} onClick=\{\(\) => onTab\(t\)\}\s*aria-current=\{tab === t \? 'page' : undefined\}/, 'the active tab is not announced');
+  assert.match(tabs, /\{tab === t && <span aria-hidden className="absolute inset-x-0 -bottom-px h-0\.5 [^"]*bg-accent" \/>\}/, 'the active tab is not underlined');
+  assert.doesNotMatch(tabs, /rounded-full/, 'the tabs are pills again');
   const profile = code(read('app/profile/page.tsx'));
-  assert.match(profile, /const chev = 'ms-auto hidden shrink-0 opacity-60 lg:block rtl:-scale-x-100';/, 'the rail chevron does not mirror');
+  assert.match(profile, /<ConsoleNav [^>]*\bflat strip\b/, 'Profile is not a tab strip');
+  assert.match(profile, /const row = 'btn-key h-9 gap-2 text-sm';/, 'the Profile actions are not keys');
   const you = code(read('components/ProfileYou.tsx'));
   assert.match(you, /\{tr\('See all'\)\}<IcChevronRight width=\{14\} height=\{14\} aria-hidden className="rtl:-scale-x-100" \/>/, 'the See all chevron does not mirror');
 });
@@ -658,4 +663,21 @@ test('Admin → Settings → Downloads comes after the pinned sections, and save
   // Its strings are in all eight languages (the console test above lists this file too).
   assert.ok(trKeys(['components/ArchiveSettings.tsx']).size >= 15, 'the scan found too few strings in the section');
   for (const f of localeFiles()) assert.deepEqual(missingIn(f, trKeys(['components/ArchiveSettings.tsx'])), [], `${f} lacks a Downloads string`);
+});
+
+test('Admin → Settings has a key for every card above them, each to its own card', () => {
+  // UI refresh: nine cards in a grid, and the one at the bottom was a long scroll away. The index names each card by its
+  // `<Section id>` and its own title. Reintroduce by adding a card without its key: "a card has no key" fails; by
+  // pointing a key at an id that no card has: "a key goes nowhere" fails.
+  const files = ['components/AdminSettings.tsx', 'components/AdminNotifications.tsx', 'components/ArchiveSettings.tsx'];
+  const cards = files.flatMap((f) => [...code(read(f)).matchAll(/<Section id="([^"]+)" title=\{tr\('([^']+)'\)\}/g)].map((m) => `${m[1]} ${m[2]}`));
+  assert.equal(cards.length, 9, 'the cards are not where this test looks');
+  const admin = code(read('components/AdminSettings.tsx'));
+  const index = admin.slice(admin.indexOf('<SectionIndex '), admin.indexOf(']} />', admin.indexOf('<SectionIndex ')));
+  const keys = [...index.matchAll(/\['([^']+)', tr\('([^']+)'\)\]/g)].map((m) => `${m[1]} ${m[2]}`);
+  for (const c of cards) assert.ok(keys.includes(c), `a card has no key: ${c}`);
+  for (const k of keys) assert.ok(cards.includes(k), `a key goes nowhere: ${k}`);
+  // Instantly under reduced motion or Reduce effects, as a `?section=` arrival is.
+  const shared = code(read('components/settings.tsx'));
+  assert.match(shared, /scrollIntoView\(\{ block: 'start', behavior: reduced \|\| fewer \? 'auto' : 'smooth' \}\)/);
 });

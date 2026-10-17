@@ -173,6 +173,33 @@ test('outrunning our own budget is recorded as slowness, never as a failure -- a
   assert.equal((await row(CF)).last_error, 'timeout after 3600ms', 'the solver source was cut at the search budget');
 });
 
+test('a search answered in time ends the slow streak, found or not (v0.55.10)', { skip }, async () => {
+  // A Discover search counted its timeouts as slowness and never ended a streak: one evening's slow searches through a
+  // busy solver left four sources "slow" on Health for six days of fast answers. Reintroduce by dropping `if (slow) void
+  // reportTimely` in askOne: both streaks still read 3.
+  try {
+    for (const id of [FAST, EMPTY]) {
+      await q('DELETE FROM source_health WHERE source_id = $1', [id]);
+      for (let i = 0; i < 3; i++) await health.reportSlow(id, 3000);
+    }
+    // A third slow answer earns a five-minute breather, which the search would honour by skipping both: it has run out.
+    await q(`UPDATE source_health SET blocked_until = now() - interval '1 minute' WHERE source_id = ANY($1)`, [[FAST, EMPTY]]);
+    assert.equal((await rowNow(FAST)).slow_streak, 3, 'premise: the source is on a streak');
+    const a = await lib.searchAll('Timely Term', [adapters[FAST], adapters[EMPTY]] as any, { waitMs: 3000, health: await hmap() });
+    assert.equal(a.per.get(FAST)?.state, 'ok');
+    assert.equal(a.per.get(EMPTY)?.state, 'empty');
+    // The search does not wait for the write (it never waits on health): read until it lands.
+    for (const id of [FAST, EMPTY]) {
+      let h = await rowNow(id);
+      for (let i = 0; i < 100 && h.slow_streak !== 0; i++) { await sleep(20); h = await rowNow(id); }
+      assert.equal(h.slow_streak, 0, `${id}: an answer inside the budget ends the streak`);
+      assert.equal(h.consecutive, 0, 'and touches nothing else');
+    }
+  } finally {
+    await q('DELETE FROM source_health WHERE source_id = ANY($1)', [[FAST, EMPTY]]);
+  }
+});
+
 test('a source that throws is recorded as a failure; an empty answer is recorded nowhere', { skip }, async (t) => {
   // Reintroduce by routing the catch's else-branch through reportSlow: `consecutive` reads 0 and status 'ok'.
   // Or by firing #115's stage note beside reportFail instead of after it: the note's bare row (consecutive 0) could
@@ -254,7 +281,8 @@ test('both shapes are what they always were, with the progress fields beside the
   assert.equal(j.rating, 'safe');
   const card = j.content.find((g: any) => g.title === 'Shared Title');
   assert.ok(card, 'the shared title was not folded into one card');
-  assert.deepEqual(Object.keys(card).sort(), ['inLibrary', 'providers', 'title', 'updatedAt'], 'the card shape changed');
+  // v0.56.0: `work`, the key the card was folded by, and `owned`, held in any language (lib/discoverIdentity.ts).
+  assert.deepEqual(Object.keys(card).sort(), ['inLibrary', 'owned', 'providers', 'title', 'updatedAt', 'work'], 'the card shape changed');
   // v0.52.0: each provider says its language (lib/lang.ts canonLang) and whether that language is held, which the
   // edition offer reads (a card is owned only when every provider's language is in the library).
   assert.deepEqual(Object.keys(card.providers[0]).sort(), ['inLibrary', 'lang', 'name', 'source', 'sourceId', 'title'], 'the provider shape changed');
@@ -270,7 +298,7 @@ test('both shapes are what they always were, with the progress fields beside the
   const rail = sj.content.find((g: any) => g.source === FAST);
   assert.ok(rail, 'the fast source has no rail');
   assert.deepEqual(Object.keys(rail).sort(), ['lang', 'name', 'results', 'source'], 'the rail shape changed');
-  assert.deepEqual(Object.keys(rail.results[0]).sort(), ['coverUrl', 'inLibrary', 'lang', 'name', 'source', 'sourceId', 'title'], 'the result shape changed');
+  assert.deepEqual(Object.keys(rail.results[0]).sort(), ['coverUrl', 'inLibrary', 'lang', 'name', 'owned', 'source', 'sourceId', 'title', 'work'], 'the result shape changed');
   assert.equal(rail.results[0].name, 'Fast Source', 'a result no longer carries its source\'s display name');
   assert.equal(sj.content.some((g: any) => g.source === EMPTY), false, 'a source with nothing must not get an empty rail');
   // wait=0 read the entry: nothing was asked again for either shape.

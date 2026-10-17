@@ -16,6 +16,8 @@ import { healthLinks } from '../lib/healthLinks';
 
 const ROOT = join(__dirname, '..');
 const read = (p: string) => readFileSync(join(ROOT, p), 'utf8');
+/** The pinned engine, as bff/test/enginePins.test.ts holds every install mode to it (the desktop pin is the reference). */
+const PIN: string = JSON.parse(read('../desktop/src/engine-pin.json')).version;
 const code = (src: string): string =>
   src.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\{\/\*[\s\S]*?\*\/\}/g, '').split('\n').filter((l) => !l.trim().startsWith('//')).join('\n');
 
@@ -83,7 +85,9 @@ test('every step names the shipped engine, never the development stack', () => {
   const unraid = onSteps('unraid', 'unset');
   assert.equal(unraid[0].vars?.name, 'uchiyomi-suwayomi', 'the Unraid template is named');
   assert.match(unraid[1].command ?? '', /chown 1000:1000 \/mnt\/user\/appdata\/uchiyomi-suwayomi$/, 'its folder is made writable for the engine first');
-  assert.equal(unraid[2].command, 'http://YOUR-SERVER-IP:4567');
+  // v0.73.0: the template asks for the engine's password, and Uchiyomi must send the same pair before it is pointed there.
+  assert.deepEqual(unraid[2].vars, { user: 'SUWAYOMI_USERNAME', default: 'uchiyomi', password: 'SUWAYOMI_PASSWORD' }, 'the engine password is not carried over');
+  assert.equal(unraid[3].command, 'http://YOUR-SERVER-IP:4567');
   const casaos = onSteps('casaos', 'switched_off');
   assert.match(casaos[1].command ?? '', /\/deploy\/casaos\/uchiyomi-suwayomi\.yml$/, 'the CasaOS add-on is the file to import');
   assert.equal(casaos[2].command, 'http://uchiyomi-suwayomi:4567');
@@ -108,8 +112,8 @@ test('somewhere else: the shipped protections in one command, and what publishin
   assert.equal(steps[warn].vars?.port, '4567');
   assert.equal(steps[warn].command, undefined);
   const run = steps[0].command ?? '';
-  for (const part of ['--memory=1536m', '-Xmx768m', 'AUTO_DOWNLOAD_CHAPTERS=false', 'DOWNLOAD_AS_CBZ=true', 'WEB_UI_ENABLED=false',
-    'FLARESOLVERR_ENABLED=true', '-v uchiyomi_suwayomi:/home/suwayomi/.local/share/Tachidesk', 'ghcr.io/suwayomi/suwayomi-server:v2.3.2243']) {
+  for (const part of ['--memory=2048m', '-Xmx768m', 'MALLOC_ARENA_MAX=2', 'AUTO_DOWNLOAD_CHAPTERS=false', 'DOWNLOAD_AS_CBZ=true', 'WEB_UI_ENABLED=false',
+    'FLARESOLVERR_ENABLED=true', '-v uchiyomi_suwayomi:/home/suwayomi/.local/share/Tachidesk', `ghcr.io/suwayomi/suwayomi-server:${PIN}`]) {
     assert.ok(run.includes(part), `the docker run lacks ${part}`);
   }
 });

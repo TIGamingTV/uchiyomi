@@ -22,35 +22,44 @@ import { schedulePageHashBackfill } from './lib/pageHashJob';
 import { solverHealth } from './lib/health';
 import { refreshHealthSummary } from './lib/healthSummary';
 import { scheduleMatchCheck } from './lib/matchCheck';
+import { startTitleWorks } from './lib/discoverIdentity';
+import { scheduleMergeLeftovers } from './lib/mergeLeftovers';
+import { scheduleAniListScores } from './lib/anilistScores';
 import { notifyAdmins } from './lib/push';
 import { runSourceCheck } from './lib/sourceWatchdog';
 import { runSweep } from './lib/updater';
+import { refreshMissingRadars } from './lib/releaseRadar';
 import { runRepair, setRepairNext, REPAIR_HOURS } from './lib/repair';
-import { autofixSettled, closeInterruptedAutofix, startAutofix } from './lib/autofix';
+import { AFTER_NIGHTLY_AUTOFIX, autofixSettled, closeInterruptedAutofix, startAutofix } from './lib/autofix';
 import { startArchive } from './lib/archive';
 import { startHeroWarmup } from './lib/autoHero';
 import { closeInterruptedFindRuns, findSettledWithin } from './lib/findSources';
 import { loadUnstatedLang } from './lib/seriesLang';
 import { refreshNoticesActive } from './lib/noticeSettings';
+import { loadAdultSources } from './lib/visibility';
 import { loadMangadexLangs } from './lib/sources/mangadexLangs';
 import { runChapterCleanup, unpruneRestored } from './lib/chapterCleanup';
 import { runExtensionMonitor } from './lib/extensionMonitor';
 import { startEngineCacheKeeper } from './lib/sources/suwayomi/cache';
 import { startSweeper } from './lib/imageCache';
+import { pruneAudit } from './lib/audit';
 import { startActivityLog, flushActivityLog } from './lib/activityLog';
-import { runBackup, backupDelay, stampDelay } from './lib/backup';
+import { runBackup, backupDelay, backupSettings, stampDelay } from './lib/backup';
 import { firstRunFloor, DESKTOP_FLOORS } from './lib/desktop';
 import { KomgaError } from './lib/komga';
 import { ZodError } from 'zod';
 import { registerWebRoot, webRootConfigured } from './lib/webRoot';
+import { addBaseCsp } from './lib/securityHeaders';
 import { registerApiDocs } from './lib/apiDocs';
 import { appVersion } from './lib/appVersion';
 import { buildPayload, installFacts, sendPing } from './lib/installPing';
 import authRoutes from './routes/auth';
+import { trustProxySetting } from './lib/auth';
 import adminRoutes, { sweepImportBatches } from './routes/admin';
 import catalogRoutes from './routes/catalog';
 import imageRoutes, { authorizeImageRequest } from './routes/images';
 import personalRoutes from './routes/personal';
+import recommendationRoutes from './routes/recommendations';
 import downloadRoutes from './routes/downloads';
 import sourceRoutes, { jobBusy } from './routes/sources';
 import opdsRoutes from './routes/opds';
@@ -60,15 +69,28 @@ import { isDesktop } from './lib/desktop';
 import { installDesktopGuards } from './lib/desktopGuard';
 import { ensureDesktopUser } from './lib/desktopUser';
 import { initialiseBulkChapterDeleteRuns } from './lib/bulkChapterDelete';
+import { authFacts, authModeProblems, authModeWarnings } from './lib/authMode';
 
 async function main() {
   await migrate();
+  // v0.63.0 (#208, lib/authMode.ts): a sign-in mode that cannot work stops the server here and says why, before any
+  // route exists -- a typo in AUTH_MODE must never leave the password routes open behind an operator who thinks them
+  // closed -- and SSO-only mode says what it changes at every start.
+  const authProblems = authModeProblems(authFacts(!!(await one('SELECT 1 FROM users LIMIT 1'))));
+  if (authProblems.length) {
+    for (const p of authProblems) console.error(`[auth] ${p}`);
+    process.exit(1);
+  }
+  for (const w of await authModeWarnings()) console.warn(`[auth] ${w}`);
   // The language of sources and series that do not say (lib/lang.ts), before anything compares languages. A
   // database that cannot be read here leaves English, the default, and never stops the boot.
   await loadUnstatedLang().catch((e) => console.warn(`[lang] could not read the unstated language: ${(e as Error)?.message || e}`));
   // Whether any notice-chapter switch is on (lib/noticeChapters.ts), before the first query is built: while none is,
   // every query is the one the previous release ran. Unreadable leaves them off, as they were before the feature.
   await refreshNoticesActive().catch((e) => console.warn(`[notices] could not read the switches: ${(e as Error)?.message || e}`));
+  // The sources the admin rated Adult only (lib/visibility.ts sourceRatedAdult), before anything asks which sources an
+  // account may reach. Unreadable, the first read of the 18+ lists loads them.
+  await loadAdultSources().catch((e) => console.warn(`[adult] could not read the sources rated Adult only: ${(e as Error)?.message || e}`));
   // A Find other sources run still `running` belonged to the process that just went away (v0.49.1): say so.
   await closeInterruptedFindRuns().catch((e) => console.warn(`[find] could not close interrupted runs: ${(e as Error)?.message || e}`));
   // v0.55.0: a Fix everything run the last process was in the middle of (lib/autofix.ts) reads `interrupted`, not running.
@@ -103,12 +125,17 @@ async function main() {
   const app = Fastify({
     logger: { level: env.NODE_ENV === 'production' ? 'info' : 'debug' },
     // Desktop: nothing sits in front of the app, so a forwarded-for header is only ever something a local
-    // process made up.
-    trustProxy: !isDesktop(),
+    // process made up. Elsewhere only the peers TRUST_PROXY names may set it (env.ts): trusting every peer let a client
+    // on the app port choose its own address for the rate limits. Reintroduce `true`: trustProxy.test.ts sees 14
+    // sign-ins with rotating X-Forwarded-For all answered 401, none 429.
+    trustProxy: isDesktop() ? false : trustProxySetting(env.TRUST_PROXY),
     bodyLimit: 2 * 1024 * 1024,
   });
 
   await app.register(helmet, { contentSecurityPolicy: false, crossOriginResourcePolicy: false });
+  // helmet's own policy stays off (its defaults would block the static export's inline scripts); the directives that
+  // cost the app nothing are sent instead, on every response (lib/securityHeaders.ts).
+  addBaseCsp(app);
   await app.register(cors, { origin: env.PUBLIC_ORIGIN, credentials: true });
   await app.register(cookie);
   await app.register(jwt, { secret: env.JWT_SECRET });
@@ -199,6 +226,7 @@ async function main() {
   await app.register(catalogRoutes);
   await app.register(imageRoutes);
   await app.register(personalRoutes);
+  await app.register(recommendationRoutes);
   await app.register(downloadRoutes);
   await app.register(sourceRoutes);
   // Neither OPDS nor the Komga-compatible API exists on desktop: both are for OTHER devices reading this
@@ -218,6 +246,11 @@ async function main() {
   await registerWebRoot(app);
 
   startSweeper();
+  // v0.69.1: the refusal rows an outside caller can write stay bounded (lib/audit.ts pruneAudit, refusals only -- the
+  // rest of audit_log is evidence other code reads back). Shortly after boot, then once a day.
+  const pruneRefusals = () => { pruneAudit().catch((e) => app.log.warn({ err: e }, 'audit prune failed')); };
+  setTimeout(pruneRefusals, 10 * 60_000).unref();
+  setInterval(pruneRefusals, 24 * 60 * 60_000).unref();
 
   // Periodic new-chapter check (owned mode), self-rescheduling so the admin can change the interval live.
   // ⚠️ `OWNED`, never `LIBRARY_BACKEND === 'owned'`: the all-in-one image and the Unraid template do not set
@@ -229,8 +262,13 @@ async function main() {
       let hours = 6;
       let retryIn = 0;
       try {
-        const s = await pool.query('SELECT updater_hours FROM server_settings WHERE id = 1');
+        const s = await pool.query('SELECT updater_hours, update_smart FROM server_settings WHERE id = 1');
         hours = Math.min(168, Math.max(1, s.rows[0]?.updater_hours || 6));
+        // v0.61.0: Admin -> Settings "Smart update checks" (off by default), read every tick so the switch applies to
+        // the next sweep: only THIS sweep rests the quiet series (lib/releaseRadar.ts isDue). Run now, Check now and
+        // everything else a person starts asks every series it means to. Reintroduce by passing it always: "the
+        // scheduled sweep is smart only while the switch is on" in smartSweep.int.test.ts finds it unconditional.
+        const smart = s.rows[0]?.update_smart === true ? { hoursMs: hours * 3_600_000 } : null;
         // ⚠️ Never beside a repair. Both download into the same series folders and both write lib_books for
         // what landed, so a chapter the repair is replacing could be the very file this sweep scans, and two
         // persistScans racing one folder mint rows twice. `runSweep` refuses on its own, but a refusal here
@@ -242,7 +280,7 @@ async function main() {
         } else {
           // The running flag, the stored result and the summary line all live in runSweep now, so the panel's
           // "Run now" button gets the same treatment as this tick -- and this tick can see the button's sweep.
-          const run = runSweep({ maxNew: 5 }, app.log);
+          const run = smart ? runSweep({ maxNew: 5, smart }, app.log) : runSweep({ maxNew: 5 }, app.log);
           if (run) await run;
           else app.log.info('updater: the previous sweep is still running, skipping this tick');
         }
@@ -271,6 +309,14 @@ async function main() {
       app.log.info(`updater: first sweep in ${Math.round(delay / 60000)} min` + (last ? ` (last completed ${new Date(last).toISOString()})` : ' (no completed sweep on record)'));
       setTimeout(tick, delay).unref();
     })();
+    // v0.61.0, the release radar (lib/releaseRadar.ts): once, a minute after boot, every series with a source and no
+    // radar yet is dated from what is already stored -- its listing and its chapters' arrivals, no source asked -- so
+    // an upgrade's Releasing soon and Expected this week are not empty until each series' next check.
+    setTimeout(() => {
+      void refreshMissingRadars()
+        .then((n) => { if (n) app.log.info(`radar: ${n} series dated from what is already here`); })
+        .catch((e) => app.log.warn(`radar: the boot pass failed: ${(e as Error)?.message || e}`));
+    }, 60 * 1000).unref();
   }
 
   /**
@@ -343,6 +389,25 @@ async function main() {
    * grouped -- or merged by Fix everything -- on a link this has not looked at yet.
    */
   scheduleMatchCheck(app.log);
+
+  /**
+   * Discover's name lookups (v0.56.0, lib/discoverIdentity.ts): the known names load, and the asking -- AniList, MangaDex,
+   * MangaUpdates, once per name, paced -- runs whenever Discover shows a name nobody has asked about yet.
+   */
+  startTitleWorks(app.log);
+
+  /**
+   * The chapters merges before v0.57.0 left twice (lib/mergeLeftovers.ts): a few minutes after boot, each kept once --
+   * the extra copy's file deleted from the download folder, or set aside where the server may not delete -- by the
+   * merge's own rules, once. It stamps itself done; every later boot only reads the stamp.
+   */
+  scheduleMergeLeftovers(app.log);
+
+  /**
+   * The outside rating (v0.58.0, lib/anilistScores.ts): AniList's score and popularity for every series linked to its
+   * entry, a few minutes after boot and then every six hours -- each round only what is missing or three days old.
+   */
+  scheduleAniListScores(app.log);
 
   /**
    * The opt-in install count.
@@ -461,7 +526,13 @@ async function main() {
           if ('busy' in r) {
             app.log.info(`repair: Fix everything could not start beside a running ${r.busy}, trying again in 10 minutes`);
             next = 10 * 60 * 1000;
-          } else await autofixSettled();
+          } else {
+            await autofixSettled();
+            // v0.60.1: then the repair steps Fix everything does not drive itself (lib/autofix.ts AFTER_NIGHTLY_AUTOFIX),
+            // as the plain nightly would have run them. A partial run: its own Tasks card, and repair_last_run left alone.
+            const rest = runRepair(app.log, { only: [...AFTER_NIGHTLY_AUTOFIX] });
+            if (rest) await rest;
+          }
         } else if (runtime.autofixing) {
           app.log.info('repair: Fix everything is running, trying again in 10 minutes');
           next = 10 * 60 * 1000;
@@ -591,6 +662,10 @@ async function main() {
     // Bumped by every arm(); an arm that is no longer the newest when its SELECT resolves stands down.
     let gen = 0;
     const backupTick = async () => {
+      // v0.61.1 (#199): switched off in Admin → Settings, read as the timer fires so the switch needs no restart. The
+      // night passes and the timer is set for the next one; Run now under Tasks still backs up (routes/admin.ts).
+      // Reintroduce by deleting this line: backupHour.test.ts "a nightly switched off does not run" finds no check.
+      if (!(await backupSettings()).enabled) { void arm(); return; }
       try {
         runtime.backingUp = true;
         // Before the run, success or not: the desktop catch-up reads it (backupDelay in lib/backup.ts).
@@ -612,13 +687,17 @@ async function main() {
     const nextBackupDelay = async (): Promise<number> => {
       let hour = 3;
       let lastRun: number | null = null;
+      // A nightly switched off has no night to catch up on: without this the desktop's catch-up would wake every five
+      // minutes to find it off (v0.61.1).
+      let on = true;
       try {
-        const s = await pool.query('SELECT backup_hour, backup_last_run FROM server_settings WHERE id = 1');
+        const s = await pool.query('SELECT backup_hour, backup_last_run, backup_enabled FROM server_settings WHERE id = 1');
         const h = Number(s.rows[0]?.backup_hour);
         if (Number.isInteger(h) && h >= 0 && h <= 23) hour = h;
         lastRun = s.rows[0]?.backup_last_run ? new Date(s.rows[0].backup_last_run).getTime() : null;
+        on = s.rows[0]?.backup_enabled !== false;
       } catch { /* settings not readable yet — keep 03:00 */ }
-      return backupDelay({ hour, lastRun, lastAttempt: runtime.lastBackupAttempt, now: Date.now(), desktop: isDesktop() });
+      return backupDelay({ hour, lastRun, lastAttempt: runtime.lastBackupAttempt, now: Date.now(), desktop: isDesktop() && on });
     };
     const arm = async () => {
       // The clear sits AFTER the await, right before the set, with nothing between them. Clearing before the
