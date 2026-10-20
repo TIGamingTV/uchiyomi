@@ -268,6 +268,12 @@ const WORDS: Record<string, (p: P) => string | null> = {
     ? tr('1 more before where you started (chapter {start})', { start: num(p, 'start') })
     : tr('{n} more before where you started (chapter {start})', { n: num(p, 'n'), start: num(p, 'start') })),
   'gaps.beforeStart': (p) => (num(p, 'n') === 1 ? tr('1 before where you started') : tr('{n} before where you started', { n: num(p, 'n') })),
+  // Holes none of the series' sources lists: not counted as missing.
+  'gaps.notListed': (p) => (num(p, 'n') === 1
+    ? tr('1 number none of its sources list — {ranges}', { ranges: str(p, 'ranges') })
+    : tr('{n} numbers none of its sources list — {ranges}', { n: num(p, 'n'), ranges: str(p, 'ranges') })),
+  'gaps.notListedSeries': (p) => (num(p, 'n') === 1 ? tr('1 with numbers none of their sources list') : tr('{n} with numbers none of their sources list', { n: num(p, 'n') })),
+  'gaps.notListedNote': () => tr('Numbers none of a series\' sources list are not counted as missing: usually a source numbered the same chapters another way, such as counting split parts as chapters. "Fill now" still asks other sources for them.'),
 
   // ---- Chapter numbering (#116). A source that could not be named at all is "Its source" where it opens the sentence,
   // "its source" inside one.
@@ -287,6 +293,13 @@ const WORDS: Record<string, (p: P) => string | null> = {
   'numbering.askedWaits': () => tr('Numbering by posting order, as asked, waits to be applied.'),
   'numbering.sourceWaits': (p) => opensOnOwnWords(p, tr('Going back to {name}\'s own numbers waits to be applied.', { name: sourceNameMid(p) })),
   'numbering.since': (p) => tr('numbered by posting order since {date}.', { date: dayText(p.at) }),
+  // v0.81.0: what the scout (bff lib/sourceScout.ts) last did for the series on a Health row.
+  'scout.following': (p) => (num(p, 'n') === 1
+    ? tr('Searched 1 other source on {date}: now also using {source}', { date: dayText(p.at), source: str(p, 'source') })
+    : tr('Searched {n} other sources on {date}: now also using {source}', { n: num(p, 'n'), date: dayText(p.at), source: str(p, 'source') })),
+  'scout.notFound': (p) => (num(p, 'n') === 1
+    ? tr('Searched 1 other source on {date}: none has it yet', { date: dayText(p.at) })
+    : tr('Searched {n} other sources on {date}: none has it yet', { n: num(p, 'n'), date: dayText(p.at) })),
   'numbering.hint': () => tr('they may be different chapters listed as versions of one.'),
   'numbering.kept': () => tr('you chose to keep the source\'s own numbers.'),
   'numbering.held': () => tr('Nothing downloads for this series until then.'),
@@ -315,6 +328,7 @@ const WORDS: Record<string, (p: P) => string | null> = {
     ? tr('1 more waits for a site that asked for a pause')
     : tr('{n} more wait for a site that asked for a pause', { n: num(p, 'n') })),
   'failures.note': (p) => tr('One entry per source, counting chapters still missing after an attempt and how often each has been tried. They clear themselves the moment the chapter lands. After {cap} failed tries the nightly sweep leaves a chapter alone until the nightly repair gives it another chance a week later; "Retry now" does that for this source at once, and "Find missing chapters" on the series still fetches it on purpose. A chapter saved with pages missing is listed on its series page and re-tried by the sweep, up to 10 a night.', { cap: num(p, 'cap') }),
+  'failures.noteRefusals': (p) => tr('While "Finish downloads on their own" is on, a chapter a site refused (a rate limit or a block) is tried up to {cap} times.', { cap: num(p, 'cap') }),
   'failures.detail': (p) => {
     const n = num(p, 'n');
     const m = num(p, 'series');
@@ -461,6 +475,16 @@ const WORDS: Record<string, (p: P) => string | null> = {
       ? tr('1 file from {source} saved again in another split: {numbers}', { source: str(p, 'source'), numbers })
       : tr('{n} files from {source} saved again in another split: {numbers}', { n: num(p, 'n'), source: str(p, 'source'), numbers });
   },
+  // Two files of one chapter in one series, the rows Keep one of each acts on.
+  'twice.heldLive': (p) => (num(p, 'n') === 1 ? tr('1 series holds the same chapter in two files') : tr('{n} series hold the same chapter in two files', { n: num(p, 'n') })),
+  'twice.held': (p) => {
+    const more = num(p, 'more');
+    const numbers = strs(p, 'numbers').join(listSep()) + (more > 0 ? ` ${tr('and {n} more', { n: more })}` : '');
+    return num(p, 'n') === 1
+      ? tr('1 chapter is here twice: {numbers}', { numbers })
+      : tr('{n} chapters are here twice: {numbers}', { n: num(p, 'n'), numbers });
+  },
+  'twice.heldNote': () => tr('A series that holds two files of one chapter offers "Keep one of each": the first file saved stays, unless it is incomplete. The other is deleted from the download folder, or set aside where Uchiyomi may not delete; reading progress moves to the copy that stays, and a bookmarked copy is kept. A part or an extra filed under its chapter\'s number (17e, 1053a) is never offered.'),
 
   // ---- Cloudflare solver. On desktop no address is sent: it carries the helper's token.
   'solver.down': (p) => {
@@ -716,6 +740,20 @@ const WORDS: Record<string, (p: P) => string | null> = {
       : p.status === 'blocked' ? tr('{source} is currently blocking downloads.', v)
       : tr('{source} is currently unreachable for downloads.', v);
   },
+  // "Finish downloads on their own" (bff lib/finishDownloads.ts): the same stops, with what happens next.
+  'job.refusingWillFinish': (p) => {
+    const v = { source: str(p, 'source') };
+    return p.status === 'rate_limited' ? tr('{source} is currently rate-limiting downloads. The series is saved, and its chapters will download on their own when the site is ready.', v)
+      : p.status === 'blocked' ? tr('{source} is currently blocking downloads. The series is saved, and its chapters will download on their own when the site is ready.', v)
+      : tr('{source} is currently unreachable for downloads. The series is saved, and its chapters will download on their own when the site is ready.', v);
+  },
+  'job.stoppedWillFinish': (p) => tr('{source} stopped part-way. The rest will download on their own.', { source: str(p, 'source') }),
+  'job.stoppedRefusingWillFinish': (p) => {
+    const v = { source: str(p, 'source') };
+    return p.status === 'rate_limited' ? tr('{source} stopped part-way: it is rate-limiting downloads. The rest will download on their own when the site is ready.', v)
+      : p.status === 'blocked' ? tr('{source} stopped part-way: it is blocking downloads. The rest will download on their own when the site is ready.', v)
+      : tr('{source} stopped part-way: it is unreachable for downloads. The rest will download on their own when the site is ready.', v);
+  },
   'job.undownloadable': () => tr('No downloadable chapters here — this title may be licensed or hosted externally on this source.'),
   'job.failed': (p) => (num(p, 'n') === 1
     ? tr('1 chapter could not be saved: {error}', { error: str(p, 'error') })
@@ -797,6 +835,8 @@ const WORDS: Record<string, (p: P) => string | null> = {
   'retire.inUse': (p) => (num(p, 'n') === 1
     ? tr('It is the main source of 1 series. Replace it first.')
     : tr('It is the main source of {n} series. Replace it first.', { n: num(p, 'n') })),
+  // An install or removal while another one runs (v0.82.0, bff lib/sources/suwayomi/installLock.ts): one at a time.
+  'extension.busy': () => tr('Another extension is being added or removed. Try again in a minute.'),
   // Rating a source Adult only past the list's limit (bff lib/visibility.ts MAX_ADULT_SOURCES): always a big number.
   'rating.tooMany': (p) => tr('At most {limit} sources can be rated Adult only.', { limit: num(p, 'limit') }),
 
@@ -990,7 +1030,7 @@ const WORDS: Record<string, (p: P) => string | null> = {
   'disk.noteFloor': (p) => tr('New downloads stop when the downloads disk has less than {floor} GB free.', { floor: numText(num(p, 'floor')) }),
   'disk.noteNoFloor': () => tr('Downloads are never stopped for free space here (MIN_FREE_GB is 0).'),
   'disk.noteArchive': (p) => tr('The slow archive waits below {floor} GB (Admin → Settings → Downloads).', { floor: numText(num(p, 'floor')) }),
-  'disk.noteFolders': () => tr('A library or download folder that cannot be read, or that is empty while the library records chapters in it, is usually a share that is not mounted; nothing is marked missing because of it. Only the top of each folder is read here: Verify chapter files (Admin → Tasks) checks every file.'),
+  'disk.noteFolders': () => tr('A library or download folder that cannot be read, or that is empty while the library records chapters in it, is usually a share that is not mounted; nothing is marked missing because of it. Only the top of each folder is read here: Verify chapter files (Admin → Settings → Maintenance) checks every file.'),
 
   // ---- Tracker sync (v0.72.0, bff lib/healthTrackers.ts, @Squeaks72's card from #253). `error` is the tracker's own.
   'trackers.refused': () => tr('The tracker refused the saved sign-in'),

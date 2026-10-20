@@ -1,5 +1,496 @@
 # Changelog
 
+## v0.90.0 — 2026-10-20
+
+**Comments and reactions can be switched off, each for themselves, and the Komga extension's WebView opens the series or
+the chapter you were on.** The WebView fix is **TIGamingTV**'s report
+([#312](https://github.com/AngeloSha/uchiyomi/issues/312)). Thank you.
+
+### Switch comments and reactions off
+
+- In **Profile → Settings → Reading → Comments and reactions**, off hides the household's comments, reactions and their
+  counts for you everywhere: the line between two chapters, the key on a chapter's last page, the comments key in the
+  top bar, the end card and the series page. You get no comment alerts either.
+- **It's yours alone.** It is saved to your account, so every device you sign in on follows it. Everyone else still sees
+  the household's talk, including what you wrote before.
+- It is offered only where there is talk: a server with one account, or Uchiyomi Desktop, has nothing to switch off.
+
+### The Komga extension's WebView opens the right page
+
+- In Mihon, Tachimanga and other apps reading Uchiyomi through the **Komga** extension, **WebView** on a series or on a
+  chapter opened Uchiyomi's library. The extension opens Komga's own web addresses (`/series/<id>`, `/book/<id>`), and
+  Uchiyomi now sends them to its series page and its reader. WebView on the source still opens the library.
+- Both ways of running Uchiyomi do it: the single container, and the two-container setup's nginx.
+
+### Upgrading
+
+- Nothing to do. If you run the two-container setup with a copy of `web/nginx.conf` of your own, add its two new
+  `location ~` lines for the WebView fix.
+
+## v0.89.0 — 2026-10-20
+
+**Badges unlock frames for your avatar, you can merge or split double pages yourself, and a series can follow up to ten
+sources.** The frames are part three of **CheetahDoesStuff**'s badges idea
+([#267](https://github.com/AngeloSha/uchiyomi/issues/267)), merging and splitting by hand began as **@Squeaks72**'s pull
+request ([#262](https://github.com/AngeloSha/uchiyomi/pull/262)), rebuilt on v0.77.0's joining, and more sources per
+series is **TIGamingTV**'s request ([#305](https://github.com/AngeloSha/uchiyomi/issues/305)). Thank you all three.
+
+### Badges unlock avatar frames
+
+- **Each badge unlocks a frame**, cast in the badge's own metal: *Bronze* for Reader, *Silver* for Bookworm, *Ember* for
+  On a roll (a flame for each day of the streak), *Gold* for Centurion (with a laurel), *Moonlight* for Devoted (a
+  crescent and stars) and *Aurora* for Legend (a crown and a slow halo).
+- **Pick one** in **Profile → Settings → Appearance → Avatar → Frame**, or from **Badges unlock frames for your avatar**
+  under the badges. A frame you have not earned yet is greyed: tap it to see what it takes. **None** takes yours off.
+- **Everyone sees it.** The frame goes wherever your avatar shows: the corner, the household board, comments and shared
+  lists. The server checks it is yours to wear, with the same rules the badges use.
+- **It moves a little.** A sheen passes over the metal now and then, the embers flicker and Legend's ring turns.
+  **Reduce effects** or your system's reduced motion keeps them still. Small avatars, in comments for example, show the
+  ring alone.
+
+### Merge and split double pages yourself
+
+- **When the joining gets it wrong.** *Join split double pages* can join two pages that are not one picture, or miss two
+  that are. Reading page by page, **This page** in the reader's settings (and the right-click menu) now offers what fits
+  the page you are on:
+  - **Merge with the page on the left** or **on the right**. Left and right are your screen's, so on a right-to-left
+    read the next page is the one on the left.
+  - **Show as two pages** for a pair the server joined, and **Join these two pages again** to give it back.
+  - **Undo the merge** for a pair you joined.
+  - In *Double spread*, two pages side by side: **Merge these two pages**.
+- **Yours alone.** It is saved on your account, so it follows you to your other devices and into chapters you download,
+  and nobody else's reader changes. A merge you made shows even with *Join split double pages* off.
+- A page is in one spread only, and wide pages and the ends of a chapter offer nothing. If a chapter's file is replaced
+  by one with another page count, it starts afresh.
+
+### More sources per series
+
+- **Other sources per series**, in **Admin → Settings → Downloads → More options**: how many sources besides its main
+  one a series may follow, from 1 to 10. It is 3 by default, as before. It counts the sources you add and the ones
+  Uchiyomi finds on its own alike.
+- Each extra source is one more chapter list to ask for at every library update, which the menu says. Lowering the number
+  unfollows nothing: a series that follows more keeps its sources, and follows no new one.
+- It replaces the server setting `MAX_FOLLOWED_SOURCES`, which is now only the starting value until the menu is used.
+- The add dialog no longer says *already following two* when a series has as many sources as it may.
+
+### Upgrading
+
+- Nothing to do. If your server sets `MAX_FOLLOWED_SOURCES`, the menu shows that number until you pick another.
+
+## v0.88.0 — 2026-10-19
+
+**Profile and Admin are one list each: no more tabs inside tabs.**
+
+### Profile and Admin, one list each
+
+- **One list, under the hero.** Your profile opens under its hero, as before, then **You** and **Insights** as two
+  pictures (your latest covers, your last four weeks), then **Settings**: **General**, **Appearance**, **Reading**,
+  **This device**, **Connections** and **Account**, with **Admin**, **Support Uchiyomi** and **Sign out** at the foot.
+  Admin opens under the server's hero (whether every check passes, the counts and **Scan library now**), then
+  **Overview** and **Health**, **Library** (Libraries, Sources, Art), **People** (Members, Sessions, Activity) and
+  **Settings** (Server, Series & chapters, Downloads, Maintenance, Notifications).
+- **On a phone the hero and the list are the first screen.** Tap a row to open its page, under a band of the same art
+  with the page's title; the key at the top, or the phone's own Back, returns you to the row you came from. On a
+  computer the list stays beside the page, and scrolls on its own when it is taller than the window.
+- **Tasks are on Maintenance**, under the nightly backup and repair, each with **Run now**.
+- **The hero is in full above You and Overview**, and a slimmer band of the same art above every other page on a
+  computer, so a settings page starts near the top.
+- **Overview** is what needs a look, each member's week and the top 10 in your library. Its four shortcut tiles are
+  gone: the list does that job.
+- **The search box finds pages too** (*tasks* finds Maintenance), and Ctrl+K (⌘K) opens a page or a setting of the
+  console you are on in place, without reloading it.
+- Old addresses and bookmarks still work: `?tab=Tasks` opens Maintenance, `?tab=Settings` the first settings page, and
+  `?tab=Health` is `?tab=health`.
+
+### One copy of each chapter
+
+- **Health finds a chapter a series holds twice, and keeps one.** Two files of one chapter in one series, such as an
+  older Suwayomi library's `Ch. 12 - Chapter 12.cbz` beside `Chapter 12.cbz` or a re-upload beside the first, were listed
+  twice and nothing showed them. "The same chapter saved twice" now lists each such series with **Keep one of each**,
+  and the card has **Keep one of each everywhere**. The first file saved stays unless it is incomplete. The other is
+  deleted from the download folder, or set aside where Uchiyomi may not delete. Reading progress moves to the copy
+  that stays, and a bookmarked copy is kept. Parts and extras filed under their chapter's number (`17e`, `1053a`)
+  are never offered. **Ignore** keeps both. Nothing runs on its own.
+- **A chapter a site numbers below zero is no longer downloaded.** A site's −1 means "number unknown". Natomanga listed
+  chapter 1 again as −1, which was saved as `Chapter -1.cbz` and read back as a second chapter 1.
+- **One chapter, one file, whatever the spelling of its number.** A site's 84.29999999999998 is the 84.3 the library
+  holds: it is not counted missing, and not downloaded a second time.
+
+### Upgrading
+
+- Nothing to do.
+
+## v0.87.0 — 2026-10-19
+
+**React to a chapter, and talk about it with your household.**
+
+### Chapter comments
+
+- **Where a chapter ends.** The reader runs one chapter into the next, so a chapter's talk sits at its end. In the
+  webtoon scroll, the line between two chapters now shows who reacted, how many comments there are, and the six
+  reactions, one tap each. Reading page by page, a small key sits on each chapter's last page, and the end card after
+  the last chapter has the same.
+- **A comments key in the top bar** opens the comments of the chapter on screen, with how many there are.
+- **Reactions:** ❤️ 😂 😭 😱 🔥 🤯, one each a chapter. Tap yours again to take it back, or tap another to change it.
+- **Comments** are plain text. One written in the reader remembers its page, and *p. 41* on it goes there. You edit or
+  delete your own, and an admin can remove anyone's.
+- **On the series page**, chapters people talked about show their top reactions and comment count, and a chapter's
+  **⋯** menu has **Comments**.
+- **Who sees it:** only members who can open the series. Faces show who reacted or commented, never who read. With
+  **Incognito reading** on, you can read comments but not post or react.
+- **Alerts:** a new comment sends a push only to the members who already commented on that chapter.
+- Nothing shows on a server with one account, or in Uchiyomi Desktop.
+
+### Fixed
+
+- **Escape** on the reader's chapter list or page grid closes it, and no longer leaves the reader as well.
+
+### Upgrading
+
+- Nothing to do. Two new tables hold the comments and reactions; v0.86.x runs on the upgraded database unchanged.
+
+## v0.86.0 — 2026-10-19
+
+**Settings are a few short categories with a search, instead of one long page.**
+
+### Settings, easier to find
+
+- **A few categories instead of one long page.** **Profile → Settings** is **General**, **Appearance**, **Reading** and
+  **This device**; **Admin → Settings** is **Server**, **Series & chapters**, **Downloads**, **Maintenance** and
+  **Notifications**. One category is on screen at a time, with at most eight rows, and its line in the list says what is
+  set in it. On a phone the categories are a list: tap one to open it, and Back returns to the list.
+- **Search every setting.** The box above the categories finds a setting by what it says, in your language or in
+  English, by the words people type for it (*discord*, *backup*, *rtl*), by a section's old name (*Scanlators*,
+  *Updates & schedules*) and by its help. Picking one opens its category and highlights the row. Ctrl+K (⌘K) and the
+  Search tab find every setting too, and go straight to it.
+- **Pictures for the choices you see.** The reader's mode and theme, what a wide page becomes, repeated pages and the
+  background are picture cards. Long lists (the language, the update interval, the backup time) are menus, and two or
+  three options are square toggles. No pills.
+- **Big settings are one row.** The scanlation groups (*Scanlators* until now), the source order, the slow archive, the
+  18+ filter, notice chapters and your avatar each say what is set and open their own editor. Rows few people change fold
+  under **More options**, and long help folds to two lines with **More** to read the rest.
+- **A few settings moved or became one:**
+  - The weekly goal is the ring at the top of your profile, no longer also a row in Settings.
+  - Brightness, the page gap, auto-scroll and the cover colour at the edges are set in the reader's own settings, while
+    you look at a page.
+  - The nightly backup is one menu: *Off*, or the time it runs. The nightly repair is one choice: *Off*, *Safe repair* or
+    *Fix everything*, with what each does under it.
+  - The space offline downloads use, **Protect downloads** and the way to the Offline downloads page are one row.
+  - **Compact chapter list** and **Type anywhere to search** are shown only where there is a mouse or a trackpad, where
+    they do something.
+- **Connections and Account** have square keys instead of pills.
+
+### Upgrading
+
+- Nothing to do. Links to the old sections (`?section=schedules`, `?section=housekeeping`, …) open where those settings
+  are now.
+
+## v0.85.0 — 2026-10-19
+
+**Read raw chapters in your own language: translated pages, an optional download that runs on your server.**
+
+### Translated pages
+
+- **Turned on once, for the whole server.** **Admin → Settings → Server → Translate pages → Download** fetches the
+  translation engine: a reader for the text in the pages, a translation model and the fonts it writes with. It is about
+  18 GB on a server with 28 GB of memory or more and about 2.4 GB elsewhere, and the row says what it will take before
+  you press it. Then one switch. Nothing changes for anyone until then, and **Remove the translation engine** takes it away.
+- **Each reader turns it on per series.** **Translate pages** in the reader's settings translates into the language
+  Uchiyomi is in for you, a page at a time from the page you are on. Each page switches to its translation as soon as it
+  is done, and the next chapter follows.
+- **It translates the scene, not single words.** A page's bubbles are translated together, with the lines before them
+  and the names already met in the series, so a character keeps one name. When the text is hard to read, the large
+  model looks at the page itself. The translation is written into each bubble in its own shape and colour, and sound
+  effects drawn on the art are left alone.
+- **Your pages stay home.** Everything runs on your server, at low priority, and stops when nobody is reading. Only the
+  download comes from the internet (GitHub and Hugging Face), each file checked against a checksum pinned in the app.
+- **Speed:** on a 6-core CPU with no graphics card, 15–20 seconds a page for Japanese and Chinese, and up to a minute for
+  a page whose text is hard to read (most Korean pages). See [USAGE](docs/USAGE.md#translated-pages) and
+  [CONFIGURATION](docs/CONFIGURATION.md#translated-pages).
+
+### Also
+
+- **A series' chapter list no longer looks short.** Its page picker said "86–129 of 149": 149 counted files, half
+  chapters like 12.5 included, next to chapter numbers, so a series numbered 0–129 looked twenty chapters short. The
+  count is gone from the picker, and the header says "149 chapters · Ch. 0–129" when the numbers and the count differ.
+
+### Upgrading
+
+- Nothing to do: the database gains three things, empty until Translate pages is used. If your config folder is on a
+  small disk, set `TRANSLATE_DIR` to a folder on a big one before pressing Download
+  ([CONFIGURATION](docs/CONFIGURATION.md#translated-pages)).
+- Not in Uchiyomi Desktop yet.
+
+## v0.84.1 — 2026-10-18
+
+**Reading on into the next chapter no longer reloads the reader.**
+
+### Seamless chapters
+
+- **The next chapter joins the one you are reading, every time.** The reader keeps the address on the chapter you are
+  reading, and moving it asked for the page again. When Uchiyomi had been updated since the reader opened, or the
+  connection dropped at that moment, the whole page loaded again on the new chapter, and the chapter before was gone.
+  The address now changes in place: reading on stays seamless, and scrolling back reaches the chapter before.
+
+### Upgrading
+
+- Nothing to do. A reader left open across this update can still reload once, at its next chapter: the open page runs
+  the previous version until then.
+
+## v0.84.0 — 2026-10-18
+
+**Downloads you can watch page by page, double pages that line up, and gallery chapters.** All three are pull requests
+from **@globalteddy** ([#296](https://github.com/AngeloSha/uchiyomi/pull/296),
+[#295](https://github.com/AngeloSha/uchiyomi/pull/295), [#294](https://github.com/AngeloSha/uchiyomi/pull/294)), merged
+with his own commits. Thank you.
+
+- **Page-by-page download progress** ([#296](https://github.com/AngeloSha/uchiyomi/pull/296)). A chapter coming in
+  shows its pages and the time left under the series in **Library → Downloads** and on the series page (*34/78 pages ·
+  about 40 s left*). The time left covers the chapters still to come, and the Library ring moves while a long chapter
+  comes in, not only when it lands. The time is measured by the server, so a device whose clock is off still reads it
+  right.
+- **Shift pairs by one page** ([#295](https://github.com/AngeloSha/uchiyomi/pull/295)). In **Double spread**, the
+  reader keeps a chapter's first page alone as a cover. For a title whose chapters start on a story page, **Shift pairs
+  by one page** in Reader settings pairs pages 1–2, 3–4 and so on. It is remembered for that title, and the page you
+  are reading stays in view when you switch it.
+- **Gallery chapters** ([#294](https://github.com/AngeloSha/uchiyomi/pull/294)). An extension that lists a gallery as
+  one chapter with no number made the series look empty. That chapter now counts as chapter 1, and an 18+ extension
+  listing only unnumbered parts gets them numbered in posting order. Chapters that have numbers are read as before.
+
+### Upgrading
+
+- Nothing to do. The database has no change.
+
+## v0.83.0 — 2026-10-18
+
+**When none of your sources has a series, Uchiyomi tries a few extensions from your repository.** A series stuck for an
+hour that no installed source has is looked for on extensions from your repository, a few at a time. One that has it is
+kept as a backup; the others are removed at once.
+
+### A few at a time
+
+- **Best matches first:** an extension named after a group that translates the series (as its chapters or
+  MangaUpdates say), then the most downloaded.
+- **Gently:** one install at a time, at most one an hour and six a day, and within the backup limit (5).
+- **One install, every waiting series:** each extension it tries is asked about every series waiting in that language
+  before it is kept or removed.
+- **Never twice for nothing:** an extension that doesn't have a series isn't tried for it again for a month. That
+  includes the ones *Fix everything* already tried, and *Fix everything* skips the ones this tried.
+- **Never** an 18+ extension for a series that isn't, one in a language you've hidden, or one you removed.
+- **One switch, as before:** *Finish downloads on their own*. Off, nothing is tried.
+
+### Upgrading
+
+- **Database:** one new table (`backup_misses`). Additive.
+
+## v0.82.0 — 2026-10-18
+
+**Extensions Uchiyomi added by itself are backups now.** They help while a series needs them, then go, and come back
+when the series is stuck again. Discover shows only the sources you added, and the extension engine doesn't keep
+extensions nothing uses.
+
+### Backup extensions
+
+- **Not in Discover.** An extension Uchiyomi installed by itself (*Fix everything* does, when no installed source has a
+  series) isn't shown in Discover or anywhere you pick a source. Your series still name it where a chapter came from.
+- **Removed when unused.** It stays while a series needs it, and is removed after 3 days without use. It is never
+  removed while a series uses it as its main source.
+- **Back when needed.** When a series it carried is stuck again for an hour or more, it is put back and the series
+  carries on, without searching every extension again.
+- **New chapters come from the main source** while that source works; a backup's copy is taken only when the main is
+  slowed or failed that chapter.
+- **At most 5 at once.** The one needed longest ago makes room; one in use never does.
+- **Yours if you want it.** **Admin → Sources → Added by Uchiyomi** lists them; **Keep** makes one yours. Installing
+  one yourself, switching its sources on or choosing it for a series does the same. One you remove is never installed
+  again, by *Fix everything* or anything else.
+- **One install at a time.** An extension you add or remove while another install runs waits for it, and says so if
+  it takes more than two minutes.
+
+### Upgrading
+
+- **Your extensions:** the ones *Fix everything* installed, and that nobody chose for a series since, become backups.
+  Each gets three days before anything is removed. An extension you removed yourself is remembered.
+- **One optional knob,** `BACKUP_EXTENSIONS_MAX` (default 5, `0` turns backups off), is in
+  [docs/CONFIGURATION.md](docs/CONFIGURATION.md) under *advanced, rarely needed*.
+- **Database:** two new tables (`backup_extensions`, `backup_links`) and one new column on `series_scout`. All additive.
+
+## v0.81.0 — 2026-10-18
+
+**Simpler, and faster.** Everything automatic about downloads is one switch now, a series says what it did for you,
+and a slow site no longer holds up the others.
+
+### One switch
+
+- **Finish downloads on their own** (Admin → Settings → Updates & schedules) now covers everything automatic about
+  downloads: going back for what is left, using a series' other sources when a site is slow or blocked, and finding a
+  new source when none of them can help. It is on by default. Off, chapters come only with the library update, from
+  the sources you picked. The separate *Use other sources on their own* switch is gone.
+- **You can see what it did.** A source Uchiyomi added is marked *followed for you* on the series' Sources list, with
+  when and why. Press × to remove it, and it is never added back for that series. Health's chapter gaps say where it
+  searched, too.
+
+### Faster
+
+- **Several sites at once.** Up to three series download side by side, each from a different site, so one slow site no
+  longer holds up the rest.
+- **The copy that can come now.** When two of a series' sources have the same release of a chapter, it comes from the
+  one that is quicker right now, not from the one that just failed it. A version you picked and a source order you set
+  are kept.
+
+### Upgrading
+
+- **Settings:** if *Finish downloads on their own* and *Use other sources on their own* were set differently, both are
+  off after the upgrade. Turn the switch back on to use them. One optional knob, `FINISH_DOWNLOADS_LANES` (default
+  3), is in [docs/CONFIGURATION.md](docs/CONFIGURATION.md) with the others, under *advanced, rarely needed*.
+- **Database:** no change to its tables.
+
+## v0.80.0 — 2026-10-18
+
+**A series its sources cannot get its chapters from finds another source on its own.** When every site a series
+follows is rate-limiting, blocking or failing it, the server now looks for the series on your other installed sources
+in the background, follows one that has the missing chapters, and carries on from there. It works the same whether
+the series came from Discover, **Find missing chapters** or the scheduled checks.
+
+### Another source, found for you
+
+- **The scout.** Every few minutes it takes one stuck series and looks for it on the other installed sources:
+  - which series: any whose sources are all cooling, silent or refusing it; an add or Fetch a site refused; or chapters
+    left after their tries;
+  - which sources: only ones in the series' language, and no 18+ source for a series that isn't 18+;
+  - what it follows: a source that passes the same title and chapter-number check as any second source, and that lists
+    a chapter the series is waiting for.
+  The series keeps its main source; the new one fills in. Chapters that had used up their tries get them back, and the
+  series goes first in the next **Finish downloads on their own** run.
+- **It looks in the right places first.** Sources it has already found the series on come first. Next are sources
+  that downloaded well on your server this week, then the rest. Within each group, sites with fewer chapters already
+  waiting on them come before busy ones. It never asks a site that shares an image server with one the series already
+  follows: Mangakakalot can't stand in for Natomanga, because they slow down together.
+- **It remembers.** A source that said "not this series" isn't asked again for two weeks, and one that didn't answer
+  for a day. The sweep's own search for a failed chapter shares that memory, and so does **Find other sources**.
+  - A source you unfollow from a series is never followed there again on its own. Following it yourself undoes that.
+- **Gentle by design.**
+  - One series at a time, at most twelve sources and sixteen searches each.
+  - Forty searches an hour in all (`SCOUT_SEARCHES_PER_HOUR`).
+  - A series it just looked at waits: six hours after a follow, up to three days after every source said no.
+- **Room for it.** A series may now follow three other sources (two before). For the server's own follows, a broken,
+  switched-off or uninstalled follower doesn't count toward that limit, and it is kept.
+
+### Changed
+
+- The switch **Look for failed chapters on other sources** is now **Use other sources on their own**, in Admin →
+  Settings → Updates & schedules. It turns the scout and the sweep's own search on or off together, and it is still on
+  unless you turned it off.
+
+### Upgrading
+
+- **Database:** two new tables, `series_scout` and `scout_verdicts`. Additive: v0.79.x ignores them.
+- **Settings:** `MAX_FOLLOWED_SOURCES` now defaults to 3. To keep two, set it to `2`. The new `SCOUT_SEARCHES_PER_HOUR`
+  (default 40) can be set to `0` to turn the scout off on its own. See [docs/CONFIGURATION.md](docs/CONFIGURATION.md).
+
+## v0.79.0 — 2026-10-17
+
+**A site that is cooling down no longer holds a series up.** When a site rate-limits or blocks the server, the series
+that use it keep downloading from the other sources they follow, and the chapters only that site has are kept for when
+it can answer, wherever the download started: an add from Discover, **Find missing chapters**, or the scheduled checks.
+
+### Downloads that keep going
+
+- **A series whose main site is cooling down downloads from the other sources it follows.** The library update and
+  **Finish downloads on their own** used to line up every series behind its main site and wait out the cooldown, even
+  when another source had the chapters.
+- **The chapters only the cooling site lists stay on the list.** They used to drop out until the site answered again,
+  so the series looked caught up. Now they wait, and they are fetched as soon as the cooldown ends.
+- **A site that refuses a chapter's page list is treated as a refusal,** like refused images. The chapter gets the
+  twelve tries a refused chapter gets, and the site is given its cooldown, instead of three tries as a broken chapter.
+- **Adding from Discover while the site is cooling down keeps the series,** and so does an add whose page list the site
+  refuses. Its chapters come on their own. It used to answer "try a different source" and add nothing.
+- **Find missing chapters takes a chapter from another followed source when its own site is cooling down.** A chapter
+  no other source has downloads on its own when the site is ready, and the dialog says so. A download that every source
+  refuses part-way hands the rest on the same way.
+- **The finishing runs give way.** The library update, the nightly repair, **Fix everything** and **Find other
+  sources** no longer wait for a finishing run to end. It stops at the next chapter and picks up after them.
+
+### Upgrading
+
+- **Database:** one new column, `lib_series.finish_after`. Additive: v0.78.x ignores it.
+- **API:** `POST /api/sources/fetch` can skip a number with the reason `later`. Its site is cooling down, no other
+  followed source lists it, and **Finish downloads on their own** will fetch it. See [docs/api.md](docs/api.md).
+
+## v0.78.1 — 2026-10-17
+
+**Sign-in and account hardening.** Update soon, especially if people outside your household can reach your server.
+Thank you to **@globalteddy**, who reported these and wrote the fixes.
+
+### Security fixes
+
+- **A session follows its account as it is now.** Disabling or deleting an account ends its sessions on their next
+  request, and taking away someone's admin role takes it away at once, not when their session is next renewed.
+- **An admin's API token needs the admin scope for every admin-only action,** not only under `/api/admin`: stopping
+  someone else's download or archive, or seeing a series' admin details. Without it, the token acts as an ordinary
+  account.
+- **Covers and pages fetched on your behalf connect only to public addresses,** checked at the moment of connecting.
+- **A stranger's wrong passwords no longer lock an account.** Five wrong passwords for one name from one address pause
+  sign-in for that name from that address for 15 minutes, and the account's owner can still sign in from anywhere
+  else. Wrong two-factor codes, and wrong current passwords behind a signed-in session, still lock the account.
+- **Sign-in answers every wrong guess the same way,** whether the name exists or not. A disabled or locked account is
+  told so only once the right password is given.
+
+### Changed
+
+- **A sign-in that is being rate-limited** says so in your language.
+
+### Fixed
+
+- **Health's "Chapters that would not download"** no longer says a chapter a site refused was left alone after three
+  tries while **Finish downloads on their own** is still trying it. Its note says how many tries a refused chapter gets.
+- **Health's Chapter gaps note** read "…greyed with what it found.; Numbers none of…" since v0.78.0. Its sentences are
+  joined as sentences now.
+
+### Upgrading
+
+- **API:** `POST /auth/login` answers **429** with `Retry-After` after five failed passwords for one name from one
+  address in 15 minutes. A wrong password for a disabled or locked account is now **401** `invalid_credentials`; the
+  right one is still **403** `disabled` or **423** `locked`. See [docs/api.md](docs/api.md).
+- **Database:** no change.
+
+## v0.78.0 — 2026-10-17
+
+**Downloads that finish on their own, and gaps that are really gaps.** A series you add from Discover, or one whose
+sources have chapters you don't, keeps downloading through rate limits and blocks until it is done. And Health no
+longer calls hundreds of chapters missing when a site only numbered them differently.
+
+### Downloads that finish on their own
+
+- **Finish downloads on their own**, in **Admin → Settings → Updates & schedules**. **It is on unless you turn it off.**
+  A series that still has chapters to download is gone back to every 15 minutes, and again as soon as a site that was
+  refusing is ready, instead of waiting for the next library update: up to ten chapters a series each time. Before, a
+  series a site rate-limited half-way through an add got five chapters every six hours, and none while the site was
+  cooling down.
+- **A chapter a site refused is tried 12 times, not 3.** A rate limit or a block is a site saying "not now", so it no
+  longer uses up the three tries a broken chapter gets. The cooldowns space the tries out, and once a site has refused a
+  chapter twice the update also looks for it on other sources (with **Look for failed chapters on other sources** on, as
+  it is unless you turned it off).
+- **An add whose first chapter the site refused is kept.** The series is saved, its download card says the chapters will
+  come on their own, and they do. It used to be not added at all, with nothing left to carry on from.
+- **The library update no longer skips a turn** when another update is running at that moment. It tries again ten
+  minutes later, where it used to wait a whole interval.
+
+### Fixed
+
+- **Chapter gaps counts only chapters a site lists.** A series that took chapters from two sites numbering them
+  differently showed a long run of chapters missing that were the same chapters under the other site's numbers: one
+  series read 306 missing. Health now says those numbers apart on the row, greyed when they are all it has, as *numbers
+  none of its sources list*, and the reader's missing-chapters notice leaves them out. **Fill now** still asks other
+  sources for them, so a chapter some site really has is still found.
+
+### Upgrading
+
+- **Database:** one new column, `server_settings.finish_downloads`, on by default. Additive: v0.77.x ignores it.
+- **Settings:** four optional knobs, `FINISH_DOWNLOADS_MINUTES`, `FINISH_DOWNLOADS_PER_SERIES`,
+  `FINISH_DOWNLOADS_SWEEP_MAX` and `FINISH_DOWNLOADS_REFUSAL_CAP`. The defaults need nothing set. See
+  [docs/CONFIGURATION.md](docs/CONFIGURATION.md) → *Downloading*.
+- To keep downloads as they were, turn **Finish downloads on their own** off.
+
 ## v0.77.1 — 2026-10-16
 
 **Sign-in and backup hardening, and recovery codes that work.** Update soon, especially if people outside your
@@ -4437,7 +4928,8 @@ removes the partial mark when the chapter is whole.
 
 ### A bounded source hunt
 
-**Admin → Settings → Updates & schedules → Look for failed chapters on other sources** is on by default.
+**Admin → Settings → Updates & schedules → Finish downloads on their own** (since v0.81.0; its own switch before, named
+*Look for failed chapters on other sources* and then *Use other sources on their own*) is on by default.
 After an ordinary failure, the scheduled sweep may search up to six eligible sources and follow one that
 matches the title and at least 90% of the known chapter numbering. A series is hunted at most once per day,
 only five hunts start in one sweep, and at most two extra sources are followed. Adult sources are eligible

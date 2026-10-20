@@ -52,20 +52,22 @@ import { findRunning, findRunSettled, findState, startFind, stopFind, FIND_BUSY_
 import { persistScan, DL_ROOT } from './library';
 import { updateSeries, runsInside } from './updater';
 import { renumberRunning, folderBusy } from './numbering';
-import { getSource, reloadAll, isSwAdapterId, SW_PREFIX } from './sources';
+import { getSource, isSwAdapterId, SW_PREFIX } from './sources';
 import { mangadexLangOf } from './sources/mangadexLangs';
 import { solverPing, solverUrl } from './sources/flaresolverr';
 import { suwayomiConfigured } from './sources/suwayomi/client';
-import { extensionFacts, listExtensions, setExtensionState, sourcesOfExtension, type ExtensionInfo } from './sources/suwayomi/extensions';
-import { downloadsPerDay, rankPackages } from './extensionRank';
+import { extensionFacts, listExtensions, type ExtensionInfo } from './sources/suwayomi/extensions';
+import { downloadsPerDay, groupsOf, pkgFits, rankPackages } from './extensionRank';
 import { seriesIsAdult } from './sourceHunt';
-import { adoptExtensionSources, getHiddenLangs, setSourcesEnabled } from './sources/suwayomi/langs';
+import { getHiddenLangs } from './sources/suwayomi/langs';
+import { BUSY } from './sources/suwayomi/installLock';
+import { backupRows, installTrial, packageUse, settleTrial } from './backupExtensions';
 import { lastSuwayomiLoad, leftOutByLimit, retrySuwayomiNow, wouldFit } from './sources/suwayomi/register';
 import { ourSolverUrl } from './sources/suwayomi/engineSolver';
 import { connectEngineSolver, engineProbe } from './extensionEngine';
 import { extensionEngineCheck } from './engineHealth';
 import { testSource } from './sourceCheck';
-import { clearBlock, pruneOrphanedHealth } from './sourceHealth';
+import { clearBlock } from './sourceHealth';
 import { retireSource } from './retireSource';
 import { switchMainSource } from './mainSource';
 import { carries, standingOf, standingRows, standingsOf, EXTENSION_OFF, EXTENSION_OFF_BY, type StandingRow } from './sourceStanding';
@@ -83,12 +85,13 @@ import { linkPair } from './editions';
 import { haveNumbers } from './libraryNumbers';
 import { atHiddenNumber } from './noticeChapters';
 import { effectiveLang, seriesLanguage } from './seriesLang';
-import { canonLang, sameLanguage } from './lang';
+import { sameLanguage } from './lang';
 import { titleMatch } from './autoFollow';
 import { altTitlesFor } from './altTitles';
 import { normGroup } from './releases';
 import type { RunOrigin } from './repairRuns';
 import { clearRunDigest, pruneRuns } from './repairRuns';
+import { wantQuiet } from './finishDownloads';
 
 // ── the shapes on the wire (SP/v491/V0550-API.md §1) ──────────────────────────────────────────────────────────────
 
@@ -291,7 +294,8 @@ function busyWith(): AutofixBusy | null {
   if (active || runtime.autofixing) return 'autofix';
   if (repairState.running || runtime.repairing) return 'repair';
   if (findRunning()) return 'find';
-  if (runtime.updating) return 'sweep';
+  // v0.79.0: the finishing sweep (lib/finishDownloads.ts) is asked to give way, so a second press a moment on starts.
+  if (runtime.updating) { wantQuiet(); return 'sweep'; }
   return null;
 }
 
@@ -351,6 +355,7 @@ export function setAutofixTiming(t: { quietMs?: number; clock?: () => number } =
 async function waitSweep(a: Run): Promise<boolean> {
   while (runtime.updating) {
     if (halted(a)) return false;
+    wantQuiet();
     now(a, say('autofix.now.waitSweep'));
     await nap(quietMs);
   }
@@ -1071,13 +1076,6 @@ async function extensionTargets(a: Run): Promise<Target[]> {
   return out;
 }
 
-/** The series' own translation groups, normalised (releases.ts normGroup): on disk, and listed by its sources. */
-async function groupsOf(seriesId: string): Promise<Set<string>> {
-  const rows = await q<{ g: string }>(
-    `SELECT DISTINCT scanlator AS g FROM lib_books WHERE series_id = $1 AND scanlator IS NOT NULL
-     UNION SELECT DISTINCT unnest(groups) AS g FROM series_listing WHERE series_id = $1`, [seriesId]).catch(() => []);
-  return new Set(rows.map((r) => normGroup(r.g)).filter((k) => k.length >= 3));
-}
 
 /**
  * Whether a package was searched for a target within TRIED_DAYS and did not carry it: it is not tried for that series
@@ -1097,15 +1095,17 @@ async function recentlyTried(): Promise<(pkg: string, t: Target) => boolean> {
       else langs.add(`${t.pkg}\u0000${t.lang}`);
     }
   }
+  // v0.83.0: and what the scout tried from the repository in vain (lib/backupExtensions.ts recordMiss). Reintroduce by
+  // reading only the runs: "a package the scout tried from the repository in vain is not tried by Fix everything" in
+  // autofixExtensions.int.test.ts finds it installed again.
+  for (const r of await q<{ pkg_name: string; series_id: string | null; lang: string | null }>(
+    `SELECT pkg_name, series_id, lang FROM backup_misses WHERE at > now() - ($1 || ' days')::interval`, [String(TRIED_DAYS)]).catch(() => [])) {
+    if (r.series_id) pairs.add(`${r.pkg_name}\u0000${r.series_id}`);
+    else langs.add(`${r.pkg_name}\u0000${r.lang}`);
+  }
   return (pkg, t) => pairs.has(`${pkg}\u0000${t.id}`) || langs.has(`${pkg}\u0000${t.lang}`);
 }
 
-/** A catalogue package's language fits a series': the same language, or a package that serves several. */
-const pkgFits = (e: ExtensionInfo, lang: string): boolean => {
-  if (!e.lang || e.lang === 'all' || e.lang === 'multi') return true;
-  const c = canonLang(e.lang);
-  return !!c && sameLanguage(c, lang);
-};
 
 /**
  * For each language with targets: the catalogue's packages that are not installed, not obsolete, and in that language
@@ -1138,7 +1138,11 @@ async function extensions(a: Run): Promise<void> {
   let catalogue: ExtensionInfo[];
   try { catalogue = await listExtensions(); } catch { return; }
   const tried = await recentlyTried();
-  const open = catalogue.filter((e) => !e.installed && !e.obsolete);
+  // Never a package a person removed (v0.82.0, lib/backupExtensions.ts `refused`): the extension check never put one
+  // back, and neither does this. Reintroduce by dropping it: "an extension a person removed is never tried" in
+  // autofixExtensions.int.test.ts finds it installed.
+  const refused = new Set([...(await backupRows())].filter(([, r]) => r.state === 'refused').map(([k]) => k));
+  const open = catalogue.filter((e) => !e.installed && !e.obsolete && !refused.has(e.pkgName));
   const facts = await extensionFacts();
   const perDay = await downloadsPerDay(open.map((e) => {
     const f = facts.get(e.pkgName);
@@ -1202,29 +1206,22 @@ async function tryPackage(a: Run, e: ExtensionInfo, lang: string, targets: Targe
   }
   a.installs++;
   now(a, say('autofix.now.installing', { name: e.name }));
-  try {
-    await setExtensionState(e.pkgName, 'install');
-  } catch {
+  // Installed as a backup's trial (v0.82.0, lib/backupExtensions.ts installTrial), one install at a time with every
+  // other (the install lock): recorded with every source switched off, then ONLY the source in the targets' language
+  // switched on. Reintroduce by adopting them as the install route does: "only the series' language is switched on" in
+  // autofix.int.test.ts finds the package's other language on.
+  const got = await installTrial(e.pkgName, { name: e.name, lang, via: 'autofix', who: 'Fix everything', waitMs: 5 * 60_000, userId: a.by, runId: a.id });
+  if (got === BUSY || !got) {
     note(a, say('autofix.item.installFailed', { name: e.name }));
     return carried;
   }
-  await logAudit('extension.install', { userId: a.by, detail: { pkgName: e.pkgName, via: 'autofix', runId: a.id } });
-  const provided = await sourcesOfExtension(e.pkgName).catch(() => []);
-  // Recorded, every one switched off; then ONLY the source in the targets' language switched on, with the bulk switch.
-  // Reintroduce by adopting them as the install route does: "only the series' language is switched on" in
-  // autofix.int.test.ts finds the package's other language on.
-  await adoptExtensionSources(provided, false);
-  const pick = provided.find((s) => !!s.lang && !!canonLang(s.lang) && sameLanguage(canonLang(s.lang)!, lang))
-    ?? provided.find((s) => !s.lang || s.lang === 'all');
-  const entry: Installed = { pkg: e.pkgName, name: e.name, lang, sourceId: pick ? `${SW_PREFIX}${pick.id}` : '', ids: provided.map((x) => x.id) };
+  const entry: Installed = { pkg: e.pkgName, name: e.name, lang, sourceId: got.sourceId, ids: got.ids };
   a.installed.push(entry);
   /** The targets the package was asked about and does not carry: what settle records. */
   const missed = new Set<string>();
   try {
     // No source in this language: it carries none of them, now or on the next run.
-    if (!pick) { for (const t of targets) missed.add(t.id); return carried; }
-    await setSourcesEnabled({ ids: [pick.id], enabled: true });
-    await reloadAll();
+    if (!entry.sourceId) { for (const t of targets) missed.add(t.id); return carried; }
     if (!getSource(entry.sourceId)) {
       if (!a.noRoom.includes(e.name)) a.noRoom.push(e.name);
       note(a, say('autofix.item.noRoom', { name: e.name }));
@@ -1320,21 +1317,10 @@ async function quietSeries(a: Run, seriesId: string): Promise<boolean> {
   return true;
 }
 
-/** How many visible series read through any source of this package: as main, or as a follower. */
-async function packageUse(pkg: string): Promise<number> {
-  const row = await one<{ n: number }>(
-    `SELECT count(DISTINCT s.id)::int AS n FROM lib_series s
-      WHERE ${visibleToAll('s')}
-        AND (s.source_id IN (SELECT '${SW_PREFIX}' || source_id FROM suwayomi_sources WHERE pkg_name = $1)
-          OR EXISTS (SELECT 1 FROM series_sources f WHERE f.series_id = s.id
-                      AND f.source_id IN (SELECT '${SW_PREFIX}' || source_id FROM suwayomi_sources WHERE pkg_name = $1)))`,
-    [pkg]).catch(() => null);
-  return row?.n ?? 0;
-}
-
 /**
- * Keep a package this run installed when a series reads through it, else remove it -- the uninstall route's way: the
- * engine's uninstall, then the package's rows and their orphaned health rows, then a reload. Never anything this run did
+ * Keep a package this run installed when a series reads through it -- as a backup extension (v0.82.0,
+ * lib/backupExtensions.ts settleTrial): out of Discover, and removed once nothing has needed it for a few days, never
+ * while a series uses it as its main source -- else remove it, the uninstall route's way. Never anything this run did
  * not install, and each package once. `missed`: the targets it was asked about and does not carry, recorded with the
  * run (Stored.tried) so no run tries it for them again within TRIED_DAYS.
  */
@@ -1342,26 +1328,18 @@ async function settle(a: Run, inst: Installed, missed: string[] = []): Promise<v
   if (inst.settled) return;
   inst.settled = true;
   if (missed.length) a.tried.push({ pkg: inst.pkg, lang: inst.lang, series: missed });
-  // adoptExtensionSources records no package; the registration's own remember() does, from the engine's answer. Written
-  // here too, so whether a package is used never depends on the engine having said.
-  await q(`UPDATE suwayomi_sources SET pkg_name = $2 WHERE source_id = ANY($1::text[]) AND pkg_name IS NULL`,
-    [inst.ids, inst.pkg]).catch(() => {});
   const n = inst.sourceId ? await packageUse(inst.pkg) : 0;
   if (n > 0) {
+    await settleTrial(inst.pkg, { via: 'autofix', who: 'Fix everything', userId: a.by, runId: a.id, ids: inst.ids });
     a.keptPkgs.push({ name: inst.name, series: n });
     did(a, 'installed', 1, say('autofix.item.installed', { name: inst.name, n }));
     return;
   }
   now(a, say('autofix.now.removing', { name: inst.name }));
-  const provided = await sourcesOfExtension(inst.pkg).catch(() => []);
-  try { await setExtensionState(inst.pkg, 'uninstall'); } catch { /* the engine's own; what is recorded goes regardless */ }
-  const ids = [...new Set([...provided.map((s) => s.id), ...inst.ids])];
-  await q('DELETE FROM suwayomi_sources WHERE source_id = ANY($1)', [ids]).catch(() => {});
-  await pruneOrphanedHealth(ids.map((x) => `${SW_PREFIX}${x}`)).catch(() => 0);
-  await logAudit('extension.uninstall', { userId: a.by, detail: { pkgName: inst.pkg, via: 'autofix', runId: a.id } });
+  const r = await settleTrial(inst.pkg, { via: 'autofix', who: 'Fix everything', userId: a.by, runId: a.id, ids: inst.ids });
+  if (r !== 'removed') return;
   a.removedPkgs.push(inst.name);
   did(a, 'uninstalled', 1, say('autofix.item.uninstalled', { name: inst.name }));
-  await reloadAll().catch(() => null);
 }
 
 // ── 9. files ────────────────────────────────────────────────────────────────────────────────────────────────────
@@ -1588,7 +1566,8 @@ function summarise(a: Run, report: HealthReport): AutofixSummary {
   const oddN = odd.reduce((k, i) => k + (i.bookIds?.length ?? 1), 0);
   needAfter(['files'], 'outliers', odd.length ? oddN : 0, say('autofix.needs.outliers', { n: oddN }));
   const twice = findings(by.get('saved-twice'));
-  const twiceN = twice.reduce((k, i) => k + (i.bookIds?.length ?? 1), 0);
+  // A Keep one of each row counts every chapter its series holds twice (`pairs`): its bookIds are capped.
+  const twiceN = twice.reduce((k, i) => k + (i.pairs ?? i.bookIds?.length ?? 1), 0);
   needAfter(['files'], 'saved-twice', twice.length ? twiceN : 0, say('autofix.needs.twice', { n: twiceN }));
 
   // Short chapters: tried again tomorrow when a source was silent or still cooling; partial ones are the sweep's; the

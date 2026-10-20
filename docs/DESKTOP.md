@@ -220,11 +220,11 @@ languages as the app).
   late; only the backup re-aims.
 - **The slow archive runs only while Uchiyomi does** — the window or the tray (since v0.49.0; [the user
   guide](USAGE.md#fetching-a-whole-series-slowly-the-slow-archive)). It never keeps the computer awake, so a PC that
-  sleeps at night is rarely inside a night-time window set under **Admin → Settings → Downloads**; a quit or a sleep
+  sleeps at night is rarely inside a night-time window set under **Admin → Settings → Downloads → Slow archive**; a quit or a sleep
   costs it nothing but time, since it carries on from where it was.
 - **Room.** Downloads stop when the library's drive has less than **5 GB** free (a server keeps 10), and the
   image cache is capped at **4 GB** (16 on a server). The slow archive keeps its own floor, 20 GB by default,
-  under **Admin → Settings → Downloads**.
+  under **Admin → Settings → Downloads → Slow archive**.
 - **Windows-safe folder names** (Windows only): a series folder loses control characters and trailing dots and
   spaces, and the names Windows reserves — `CON`, `PRN`, `AUX`, `NUL`, `COM0`–`COM9`, `LPT0`–`LPT9`, also with
   an extension — get a `_` (`CON` becomes `CON_`). A custom site's name is treated the same when it becomes the
@@ -416,7 +416,7 @@ card says why.
 The app backs itself up every night, exactly as a server does, to the `backups` folder in its data folder:
 one folder per run named by date and time, holding `db.sql.gz` (the whole database as plain SQL) and
 `config.zip` (the settings, custom sites and art; a server writes `config.tar.gz`). The time is the backup hour
-under **Admin → Settings → Updates & schedules**, 03:00 by default. A computer is not always on at 3 am, so:
+under **Admin → Settings → Maintenance → Nightly backup**, 03:00 by default. A computer is not always on at 3 am, so:
 
 - If there has never been a backup, or the last one — or the last attempt — is more than a day old, one runs
   about five minutes after Uchiyomi starts. If the computer is off then, it runs the next time Uchiyomi opens.
@@ -425,10 +425,10 @@ under **Admin → Settings → Updates & schedules**, 03:00 by default. A comput
 - A failed run counts as a run: it is not retried in a loop.
 
 **Nightly backup** and **Backups to keep** sit beside the hour (since v0.61.1): switched off, nothing runs at night and
-nothing catches up, while **Run now** under Tasks still makes one; the oldest runs beyond the number kept (14 by default)
+nothing catches up, while **Run now** among Maintenance's tasks still makes one; the oldest runs beyond the number kept (14 by default)
 are deleted after each backup. The `before-restore-…` safety copies below are never counted or deleted.
 
-**Admin → Tasks** has **Open backups folder** and **Restore a backup…**; the icon's menu has **Restore a
+**Admin → Settings → Maintenance** has **Open backups folder** and **Restore a backup…**; the icon's menu has **Restore a
 backup…** too. Restoring:
 
 1. Pick the `db.sql.gz` inside the backup folder you want, and confirm.
@@ -543,10 +543,11 @@ Its server answers *not found* for each of these, so they are gone, not just out
 | Push notifications, *Install app* | The window has no push service. Notification targets — a webhook, Home Assistant, ntfy, Discord — still work, and are the way to hear about new chapters on a phone. |
 | **Save offline**, *Save all offline*, the Offline tab, the *Offline downloads* settings | They copy chapters into the browser's storage, and on this computer the chapters are already on the disk. What the app fetched from your sources is under **Library → Downloads**, where a link to the Offline tab also leads. |
 | The anonymous install count | Never sent from the desktop app, whatever a restored database says. |
+| Translated pages, for now | The translation engine runs as processes beside a server, and this one runs inside the app. Connected to a server that has it, you read translated pages as usual. |
 
-In the admin that means no Members or Sessions tabs (a link to either opens Overview), no Sessions tile and no
-member count; on the profile, no Account tab; under Settings no Offline downloads or This device sections; under
-Connections no OPDS or API tokens (progress tracking with AniList, MyAnimeList and Kitsu stays).
+In the admin that means no Members or Sessions pages (a link to either opens Overview) and no member count; on the
+profile, no Account or This device page; under Connections no OPDS or API tokens (progress tracking with AniList,
+MyAnimeList and Kitsu stays).
 
 If you want any of these — other people in your household, reading on a phone, OPDS readers — that is what a
 server is for: run the [Docker install](INSTALL.md) on a machine that stays on, and use this app's **Connect to

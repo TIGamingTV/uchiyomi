@@ -142,12 +142,17 @@ test('prefers-reduced-motion does exactly what it did before the switch existed'
   // zero durations -- and gains nothing. Reintroduce by folding the switch into it (hiding the fx layers
   // under the media query): "the reduced-motion block changed" fails. (v0.75.0: the phone hero's drift, a CSS
   // animation since then, stops here as the mesh's does -- the same "no drift", not a Reduce effects rule -- and so do the
-  // badge emblems' sheen and Legend's halo, v0.75.0.)
+  // badge emblems' sheen and Legend's halo, v0.75.0. v0.86.0: a settings row search lands on is lit still instead of
+  // fading -- a fade cut to nothing by the last rule would never show where the row is; the same "no motion". v0.89.0:
+  // the avatar frames the badges unlock -- their sheen, Legend's turning ring and halo, the embers' flicker -- as the
+  // badges' own do.)
   const inPrm = CSS().filter((r) => r.ctx.join('|') === '@media (prefers-reduced-motion: reduce)');
   assert.deepEqual(inPrm.map((r) => `${r.sel} { ${flat(r.body)} }`), [
     '.fx-mesh { animation: none; }',
     '.hero-drift { animation: none; }',
     '.badge-sheen, .badge-halo { animation: none; }',
+    '.frame-sheen, .frame-spin, .frame-halo, .frame-flicker { animation: none; }',
+    '.settings-flash { animation: none; background-color: rgb(var(--accent) / 0.14); }',
     '*, *::before, *::after { animation-duration: 0.001ms !important; transition-duration: 0.001ms !important; }',
   ], 'the reduced-motion block changed');
 });
@@ -294,11 +299,25 @@ test('every consumer honours the switch', () => {
     'covers still sharpen in under Reduce effects (or lost the sharpen-in by default)');
   // The notices (v0.49.0) slide up from the bottom edge; under the switch a card simply appears. Reintroduce
   // `initial={{ opacity: 0, y: 16 }}` on NoticeCard: "components/Toast.tsx still animates in" fails.
-  for (const f of ['components/PageTransition.tsx', 'components/ConsoleNav.tsx', 'components/Toast.tsx']) {
+  for (const f of ['components/PageTransition.tsx', 'components/ConsoleLayout.tsx', 'components/Toast.tsx']) {
     const src = code(read(f));
     assert.match(src, /initial=\{reduced \? false : \{ opacity: 0, y: \d+ \}\}/, `${f} still animates in under Reduce effects`);
     assert.match(src, /transition=\{reduced \? \{ duration: 0 \} : \{ duration: 0\.2\d/, `${f} still animates in under Reduce effects`);
   }
+  // v0.88.0: the consoles' heroes and pictures read both settings, as Toast.tsx does -- and the console sets aside the
+  // page transition's `initial={false}`, which otherwise held every entrance in it still after a direct load (a
+  // refresh, a link, a language change). Reintroduce the plain `useReducedMotion()` in a hero: its name fails here.
+  const both = /const plain = useReduceEffects\(\);\s*const still = useReducedMotion\(\);\s*const reduced = plain \|\| !!still;/;
+  const profilePage = code(read('app/profile/page.tsx'));
+  for (const [name, from, to] of [['ProfileHero', 'function ProfileHero(', 'function CoverFan('], ['ActivityBars', 'function ActivityBars(', 'function YouBoard(']] as const) {
+    assert.match(profilePage.slice(profilePage.indexOf(from), profilePage.indexOf(to)), both, `${name} reads the motion settings conditionally, or only one of them`);
+  }
+  const adminPage = code(read('app/admin/page.tsx'));
+  assert.match(adminPage.slice(adminPage.indexOf('function AdminHero('), adminPage.indexOf('function VersionLine(')), both, 'AdminHero reads the motion settings conditionally, or only one of them');
+  assert.match(code(read('components/ConsoleLayout.tsx')), /<PresenceContext\.Provider value=\{null\}>/, 'the console\'s entrance is held still after a direct load');
+  // The console's tiles, groups and page all come in under the same rule: nothing in it animates unconditionally.
+  // Reintroduce `initial={{ opacity: 0, y: 6 }}` on the page: "the console animates in under Reduce effects" fails.
+  assert.doesNotMatch(code(read('components/ConsoleLayout.tsx')), /initial=\{\{/, 'the console animates in under Reduce effects');
   const page = code(read('components/PageTransition.tsx'));
   assert.match(page, /mode=\{reduced \? 'sync' : 'wait'\}/,
     'PageTransition still waits for a zero-duration exit under Reduce effects');
@@ -353,7 +372,7 @@ test('the Appearance section has the Reduce effects switch, and it saves to the 
   const end = src.indexOf('function ReadingSection(');
   assert.ok(start > 0 && end > start, 'AppearanceSection or ReadingSection moved');
   const slice = src.slice(start, end);
-  assert.match(slice, /<SwitchRow label=\{tr\('Reduce effects'\)\}\s*help=\{tr\('Turns off the animated background, blur, smooth scrolling and transitions\. Try it if scrolling feels slow\.'\)\}\s*on=\{reduceEffects\} onChange=\{saveReduceEffects\} \/>/,
+  assert.match(slice, /<SwitchRow id="reduce-effects" label=\{tr\('Reduce effects'\)\}\s*help=\{tr\('Turns off the animated background, blur, smooth scrolling and transitions\. Try it if scrolling feels slow\.'\)\}\s*on=\{reduceEffects\} onChange=\{saveReduceEffects\} \/>/,
     'the Reduce effects row is not in Appearance');
   assert.match(slice, /const \[reduceEffects, saveReduceEffects\] = useReduceEffects\(\);/, 'the row does not read the account setting');
   // The hook is shared with the profile's quick settings (components/ProfileMenu.tsx), so it is read where it lives.

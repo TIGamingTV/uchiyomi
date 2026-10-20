@@ -4,6 +4,7 @@ import { q, one } from '../lib/db';
 import { cleanLibraryReader } from '../lib/libraryReader';
 import { junkPagesFor, setPageOverride } from '../lib/junkPages';
 import { spreadsFor } from '../lib/spreadMeasure';
+import { marksFor, marksJson, setMark } from '../lib/spreadMarks';
 import { komgaImage } from '../lib/komga';
 import { content as komga, NATIVE_PROGRESS, OWNED } from '../lib/backend';
 import { UnsupportedFilter, owned } from '../lib/ownedCatalog';
@@ -16,7 +17,7 @@ import { dominantHex } from '../lib/color';
 import { runtime } from '../lib/runtime';
 import { scheduleHealthSummaryRefresh } from '../lib/healthSummary';
 import { sourceLabel } from '../lib/health';
-import { authenticate, roleOf, userIdOf } from '../lib/auth';
+import { actsAsAdmin, authenticate, roleOf, userIdOf } from '../lib/auth';
 import { warmHeroBackdrops } from './images';
 import { writeProgress, reachedEnd } from '../lib/progress';
 import { onDeckPicks, type DeckPick } from '../lib/onDeck';
@@ -68,7 +69,7 @@ function overlay(books: any[], map: Map<string, { page: number; completed: boole
 
 /** Apply this user's reading state to a set of Komga books (no-op for admin = native Komga state). */
 async function booksForUser(req: FastifyRequest, books: any[]): Promise<any[]> {
-  if ((NATIVE_PROGRESS && roleOf(req) === 'admin') || !books.length) return books;
+  if ((NATIVE_PROGRESS && actsAsAdmin(req)) || !books.length) return books;
   return overlay(books, await userProgress(userIdOf(req), books.map((b) => b.id)));
 }
 
@@ -285,7 +286,7 @@ export default async function catalogRoutes(app: FastifyInstance) {
     // ⚠️ The owned library has ONE scan, of every root, whatever library id it is handed (lib/ownedCatalog.ts):
     // one call per library started that whole scan once per library, all at the same time. Komga scans each.
     const targets = NATIVE_PROGRESS ? libs : [libs[0] ?? { id: 'lib' }];
-    const admin = roleOf(req) === 'admin';
+    const admin = actsAsAdmin(req);
     // Each library's answer, or why its scan failed: v0.49.0 swallowed a failure into "scanned" without counts.
     const run = Promise.all(targets.map((l: any) => komga.scanLibrary(SYSTEM_CTX, l.id)
       .then((a: any) => ({ a }), (e: unknown) => ({ a: null, failed: (e as Error)?.message || String(e) }))));
@@ -324,7 +325,7 @@ export default async function catalogRoutes(app: FastifyInstance) {
   // and the server's clock, so the web compares the server's times with each other and never with its own.
   app.get('/api/refresh', async (req) => {
     const running = scanRunning();
-    if (roleOf(req) !== 'admin') return { running };
+    if (!actsAsAdmin(req)) return { running };
     const p = scanProgress();
     const last = lastScanReport();
     const failed = lastScanFailure();
@@ -338,7 +339,7 @@ export default async function catalogRoutes(app: FastifyInstance) {
 
   app.get('/api/home', async (req) => {
     const uid = userIdOf(req);
-    const admin = NATIVE_PROGRESS && roleOf(req) === 'admin';
+    const admin = NATIVE_PROGRESS && actsAsAdmin(req);
     // The part-way-through pick is a read_progress row, which survives a prune by design, so the resolved book is checked
     // as well: Continue Reading must never hand someone a chapter with no pages.
     const resolvePicks = async (picks: DeckPick[]): Promise<any[]> => {
@@ -501,7 +502,7 @@ export default async function catalogRoutes(app: FastifyInstance) {
          FROM lib_series s LEFT JOIN libraries l ON l.id = s.library_id WHERE s.id = $1`, [id]);
     out.libraryReader = cleanLibraryReader(lr?.p);
     // Admins only: which library it is in, for the reader's "use these settings for the library" key.
-    if (roleOf(req) === 'admin' && lr?.lid) out.library = { id: lr.lid, name: lr.lname };
+    if (actsAsAdmin(req) && lr?.lid) out.library = { id: lr.lid, name: lr.lname };
     // v0.61.0: what kind of comic it is -- the admin's override, else what the evidence learned, else unknown -- for EVERY
     // viewer: the reader's "Pick the mode for each series" opens a manhwa as a webtoon and a manga page by page. The
     // evidence behind it (`detectedType`) stays an admin's, below. Additive: the admin block sets the same value.
@@ -516,7 +517,7 @@ export default async function catalogRoutes(app: FastifyInstance) {
     // null (rather than absent) says "none of its own, the global ones apply".
     // So does its own source order (lib/sourcePrefs.ts), for the Sources sheet's preferred-source chips: null
     // means the server-wide order applies.
-    if (roleOf(req) === 'admin') {
+    if (actsAsAdmin(req)) {
       const f = await one<{ folder: string; source_prefs: { priority?: unknown } | null; borrow_names: boolean | null; server_borrow: boolean | null;
                             reading_direction: string | null; reading_direction_from: string | null; lang: string | null; source_id: string | null; roots: string[] | null;
                             series_type: string | null; series_type_from: string | null; type_override: string | null; hide_notices: boolean | null;
@@ -727,7 +728,7 @@ export default async function catalogRoutes(app: FastifyInstance) {
     const res = await komga.seriesBooks(vc(req), id, Number(page), Number(size), sort || undefined);
     const content = await booksForUser(req, res.content);
     // An admin's chapter menu copies the file's full path (#136). Nobody else is told where anything is on the host.
-    if (roleOf(req) !== 'admin' || !OWNED) return { ...res, content };
+    if (!actsAsAdmin(req) || !OWNED) return { ...res, content };
     const paths = await bookPaths(content.map((b: any) => b.id));
     return { ...res, content: content.map((b: any) => (paths.has(b.id) ? { ...b, path: paths.get(b.id) } : b)) };
   });
@@ -758,7 +759,7 @@ export default async function catalogRoutes(app: FastifyInstance) {
     // page draws a deliberately deleted chapter as a ghost row from it. Here rather than in the series' admin block,
     // which only an admin is sent.
     const [listing, numbering, archive, deletedAsGhosts] = await Promise.all([
-      listingFor(id, { floor, archiveBoundary, admin: roleOf(req) === 'admin', userId: userIdOf(req) }),
+      listingFor(id, { floor, archiveBoundary, admin: actsAsAdmin(req), userId: userIdOf(req) }),
       numberingSummary(id),
       archiveSummaryFor(id, userIdOf(req)).catch(() => null),
       deletedAsGhostsOn(),
@@ -1014,8 +1015,11 @@ export default async function catalogRoutes(app: FastifyInstance) {
     // download manifest -- which both read this route -- get it without either knowing the feature exists.
     // A chapter whose pages have not been hashed yet simply comes back with nothing flagged.
     const junk = await junkPagesFor(id).catch(() => new Set<number>());
-    const listed = junk.size && Array.isArray(pages)
-      ? pages.map((p: any) => (junk.has(p.number) ? { ...p, junk: true } : p))
+    // v0.89.0 (#262): the caller's own marks ride along the same way, `mark` on the first page of a pair (lib/spreadMarks.ts):
+    // this account's word on where its spreads are, which the reader applies over the detector's joins below.
+    const marks = Array.isArray(pages) ? await marksFor(userIdOf(req), id, pages.length).catch(() => new Map()) : new Map();
+    const listed = (junk.size || marks.size) && Array.isArray(pages)
+      ? pages.map((p: any) => ({ ...p, ...(junk.has(p.number) ? { junk: true } : {}), ...(marks.has(p.number) ? { mark: marks.get(p.number) } : {}) }))
       : pages;
     // #229, opt-in: a reader who turned Join split double pages on asks with ?spreads=1, and the pages a source cut from
     // one spread come back with `join` (which side the next page is on). Only READ here: a chapter not measured yet is
@@ -1047,6 +1051,31 @@ export default async function catalogRoutes(app: FastifyInstance) {
     const v = body.junk === null || body.junk === undefined ? null : !!body.junk;
     await setPageOverride(id, page, v);
     return { ok: true };
+  });
+
+  // v0.89.0 (#262): this account's word on the pair (n, n + 1) -- `join` shows it as one spread, `split` takes the
+  // detector's join apart, null lets the detector's answer stand (lib/spreadMarks.ts). Unlike the flag above it changes
+  // nothing for anyone else, and it is still resolved through the page list's visibility gate, which also bounds `n`: it
+  // must start a pair. Answers the chapter's marks as they now are. Reintroduce by writing from :id unchecked: "a chapter
+  // the account may not open" in spreadMarks.int.test.ts saves a mark on it.
+  // `pages`, when sent, is the page count the reader is looking at: a downloaded copy can be an older file of the chapter,
+  // whose page numbers are not this file's, so a mark made on it is refused (409) rather than put on other pages.
+  app.put('/api/books/:id/pages/:n/spread', async (req, reply) => {
+    const { id, n } = req.params as { id: string; n: string };
+    const page = Number(n);
+    const body = z.object({ mark: z.enum(['join', 'split']).nullable(), pages: z.number().int().min(1).optional() }).safeParse(req.body ?? {});
+    if (!body.success) return reply.code(400).send({ error: 'bad_mark' });
+    const pages = await komga.bookPages(vc(req), id);
+    if (!Array.isArray(pages) || !pages.length) return reply.code(404).send({ error: 'not_found' });
+    if (!Number.isInteger(page) || page < 1 || page >= pages.length) return reply.code(400).send({ error: 'bad_page' });
+    if (body.data.pages !== undefined && body.data.pages !== pages.length) return reply.code(409).send({ error: 'pages_changed' });
+    try {
+      return { marks: marksJson(await setMark(userIdOf(req), id, page, body.data.mark, pages.length)) };
+    } catch (e) {
+      // A chapter with no library row of its own (a Komga-backed server): nothing to keep a mark against.
+      if ((e as { code?: string })?.code === '23503') return reply.code(404).send({ error: 'not_found' });
+      throw e;
+    }
   });
 
   // Smart-offline plan: the next N unread chapters of each favorite the user should keep offline.
@@ -1120,7 +1149,7 @@ export default async function catalogRoutes(app: FastifyInstance) {
 
     await writeProgress({ userId: uid, bookId: id, seriesId: sid, page, completed: done, silent, deviceId, at, incognito });
 
-    if (NATIVE_PROGRESS && roleOf(req) === 'admin') komga.setReadProgress(vc(req), id, page, done).catch(() => {});
+    if (NATIVE_PROGRESS && actsAsAdmin(req)) komga.setReadProgress(vc(req), id, page, done).catch(() => {});
     return reply.send({ ok: true });
   });
 }

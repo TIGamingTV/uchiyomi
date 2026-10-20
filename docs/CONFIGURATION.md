@@ -24,6 +24,11 @@ The ones worth knowing:
   peer, which lets anyone who can reach the port directly choose their own address. Behind Cloudflare's proxy (the
   orange cloud) the visitor reaches you through Cloudflare's own addresses: have your reverse proxy restore the real
   address from `CF-Connecting-IP`, or add Cloudflare's published ranges the same way, or the log shows Cloudflare's.
+  The default trusts every device and container on those networks too. If someone you do not trust can reach the
+  app's port directly, around your proxy (another device on the LAN, another container on its Docker network), set
+  `TRUST_PROXY` to your proxy's own address, so only it can say who a visitor is (`TRUST_PROXY=172.18.0.5`), or to
+  `false` when there is no proxy at all. Since v0.78.1 sign-in counts wrong passwords per address and name, so the
+  address the app sees is worth getting right.
 - **Database** — `DATABASE_URL`, on the app container. **Unset** (the shipped one-container file leaves it
   unset on purpose): the container runs its own Postgres 16 in `/data/pg` (the `uchiyomi_data` volume), on a
   unix socket only — no network listener, no password — and the nightly task dumps it into `/backups` like
@@ -34,6 +39,8 @@ The ones worth knowing:
   database*), and moving between the two is a dump and a restore, written down in both directions in
   [MIGRATING.md](MIGRATING.md). How to open a `psql` shell on either, and how to restore, is in
   [USAGE §12](USAGE.md#12-backups--restore).
+- `TRANSLATE_DIR`: where the optional translation engine goes when an admin downloads it (default
+  `<CONFIG_DIR>/translate`). See [Translated pages](#translated-pages).
 
 
 ## What leaves your server
@@ -86,6 +93,11 @@ to anything.
 Set `UCHIYOMI_PING_URL` to point the count somewhere else — at your own collector if you run a fork — or to
 an empty string to make sure it can never send anything regardless of the setting.
 
+**Translate pages** — *off, and nothing downloaded, until an admin presses Download* (Admin → Settings → Server).
+Download fetches the translation engine once: the pack from this project's GitHub releases (`translate-v1`) and the
+model from Hugging Face, each file checked against a SHA-256 pinned in the app. Translating runs on your server: pages,
+their text and the names it learns never leave it. See [Translated pages](#translated-pages).
+
 ### Progress trackers
 
 The tracker calls are the only ones this server makes **with your token**: AniList, MyAnimeList, Kitsu and MangaUpdates,
@@ -119,7 +131,7 @@ a request AniList asks to wait waits. Of the knobs below, only `ANILIST_API_URL`
 moves them (AniList's, since v0.55.7); the other two point only the token-bearing tracker calls elsewhere.
 
 Since v0.55.8 ([discussion #168](https://github.com/AngeloSha/uchiyomi/discussions/168)), each library — the default
-one included — has **Look up art and metadata on AniList automatically** under Admin → Content → Libraries. Switch it
+one included — has **Look up art and metadata on AniList automatically** under Admin → Libraries. Switch it
 off to prevent automatic art lookup, title/id matching, reading-direction/type repair, startup match checks and
 scheduled enrichment for series currently in that library. Uchiyomi creates no negative lookup cache entry while it
 is off, clears none of the art, links, type or direction it already learned, and applies the destination library's
@@ -324,7 +336,23 @@ ever hit.
 - `UPDATER_SWEEP_MAX` (default `150`): most chapter-fetch attempts in one scheduled sweep, so a backlog
   cannot occupy the whole night.
 - `CHAPTER_RETRY_CAP` (default `3`): ordinary failures before a chapter is left as failed until a person
-  explicitly retries it.
+  explicitly retries it. A chapter a site refused (a 429 or a 403) gets `FINISH_DOWNLOADS_REFUSAL_CAP` tries instead
+  while **Finish downloads on their own** is on.
+
+**Finish downloads on their own** (Admin → Settings → Downloads, on by default) needs nothing set. Advanced,
+rarely needed:
+
+- `FINISH_DOWNLOADS_MINUTES` (default `15`, at least `5`): how often the series with chapters left are gone back to,
+  or right after a site's cooldown ends if that comes first.
+- `FINISH_DOWNLOADS_PER_SERIES` (default `10`) and `FINISH_DOWNLOADS_SWEEP_MAX` (default `60`): chapters one of those
+  runs fetches for a series, and in all.
+- `FINISH_DOWNLOADS_LANES` (default `3`, 1 to 6): series one of those runs works on at once, each on a different site.
+- `FINISH_DOWNLOADS_REFUSAL_CAP` (default `12`): tries a chapter a site refused gets.
+- `SCOUT_SEARCHES_PER_HOUR` (default `40`; `0` stops it looking for new sources on its own, and keeps the rest):
+  searches it may make in an hour when it looks for a series on your other installed sources.
+- `BACKUP_EXTENSIONS_MAX` (default `5`, the desktop app `3`; `0`: never): backup extensions -- the ones Uchiyomi
+  installed by itself -- installed at once. One a series uses as its main source does not count. When it is full, the
+  one needed longest ago is removed to make room, and one in use never is.
 
 - `DOWNLOAD_CONCURRENCY` (default `2`): chapters downloaded at once, per source -- per rate key: the MangaDex languages
   share one, and since v0.55.3 so do sources whose pages come from one image server (Natomanga and Mangakakalot). One
@@ -431,25 +459,26 @@ ever hit.
   `AUTOFIX_MAX_MINUTES` is spent, and the next run continues down the list. `0` switches its extensions phase off. A
   package that carries none of the series it was searched for is removed again at once, and is not tried for those
   series again for a month.
-- `MAX_FOLLOWED_SOURCES` (default `2`, 1 to 6): how many sources besides the main one a series may follow, by hand or
-  automatically. A failed chapter may be asked from that many of them, up to four. Each one is another chapter list
-  read on every sweep, for every series.
+- `MAX_FOLLOWED_SOURCES` (default `3`, 1 to 10): how many sources besides the main one a series may follow, by hand or
+  automatically, until an admin picks a number. Since v0.89.0 that is a menu in the app, **Admin → Settings → Downloads
+  → More options → Other sources per series** (1 to 10), and this is only its starting value. Each one is another
+  chapter list read on every update. A source that is broken, switched off or no longer installed does not count
+  toward it for the sources Uchiyomi adds on its own.
 - `MIN_FREE_GB` (default `10`): refuse to start a download when the download disk has less than this free.
   `0` disables the floor. Fails open if free space cannot be measured.
 
-An ordinary chapter failure may continue from up to `MAX_FOLLOWED_SOURCES` (default two, at most four) of the sources
-already followed for that series. A copy explicitly picked by a person never switches. A 403/429 never becomes a partial chapter or starts a hunt;
-the refusing source cools down, while an already-followed copy can keep the queue moving. The sweep can also
-find a new matching source when **Admin → Settings → Updates & schedules → Look for failed chapters on other
-sources** is on (the default): once per series per day, at most six candidates and five hunts per
-sweep, with no more than two extra follows. Title and 90%-chapter matching apply, and a clean series never
-causes an adult source to be followed. There is intentionally no environment variable for this switch.
+An ordinary chapter failure may continue from as many of the sources already followed for that series as a series may
+follow (**Other sources per series**, three by default), at most four. A copy explicitly picked by a person never switches. A 403/429 never becomes a
+partial chapter; the refusing source cools down, while an already-followed copy can keep the queue moving. With
+**Admin → Settings → Downloads → Finish downloads on their own** on (the default), Uchiyomi also finds and
+follows a new source for a series its sources cannot serve. Title and 90%-chapter matching apply, and a clean series
+never causes an adult source to be followed.
 
 ## The slow archive
 
 Since v0.49.0 a series can be queued to come in a chapter at a time over nights or days
 ([USAGE §4](USAGE.md#fetching-a-whole-series-slowly-the-slow-archive)). Its pace is set in the admin panel, not
-here — **Admin → Settings → Downloads**, and every change reaches the running archive at once, with no restart:
+here — **Admin → Settings → Downloads → Slow archive**, and every change reaches the running archive at once, with no restart:
 
 - *Slow archive* — on unless you pause it; off pauses every archive, and nothing queued is lost.
 - *Chapters an hour, per source* — default `4`, 1–30. A break after each chapter is drawn at random around what is
@@ -479,8 +508,8 @@ break and the scheduler's one-minute look, so a test can watch a chapter land. L
 
 ## The nightly repair
 
-On by default, under **Admin → Settings → Library housekeeping → Repair the library nightly**, and listed as
-**Admin → Tasks → Repair library**. Once every `REPAIR_HOURS` it does the six things that are reversible or
+On by default, under **Admin → Settings → Maintenance → Repair the library nightly**, and listed as
+**Admin → Settings → Maintenance → Repair library**. Once every `REPAIR_HOURS` it does the six things that are reversible or
 provable on their own, and two more only when you switch them on, in this order:
 
 1. **Cloudflare state.** If the solver answers *and* sources are blaming it, the remembered sessions and
@@ -514,13 +543,13 @@ provable on their own, and two more only when you switch them on, in this order:
    it keeps its place and is looked at on the next run rather than skipped for a day. Since v0.49.0 a series whose
    every gap its slow archive is going to fetch is left to the archive, and is not marked as checked, so it comes
    back once the archive is done; *Fill now* on Health still fetches those chapters at once.
-6. **Group upgrades** (since v0.47.0), **off** until **Admin → Settings → Scanlators → Upgrade chapters to a
+6. **Group upgrades** (since v0.47.0), **off** until **Admin → Settings → Downloads → Scanlation groups → Upgrade chapters to a
    preferred group** is switched on. `REPAIR_GROUPS_MAX` chapters Uchiyomi downloaded itself whose group
    ranks below one your release preferences name, when that group's copy is on a source the series follows:
    the listing is refreshed first, the preferred copy's page list is counted before anything is downloaded,
    and a copy with fewer pages than the file on disk, or one that arrives incomplete, never replaces it. A
    chapter someone picked a version for by hand is never touched, and one whose swap failed waits a week.
-7. **Chapter names from another source** (since v0.47.0), **off** until **Admin → Settings → Scanlators →
+7. **Chapter names from another source** (since v0.47.0), **off** until **Admin → Settings → Series & chapters →
    Borrow chapter names from other sources** is switched on, or a series ticks the box on its own sheet.
    `REPAIR_NAMES_MAX` series that hold a chapter with no name: a donor is searched for across at most
    `HUNT_MAX_SOURCES` sources in the series' own language, and used only if it passes the same identity and
@@ -533,7 +562,7 @@ provable on their own, and two more only when you switch them on, in this order:
    asked for the original language of the ones that follow it, then AniList for the country of origin of the ones
    linked there — at most `REPAIR_DIRECTIONS_MAX` series from each in a run, picked at random. Only the reading
    direction is ever written, and never over one set by hand.
-9. **Missing details** (since v0.73.0), **off** until **Admin → Settings → Library housekeeping → Fill in missing
+9. **Missing details** (since v0.73.0), **off** until **Admin → Settings → Series & chapters → Fill in missing
    details** is switched on. A series with no description, genres or author of its own is given them: first by
    AniList, for series linked there with a checked link, in libraries whose AniList lookups are on, in English, at most
    500 a run in requests of fifty by id; then, for at most `REPAIR_DETAILS_MAX` series that are kept updated, by the
@@ -554,7 +583,7 @@ only a deliberate `0` turns the pause off.
 
 **Runs are kept** (since v0.49.0): every run, nightly or pressed on the Health page, is a row the Health page lists
 under *Recent repairs* — the newest 50 and everything from the last 90 days are kept. Only a **full** run (the
-nightly, or *Run now* on Tasks) is the Tasks line and sets when the next nightly is due, so a fix pressed on one
+nightly, or *Run now* on Maintenance) is the task's line and sets when the next nightly is due, so a fix pressed on one
 Health row neither replaces that line nor moves the schedule. *Fill now* on one series looks at it even while its
 automatic updates are off, and fetches the gap chapters a source it already follows lists (up to 20) instead of
 leaving them to the sweep; the nightly's rule above is unchanged.
@@ -568,7 +597,7 @@ actions an admin confirms.
 ## Deleting chapters after they are read
 
 Off, and there is deliberately **no environment variable that turns it on**. It is switched on in
-**Admin → Settings → Library housekeeping → Delete read chapters**, behind a confirmation, because an install that upgraded into a
+**Admin → Settings → Downloads → Delete read chapters**, behind a confirmation, because an install that upgraded into a
 file-deleting job because of a line in a compose file would be indefensible. See
 [USAGE](USAGE.md#deleting-chapters-after-they-are-read) for what it will and will not touch.
 
@@ -609,3 +638,43 @@ defaulting to `off` ever since, so on a default install a renamed folder has alw
 opt-in because getting a rematch wrong merges two series, and the guards that prevent that (a minimum book
 count, a minimum overlap, exactly one candidate, and every book fingerprinted) are worth understanding
 before you turn it on. Start with `report`.
+
+## Translated pages
+
+The optional translation engine (since v0.85.0; how readers use it is in
+[USAGE §5](USAGE.md#translated-pages)). Nothing below exists until an admin presses **Download** under
+**Admin → Settings → Server → Translate pages**.
+
+**What Download fetches**, each file checked against its pinned SHA-256 and resumed if it stops part-way:
+
+- The engine pack for your server's architecture (amd64 or arm64), about 100 MB: llama.cpp's `llama-server`, the OCR
+  models (PaddleOCR) and their runtime, and the fonts.
+- One translation model, picked by the server's memory: **Qwen3.6 35B-A3B** (17 GB, and 0.8 GB more that lets it look
+  at pages) on a machine with 28 GB of memory or more, **Qwen3 4B** (2.3 GB) elsewhere. Both are Apache-2.0.
+
+**Where it goes:** `TRANSLATE_DIR`, by default `translate/` in the config folder (`/config/translate`). The download
+refuses to start without room for it plus 1 GB. On a small system disk, mount a folder on a big disk and point the
+variable at it. The folder must be writable by the user the app runs as (`PUID`):
+
+```yaml
+services:
+  uchiyomi:
+    environment:
+      TRANSLATE_DIR: /translate
+    volumes:
+      - /mnt/big-disk/uchiyomi-translate:/translate
+```
+
+**While it translates,** the engine runs as two processes beside the app (the model, and the OCR), at low priority. The
+model takes about its own size in memory, so 19 GB for the large model and 3.3 GB for the small one. The engine won't
+start a model that does not fit in the memory free at that moment, and says so under Translate pages. Both processes
+stop after 10 minutes without a page.
+
+| Variable | Default | What it does |
+|---|---|---|
+| `TRANSLATE_DIR` | `<CONFIG_DIR>/translate` | Where the engine is downloaded to. |
+| `TRANSLATE_THREADS` | half the CPUs | CPU threads the model uses. The OCR uses at most 4. |
+| `TRANSLATE_MODEL` | by memory | `large` or `small`, to pick the model yourself. |
+| `TRANSLATE_ENGINE_URL` | none | Translate with a llama.cpp server you already run (a machine with a graphics card, say) instead of downloading a model. Download then fetches only the engine pack, for the OCR and the fonts. |
+
+Not in Uchiyomi Desktop yet: its server runs inside the app, where the engine's processes cannot.

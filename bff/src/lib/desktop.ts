@@ -64,6 +64,12 @@ export const DESKTOP_FLOORS = Object.freeze({
   healthSummary: 5 * 60 * 1000,
   archive: 3 * 60 * 1000,
   autoHero: 10 * 60 * 1000,
+  // The sweep of the series still behind their sources (lib/finishDownloads.ts), just after the full sweep's own floor.
+  finishDownloads: 3 * 60 * 1000,
+  // The scout (lib/sourceScout.ts), after the finishing sweep has had its first go.
+  scout: 5 * 60 * 1000,
+  // The backup extensions' upkeep (lib/backupExtensions.ts), after the scout's first look.
+  backups: 8 * 60 * 1000,
 });
 export type DesktopFloor = keyof typeof DESKTOP_FLOORS;
 
@@ -80,7 +86,9 @@ export function firstRunFloor(serverMs: number, key: DesktopFloor): number {
  * one-person PC app: first-run setup and password sign-in (the shell signs the window in, routes/auth.ts
  * `POST /auth/desktop`), OIDC, password/2FA/sessions, creating or changing members (the LIST stays: the
  * Library tab and the notification-target dialog read it), everyone's sessions, OPDS and API tokens, web push
- * (Electron has no push service), and the install-count preview (desktop installs are not counted).
+ * (Electron has no push service), the install-count preview (desktop installs are not counted), translated pages
+ * (v0.85.0: the engine's processes do not run inside the app yet), and a chapter's comments and reactions (v0.87.0:
+ * talk between the members of a household).
  *
  * ⚠️ A renamed route would silently escape this list, so desktopRoutes.test.ts asserts every entry is a real
  * route of the server build.
@@ -114,6 +122,22 @@ export const DESKTOP_HIDDEN_ROUTES: readonly string[] = Object.freeze([
   'POST /api/push/subscribe',
   'POST /api/push/unsubscribe',
   'GET /api/admin/install-ping/preview',
+  // v0.85.0: translated pages are Docker only for now (lib/translate/engine.ts says why).
+  'GET /api/translate',
+  'GET /api/books/:id/translations',
+  'POST /api/books/:id/translations',
+  'GET /api/admin/translate',
+  'PUT /api/admin/translate',
+  'DELETE /api/admin/translate',
+  'POST /api/admin/translate/download',
+  // Chapter comments and reactions (v0.87.0, routes/comments.ts): a household's talk, and the desktop app is one person.
+  'GET /api/books/:id/comments',
+  'POST /api/books/:id/comments',
+  'PATCH /api/comments/:id',
+  'DELETE /api/comments/:id',
+  'PUT /api/books/:id/reaction',
+  'DELETE /api/books/:id/reaction',
+  'GET /api/series/:id/comments',
 ]);
 
 /** What `desktopPlan` works out from the shell's environment. */

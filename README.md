@@ -86,12 +86,15 @@ sites' terms and your local law.
 
 - **Webtoon-first reader** — continuous vertical scroll that runs straight into the next chapter, or paged, RTL and
   double-page spreads, with the mode picked for each series from its pages. A spread a source cut into two pages can be
-  joined back into one, wide spreads split or turned on a phone, borders cropped, an e-ink, grayscale or inverted
+  joined back into one (or merged and split by hand, for you alone), wide spreads split or turned on a phone, borders cropped, an e-ink, grayscale or inverted
   filter, tap zones, rebindable keys and a game controller, a narrower column for a wide screen and pages fetched at
   your screen's size, each set per device. A refresh reopens the chapter you are reading, and moving on says which
   chapters the series is missing.
 - **Skips the pages that are not the story** — the scanlator credit page that opens every chapter is found
   by repetition and collapsed into a band you can tap open (or hide entirely, or show everything).
+- **Translated pages (opt-in)** — read a raw chapter in your own language: the server reads each speech bubble, translates
+  the page with the lines before and the series' names, and writes it back into the bubble. Runs on your server, as an
+  optional download; nothing changes until an admin turns it on.
 - **True-black OLED interface**, or a softer *Graphite* or *Midnight* if you prefer, built for a phone and installable
   as a PWA.
 - **Offline downloads** — save chapters to the device and read them with no connection at all; with *Keep favorites
@@ -103,7 +106,7 @@ sites' terms and your local law.
 - **Reading Studio & Wrapped** — a year heat-map (or all time, scrolling back to your first read), chapters by month
   and weekday, your top series and genres, and how long you read: hours, minutes a chapter, by hour of the day and by
   device. **Insights** adds when you would finish what you are reading, your best day and week, this month's genre
-  mix, the series you dropped and your backlog; badges say what they take.
+  mix, the series you dropped and your backlog; badges say what they take, and each unlocks a frame for your avatar.
 - **Release radar** — when each series' next chapter is likely, said as an estimate (*~Friday*, *usually Fridays*,
   *running late*), with an *Expected this week* list and a *Releasing soon* order.
 - **Incognito reading** — keep your place without leaving history, stats or tracker updates, on every device.
@@ -154,8 +157,8 @@ sites' terms and your local law.
   appear as each source replies instead of waiting for the slowest, and every source says whether it answered,
   failed or timed out. *Because you read* and trending manhwa, manga and manhua rails come from AniList, and any
   chapter can be **read before you add the series**.
-- **Follows a series on more than one source**, and when a chapter will not come down it tries the other
-  copies, then other sources, before giving up. When a site dies for good, *Find other sources* and **Replace
+- **Follows a series on more than one source** (three besides its main one, or up to ten if you allow it), and when a
+  chapter will not come down it tries the other copies, then other sources, before giving up. When a site dies for good, *Find other sources* and **Replace
   a source** move its series to sources that work, after you have looked at each match.
 - **Chooses the translation** — prefer or block scanlation groups, server-wide or per series; wait a couple
   of days for a preferred group, and, if you switch it on, **upgrade** to its release when it turns up after another
@@ -183,6 +186,9 @@ sites' terms and your local law.
 **Household**
 
 - **Multi-user** — accounts, per-user progress and favourites, streaks and a leaderboard.
+- **Chapter comments** — react to a chapter with one tap or say something about it, right where the chapter ends in
+  the reader, and see which chapters the household talked about on the series page. Only members who can open the
+  series see it, and anyone can switch it off for themselves.
 - **Age ratings and an 18+ library** that stays off the home screen, the grid and search until somebody asks
   for it, with a per-member rating cap, a whole source rated *Adult only* when its extension does not say so, and a
   per-member permission to add series at all.
@@ -194,7 +200,8 @@ sites' terms and your local law.
 
 **Beyond the browser**
 
-- **Push notifications** when a followed series gets a new chapter, and one digest per library update to a
+- **Push notifications** when a followed series gets a new chapter or someone adds to a chapter's comments you are in,
+  and one digest per library update to a
   **webhook, Home Assistant, ntfy or Discord**.
 - **OPDS** — read from Panels, Chunky or KOReader, page by page over OPDS-PSE.
 - **A Mihon / Tachimanga extension** — read your library from Mihon, any Tachiyomi fork, Tachimanga (iOS)
@@ -279,7 +286,7 @@ uninstalling — is in **[the desktop guide](docs/DESKTOP.md)**. No Linux or Win
 ## Translations
 
 The interface ships in **English, Spanish, French, German, Portuguese (Brazil), Russian, Japanese, Chinese
-and Arabic**, with right-to-left layout for Arabic. Pick one under **Profile → Settings → Language**; the choice
+and Arabic**, with right-to-left layout for Arabic. Pick one under **Profile → Settings → General → Language**; the choice
 follows your account to other devices.
 
 **Everything except English is machine-assisted and has not been checked by a native speaker.** If something

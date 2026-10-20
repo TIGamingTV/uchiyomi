@@ -3,7 +3,7 @@
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import { randomBytes } from 'node:crypto';
 import { z } from 'zod';
-import { authenticate, userIdOf, roleOf } from '../lib/auth';
+import { actsAsAdmin, authenticate, userIdOf, roleOf } from '../lib/auth';
 import { getSource, listSources, isSwAdapterId, SW_PREFIX, swAdapterId, withTimeout } from '../lib/sources';
 import { MANGADEX_GROUP } from '../lib/sources/mangadex';
 import type { SourceAdapter, SourceSeries, SourceChapter } from '../lib/sources/types';
@@ -110,6 +110,8 @@ import { noticeListed } from '../lib/noticeChapters';
 import { hiddenNumbersOf } from '../lib/hiddenChapters';
 import { q, one } from '../lib/db';
 import { healthAll, isDisabled, blockedNow, reportLatest, reportFail, reportSlow, classify, noteStage, slowStreakNow } from '../lib/sourceHealth';
+import { finishDownloadsOn, backFirst } from '../lib/finishDownloads';
+import { requestScout } from '../lib/scoutRequests';
 import { diagnose, EMPTY_SUSPECT } from '../lib/sourceDiagnosis';
 import {
   gapsOf, assess, verdict, authorise, putPlan, getPlan, planKey, sweepPlans,
@@ -572,6 +574,11 @@ export function startDownloadJob(input: DownloadJobInput, reserved?: DownloadJob
       ...(await q<{ source_id: string }>('SELECT source_id FROM series_sources WHERE series_id = $1', [seriesId]).catch(() => [])).map((r) => r.source_id),
     ]);
     const exhausted = () => [...sources, ...followed].every((sid) => refusing.has(sid));
+    // v0.79.0: a Fetch, a fill or an add's job that every source refuses hands what is left to "Finish downloads on their
+    // own" (lib/finishDownloads.ts) -- first in its line, which comes back when a source can answer -- instead of
+    // ending a card that a person must remember to press again. Reintroduce by dropping `handsOn`: "a Fetch job every
+    // source refuses hands the rest on" in fetchRotation.int.test.ts finds source_checked_at unchanged.
+    const handsOn = !!seriesId && (origin === 'fetch' || origin === 'add' || origin === 'fill') && await finishDownloadsOn().catch(() => false);
     // Whichever way it failed -- a full disk, every source refusing, chapters that would not save, a scan that
     // missed them -- a failed card says what is still to fetch (`Job.left`). Twice: the moment the loop stops,
     // because the library scan after it can take minutes and the card already reads failed; and at the very
@@ -738,7 +745,7 @@ export function startDownloadJob(input: DownloadJobInput, reserved?: DownloadJob
         await settle(ch, false);
         if (refusing.has(out.via)) {
           if (j) {
-            tell(j, say('job.stopped', { source: nameOf(out.via) }), savedSoFar(j));
+            tell(j, handsOn && exhausted() ? say('job.stoppedWillFinish', { source: nameOf(out.via) }) : say('job.stopped', { source: nameOf(out.via) }), savedSoFar(j));
             if (exhausted()) { j.status = 'error'; j.finishedAt = Date.now(); }
           }
         } else if (j) {
@@ -795,6 +802,16 @@ export function startDownloadJob(input: DownloadJobInput, reserved?: DownloadJob
     }
     await Promise.all([...running].map((l) => l.done));
     noteLeft();
+    if (handsOn && refusing.size && exhausted()) {
+      await backFirst(seriesId);
+      // v0.80.0: and the scout looks for the rest elsewhere (lib/sourceScout.ts). A fill's chapters came from a source
+      // the series may not follow: it is the first the scout tries. Reintroduce by dropping it: "a Fetch job every
+      // source refuses hands the rest on" in fetchRotation.int.test.ts finds no request.
+      const rest = leftOf(chapters, landed, onDisk);
+      await requestScout(seriesId, origin === 'fill' ? 'capped' : 'refused', {
+        numbers: rest, ...(origin === 'fill' ? { seeds: [...new Set(chapters.map((c) => c.source ?? '').filter(Boolean))] } : {}),
+      });
+    }
     // Settled BEFORE the scan, so a copy the hook puts back is on disk when the scanner looks.
     for (const ch of chapters) if (!settled.has(ch)) await settle(ch, false);
     await persistScan().catch((e) => console.warn(`[download] ${folder}: the library scan after the job threw: ${(e as Error)?.message || e}`));
@@ -1869,7 +1886,52 @@ export async function addSeriesFromSource(opts: {
    * Cloudflare source every step is a real challenge solve. The job row already existed by this point, so
    * the Discover strip knew the download had started while the caller was still waiting to be told.
    */
+  /**
+   * "Finish downloads on their own" (lib/finishDownloads.ts): an add whose FIRST chapter a site refused -- a rate limit,
+   * a block -- used to leave no series at all. Only the card knew what was asked for, nothing could resume it, and a
+   * restart lost even the card. With the switch on, the series is written the way a nothing-yet add writes it, but
+   * BEHIND and never checked: the selection's floor (none for All), `source_checked_at` NULL and `source_missing` what
+   * was selected, so the next finishing sweep (server.ts) takes it first, once the site's cooldown is over. The other
+   * sources the dialog asked to check are judged as on any add, and the rest the person asked to archive is queued.
+   * Returns the series id. Reintroduce by answering the refusal alone: "an add whose first chapter a site refused keeps
+   * the series, behind" in finishDownloads.int.test.ts finds no row.
+   */
+  const keepForLater = async (): Promise<string> => {
+    const libs = await libraryRows();
+    const libraryId = existing
+      ? (await one<{ library_id: string }>('SELECT library_id FROM lib_series WHERE id = $1', [existing.id]))?.library_id ?? libraryIdFor(folder, libs)
+      : libraryIdFor(folder, libs);
+    const { id } = (await q<{ id: string }>(
+      `INSERT INTO lib_series (id, source, title, summary, author, status, genres, web, folder, books_count, library_id, scanned_at,
+                               auto_update, source_id, source_series_id, chapter_floor, source_checked_at, source_chapters, source_missing, lang, age_rating)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,0,$10,now(),$11,$12,$13,$14,NULL,$15,$16,$17,$18)
+       ON CONFLICT (library_id, folder) DO UPDATE SET
+         auto_update = EXCLUDED.auto_update, source_id = EXCLUDED.source_id, source_series_id = EXCLUDED.source_series_id,
+         chapter_floor = EXCLUDED.chapter_floor, scanned_at = now(), deleted_at = NULL,
+         source_checked_at = NULL, source_chapters = EXCLUDED.source_chapters, source_missing = EXCLUDED.source_missing,
+         lang = COALESCE(lib_series.lang, EXCLUDED.lang), age_rating = GREATEST(lib_series.age_rating, EXCLUDED.age_rating)
+       RETURNING id`,
+      [newSeriesId(), src.name, title, meta.summary || null, meta.author ?? null, meta.status ?? null, meta.genres ?? [], meta.url ?? null,
+       folder, libraryId, autoUpdate !== false, source, sourceId, floor, chosen.length, toFetch.length, stateLang, addedAgeRating],
+    ))[0];
+    await linkHere(id);
+    await stampAddNumbering({ id }, source!, numbered.decision).catch((e) => console.warn(`[add] ${folder}: numbering not recorded: ${(e as Error)?.message || e}`));
+    await replaceListing(id, listingRows(chapters, chosen, new Set(), source!, releaseOrder(prefs))).catch(() => {});
+    await learnAltTitles(id, series?.summary);
+    if (series?.coverUrl) {
+      await q(`INSERT INTO series_art (series_id, cover, checked_at) VALUES ($1, $2, NULL)
+        ON CONFLICT (series_id) DO UPDATE SET cover = COALESCE(series_art.cover, EXCLUDED.cover)`, [id, series.coverUrl]).catch(() => {});
+    }
+    await learnDirection({ id }, series?.readingDirection, 'source').catch(() => {});
+    await learnTypeFromSource({ id }, series);
+    void artByTitle({ id }, title, opts.userId ?? null);
+    if (archiveOpt) await archiveRest(id, archiveOpt).catch(() => {});
+    if (opts.alsoFollow?.length) judgeAlsoFollow(folder, id, opts);
+    return id;
+  };
+
   const run = async (): Promise<AddResult> => {
+    const finishOn = opts.wait === false && await finishDownloadsOn().catch(() => false);
     // Which chapters this run wrote, for the provenance stamp. Only what LANDED, never the selection: a
     // copy the downloader skipped because the file was already there is somebody else's work.
     const landed: Array<{ number: number; scanlator?: string; source?: string; missing?: number[]; title?: string; chapterId?: string }> = [];
@@ -1911,11 +1973,35 @@ export async function addSeriesFromSource(opts: {
       } else if (out.kind === 'skipped' && out.why === 'on_disk') {
         firstPages = 1;
         onDisk.push(toFetch[0].number);
+      } else if (out.kind === 'skipped' && out.why === 'refusing') {
+        // v0.79.0: not asked at all -- the source was already in a cooldown when the add began (a Discover search a
+        // moment ago can put it there). That is the same "not now" as a refusal, and with Finish downloads on their own
+        // the series is kept for later; it read as an undownloadable title ("Try a different source", 422). Reintroduce
+        // by dropping this branch: "an add whose source is cooling keeps the series" in finishDownloads.int.test.ts
+        // finds no row.
+        const h = await blockedNow(source!).catch(() => null);
+        if (h) blockReason = h.status === 'ok' ? 'down' : h.status;
       } else if (out.kind === 'failed') {
         blockReason = out.err?.blockStatus || null;
       }
     }
     catch (e: any) { blockReason = e?.blockStatus || null; diskFull = e?.diskFull ? String(e.message) : null; }
+    if (!firstPages && finishOn && blockReason && !diskFull) {
+      const kept = await keepForLater().catch((e) => { console.warn(`[add] ${folder}: not kept for later: ${(e as Error)?.message || e}`); return null; });
+      if (kept) {
+        // v0.80.0: the scout looks for it on the other sources meanwhile (lib/sourceScout.ts), first of all.
+        // Reintroduce by dropping it: "an add whose source is cooling keeps the series" in finishDownloads.int.test.ts
+        // finds no request.
+        await requestScout(kept, 'refused');
+        const j = jobs.get(folder);
+        if (j) {
+          j.status = 'error'; j.seriesId = kept; j.finishedAt = Date.now(); j.left = leftOf(toFetch, [], []);
+          tell(j, say('job.refusingWillFinish', { source: src.name, status: blockReason }));
+        }
+        return { ok: false, status: 429, error: 'blocked', blockStatus: blockReason, seriesId: kept,
+          message: `${say('job.refusingWillFinish', { source: src.name, status: blockReason }).text}` };
+      }
+    }
     if (!firstPages) {
       // A full disk used to read as "this title may be licensed", which sends a person off to try another
       // source for a problem no source can fix.
@@ -2036,8 +2122,12 @@ export async function addSeriesFromSource(opts: {
           }
           if (j) {
             j.status = 'error';
-            tell(j, say('job.stopped', { source: src.name }), savedSoFar(j));
+            tell(j, finishOn ? say('job.stoppedWillFinish', { source: src.name }) : say('job.stopped', { source: src.name }), savedSoFar(j));
             j.finishedAt = Date.now();
+          }
+          if (finishOn && seriesId) {
+            await backFirst(seriesId);
+            await requestScout(seriesId, 'refused', { numbers: leftOf(toFetch, landed, onDisk) });
           }
           break;
         }
@@ -2047,8 +2137,14 @@ export async function addSeriesFromSource(opts: {
         if (refusing.has(out.via)) {
           if (j) {
             j.status = 'error';
-            tell(j, say('job.stoppedRefusing', { source: src.name, status: String(out.err?.blockStatus ?? '') }), savedSoFar(j));
+            tell(j, finishOn
+              ? say('job.stoppedRefusingWillFinish', { source: src.name, status: String(out.err?.blockStatus ?? '') })
+              : say('job.stoppedRefusing', { source: src.name, status: String(out.err?.blockStatus ?? '') }), savedSoFar(j));
             j.finishedAt = Date.now();
+          }
+          if (finishOn && seriesId) {
+            await backFirst(seriesId);
+            await requestScout(seriesId, 'refused', { numbers: leftOf(toFetch, landed, onDisk) });
           }
           break;
         }
@@ -2269,7 +2365,7 @@ export default async function sourceRoutes(app: FastifyInstance) {
     const me = await one<{ role: string; perms: { canDownload?: boolean } | null }>(
       'SELECT role, perms FROM users WHERE id = $1', [userIdOf(req)]).catch(() => null);
     if (!me) return reply.code(403).send({ error: 'forbidden', message: 'Could not check your permissions.' });
-    if (me.role !== 'admin' && me.perms?.canDownload === false) {
+    if (!actsAsAdmin(req) && me.perms?.canDownload === false) {
       return reply.code(403).send({ error: 'forbidden', message: "You don't have permission to add series." });
     }
     // Resolved once per request, as in catalog.ts. Only `maxAgeRating` is read here, but taking the whole
@@ -2321,6 +2417,15 @@ export default async function sourceRoutes(app: FastifyInstance) {
     const ctx = vc(req);
     return reachable(req).filter((s) => sourceBrowsableFor(s, ctx));
   };
+  /**
+   * The sources a person may browse, search and pick from: `surfaceable` minus the backup extensions' (v0.82.0,
+   * lib/backupExtensions.ts) -- the ones Uchiyomi installed by itself to finish downloads, which download like any
+   * source and are nobody's choice. The owner: Discover should show "only the sources he actually added". Every
+   * Discover fan-out and listing reads this; GET /api/sources still lists them, flagged, because it is also how the
+   * reader, the series page and the downloads name a chapter's source. Reintroduce by reading `surfaceable` here:
+   * "a backup is listed for its name, flagged, and never asked by Discover" in backupDiscover.int.test.ts finds it searched.
+   */
+  const discoverable = (req: FastifyRequest): SourceAdapter[] => surfaceable(req).filter((s) => !s.backup);
 
   app.get('/api/sources', async (req) => {
     const health = new Map((await healthAll()).map((h) => [h.source_id, h]));
@@ -2414,6 +2519,9 @@ export default async function sourceRoutes(app: FastifyInstance) {
           // null for the other built-ins, packs and custom sites. Providers groups by `pkgName` (or by `name` when
           // that is null) so 3Hentai's twenty-nine language variants are one card rather than twenty-nine.
           extension: extensionOf(s),
+          // v0.82.0: a backup extension's source (lib/backupExtensions.ts). Listed for its name; Discover and every
+          // source picker leave it out (web lib/sourceGroups.ts discoverSources).
+          ...(s.backup ? { backup: true } : {}),
           latest: typeof s.latest === 'function',
           // Reported from the method's presence, exactly as `latest` is. A source without it simply
           // drops out of the wall while Popular is selected, the same way one without `latest` does.
@@ -2457,7 +2565,7 @@ export default async function sourceRoutes(app: FastifyInstance) {
     // `denySource` -- 403 is the permission answer and this is not a permission (the same account with
     // `?adult=1` gets the results), and `{ content: [] }` is already what this route answers for a source
     // that has nothing. The source is never even asked, so hiding it costs nothing outbound either.
-    if (!surfaceable(req).some((s) => s.id === src.id)) return { content: [] };
+    if (!discoverable(req).some((s) => s.id === src.id)) return { content: [] };
     const raw = await src.search(query.trim()).catch(() => []);
     // dedupe by sourceId (duplicate ids collide on the React key → wrong cover/title on a card)
     const seen = new Set<string>();
@@ -3040,7 +3148,7 @@ export default async function sourceRoutes(app: FastifyInstance) {
     const p = new Params();
     const rows = await q<any>(
       `SELECT s.id, s.title, s.folder, s.summary, s.author, s.genres, s.web, s.status, s.source_id,
-              s.numbering, s.numbering_pending, s.renumber_plan
+              s.numbering, s.numbering_pending, s.renumber_plan, s.auto_update
          FROM lib_series s WHERE s.id = ${p.add(seriesId)} AND ${visible('s', vc(req), p)}`, p.values,
     ).then((r) => r, () => null);
     if (rows === null) return reply.code(503).send({ error: 'unavailable' });
@@ -3132,6 +3240,9 @@ export default async function sourceRoutes(app: FastifyInstance) {
     ));
 
     const chapters: Array<SourceChapter & { pinned?: boolean }> = [];
+    // "Finish downloads on their own" (lib/finishDownloads.ts): a number no source can serve now is handed to it.
+    const finishOn = await finishDownloadsOn().catch(() => false);
+    let handOff = false;
     // Health is per source, asked once per source rather than once per number.
     const sourceState = new Map<string, 'ok' | 'source_unavailable' | 'cooldown' | 'denied'>();
     // The series' language rules (v0.62.0), read once and only when a blocked number needs explaining.
@@ -3190,8 +3301,30 @@ export default async function sourceRoutes(app: FastifyInstance) {
       const st = await stateOf(row.source_id);
       // The same by-id rejection the rest of this file gives, and it does not say what is being withheld.
       if (st === 'denied') return denySource(reply);
+      if (st === 'cooldown') {
+        // v0.79.0: the copy the rules chose is on a source in a cooldown. Another followed source's copy of the same
+        // number, as the sweep's fallback would take it (the blocklist and the series' language as they stand), is
+        // fetched instead. It worked only by accident before -- the refresh above rewrote the listing from the source
+        // that answered -- and stopped working once a cooling source's rows are kept (lib/updater.ts). With none, the
+        // number is left to the finishing sweep (`later`, lib/finishDownloads.ts), which comes back when the source
+        // can answer. Reintroduce by skipping it as `cooldown`: "a Fetch while the main cools takes the follower's copy"
+        // in fetchRotation.int.test.ts reads 409.
+        let alt: ListingCopy | null = null;
+        for (const c of await automaticCopiesFor(seriesId, row.copies ?? [])) {
+          if (c.source !== row.source_id && (await stateOf(c.source)) === 'ok') { alt = c; break; }
+        }
+        if (alt) { chapters.push(copyToChapter(alt, { number: n, title: row.title })); continue; }
+        if (finishOn && s.auto_update !== false) { skipped.push({ number: n, reason: 'later' }); handOff = true; continue; }
+      }
       if (st !== 'ok') { skipped.push({ number: n, reason: st }); continue; }
       chapters.push({ ...row.chosen, source: row.source_id });
+    }
+    // What a cooldown left (v0.79.0): first in the finishing sweep's line, so it comes back for them the moment it can.
+    if (handOff) {
+      await backFirst(seriesId);
+      // v0.80.0: and the scout looks for them on other sources (lib/sourceScout.ts). Reintroduce by dropping it: "a Fetch
+      // while the main cools takes the follower's copy" in fetchRotation.int.test.ts finds no request.
+      await requestScout(seriesId, 'refused', { numbers: skipped.filter((x) => x.reason === 'later').map((x) => x.number) });
     }
     chapters.sort((a, b) => a.number - b.number);
     if (!chapters.length) {
@@ -3203,6 +3336,7 @@ export default async function sourceRoutes(app: FastifyInstance) {
         : first === 'other_language' ? 'That chapter is only in another language than the series. Pick a copy under Versions to fetch it anyway.'
         : first === 'already_here' ? 'That chapter is already here.'
         : first === 'cooldown' ? 'That source is in a cooldown. Try again later.'
+        : first === 'later' ? 'That source is in a cooldown. These chapters will download on their own when it is ready.'
         : first === 'hidden' ? 'That chapter is hidden from this series. Restore it under More to fetch it.'
         : 'That source is not available right now.';
       return reply.code(409).send({ error: 'nothing_to_fetch', message, skipped });
@@ -3265,7 +3399,7 @@ export default async function sourceRoutes(app: FastifyInstance) {
     // "Show 18+" chip. The chip belongs here and not only in the shaping below, because a source left in
     // `ask` is a source this request STARTS -- an outbound query to an adult site on behalf of someone who
     // asked not to see one, and its results would then also land in the shared entry under this term.
-    const all = surfaceable(req);
+    const all = discoverable(req);
     // `source` narrows the fan-out to one source, for a search made while Discover is filtered to it. The
     // filter was display-only before, and did not survive a search at all: submitting a term asked every
     // source and answered with everything, so choosing a source and then searching within it was not
@@ -3333,7 +3467,7 @@ export default async function sourceRoutes(app: FastifyInstance) {
     // surfacing rule rather than the permission one, and it answers exactly what a source with nothing new
     // answers. It sits beside the disabled short-circuit because it means the same thing to the caller --
     // this source paints no covers right now -- and above it because it needs no database read (#64).
-    if (!surfaceable(req).some((s) => s.id === src.id)) return { content: [] };
+    if (!discoverable(req).some((s) => s.id === src.id)) return { content: [] };
     if (await isDisabled(source!).catch(() => false)) return { content: [] };
     const p = Math.max(1, parseInt(page || '1', 10) || 1);
     // A source serving out a cooldown is not asked again -- that is what the cooldown is FOR. Reporting
@@ -3364,7 +3498,7 @@ export default async function sourceRoutes(app: FastifyInstance) {
     if (!src || typeof src.popular !== 'function') return { content: [] };
     if (!sourceAllowedFor(src, vc(req).maxAgeRating)) return denySource(reply);
     // The 18+ hide, exactly as on the newest listing above and for the same reason (#64).
-    if (!surfaceable(req).some((s) => s.id === src.id)) return { content: [] };
+    if (!discoverable(req).some((s) => s.id === src.id)) return { content: [] };
     if (await isDisabled(source!).catch(() => false)) return { content: [] };
     const p = Math.max(1, parseInt(page || '1', 10) || 1);
     const resting = await blockedNow(source!).catch(() => null);
@@ -3385,7 +3519,7 @@ export default async function sourceRoutes(app: FastifyInstance) {
    */
   const receivedBy = async (req: FastifyRequest, folder: string, j: Job) => {
     const me = userIdOf(req);
-    const admin = roleOf(req) === 'admin';
+    const admin = actsAsAdmin(req);
     return receives(await downloadsAudience(vc(req), me, admin, { folders: [folder] }), admin, me, folder, j);
   };
 
@@ -3397,7 +3531,7 @@ export default async function sourceRoutes(app: FastifyInstance) {
   app.get('/api/sources/jobs', async (req) => {
     sweepJobs();
     const me = userIdOf(req);
-    const admin = roleOf(req) === 'admin';
+    const admin = actsAsAdmin(req);
     // The server's own runs (lib/downloadJobs.ts, #82): the sweep, the repair, a bulk "Fetch newest". An
     // admin's to see and stop -- and a bulk run its starter's too, since it is their selection. Nobody
     // else's: the series a sweep is on may be in a library this viewer cannot open.
@@ -3452,7 +3586,7 @@ export default async function sourceRoutes(app: FastifyInstance) {
     const { folder } = req.params as { folder: string };
     const j = jobs.get(folder);
     if (!j || !(await receivedBy(req, folder, j))) return reply.code(404).send({ error: 'not_found' });
-    if (roleOf(req) !== 'admin' && !(j.by && j.by === userIdOf(req))) return reply.code(403).send({ error: 'forbidden' });
+    if (!actsAsAdmin(req) && !(j.by && j.by === userIdOf(req))) return reply.code(403).send({ error: 'forbidden' });
     if (j.status !== 'downloading') return reply.code(409).send({ error: 'not_running' });
     j.cancelRequested = true;
     await logAudit('download.cancel', { userId: userIdOf(req), detail: { folder, title: j.title }, req });
@@ -3464,7 +3598,7 @@ export default async function sourceRoutes(app: FastifyInstance) {
     const { kind } = req.params as { kind: string };
     const card = listRuns().find((r) => r.kind === kind && r.status === 'running');
     if (!card) return reply.code(404).send({ error: 'not_found' });
-    if (roleOf(req) !== 'admin' && !(card.by && card.by === userIdOf(req))) return reply.code(403).send({ error: 'forbidden' });
+    if (!actsAsAdmin(req) && !(card.by && card.by === userIdOf(req))) return reply.code(403).send({ error: 'forbidden' });
     requestStop(card.kind);
     await logAudit('download.cancel', { userId: userIdOf(req), detail: { run: card.kind }, req });
     return { ok: true };
@@ -3475,7 +3609,7 @@ export default async function sourceRoutes(app: FastifyInstance) {
     const { kind } = req.params as { kind: string };
     const card = listRuns().find((r) => r.kind === kind);
     if (!card) return reply.code(404).send({ error: 'not_found' });
-    if (roleOf(req) !== 'admin' && !(card.by && card.by === userIdOf(req))) return reply.code(403).send({ error: 'forbidden' });
+    if (!actsAsAdmin(req) && !(card.by && card.by === userIdOf(req))) return reply.code(403).send({ error: 'forbidden' });
     const r = dismissRun(card.kind);
     if (r === 'running') return reply.code(409).send({ error: 'running' });
     return { ok: true };
@@ -3491,7 +3625,7 @@ export default async function sourceRoutes(app: FastifyInstance) {
   app.delete('/api/sources/jobs/:folder', async (req, reply) => {
     const { folder } = req.params as { folder: string };
     const j = jobs.get(folder);
-    const admin = roleOf(req) === 'admin';
+    const admin = actsAsAdmin(req);
     const me = userIdOf(req);
     if (!j) {
       // v0.50.0: a Needs attention card can be only chapters that could not be saved -- the scheduled check's, a
@@ -3624,7 +3758,7 @@ export default async function sourceRoutes(app: FastifyInstance) {
     // `surfaceable`, like search-all above: this is the other cross-source fan-out Discover runs, so a
     // source the "Show 18+" chip is hiding must be neither asked nor listed here (#64). A client naming it
     // in `sources` does not override the hide -- `wanted` only narrows the set, it never widens it.
-    const allowed = new Set(surfaceable(req).map((x) => x.id));
+    const allowed = new Set(discoverable(req).map((x) => x.id));
     const ids = findOrder().filter((id) => allowed.has(id) && (!wanted || wanted.has(id)));
     const one = async (id: string) => {
       const src = getSource(id);
@@ -3675,7 +3809,7 @@ export default async function sourceRoutes(app: FastifyInstance) {
     const taken = new Set(rows.map((r) => r.lang));
     const health = new Map((await healthAll().catch(() => [])).map((h) => [h.source_id, h] as const));
     const now = Date.now();
-    const usable = surfaceable(req).filter((x) => {
+    const usable = discoverable(req).filter((x) => {
       const h = health.get(x.id);
       return !h?.disabled && !(h?.blocked_until && new Date(h.blocked_until).getTime() > now);
     });
@@ -3823,7 +3957,7 @@ export default async function sourceRoutes(app: FastifyInstance) {
     // dropped here, before the add, rather than refused: the add itself is theirs to make, and it goes
     // through exactly as if the switch had been off (no judgement, no carrier card). The dialog hides the
     // switch from members; this is the server's half of that.
-    const alsoFollow = roleOf(req) === 'admin' ? b.data.alsoFollow : undefined;
+    const alsoFollow = actsAsAdmin(req) ? b.data.alsoFollow : undefined;
     // canDownload is now checked for the whole plugin in the preHandler above, including this route.
     if (!sourceAllowedFor(getSource(source), vc(req).maxAgeRating)) return denySource(reply);
     // `wait: false` -- answer once the decision is made and download afterwards. Everything that decides
@@ -3852,7 +3986,7 @@ export default async function sourceRoutes(app: FastifyInstance) {
       // makes, asked here because this is where the viewer is (#67).
       const seen = r.existing && await seriesVisible(r.existing.id, vc(req)).catch(() => false);
       // A removed edition is visible to nobody; its id goes to an admin, who can put it back (Admin → Library).
-      const named = seen || (r.existing?.hidden && roleOf(req) === 'admin');
+      const named = seen || (r.existing?.hidden && actsAsAdmin(req));
       const existing = r.existing && {
         title: r.existing.title, ...(r.existing.source ? { source: r.existing.source } : {}),
         ...(r.existing.lang ? { lang: r.existing.lang } : {}), ...(named ? { id: r.existing.id } : {}),

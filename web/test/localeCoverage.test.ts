@@ -223,6 +223,8 @@ function otherHalf(all: readonly string[], k: string, at: number, one: boolean):
 /** Pairs English inflects around the count as well as after it, named explicitly: singular → plural. */
 const IRREGULAR_PAIRS: Record<string, string> = {
   '1 is not listed yet and comes with the next check.': '{m} are not listed yet and come with the next check.',
+  // v0.79.0, Find missing's chapters left to Finish downloads on their own: the verb and two pronouns agree.
+  '1 will download on its own when its site is ready.': '{m} will download on their own when their site is ready.',
   '1 chapter behind': '{n} chapters behind in 1 series',
   '{n} chapters behind in 1 series': '{n} chapters behind across {m} series',
   'Ch. {n} · 1 older chapter not here yet': 'Ch. {a}–{b} · {n} older chapters not here yet',
@@ -251,6 +253,8 @@ const IRREGULAR_PAIRS: Record<string, string> = {
     'the library still marks these {n} deleted, and no scan has read the files since',
   // v0.50.0, The same chapter saved twice: the Fix all confirmation, "this series" against "these {n} series".
   'Delete the later copies in this series?': 'Delete the later copies in these {n} series?',
+  // The same chapter saved twice, Keep one of each: one series' confirmation and the card's, the same way.
+  'Keep one of each in this series?': 'Keep one of each in these {n} series?',
   // v0.53.0, Source health's Turn off all: what it asks first, "this source" against "these {n} sources". It names no
   // place (v0.54.0): it is asked on Admin → Sources itself as well as on Health.
   'Turn off this source? No series uses it. You can turn it back on any time.':

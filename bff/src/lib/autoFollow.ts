@@ -38,12 +38,10 @@ import { assess, verdict, followable, MIN_HAVE, MIN_COVERAGE } from './fill';
 import { logAudit } from './audit';
 import type { SourceChapter } from './sources/types';
 import { normTitle } from './titleMatch';
-import { followLimit } from './followLimit';
+import { followerLimit } from './followLimit';
 import { altTitlesFor, MIN_ALT_KEY } from './altTitles';
 import { languageFits, seriesLanguage } from './seriesLang';
 
-/** How many sources a series may FOLLOW, on top of its primary (env MAX_FOLLOWED_SOURCES, 1 to 6, default 2: lib/followLimit.ts). */
-export const MAX_FOLLOWERS = followLimit();
 /** How many of an add's candidates are asked at all; the rest are `not_tried`. */
 export const MAX_AUTO_CANDIDATES = 6;
 /**
@@ -133,7 +131,7 @@ export type FollowWhy =
   | 'too_few_listed'
   /** Never asked: past the wall budget or the candidate cap. */
   | 'not_tried'
-  /** It qualified, but the series already follows MAX_FOLLOWERS sources. */
+  /** It qualified, but the series already follows as many sources as it may (lib/followLimit.ts). */
   | 'cap'
   /** The primary itself, a disabled source, one in a cooldown, one not loaded, or one this viewer may not reach. */
   | 'unavailable'
@@ -377,7 +375,7 @@ export function refusals(candidates: FollowCandidate[], why: FollowWhy): FollowR
  * The judgements run in parallel under the scan's slots; the follows are written afterwards in body
  * order, so "which two of three good ones" is the order the dialog listed them and not whichever source
  * answered first. Each follow is one transaction that locks the series row and inserts only while the
- * series follows fewer than MAX_FOLLOWERS OTHER sources: two adds of the same title racing each other
+ * series follows fewer OTHER sources than it may (lib/followLimit.ts followerLimit): two adds of the same title racing each other
  * (a double tap before the dialog's busy state paints) both read the count under the lock, so the second
  * sees the first's rows and reads `cap`. A re-follow of a source already followed always goes through --
  * it counts the others -- and keeps a human's `added_by` through the COALESCE, as the manual route does.
@@ -476,10 +474,16 @@ export async function autoFollow(seriesId: string, candidates: FollowCandidate[]
  * in the same instant could both pass it (READ COMMITTED sees neither's row yet). That window is
  * microseconds wide -- the racing test does not open it, and passes with the lock removed -- so the lock
  * is here for the day the window is hit, not because a test says so.
+ *
+ * `notCounted` (v0.80.0): followers left out of the count -- the automatic follows pass the ones that cannot carry the
+ * series now (lib/sourceStanding.ts notCarrying), so a broken follower does not hold a series at its limit. Nothing is
+ * deleted. Reintroduce by counting every follower: "a broken follower does not hold the series at its limit" in
+ * sourceScout.int.test.ts reads cap.
  */
 export async function followJudged(
-  seriesId: string, j: Omit<Judgement, 'why' | 'chapters'>, opts: { addedBy?: string | null } = {},
+  seriesId: string, j: Omit<Judgement, 'why' | 'chapters'>, opts: { addedBy?: string | null; notCounted?: readonly string[] } = {},
 ): Promise<'inserted' | 'cap' | 'gone'> {
+  const limit = await followerLimit();
   return tx(async (qq) => {
     const row = (await qq<{ deleted_at: string | null; merged_into: string | null }>(
       'SELECT deleted_at, merged_into FROM lib_series WHERE id = $1 FOR UPDATE', [seriesId]))[0];
@@ -487,12 +491,12 @@ export async function followJudged(
     const r = await qq<{ source_id: string }>(
       `INSERT INTO series_sources (series_id, source_id, source_series_id, title, coverage, added_by)
        SELECT $1::text, $2::text, $3::text, $4::text, $5::real, $7::uuid
-        WHERE (SELECT count(*) FROM series_sources WHERE series_id = $1 AND source_id <> $2) < $6::int
+        WHERE (SELECT count(*) FROM series_sources WHERE series_id = $1 AND source_id <> $2 AND source_id <> ALL($8::text[])) < $6::int
        ON CONFLICT (series_id, source_id) DO UPDATE SET source_series_id = EXCLUDED.source_series_id,
          title = EXCLUDED.title, coverage = EXCLUDED.coverage,
          added_by = COALESCE(EXCLUDED.added_by, series_sources.added_by)
        RETURNING source_id`,
-      [seriesId, j.source, j.sourceSeriesId, j.theirTitle, j.coverage, MAX_FOLLOWERS, opts.addedBy ?? null]);
+      [seriesId, j.source, j.sourceSeriesId, j.theirTitle, j.coverage, limit, opts.addedBy ?? null, [...(opts.notCounted ?? [])]]);
     return r.length ? 'inserted' : 'cap';
   });
 }

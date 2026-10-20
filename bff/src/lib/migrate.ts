@@ -1831,6 +1831,169 @@ CREATE INDEX IF NOT EXISTS lib_series_hiding_idx ON lib_series (id) WHERE hidden
 -- chapter looked at, nothing found and unreadable alike, so none is measured twice; a new mtime or detector measures
 -- again. Additive: v0.76.x ignores it.
 ALTER TABLE lib_books ADD COLUMN IF NOT EXISTS spreads jsonb;
+
+-- Admin -> Settings "Finish downloads on their own" (lib/finishDownloads.ts). ON by default: a series whose source
+-- lists chapters it does not have yet is gone back to every quarter of an hour, and again the moment a site's
+-- cooldown ends, instead of five chapters every six hours; a site's "slow down" (429) or block (403) is a later, not
+-- a never, so it does not use up a chapter's three tries; and an add whose first chapter a site refused keeps the
+-- series, so it can be finished. Off, all of it behaves as v0.77.x did. Additive: v0.77.x ignores it.
+ALTER TABLE server_settings ADD COLUMN IF NOT EXISTS finish_downloads boolean NOT NULL DEFAULT true;
+-- What the finishing sweep goes back for (lib/finishDownloads.ts BEHIND_SQL): the chapters a series is behind on that
+-- the sweep still tries -- not one left alone at its retry cap, nor one held for its preferred group. source_missing
+-- counts those too ("{n} behind" must), and a series behind only on them was visited every quarter of an hour by a
+-- sweep that could fetch nothing of it. NULL until the next visit, read as source_missing. Additive: v0.77.x ignores it.
+ALTER TABLE lib_series ADD COLUMN IF NOT EXISTS finish_missing integer;
+-- v0.79.0: when a series whose remaining chapters only a source that did not answer lists is worth going back to: that
+-- source's cooldown end, or a quarter of an hour on (lib/updater.ts staleUntil). NULL when it is not waiting on one.
+-- Additive: v0.78.x ignores it.
+ALTER TABLE lib_series ADD COLUMN IF NOT EXISTS finish_after timestamptz;
+
+-- v0.80.0, the scout (lib/sourceScout.ts): a series whose sources cannot get it its chapters -- every one cooling,
+-- refusing or broken for the numbers it lacks -- is looked for on the other installed sources, and a source that is
+-- this series and lists what it lacks is followed on its own. series_scout is the series' request: why, which numbers,
+-- which sources to try first, and when it may be looked at again (the backoff). Written by a cheap upsert wherever a
+-- series gets stuck (lib/scoutRequests.ts); the worker decides what, if anything, to search. Additive: v0.79.x ignores
+-- it.
+CREATE TABLE IF NOT EXISTS series_scout (
+  series_id  text PRIMARY KEY REFERENCES lib_series(id) ON DELETE CASCADE,
+  reason     text NOT NULL,
+  numbers    real[] NOT NULL DEFAULT '{}',
+  seeds      text[] NOT NULL DEFAULT '{}',
+  priority   int NOT NULL DEFAULT 0,
+  asked_at   timestamptz NOT NULL DEFAULT now(),
+  next_at    timestamptz NOT NULL DEFAULT now(),
+  last_at    timestamptz,
+  fruitless  int NOT NULL DEFAULT 0,
+  verdict    text,
+  detail     jsonb
+);
+CREATE INDEX IF NOT EXISTS idx_series_scout_next ON series_scout (next_at);
+-- What each source said when the server looked for a series on it (lib/scoutMemory.ts): one row per series and
+-- source, kept for a while so a source that said no is not asked again every day. 'removed': an admin unfollowed it,
+-- and nothing automatic follows it again for that series. Additive: v0.79.x ignores it.
+CREATE TABLE IF NOT EXISTS scout_verdicts (
+  series_id        text NOT NULL REFERENCES lib_series(id) ON DELETE CASCADE,
+  source_id        text NOT NULL,
+  verdict          text NOT NULL,
+  their_title      text,
+  source_series_id text,
+  coverage         real,
+  our_count        int,
+  at               timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (series_id, source_id)
+);
+
+-- Backup extensions (v0.82.0, lib/backupExtensions.ts): the extensions Uchiyomi installed by itself to finish downloads
+-- -- Fix everything's, and the scout's. Hidden from Discover, removed after three days without use, put back when a
+-- series is stuck again. state: trial (installed, being checked), active, parked (removed by Uchiyomi, may come back),
+-- refused (a person removed it: Uchiyomi never installs it again). via: autofix or scout. A package with no row is the
+-- admin's own. Additive: v0.81.x ignores it.
+CREATE TABLE IF NOT EXISTS backup_extensions (
+  pkg_name       text PRIMARY KEY,
+  name           text,
+  lang           text,
+  state          text NOT NULL,
+  via            text,
+  installed_at   timestamptz,
+  last_needed_at timestamptz NOT NULL DEFAULT now(),
+  parked_at      timestamptz,
+  why            text,
+  updated_at     timestamptz NOT NULL DEFAULT now()
+);
+-- The follows a removed backup took with it: the series, its id there and its title there, so a series stuck again
+-- gets it back with one reinstall and one look instead of a search through every extension.
+CREATE TABLE IF NOT EXISTS backup_links (
+  series_id        text NOT NULL REFERENCES lib_series(id) ON DELETE CASCADE,
+  source_id        text NOT NULL,
+  pkg_name         text NOT NULL REFERENCES backup_extensions(pkg_name) ON DELETE CASCADE,
+  source_series_id text,
+  their_title      text,
+  parked_at        timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (series_id, source_id)
+);
+CREATE INDEX IF NOT EXISTS idx_backup_links_pkg ON backup_links (pkg_name);
+-- Since when the series has been waiting for the scout, kept across its requests: a backup is reinstalled only for a
+-- series stuck an hour or more, never for a cooldown of a few minutes.
+ALTER TABLE series_scout ADD COLUMN IF NOT EXISTS stuck_since timestamptz;
+-- v0.83.0: what a repository extension the scout tried did not have (lib/backupExtensions.ts recordMiss): a series it
+-- was searched for in vain, or (series_id NULL) a language it has no source in. Not tried again for it for 30 days.
+CREATE TABLE IF NOT EXISTS backup_misses (
+  pkg_name  text NOT NULL,
+  series_id text REFERENCES lib_series(id) ON DELETE CASCADE,
+  lang      text,
+  at        timestamptz NOT NULL DEFAULT now()
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_backup_misses ON backup_misses (pkg_name, COALESCE(series_id, ''), COALESCE(lang, ''));
+-- Translated pages (v0.85.0, lib/translate/): off until an admin downloads the engine and turns this on.
+ALTER TABLE server_settings ADD COLUMN IF NOT EXISTS translate_pages boolean NOT NULL DEFAULT false;
+-- One page in one language: the bubbles the engine read and what it wrote in each (regions), never the picture -- that
+-- is drawn from the regions when asked for. engine: the model size and pipeline version it was made with, so a new
+-- engine translates afresh rather than serve an old one's work. status: done, or failed (error says why).
+CREATE TABLE IF NOT EXISTS page_translations (
+  book_id    text NOT NULL REFERENCES lib_books(id) ON DELETE CASCADE,
+  page       int NOT NULL,
+  lang       text NOT NULL,
+  engine     text NOT NULL,
+  status     text NOT NULL,
+  regions    jsonb,
+  error      text,
+  ms         int,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (book_id, page, lang, engine)
+);
+-- The spelling each name was first given in a series and language: the next pages are told to keep it.
+CREATE TABLE IF NOT EXISTS translate_names (
+  series_id text NOT NULL REFERENCES lib_series(id) ON DELETE CASCADE,
+  lang      text NOT NULL,
+  source    text NOT NULL,
+  target    text NOT NULL,
+  at        timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (series_id, lang, source)
+);
+
+-- v0.87.0: what the household says about a chapter (lib/comments.ts). Keyed on the chapter row, which keeps its id when
+-- its file moves, its series merges or a rescan follows a renamed file; the few places that delete a chapter row carry
+-- these first (extraCopies.ts removeCopy, rescan.ts HOLDS) or count them as gone (libraryAdmin.ts Forget). A member's
+-- words go with their account. page: the page the comment was written on, when it was written in the reader.
+-- Additive: v0.86.x ignores both tables.
+CREATE TABLE IF NOT EXISTS chapter_comments (
+  id         uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  book_id    text NOT NULL REFERENCES lib_books(id) ON DELETE CASCADE,
+  user_id    uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  body       text NOT NULL,
+  page       integer,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  edited_at  timestamptz
+);
+CREATE INDEX IF NOT EXISTS idx_chapter_comments_book ON chapter_comments (book_id, created_at);
+-- One reaction a member a chapter: tapping another emoji changes it.
+CREATE TABLE IF NOT EXISTS chapter_reactions (
+  book_id    text NOT NULL REFERENCES lib_books(id) ON DELETE CASCADE,
+  user_id    uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  emoji      text NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (book_id, user_id)
+);
+
+-- v0.89.0 (#305): how many other sources a series may follow, the admin's choice (lib/followLimit.ts), 1 to 10. NULL until
+-- one is picked, and then MAX_FOLLOWED_SOURCES (or three) is the limit, as it was. Additive: v0.88.x reads the env alone.
+ALTER TABLE server_settings ADD COLUMN IF NOT EXISTS max_followed_sources int;
+
+-- v0.89.0 (#262): a reader's own say on where a double-page spread is (lib/spreadMarks.ts). join shows the pair (page,
+-- page + 1) as one spread where the detector found none; split shows a pair it joined as two pages. One account's, for
+-- its own reader only, and never in lib_books.spreads, so a re-measure cannot erase it. pages: the chapter's page count
+-- when it was made -- a mark on another file of the chapter points at other pages, and is not applied. Goes with its
+-- chapter row and its account. Additive: v0.88.x ignores the table.
+CREATE TABLE IF NOT EXISTS spread_marks (
+  user_id    uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  book_id    text NOT NULL REFERENCES lib_books(id) ON DELETE CASCADE,
+  page       int  NOT NULL CHECK (page >= 1),
+  mark       text NOT NULL CHECK (mark IN ('join', 'split')),
+  pages      int  NOT NULL,
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (user_id, book_id, page)
+);
+CREATE INDEX IF NOT EXISTS idx_spread_marks_book ON spread_marks (book_id);
 `;
 
 // Serialises migrate() across processes. CREATE TABLE IF NOT EXISTS is not safe to run concurrently:
@@ -1876,6 +2039,58 @@ export async function runOnce(
  * are permanent, and this one was written before its release had a number.
  */
 export const CHAPTER_DATES_MIGRATION = 'suwayomi-chapter-dates-in-seconds';
+
+/** The backup extensions' one-time seed, apart because backupExtensions.int.test.ts runs it again by name. */
+export const BACKUP_SEED_MIGRATION = 'v0.82.0-backup-extensions';
+
+/**
+ * v0.82.0: the extensions Fix everything installed before backups existed become backups, by the audit log -- the one
+ * record of who installed what. Per package, its newest install, uninstall or "turn on its sources":
+ *   - a Fix everything install, still installed, and none of its sources since followed, attached or made a series'
+ *     main by a person: a backup (`active`), needed as of now -- three days' grace before anything is removed;
+ *   - otherwise, when a person's newest act on it was to remove it and it is not installed: `refused`, never installed
+ *     by Uchiyomi again.
+ * A person's follow is one with neither `auto` nor a Find run's own pick (`find_sources`, `replace`): the follow route,
+ * a Find review, an attach, a Make main. Anything else -- an extension a person installed, or turned on, or chose for
+ * a series -- stays theirs, as it was.
+ */
+async function seedBackupExtensions(c: PoolClient): Promise<void> {
+  await c.query(`
+    WITH last AS (
+      SELECT DISTINCT ON (detail->>'pkgName') detail->>'pkgName' AS pkg, event, detail->>'via' AS via, at
+        FROM audit_log
+       WHERE event IN ('extension.install', 'extension.uninstall', 'extension.enable') AND detail->>'pkgName' IS NOT NULL
+       ORDER BY detail->>'pkgName', at DESC, id DESC),
+    srcs AS (
+      SELECT pkg_name, array_agg('sw:' || source_id) AS ids, max(ext_name) AS name,
+             min(lang) FILTER (WHERE enabled) AS lang
+        FROM suwayomi_sources WHERE pkg_name IS NOT NULL GROUP BY pkg_name),
+    chosen AS (
+      SELECT DISTINCT s.pkg_name FROM srcs s JOIN last l ON l.pkg = s.pkg_name JOIN audit_log a ON a.at > l.at
+       WHERE (a.event = 'series.follow_source' AND a.detail->>'auto' IS NULL
+               AND (a.detail->>'via' IS NULL OR a.detail->>'via' IN ('find_review', 'replace_review'))
+               AND a.detail->>'source' = ANY(s.ids))
+          OR (a.event = 'series.attach_source' AND a.detail->>'source' = ANY(s.ids))
+          OR (a.event = 'series.main_source' AND a.detail->>'via' IN ('manual', 'review') AND a.detail->>'to' = ANY(s.ids)))
+    INSERT INTO backup_extensions (pkg_name, name, lang, state, via, installed_at, last_needed_at, why)
+    SELECT l.pkg, s.name, s.lang, 'active', 'autofix', l.at, now(), 'seed'
+      FROM last l JOIN srcs s ON s.pkg_name = l.pkg
+     WHERE l.event = 'extension.install' AND l.via = 'autofix'
+       AND NOT EXISTS (SELECT 1 FROM chosen ch WHERE ch.pkg_name = l.pkg)
+    ON CONFLICT (pkg_name) DO NOTHING`);
+  await c.query(`
+    WITH person AS (
+      SELECT DISTINCT ON (detail->>'pkgName') detail->>'pkgName' AS pkg, event, at
+        FROM audit_log
+       WHERE event IN ('extension.install', 'extension.uninstall', 'extension.enable')
+         AND detail->>'via' IS NULL AND detail->>'pkgName' IS NOT NULL
+       ORDER BY detail->>'pkgName', at DESC, id DESC)
+    INSERT INTO backup_extensions (pkg_name, state, parked_at, why)
+    SELECT p.pkg, 'refused', p.at, 'by_admin' FROM person p
+     WHERE p.event = 'extension.uninstall'
+       AND NOT EXISTS (SELECT 1 FROM suwayomi_sources ss WHERE ss.pkg_name = p.pkg)
+    ON CONFLICT (pkg_name) DO NOTHING`);
+}
 
 /**
  * Run-once data migrations, oldest first. Ids are permanent: renaming one re-runs it everywhere.
@@ -2178,6 +2393,22 @@ const DATA_MIGRATIONS: { id: string; run: (c: PoolClient) => Promise<void> }[] =
             AND EXISTS (SELECT 1 FROM jsonb_array_elements(l.copies) cp WHERE ${bad('cp')})`,
       );
     },
+  },
+  {
+    // v0.81.0: "Finish downloads on their own" is the one switch for everything automatic about downloads, looking for
+    // other sources included -- that was its own switch, "Use other sources on their own" (auto_follow_on_failure,
+    // "Look for failed chapters on other sources" before v0.80.0). The two columns stay, and Admin -> Settings now
+    // writes both together. Where they disagree, both go off: an admin who turned either off never finds part of it
+    // switched back on by an upgrade.
+    id: 'v0.81.0-one-switch-for-automatic-downloads',
+    run: async (c) => {
+      await c.query(`UPDATE server_settings SET finish_downloads = false, auto_follow_on_failure = false
+                      WHERE id = 1 AND finish_downloads IS DISTINCT FROM auto_follow_on_failure`);
+    },
+  },
+  {
+    id: BACKUP_SEED_MIGRATION,
+    run: seedBackupExtensions,
   },
 ];
 

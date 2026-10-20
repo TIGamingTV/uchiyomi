@@ -12,6 +12,7 @@ import { readFileSync, readdirSync, statSync, existsSync } from 'fs';
 import { join } from 'path';
 import { DESKTOP_HIDDEN } from '../lib/desktop';
 import { offlineKeyShown } from '../lib/seriesActions';
+import { PROFILE_SETTINGS } from '../lib/settingsIndex.profile';
 
 const ROOT = join(__dirname, '..');
 const read = (p: string) => readFileSync(join(ROOT, p), 'utf8');
@@ -68,42 +69,33 @@ test('the desktop app is recognised in one place only', () => {
   assert.equal((code(read('app/reader/page.tsx')).match(/serverReachableHint\(\)/g) ?? []).length, 2, 'the reader has two offline checks');
 });
 
-test('the admin and profile consoles hide tabs by filtering what the rail receives, and keep their pinned lines', () => {
-  // The tab lists are pinned (settingsConsole.test.ts, importBatch.test.ts) and `useTabParam` reads them, so
-  // they stay whole; only ConsoleNav's copy is filtered, and a deep link to a hidden tab falls back to the
-  // first one with the panel withheld meanwhile. Reintroduce by passing `groups={GROUPS}` again: "the admin
-  // rail still lists Members and Sessions on desktop" fails; by dropping `{hiddenTab ? null : panel}`: "a
-  // hidden tab's panel renders" fails.
-  assert.deepEqual([...DESKTOP_HIDDEN.adminTabs], ['Members', 'Sessions']);
-  assert.deepEqual([...DESKTOP_HIDDEN.profileTabs], ['Account']);
+test('the admin and profile consoles hide Desktop\'s missing pages by their registries, and a link to one opens the first', () => {
+  // v0.88.0: one list each (components/ConsoleLayout.tsx), drawn from the registry's pages that are `shown` under the
+  // console's conditions, and `?tab=` read only among those -- so a link to Members on Desktop opens Overview. Reintroduce
+  // by passing `web: true` from either page: "the admin console lists Members and Sessions on desktop" fails; by reading
+  // `?tab=` among every page: "a link to a hidden page opens it" fails.
   const admin = code(read('app/admin/page.tsx'));
-  assert.match(admin, /const \[tab, setTab\] = useTabParam<Tab>\(TABS, 'Overview', SOURCES_TAB_ALIASES\);/, 'the pinned admin useTabParam line changed');
-  assert.match(admin, /keys\('Members', 'Sessions', 'Activity'\)/, 'GROUPS itself was edited rather than filtered');
-  assert.match(admin, /<ConsoleNav groups=\{isDesktop\(\) \? visibleGroups\(GROUPS, DESKTOP_HIDDEN\.adminTabs\) : GROUPS\}/, 'the admin rail still lists Members and Sessions on desktop');
-  assert.match(admin, /const hiddenTab = hiddenOnDesktop\(DESKTOP_HIDDEN\.adminTabs, tab\);\s*useEffect\(\(\) => \{ if \(hiddenTab\) setTab\('Overview'\); \}, \[hiddenTab\]\);/, 'a deep link to a hidden admin tab does not fall back to Overview');
-  assert.match(admin, /\{hiddenTab \? null : panel\}/, 'a hidden tab\'s panel renders');
+  assert.match(admin, /conds=\{\{ web: !desktop,/, 'the admin console lists Members and Sessions on desktop');
   const profile = code(read('app/profile/page.tsx'));
-  assert.match(profile, /const \[tab, setTab\] = useTabParam<Tab>\(PROFILE_TABS, 'You'\);/, 'the pinned profile useTabParam line changed');
-  assert.match(profile, /keys\('You', 'Insights', 'Settings', 'Connections', 'Account'\)/, 'the pinned profile tab literal changed');
-  assert.match(profile, /<ConsoleNav groups=\{isDesktop\(\) \? visibleGroups\(PROFILE_GROUPS, DESKTOP_HIDDEN\.profileTabs\) : PROFILE_GROUPS\}/, 'the profile rail still lists Account on desktop');
-  assert.match(profile, /useEffect\(\(\) => \{ if \(hiddenTab\) setTab\('You'\); \}, \[hiddenTab\]\);/, 'a deep link to Account does not fall back to You');
-  assert.match(profile, /\{hiddenTab \? null : panel\}/, 'the Account panel renders on desktop');
-  // Sign out: the rail's button, gated; the Account tab's own row goes with the tab.
-  const rail = slice(profile, 'function RailActions(', 'function GoalModal(');
-  assert.match(rail, /\{!isDesktop\(\) && \(\s*<button onClick=\{logout\}/, 'the rail offers Sign out on desktop');
+  assert.match(profile, /conds=\{\{ web: !desktop,/, 'the profile console lists Account and This device on desktop');
+  const layout = code(read('components/ConsoleLayout.tsx'));
+  assert.match(layout, /const pages = useMemo\(\(\) => index\.categories\.filter\(\(c\) => shown\(c\.when, conds\) && views\[c\.id\]\)/, 'the console lists a page its conditions hide');
+  assert.match(layout, /const fromUrl = readPage\(index, params\.get\('tab'\), params\.get\('cat'\), ids\);/, 'a link to a hidden page opens it');
+  // Sign out: the profile's foot row, gated; the Account page's own row goes with the page.
+  const foot = slice(profile, 'function FootRows(', 'function GoalModal(');
+  assert.match(foot, /\{!isDesktop\(\) && <ConsoleFootRow onClick=\{logout\}/, 'the profile offers Sign out on desktop');
 });
 
-test('the Overview does not ask for sessions on desktop, and the hero does not count members', () => {
-  // `GET /api/admin/sessions` is a 404 on desktop; the Overview asked for it on every visit and showed a
-  // Sessions tile that opened a tab that is not there. Reintroduce by dropping `enabled: !desktop` from the
-  // sessions query: "the Overview asks for sessions on desktop" fails.
+test('the Overview asks nothing Desktop does not answer, and the server card does not count members there', () => {
+  // `GET /api/admin/sessions` is a 404 on desktop; the Overview asked for it on every visit, for a Sessions tile that
+  // opened a tab that is not there. v0.88.0: the tiles are gone -- the list is the way to every page -- and with them
+  // every question the Overview asked for one. Reintroduce a sessions query on the Overview: "the Overview asks for
+  // sessions" fails; drop `!isDesktop()` from the card's facts: "the server card counts members on desktop" fails.
   const admin = code(read('app/admin/page.tsx'));
   const overview = slice(admin, 'function Overview(', 'function NeedsAttention(');
-  assert.match(overview, /queryKey: \['admin-sessions'\], queryFn: \(\) => api<\{ content: any\[\] \}>\('\/api\/admin\/sessions'\), enabled: !desktop \}/, 'the Overview asks for sessions on desktop');
-  assert.match(overview, /const desktop = isDesktop\(\);/, 'the Overview does not decide from lib/desktop');
-  assert.match(overview, /\{!desktop && \(\s*<TabTile label=\{tr\('Sessions'\)\}/, 'the Sessions tile shows on desktop');
-  const hero = slice(admin, 'function AdminHero(', 'function Overview(');
-  assert.match(hero, /stats && !isDesktop\(\) \? \(stats\.members === 1/, 'the hero counts members on desktop');
+  assert.doesNotMatch(overview, /\/api\/admin\/sessions/, 'the Overview asks for sessions');
+  const card = slice(admin, 'function AdminHero(', 'function VersionLine(');
+  assert.match(card, /stats && !isDesktop\(\) \? \(stats\.members === 1/, 'the server card counts members on desktop');
 });
 
 test('per-person library access is hidden on desktop, and Extensions becomes the engine download', () => {
@@ -156,28 +148,31 @@ test('the desktop-only admin additions render nothing without the bridge', () =>
 });
 
 test('the profile settings and connections hide what only other devices use', () => {
-  // Downloads and This device (Save offline, push, "Install app"), OPDS and API tokens. The sections are
-  // gated where the grid composes them, and still defined: settingsConsole.test.ts pins their insides.
-  // Reintroduce by rendering `<DeviceSection />` unconditionally: "This device shows on desktop" fails.
+  // Offline downloads and This device's alerts (Save offline, push, "Install app"), OPDS and API tokens. Since v0.86.0
+  // the two are the This device category, which the registry draws only on a web install (`when: ['web']`), and the
+  // page says which install it is. Reintroduce by dropping `when: ['web']` from the category: "This device shows on
+  // desktop" fails; by passing `web: true`: "the page does not say it is on desktop" fails.
   const settings = code(read('components/ProfileSettings.tsx'));
-  assert.match(settings, /\{!desktop && <DownloadsSection \/>\}/, 'Downloads shows on desktop');
-  assert.match(settings, /\{!desktop && <DeviceSection \/>\}/, 'This device shows on desktop');
+  const device0 = PROFILE_SETTINGS.categories.find((c) => c.id === 'device');
+  assert.deepEqual(device0?.when, ['web'], 'This device shows on desktop');
+  assert.match(code(read('app/profile/page.tsx')), /conds=\{\{ web: !desktop, /, 'the page does not say it is on desktop');
+  assert.match(settings, /<DownloadsSection usage=\{usage\} \/>\s*<DeviceSection \/>/, 'the This device category lost a group');
   assert.match(settings, /function DeviceSection\(/, 'DeviceSection was deleted rather than gated');
   // v0.45.0: the desktop app's server mode is a plain window onto the server, so the server's own settings
   // render there -- but the window IS the installed app. Reintroduce by dropping `|| inDesktopWindow()`:
   // "Install Uchiyomi shows inside the desktop app" fails.
   const device = settings.slice(settings.indexOf('function DeviceSection('));
   assert.match(device, /setStandalone\(window\.matchMedia\('\(display-mode: standalone\)'\)\.matches \|\| \(navigator as any\)\.standalone === true \|\| inDesktopWindow\(\)\);/, 'Install Uchiyomi shows inside the desktop app');
-  assert.match(device, /\{!standalone && \(\s*<Row stacked label=\{tr\('Install Uchiyomi'\)\}>/, 'the install row is no longer gated on standalone');
+  assert.match(device, /\{!standalone && \(\s*<Row id="install" stacked label=\{tr\('Install Uchiyomi'\)\}>/, 'the install row is no longer gated on standalone');
   // ...and the window has no push service (Electron ships none): the push switch there could only fail with
   // "The browser did not grant it." (V2 review). Reintroduce by rendering the SwitchRow whatever `inApp` says:
   // "the push switch is offered inside the desktop app" fails; by dropping `!inApp &&` from `supported`: "push
   // counts as supported inside the desktop app" fails.
   assert.match(device, /const \[inApp\] = useState\(\(\) => inDesktopWindow\(\)\);/, 'the device section no longer asks whether it is inside the desktop app');
   assert.match(device, /const \[supported\] = useState\(\(\) => !inApp && typeof window !== 'undefined'/, 'push counts as supported inside the desktop app');
-  assert.match(device, /\{enabledSrv && \(inApp \? \(\s*<Row stacked label=\{tr\('New-chapter alerts'\)\}>\s*<p[^>]*>\{tr\('The desktop app cannot receive push notifications\./, 'the push switch is offered inside the desktop app');
+  assert.match(device, /\{enabledSrv && \(inApp \? \(\s*<Row id="chapter-alerts" stacked label=\{tr\('New-chapter alerts'\)\}>\s*<p[^>]*>\{tr\('The desktop app cannot receive push notifications\./, 'the push switch is offered inside the desktop app');
   // The server's own row is unchanged in a browser.
-  assert.match(device, /\) : \(\s*<SwitchRow label=\{tr\('New-chapter alerts'\)\}\s*help=\{supported \? tr\('Get a push notification when one of your favorites gets a new chapter\.'\) : tr\('Not supported on this browser\.'\)\}\s*on=\{on\} disabled=\{!supported\} onChange=\{toggle\} \/>/, 'the browser\'s push switch changed');
+  assert.match(device, /\) : \(\s*<SwitchRow id="chapter-alerts" device label=\{tr\('New-chapter alerts'\)\}\s*help=\{supported \? tr\('Get a push notification when one of your favorites gets a new chapter, or when someone comments on a chapter you commented on\.'\) : tr\('Not supported on this browser\.'\)\}\s*on=\{on\} disabled=\{!supported\} onChange=\{toggle\} \/>/, 'the browser\'s push switch changed');
   const conn = code(read('components/ProfileConnections.tsx'));
   assert.match(conn, /<TrackerSection focus=\{focusTracking\} \/>\s*\{!desktop && <OpdsSection \/>\}\s*\{!desktop && <TokensSection \/>\}/, 'OPDS or API tokens show on desktop, or the trackers moved');
   for (const [f, src] of [['ProfileSettings', settings], ['ProfileConnections', conn]] as const) {
@@ -193,14 +188,14 @@ test('Admin → Settings hides registration, the install count and the Mihon row
   const server = slice(src, 'function ServerSection(', 'function SchedulesSection(');
   assert.match(server, /queryFn: \(\) => api<[^\n]*'\/api\/admin\/install-ping\/preview'\),\s*staleTime: 60_000,\s*enabled: !desktop,/, 'the install-count preview is requested on desktop');
   // `!ssoOnly(authConfig)` since v0.63.0: an SSO-only server has no sign-up either (web/test/ssoOnly.test.ts).
-  assert.match(server, /\{!desktop && !ssoOnly\(authConfig\) && \(\s*<SwitchRow label=\{tr\('Open registration'\)\}/, 'the registration switch shows on desktop');
-  assert.match(server, /\{!desktop && <SwitchWithMore label=\{tr\('Count this server in the anonymous install count'\)\}/, 'the install count shows on desktop');
-  const house = slice(src, 'function HousekeepingSection(', 'const NO_PREFS');
-  assert.match(house, /\{!isDesktop\(\) && \(\s*<SwitchRow label=\{tr\('Show missing chapters in Mihon'\)\}/, 'the Mihon row shows on desktop');
-  // The backup hour gains one sentence on desktop and keeps its own on the server.
-  const sched = slice(src, 'function SchedulesSection(', 'function HousekeepingSection(');
-  assert.match(sched, /const nightly = tr\('Nightly, local time\. Shown under Tasks\.'\);/);
-  assert.match(sched, /help=\{isDesktop\(\) \? `\$\{nightly\} \$\{tr\('If the PC is off then, it runs the next time Uchiyomi opens\.'\)\}` : nightly\}/, 'the backup help does not say a missed backup catches up on desktop');
+  assert.match(server, /\{!desktop && !ssoOnly\(authConfig\) && \(\s*<SwitchRow id="registration" label=\{tr\('Open registration'\)\}/, 'the registration switch shows on desktop');
+  assert.match(server, /\{!desktop && <SwitchWithMore id="install-count" label=\{tr\('Count this server in the anonymous install count'\)\}/, 'the install count shows on desktop');
+  const series = slice(src, 'function SeriesSection(', 'function SchedulesSection(');
+  assert.match(series, /\{!isDesktop\(\) && \(\s*<MoreOptions id="series-more">\s*<SwitchRow id="mihon-missing" label=\{tr\('Show missing chapters in Mihon'\)\}/, 'the Mihon row shows on desktop');
+  // The backup gains one sentence on desktop and keeps its own on the server (Maintenance since v0.86.0).
+  const maintenance = slice(src, 'function MaintenanceSection(', 'export function NightlyModeRow(');
+  assert.match(maintenance, /const nightly = tr\('Nightly, local time\. Shown under Tasks\.'\);/);
+  assert.match(maintenance, /isDesktop\(\) \? `\$\{nightly\} \$\{tr\('If the PC is off then, it runs the next time Uchiyomi opens\.'\)\}` : nightly,/, 'the backup help does not say a missed backup catches up on desktop');
 });
 
 test('"Save offline" and the Offline tab are hidden on desktop, and smart offline never runs there', () => {

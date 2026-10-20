@@ -74,7 +74,7 @@ import type { SourceSeries } from './sources/types';
 import { healthAll, isDisabled } from './sourceHealth';
 import { scanOrder } from './scanOrder';
 import {
-  judgeCandidate, followJudged, bounded, titleMatch, MAX_FOLLOWERS, MIN_TRY_MS, type Judgement, type PrimaryFacts,
+  judgeCandidate, followJudged, bounded, titleMatch, MIN_TRY_MS, type Judgement, type PrimaryFacts,
 } from './autoFollow';
 import { chooseReleases, type ReleasePrefs } from './releases';
 import { effectivePrefsFor, readSeriesPrefs } from './scanlatorPrefs';
@@ -82,7 +82,8 @@ import { assess, MIN_HAVE } from './fill';
 import { postingOrderSeries } from './numbering';
 import { haveNumbers } from './libraryNumbers';
 import { altTitlesFor, learnAltTitles, parseAltTitles, SEARCH_NAMES } from './altTitles';
-import { searchByNames, takeHuntSlot, releaseHuntSlot } from './sourceHunt';
+import { searchByNames, takeHuntSlot, releaseHuntSlot, rememberJudgement } from './sourceHunt';
+import { recordVerdict, forgetVerdict } from './scoutMemory';
 import { budgetFor } from './sources/budget';
 import { seriesByIds, seriesOfMainSource } from './findScope';
 import { runtime } from './runtime';
@@ -105,6 +106,8 @@ import { refileFailures } from './chapterFailures';
 import { deadFollowers, rankFollowers, replaceCounts, replaceFacts, type RankedFollower, type SeriesFacts, type SkipWhy } from './replaceSource';
 import { MIN_COVERAGE } from './fill';
 import { carries, standingsOf, type Standing } from './sourceStanding';
+import { wantQuiet } from './finishDownloads';
+import { followerLimit } from './followLimit';
 
 /** How long one series may spend searching and judging before what is left of it is `not_tried`. */
 export const FIND_SERIES_WALL_MS = 90_000;
@@ -133,7 +136,7 @@ export type FindStatus = 'running' | 'done' | 'stopped' | 'failed' | 'interrupte
 /**
  * Why a series gained no source, each for exactly what happened (the web words every code):
  * - `posting_order`: numbered by posting order, so no follower is ever merged (not searched);
- * - `full`: it already follows MAX_FOLLOWERS sources (not searched), or a hunt filled the last slot meanwhile;
+ * - `full`: it already follows as many sources as a series may (lib/followLimit.ts; not searched), or a hunt filled the last slot meanwhile;
  * - `too_few`: it lists under MIN_HAVE chapter numbers, which no candidate can be measured against (not searched);
  * - `no_source`: no other source could be asked -- every one disabled, cooling down, beyond the starting admin's
  *   age cap, in another language than the series (v0.52.0), or one it already follows (not searched; the server log
@@ -400,6 +403,8 @@ async function waitQuiet(a: ActiveRun): Promise<boolean> {
   for (;;) {
     if (isStopped(a)) return false;
     a.waiting = runtime.updating ? 'sweep' : runtime.repairing ? 'repair' : checkRunning() ? 'check' : null;
+    // v0.79.0: a finishing sweep (lib/finishDownloads.ts) gives way when asked, instead of holding the run for its pass.
+    if (a.waiting === 'sweep') wantQuiet();
     if (a.waiting) a.card.waiting = a.waiting;
     else delete a.card.waiting;
     if (!a.waiting) return true;
@@ -609,7 +614,7 @@ async function findFor(
   // reads full for the series whose two followers are switched off.
   const dead = new Set((replacing?.dead ?? []).map((d) => d.sourceId));
   const live = [...followers].filter((id) => !dead.has(id));
-  const free = MAX_FOLLOWERS - live.length;
+  const free = (await followerLimit()) - live.length;
   if (free <= 0) return end('full', false);
   const numbers = await numbersOf(s.id);
   // judgeCandidate refuses every candidate of a series listing under MIN_HAVE numbers before asking anything, so
@@ -696,6 +701,8 @@ async function findFor(
       asked = true;
       const found = await searchByNames(src, row.title, names, left);
       if (found.answered) answered++;
+      // v0.80.0: what it said is kept for the scout and the hunt (lib/scoutMemory.ts), as theirs is.
+      if (found.answered && !found.hit) void recordVerdict(s.id, id, 'no_hit', { ourCount: numbers.length });
       if (!found.hit || enough() || isStopped(a)) return;
       carriers++;
       if (left() < MIN_TRY_MS) { cut = true; return; }
@@ -705,6 +712,7 @@ async function findFor(
       if (!j) { cut = true; return; }
       judged[i] = j;
       hits[i] = found.hit;
+      void rememberJudgement(s.id, j, numbers.length);
       if (j.why === 'ok') ok++;
       // Failed the title or the chapter-number check: the one thing `refused` says. (`too_few_listed` cannot come
       // back: a series listing too few numbers ended `too_few` before any search.)
@@ -792,7 +800,7 @@ async function makeRoom(
   seriesId: string, dead: ReadonlyArray<{ sourceId: string; name: string }>, dropped: Array<{ sourceId: string; name: string }>,
 ): Promise<void> {
   const [{ n }] = await q<{ n: number }>('SELECT count(*)::int AS n FROM series_sources WHERE series_id = $1', [seriesId]);
-  let over = Number(n) - MAX_FOLLOWERS + 1;
+  let over = Number(n) - (await followerLimit()) + 1;
   let made = 0;
   for (const d of dead) {
     if (over <= 0) break;
@@ -1059,6 +1067,8 @@ async function decide(
       { addedBy: userId }).catch(() => 'gone' as const);
     if (written === 'cap') return { refused: 'full' };
     if (written !== 'inserted') return { refused: 'not_found' };
+    // An admin's own pick (v0.80.0): what the scout remembered about it for this series, `removed` included, is gone.
+    await forgetVerdict(seriesId, sourceId);
     await logAudit('series.follow_source', {
       userId,
       detail: {
@@ -1157,6 +1167,7 @@ async function promote(
         { addedBy: userId }).catch(() => 'gone' as const);
       if (written === 'cap') return { refused: 'full' };
       if (written !== 'inserted') return { refused: 'not_found' };
+      await forgetVerdict(seriesId, sourceId);
       await logAudit('series.follow_source', {
         userId,
         detail: {

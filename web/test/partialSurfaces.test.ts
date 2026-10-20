@@ -80,8 +80,8 @@ test('the reader names the source from what it already has, and asks /api/source
   assert.match(q, /enabled: unnamedMissingSource && canDownload\(user\)/, 'the full source list is asked for by a viewer the route refuses, or with no missing page to name');
   assert.match(src, /const unnamedMissingSource = chapters\.some\(\(c\) => !!c\.sourceId && !seriesSourceNames\[c\.sourceId\] && c\.pages\.some\(\(p\) => p\.missing\)\)/, 'the gate no longer keys on an unnamed source with a missing page');
   // The flag and the source id both have to survive loadChapter, or the caption never renders online. (v0.77.0: the page
-  // list is read by pageList, which carries #229's `join` beside them.)
-  assert.match(src, /junk: p\.junk, missing: p\.missing, join: p\.join \}\)\)/, 'loadChapter drops the missing flag from the page list');
+  // list is read by pageList, which carries #229's `join` beside them, and since v0.89.0 #262's `mark`.)
+  assert.match(src, /junk: p\.junk, missing: p\.missing, join: p\.join, mark: p\.mark \}\)\)/, 'loadChapter drops the missing flag from the page list');
   assert.match(src, /sourceId: b\.sourceId \?\? null,/, 'loadChapter drops the book\'s sourceId');
 });
 
@@ -101,7 +101,7 @@ test('a chapter row says how many pages are missing, as an amber chip before the
   assert.doesNotMatch(cap, /<button/, 'RowCaption renders a button inside the row opener');
   // And ChapterRow feeds it from the DTO.
   const row = between(page, 'function ChapterRow(', 'function GhostRow(', 'ChapterRow');
-  assert.match(row, /<RowCaption group=\{book\.scanlator\} via=\{altSource\} versions=\{versions\} pruned=\{prunedWords\(book\)\} missing=\{book\.missingPages\?\.length\} \/>/, 'ChapterRow does not pass the book\'s missingPages to the caption');
+  assert.match(row, /<RowCaption group=\{book\.scanlator\} via=\{altSource\} versions=\{versions\} pruned=\{prunedWords\(book\)\} missing=\{book\.missingPages\?\.length\}(?: talk=\{talk\})? \/>/, 'ChapterRow does not pass the book\'s missingPages to the caption');
 });
 
 // ---- offline ----
@@ -111,11 +111,11 @@ test('the offline record keeps the missing flag beside junk', () => {
   // lives in the manifest is one the reader never sees: online the caption, offline a blank grey page.
   // Reintroduce by dropping `missing: p.missing` from the pages map in saveChapter.
   const src = code(read('lib/downloads.ts'));
-  // v0.77.0: #229's `join` rides beside them, for the same reason (bff routes/downloads.ts).
-  assert.match(src, /pages: manifest\.pages\.map\(\(p\) => \(\{ number: p\.number, width: p\.width, height: p\.height, junk: p\.junk, missing: p\.missing, join: p\.join \}\)\)/, 'the offline record does not copy `missing` beside `junk`');
-  assert.match(src, /junk\?: boolean; missing\?: true; join\?: 'rtl' \| 'ltr' \}\[\];/, 'the OfflineChapter page type lost `missing`');
+  // v0.77.0: #229's `join` rides beside them, for the same reason (bff routes/downloads.ts); v0.89.0, #262's `mark` too.
+  assert.match(src, /pages: manifest\.pages\.map\(\(p\) => \(\{ number: p\.number, width: p\.width, height: p\.height, junk: p\.junk, missing: p\.missing, join: p\.join, mark: p\.mark \}\)\)/, 'the offline record does not copy `missing` beside `junk`');
+  assert.match(src, /junk\?: boolean; missing\?: true; join\?: 'rtl' \| 'ltr'; mark\?: 'join' \| 'split' \}\[\];/, 'the OfflineChapter page type lost `missing`');
   // The manifest type it reads from carries the flag too, or the copy above is a type error at best.
-  assert.match(code(read('lib/types.ts')), /bytes: number \| null; junk\?: boolean; missing\?: true; join\?: 'rtl' \| 'ltr' \}\[\];/, 'DownloadManifest pages lost `missing`');
+  assert.match(code(read('lib/types.ts')), /bytes: number \| null; junk\?: boolean; missing\?: true; join\?: 'rtl' \| 'ltr'; mark\?: 'join' \| 'split' \}\[\];/, 'DownloadManifest pages lost `missing`');
   assert.match(code(read('lib/types.ts')), /missingPages\?: number\[\] \| null;/, 'Book lost `missingPages`');
 });
 
@@ -162,20 +162,22 @@ test('the three job-card readers all draw the lines through jobNoteLines', () =>
 
 // ---- the admin switch ----
 
-test('Admin → Settings has exactly one switch for the hunt, under Updates & schedules, on unless told otherwise', () => {
+test('Admin → Settings has exactly one switch for the hunt, under Downloads, on unless told otherwise', () => {
   // The hunt is on by default (server column `auto_follow_on_failure NOT NULL DEFAULT true`), so the row
   // reads `!== false`: a server that does not send the key yet is a server that hunts, and the switch says
   // so. It lives outside the extensions block because the hunt asks every registered source.
-  // Reintroduce by a second `autoFollowOnFailure` anywhere in the file, or by `on={!!data.auto_follow_on_failure}`.
+  // v0.81.0: it is no longer a switch of its own -- "Finish downloads on their own" writes it with finish_downloads, the
+  // one switch for everything automatic about downloads (finishDownloads.test.ts pins that row).
+  // Reintroduce by a second `autoFollowOnFailure` anywhere in the file, or by `!!data.auto_follow_on_failure`.
   const src = code(read('components/AdminSettings.tsx'));
   assert.equal((src.match(/autoFollowOnFailure/g) ?? []).length, 1, 'the hunt switch is saved from more or fewer than one place');
-  const section = between(src, 'function SchedulesSection(', 'function HousekeepingSection(', 'SchedulesSection');
-  assert.match(section, /<SwitchRow label=\{tr\('Look for failed chapters on other sources'\)\}\s*help=\{tr\('When a chapter cannot be saved from the sources this series follows, search the others once a day and follow the one that has it'\)\}\s*on=\{data\.auto_follow_on_failure !== false\} onChange=\{\(next\) => save\(\{ autoFollowOnFailure: next \}\)\} \/>/, 'the hunt switch is not the one SwitchRow with these words, or is not on by default');
-  // After the extensions block, not inside it: an install without an engine still hunts.
-  const ext = section.indexOf('data.extensions_configured && (');
-  const sw = section.indexOf("tr('Look for failed chapters on other sources')");
-  const extEnd = section.indexOf('</>\n      )}', ext);
-  assert.ok(ext > 0 && extEnd > ext && sw > extEnd, 'the hunt switch is inside the extensions block, so an install without an engine cannot see it');
+  assert.match(src, /data\.auto_follow_on_failure !== false/, 'the hunt is not on unless told otherwise');
+  // In Downloads (v0.86.0), and never behind the extensions' condition: an install without an engine still hunts.
+  // Reintroduce by wrapping the row in `data.extensions_configured && (…)`: "the hunt switch is behind the extensions"
+  // fails.
+  const section = between(src, 'function SchedulesSection(', 'function MaintenanceSection(', 'SchedulesSection');
+  assert.ok(section.includes('autoFollowOnFailure: next'), 'the hunt switch is not in Downloads');
+  assert.ok(!section.includes('extensions_configured'), 'the hunt switch is behind the extensions');
 });
 
 test('Health keeps explanatory notes reachable when a check has no active findings', () => {

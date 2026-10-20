@@ -32,6 +32,9 @@ if (DSN) {
   // One search at a time, so "asked in scan order" and "stopped before asking" are exact.
   process.env.SCAN_CONCURRENCY = '1';
   process.env.UCHIYOMI_PING_URL = '';
+  // The follower limit these tests count to. Three by default since v0.80.0 (lib/followLimit.ts, pinned in
+  // followLimit.test.ts); the rules here are the same at any limit, and these fixtures measure them at two.
+  process.env.MAX_FOLLOWED_SOURCES = '2';
 }
 const skip = DSN ? false : 'set TEST_DATABASE_URL to run';
 
@@ -358,10 +361,15 @@ test('one run at a time; the scope must name something; a stop ends it at once, 
   const memberJobs = (await app.inject({ method: 'GET', url: '/api/sources/jobs', headers: memberAuth })).json();
   assert.equal(memberJobs.runs.some((x: any) => x.kind === 'find_sources'), false);
   // Its starter, no longer an admin, does not keep it either. Reintroduce by dropping the kind test from the jobs
-  // route's filter: the starter's own-run rule hands it over.
-  const demoted = { authorization: `Bearer ${app.jwt.sign({ sub: adminId, role: 'member' })}` };
-  const demotedJobs = (await app.inject({ method: 'GET', url: '/api/sources/jobs', headers: demoted })).json();
-  assert.equal(demotedJobs.runs.some((x: any) => x.kind === 'find_sources'), false, 'a find_sources card is an admin\'s alone');
+  // route's filter: the starter's own-run rule hands it over. Demoted in the database, not in a token: since v0.78.1 a
+  // session takes its account's role as it is now (lib/auth.ts authenticate), so the same token stops being an admin's.
+  await q(`UPDATE users SET role = 'user' WHERE id = $1`, [adminId]);
+  try {
+    const demotedJobs = (await app.inject({ method: 'GET', url: '/api/sources/jobs', headers: adminAuth })).json();
+    assert.equal(demotedJobs.runs.some((x: any) => x.kind === 'find_sources'), false, 'a find_sources card is an admin\'s alone');
+  } finally {
+    await q(`UPDATE users SET role = 'admin' WHERE id = $1`, [adminId]);
+  }
 
   const stop = await app.inject({ method: 'POST', url: '/api/admin/sources/find/stop', headers: adminAuth });
   assert.deepEqual(stop.json(), { stopped: true });

@@ -18,7 +18,9 @@ import { SeriesCard } from '@/components/cards';
 import { useToast } from '@/components/Toast';
 import { ConfirmDialog, Modal, msgOf } from '@/components/ConfirmDialog';
 import { useAuth, canDownload } from '@/lib/auth';
-import { IcChevronLeft, IcDownload, IcCloudDownload, IcCheck, IcTrash, IcHourglass, IcGrid, IcRows } from '@/components/icons';
+import { IcChevronLeft, IcDownload, IcCloudDownload, IcCheck, IcTrash, IcHourglass, IcGrid, IcRows, IcComment } from '@/components/icons';
+import { commentsLine, seriesTalkKey, talkWantedOf, type ChapterTalkCount } from '@/lib/comments';
+import { ChapterTalkSheet } from '@/components/ChapterTalk';
 import { t as tr } from '@/lib/i18n';
 import { statusText } from '@/lib/activity';
 import { deletedText, selectedText, skippedBookmarkedText, skippedNotOursText } from '@/lib/counted';
@@ -29,7 +31,7 @@ import { normGroup } from '@/lib/scanlators';
 import { GHOST_CAP, mergeRows, whyLabel, runLabel, chunkNumbers, countsAsBehind, MARK_CHUNK, heldBy, lastOf, wholesHeld, prunedWords, deliberatelyDeleted, ghostOfDeleted, type Row } from '@/lib/chapterRows';
 import { chParam, landingNumber } from '@/lib/healthLinks';
 import { effectsReduced } from '@/lib/effects';
-import { clampPage, pageCount, pageLabel, pageOf, pageSizeFor, pageSlice } from '@/lib/chapterPages';
+import { clampPage, numberingSpan, pageCount, pageLabel, pageOf, pageSizeFor, pageSlice } from '@/lib/chapterPages';
 import { openRuns, showAllChaptersOn } from '@/lib/showAllChapters';
 import { buttonsClass, compactChaptersOn, dotHide, rowClass, thumbHide } from '@/lib/compactChapters';
 import { chapterRowsClass, chapterViewOn, setChapterView, type ChapterView } from '@/lib/chapterView';
@@ -273,8 +275,13 @@ function ChapterEditModal({ book, onClose, onSaved }: { book: Book; onClose: () 
  * sat OUTSIDE the opener for exactly this reason). The copies open from ⋯ → Versions on a chapter row, and
  * from the row tap on a ghost row.
  */
-function RowCaption({ group, via, versions, tone = 'text-fog-500', pruned, lead, missing }: {
+function RowCaption({ group, via, versions, tone = 'text-fog-500', pruned, lead, missing, talk }: {
   group?: string | null;
+  /**
+   * v0.87.0: the chapter's talk, while the household has any (lib/comments.ts): its two most used reactions with how many
+   * reacted ("😂🔥 3"), and how many comments ("💬 2"). Absent, or a chapter nobody talked about, draws nothing.
+   */
+  talk?: ChapterTalkCount | null;
   via?: string | null;
   versions?: number;
   tone?: string;
@@ -313,6 +320,16 @@ function RowCaption({ group, via, versions, tone = 'text-fog-500', pruned, lead,
   if (group) { parts.push(<span key="g"><GroupAvatar name={group} size={14} className="me-1 align-text-bottom" />{group}</span>); plain.push(group); }
   if (via) { const t = tr('via {source}', { source: via }); parts.push(<span key="via">{t}</span>); plain.push(t); }
   if (versions && versions >= 2) { const t = tr('{n} versions', { n: versions }); parts.push(<span key="v">{t}</span>); plain.push(t); }
+  if (talk && talk.reactions > 0) {
+    const t = talk.reactions === 1 ? tr('1 reaction') : tr('{n} reactions', { n: talk.reactions });
+    parts.push(<span key="r" data-row-reactions><span aria-hidden>{talk.top.join('')} {talk.reactions}</span><span className="sr-only">{t}</span></span>);
+    plain.push(t);
+  }
+  if (talk && talk.comments > 0) {
+    const t = commentsLine(talk.comments);
+    parts.push(<span key="c" data-row-comments><span aria-hidden><IcComment width={11} height={11} className="me-0.5 inline align-[-1px]" />{talk.comments}</span><span className="sr-only">{t}</span></span>);
+    plain.push(t);
+  }
   if (!parts.length && !pruned && !short) return null;
   const title = [...(pruned ? [pruned.full] : []), ...(short ? [short] : []), ...plain].join(' · ');
   if (pruned) {
@@ -395,8 +412,11 @@ function ButtonsWrap({ compact, menuOpen, children }: { compact: boolean; menuOp
   return <div className={buttonsClass(menuOpen)}>{children}</div>;
 }
 
-function ChapterRow({ book, downloaded, sourceNames, primarySource, versions, onReader, onToggleDownload, onMark, onEdit, onVersions, onReplaceFrom, onCopyPath, onHide, onRefetch, onDelete, selectable, selected, onToggle, compact, lit }: {
+function ChapterRow({ book, downloaded, sourceNames, primarySource, versions, onReader, onToggleDownload, onMark, onEdit, onVersions, onReplaceFrom, onCopyPath, onHide, onRefetch, onDelete, selectable, selected, onToggle, compact, lit, talk, onTalk }: {
   book: Book;
+  /** v0.87.0: the chapter's talk for the caption, and the menu's Comments, while the household has any. */
+  talk?: ChapterTalkCount | null;
+  onTalk?: () => void;
   /** Admins only (#136): copy the chapter file's full path. Absent for everyone else and for a row with no path. */
   onCopyPath?: () => void;
   /**
@@ -445,6 +465,7 @@ function ChapterRow({ book, downloaded, sourceNames, primarySource, versions, on
     ...(state !== 'read' ? [{ label: tr('Mark read'), onSelect: () => onMark('read') }] : []),
     ...(state !== 'unread' ? [{ label: tr('Mark unread'), onSelect: () => onMark('unread') }] : []),
     { label: tr('Mark previous as read'), onSelect: () => onMark('previous') },
+    ...(onTalk ? [{ label: talk?.comments ? `${tr('Comments')} · ${talk.comments}` : tr('Comments'), divider: true, hook: 'comments', onSelect: onTalk }] : []),
     ...(onVersions ? [{ label: tr('Versions'), divider: true, onSelect: onVersions }] : []),
     ...(onReplaceFrom ? [{ label: tr('Replace from another source…'), onSelect: onReplaceFrom }] : []),
     ...(onEdit ? [{ label: tr('Edit number & title'), divider: true, onSelect: onEdit }] : []),
@@ -493,7 +514,7 @@ function ChapterRow({ book, downloaded, sourceNames, primarySource, versions, on
             {/* The chapter's own name, when the source gave one that is not just the number again. */}
             {chapterName(book) && <span className="text-fog-500"> · {chapterName(book)}</span>}
           </p>
-          <RowCaption group={book.scanlator} via={altSource} versions={versions} pruned={prunedWords(book)} missing={book.missingPages?.length} />
+          <RowCaption group={book.scanlator} via={altSource} versions={versions} pruned={prunedWords(book)} missing={book.missingPages?.length} talk={talk} />
           {state === 'reading' && rp && (
             <p className="text-[11px] text-accent">{tr('page {page}/{pages}', { page: rp.page, pages: book.media.pagesCount })}</p>
           )}
@@ -677,9 +698,13 @@ function readShowGhosts(): boolean {
 /**
  * Prev / a range picker / Next for the chapter list. The picker names each page by the first and last chapter
  * numbers it shows ("901–1000", or "1193–1094" newest first), which is what a reader hunting for a chapter
- * number actually scans for; `total` is chapters, not rows.
+ * number actually scans for.
+ *
+ * ⚠️ No count beside it: "86–129 of 149" counted FILES (149, half chapters included) next to chapter numbers, and read as
+ * chapters 130–149 missing (the owner, 10-19). The header says how many chapters there are, and their numbers when those
+ * differ (numberingSpan). Reintroduce by putting `of {n}` back: chapterPages.test.ts finds it.
  */
-function ChapterPager({ page, pages, rows, asc, total, onPage }: { page: number; pages: number; rows: readonly Row[]; asc: boolean; total: number; onPage: (p: number) => void }) {
+function ChapterPager({ page, pages, rows, asc, onPage }: { page: number; pages: number; rows: readonly Row[]; asc: boolean; onPage: (p: number) => void }) {
   const range = (p: number) => pageLabel(rows, p, asc);
   return (
     <nav aria-label={tr('Chapter pages')} data-chapter-pager className="my-2 flex items-center justify-center gap-2 text-xs">
@@ -689,7 +714,6 @@ function ChapterPager({ page, pages, rows, asc, total, onPage }: { page: number;
         className="h-8 rounded-lg border border-ink-700 bg-ink-850 px-2.5 text-fog-100">
         {Array.from({ length: pages }, (_, p) => <option key={p} value={p}>{range(p)}</option>)}
       </select>
-      <span className="text-fog-500">{tr('of {n}', { n: total })}</span>
       <button type="button" onClick={() => onPage(page + 1)} disabled={page >= pages - 1} className="btn-key">{tr('Next')}</button>
       <button type="button" onClick={() => onPage(pages - 1)} disabled={page >= pages - 1} className="btn-key px-2.5" aria-label={tr('Last page')}>»</button>
     </nav>
@@ -721,6 +745,8 @@ function SeriesInner() {
   const wantCh = chParam(useSearchParams().get('ch'));
   // Health's Open on a numbering finding (#116, lib/healthLinks.ts numberingHref): the plan, open on arrival.
   const wantPlan = useSearchParams().get('numbering') === 'review';
+  // A new comment's push (v0.87.0, bff lib/comments.ts conversationPush): that chapter's talk, open on arrival.
+  const wantTalk = useSearchParams().get('comments');
   const router = useRouter();
   const qc = useQueryClient();
   const toast = useToast();
@@ -806,6 +832,30 @@ function SeriesInner() {
   // them rather than on its placeholders.
   const { data: series } = useQuery({ ...seriesQuery(id), enabled: !!id });
   const { data: books } = useQuery({ ...seriesBooksQuery(id), enabled: !!id });
+  // v0.87.0: which chapters have talk, and how much (GET /api/series/:id/comments); nothing while `on` is false, and never
+  // asked on Uchiyomi Desktop, where the route does not exist. v0.90.0: nor by an account that switched Comments and
+  // reactions off (lib/comments.ts talkWantedOf).
+  const talkWanted = talkWantedOf(user?.settings);
+  const { data: talkData } = useQuery({
+    queryKey: seriesTalkKey(id),
+    queryFn: () => api<{ on: boolean; content: ChapterTalkCount[] }>(`/api/series/${id}/comments`),
+    enabled: !!id && !isDesktop() && talkWanted,
+    staleTime: 60_000,
+  });
+  const talkOn = !!talkData?.on && talkWanted;
+  const talkOf = useMemo(() => new Map((talkData?.content ?? []).map((x) => [x.bookId, x])), [talkData]);
+  const [talkFor, setTalkFor] = useState<string | null>(null);
+  const talkedOf = useRef<string | null>(null);
+  useEffect(() => {
+    if (!wantTalk || !talkOn || !books || talkedOf.current === wantTalk) return;
+    talkedOf.current = wantTalk;
+    try {
+      const u = new URL(window.location.href);
+      u.searchParams.delete('comments');
+      window.history.replaceState(window.history.state, '', `${u.pathname}${u.search}${u.hash}`);
+    } catch { /* the sheet opens regardless */ }
+    if (books.content.some((b) => b.id === wantTalk)) setTalkFor(wantTalk);
+  }, [wantTalk, talkOn, books]);
   // What the sources list that the library lacks, as of the updater's last visit. A courtesy, never a
   // blocker: no retry, and an error renders no ghost rows rather than a message, because the chapters on
   // disk are the page and this is the margin note.
@@ -1705,10 +1755,13 @@ function SeriesInner() {
     </div>
   );
 
+  const span = series && books && !mostlyVolumes ? numberingSpan(books.content, series.booksCount) : null;
   const metaBits: ReactNode[] = [
     author ? <span className="text-fog-300">{tr('by {author}', { author: `\u2068${author}\u2069` })}</span> : null,
     meta?.status ? <span className="capitalize">{statusText(meta.status)}</span> : null,
     series ? <>{bookCountText(series.booksCount, mostlyVolumes)}</> : null,
+    // Their numbers, when they do not run 1 to the count (half chapters, a chapter 0, gaps): "149 chapters · Ch. 0–129".
+    span ? <>{tr('Ch. {a}–{b}', span)}</> : null,
     (series?.yomi?.unread ?? series?.booksUnreadCount ?? 0) > 0 ? <span className="text-accent">{tr('{n} unread', { n: series!.yomi?.unread ?? series!.booksUnreadCount })}</span> : null,
     // "{n} behind" used to sit here; the supply line under the title carries that count now ("4 not here
     // yet"), with the source and the groups beside it, and one line saying it is enough.
@@ -1795,7 +1848,7 @@ function SeriesInner() {
           {tr('{n} of {m} chapters match', { n: filteredBooks.length + filteredGhosts.length, m: rowBooks.length + visibleGhosts.length })}
         </p>
       )}
-      {pages > 1 && <ChapterPager page={shownPage} pages={pages} rows={rows} asc={asc} total={filteredBooks.length + filteredGhosts.length} onPage={(p) => goPage(p, false)} />}
+      {pages > 1 && <ChapterPager page={shownPage} pages={pages} rows={rows} asc={asc} onPage={(p) => goPage(p, false)} />}
       <div className={chapterRowsClass(view)} data-chapter-rows={view}>
         {pageRows.map((r) => {
           if (r.kind === 'book') {
@@ -1812,7 +1865,8 @@ function SeriesInner() {
                 selectable={selecting} selected={pickedBooks.has(b.id)} onToggle={() => togglePickBook(b.id)}
                 versions={versionsOf.get(b.number)?.length}
                 onVersions={versionsOf.has(b.number) ? () => setChapterSheet({ number: b.number, book: b }) : undefined}
-                onReplaceFrom={isAdmin && b.owned !== false && versionsOf.get(b.number)?.some((c) => !c.onDisk) ? () => setComparing(b) : undefined} />
+                onReplaceFrom={isAdmin && b.owned !== false && versionsOf.get(b.number)?.some((c) => !c.onDisk) ? () => setComparing(b) : undefined}
+                talk={talkOn ? talkOf.get(b.id) : null} onTalk={talkOn ? () => setTalkFor(b.id) : undefined} />
             );
           }
           if (r.kind === 'ghost') {
@@ -1878,7 +1932,7 @@ function SeriesInner() {
         })}
         {!books && Array.from({ length: 8 }).map((_, i) => <div key={i} className="skeleton my-3 h-6 rounded" />)}
       </div>
-      {pages > 1 && <ChapterPager page={shownPage} pages={pages} rows={rows} asc={asc} total={filteredBooks.length + filteredGhosts.length} onPage={(p) => goPage(p, true)} />}
+      {pages > 1 && <ChapterPager page={shownPage} pages={pages} rows={rows} asc={asc} onPage={(p) => goPage(p, true)} />}
     </div>
   );
 
@@ -2222,6 +2276,14 @@ function SeriesInner() {
       )}
       {showHidden && <HiddenChaptersDialog seriesId={id} onClose={() => setShowHidden(false)} onChanged={invalidateChapters} />}
       {coverPicker && <CoverPickerSheet seriesId={id} artVersion={series?.artVersion} onClose={() => setCoverPicker(false)} />}
+      {talkFor && (() => {
+        const b = books?.content.find((x) => x.id === talkFor);
+        // A comment's "p. 12" opens the reader at that page.
+        return (
+          <ChapterTalkSheet bookId={talkFor} seriesId={id} title={b ? (b.metadata?.title || b.name || chapterLabel(b)) : tr('Comments')} subtitle={title}
+            onPage={(n) => router.push(`/reader/?book=${talkFor}&page=${n}`)} onClose={() => setTalkFor(null)} overBottomNav />
+        );
+      })()}
       {comparing && (
         <CompareCopiesDialog seriesId={id} book={comparing} copies={versionsOf.get(comparing.number) ?? []} sourceNames={sourceNames}
           // The compare closes FIRST, then the confirm opens: the same Modal-over-Modal rule as the versions sheet.

@@ -3,8 +3,8 @@
 //
 // The owner: "settings are buried too much". Kedryn looked for the version in "a menu on the left somewhere" (#150) and
 // DannyDynamite39 for the import (#158), and both were there -- a tab, a section and a scroll away. Typing what you are
-// looking for is the one way in that needs no map, so every admin tab, Admin → Settings' sections, the profile's tabs
-// and cards, the import page and the settings people ask for by name are destinations here: shown for a query of two
+// looking for is the one way in that needs no map, so every page of the two consoles, every row of their settings, the
+// profile's cards, the import page and the settings people ask for by name are destinations here: shown for a query of two
 // characters or more, under their own heading after the series, to admins only where the page is theirs, and never on
 // Uchiyomi Desktop where the page or the setting does not exist there (lib/desktop.ts DESKTOP_HIDDEN).
 //
@@ -13,34 +13,34 @@
 // once the page has it (lib/useSectionArrival.ts); each such id is on its card (web/test/destinations.test.ts holds
 // every one to its source).
 import { keys, t as tr } from './i18n';
+import { fold, rankMatch, type SettingsIndex } from './settingsIndex';
+import { PROFILE_SETTINGS } from './settingsIndex.profile';
+import { ADMIN_SETTINGS, SETTINGS_NAME_ALIASES } from './settingsIndex.admin';
 
-/** Every label and place below, declared so the translation extractor sees them (lib/i18n.ts `keys`). */
+export { fold };
+
+/** Every label and place below, declared so the translation extractor sees them (lib/i18n.ts `keys`). The consoles' pages
+ * and groups are declared with their registries (lib/settingsIndex*.ts). */
 const LABELS = keys(
-  // The admin tabs.
-  'Overview', 'Tasks', 'Settings', 'Members', 'Sessions', 'Activity', 'Library', 'Health', 'Art', 'Sources',
-  // The sections of Admin → Settings, in their order.
-  'Server', 'Updates & schedules', 'Library housekeeping', 'Scanlators', 'Notifications', 'Downloads', '18+ filter',
-  'Source order', 'Notice chapters',
-  // Settings people ask for by name.
-  'Check for updates', 'Open registration', 'Backup time', 'Delete read chapters', 'Show missing chapters in Mihon',
-  'Slow archive', 'Cloudflare solver', 'Version', 'Import a list', 'Rescan everything', 'Smart update checks',
-  'Backups to keep',
-  // The profile: its tabs, its cards and its settings by name.
-  'You', 'Insights', 'Connections', 'Account', 'Badges', 'Reading studio', 'Appearance', 'Language', 'Reduce effects', 'Reading',
-  'Weekly goal', 'Reading direction', 'Offline downloads', 'This device', 'New-chapter alerts', 'Progress tracking',
+  // The settings pages by their old tab's name, and what was the Tasks tab.
+  'Settings', 'Tasks',
+  // Pages and cards people ask for by name, besides the consoles' pages and settings (generated below).
+  'Cloudflare solver', 'Version', 'Import a list', 'Rescan everything',
+  // The profile's cards.
+  'Badges', 'Reading studio', 'Weekly goal', 'Progress tracking',
   'External readers (OPDS)', 'API tokens', 'Change password', 'Two-factor authentication', 'Active sessions',
   // Where each one is.
-  'Admin', 'Profile',
+  'Admin', 'Profile', 'Health', 'Maintenance', 'Connections', 'Account',
 );
 export type DestinationLabel = (typeof LABELS)[number];
 
 export interface Destination {
   /** Stable: React's key and the tests'. */
   key: string;
-  /** What the row says, an English key shown through tr(). */
-  label: DestinationLabel;
-  /** Where it is, said after the label: Admin → Settings. */
-  where: readonly DestinationLabel[];
+  /** What the row says, an English key shown through tr(). A setting's is its row's own label (lib/settingsIndex*.ts). */
+  label: string;
+  /** Where it is, said after the label: Admin → Settings → Downloads. */
+  where: readonly string[];
   /** The page, its `?tab=` and the card it scrolls to (`?section=`). */
   href: string;
   /** English words someone might type for it besides its label. */
@@ -52,80 +52,29 @@ export interface Destination {
 }
 
 const ADMIN = ['Admin'] as const;
-const ADMIN_SETTINGS = ['Admin', 'Settings'] as const;
 const ADMIN_HEALTH = ['Admin', 'Health'] as const;
-const ADMIN_TASKS = ['Admin', 'Tasks'] as const;
+const ADMIN_MAINTENANCE = ['Admin', 'Settings', 'Maintenance'] as const;
 const PROFILE = ['Profile'] as const;
-const PROFILE_SETTINGS = ['Profile', 'Settings'] as const;
 const PROFILE_CONNECTIONS = ['Profile', 'Connections'] as const;
 const PROFILE_ACCOUNT = ['Profile', 'Account'] as const;
-const settings = (section: string) => `/admin/?tab=Settings&section=${section}`;
 
-export const DESTINATIONS: readonly Destination[] = [
-  // ---- Admin's tabs (app/admin/page.tsx GROUPS) ----
-  { key: 'admin-overview', label: 'Overview', where: ADMIN, href: '/admin/', admin: true, keywords: ['admin', 'dashboard', 'stats'] },
-  { key: 'admin-tasks', label: 'Tasks', where: ADMIN, href: '/admin/?tab=Tasks', admin: true, keywords: ['jobs', 'scheduled', 'run now'] },
-  { key: 'admin-settings', label: 'Settings', where: ADMIN, href: '/admin/?tab=Settings', admin: true,
+/** Besides the consoles' own pages and settings rows (generated from their registries, `consoleDestinations` below). */
+const PAGES: readonly Destination[] = [
+  // ---- Admin ----
+  // The settings pages by the tab they sat in before v0.88.0: Server is the first of them.
+  { key: 'admin-settings', label: 'Settings', where: ADMIN, href: '/admin/?tab=server', admin: true,
     keywords: ['server settings', 'admin settings', 'configuration', 'config', 'options'] },
-  { key: 'admin-members', label: 'Members', where: ADMIN, href: '/admin/?tab=Members', admin: true, desktopHidden: true,
-    keywords: ['users', 'accounts', 'people', 'roles', 'age limit', 'reset password'] },
-  { key: 'admin-sessions', label: 'Sessions', where: ADMIN, href: '/admin/?tab=Sessions', admin: true, desktopHidden: true,
-    keywords: ['devices', 'signed in', 'logins'] },
-  { key: 'admin-activity', label: 'Activity', where: ADMIN, href: '/admin/?tab=Activity', admin: true, keywords: ['audit', 'log', 'events'] },
-  { key: 'admin-library', label: 'Library', where: ADMIN, href: '/admin/?tab=Library', admin: true,
-    keywords: ['libraries', 'folders', 'hidden series', 'removed series', 'restore', 'age rating'] },
-  { key: 'admin-health', label: 'Health', where: ADMIN, href: '/admin/?tab=Health', admin: true,
-    keywords: ['problems', 'errors', 'fix everything', 'repair', 'checks', 'missing chapters', 'gaps'] },
-  { key: 'admin-art', label: 'Art', where: ADMIN, href: '/admin/?tab=Art', admin: true, keywords: ['covers', 'artwork', 'banners', 'images'] },
-  { key: 'admin-sources', label: 'Sources', where: ADMIN, href: '/admin/?tab=Sources', admin: true,
-    keywords: ['providers', 'extensions', 'mangadex', 'sites', 'add a site', 'repositories'] },
-
-  // ---- Admin → Settings' sections (components/AdminSettings.tsx), each by its `id` ----
-  { key: 'settings-server', label: 'Server', where: ADMIN_SETTINGS, href: settings('server'), admin: true, keywords: ['server name'] },
-  { key: 'settings-schedules', label: 'Updates & schedules', where: ADMIN_SETTINGS, href: settings('schedules'), admin: true,
-    keywords: ['update interval', 'schedule', 'extension updates'] },
-  { key: 'settings-housekeeping', label: 'Library housekeeping', where: ADMIN_SETTINGS, href: settings('housekeeping'), admin: true,
-    keywords: ['cleanup', 'repair nightly'] },
-  { key: 'settings-scanlators', label: 'Scanlators', where: ADMIN_SETTINGS, href: settings('scanlators'), admin: true,
-    keywords: ['groups', 'scanlation', 'translation groups', 'blocked groups'] },
-  { key: 'settings-notifications', label: 'Notifications', where: ADMIN_SETTINGS, href: settings('notifications'), admin: true,
-    keywords: ['webhook', 'discord', 'ntfy', 'home assistant', 'alerts'] },
-  { key: 'settings-downloads', label: 'Downloads', where: ADMIN_SETTINGS, href: settings('downloads'), admin: true,
-    keywords: ['chapters an hour', 'pace', 'free space'] },
-  { key: 'settings-adult', label: '18+ filter', where: ADMIN_SETTINGS, href: settings('adult-filter'), admin: true,
-    keywords: ['adult', 'nsfw', 'mature', 'show 18+'] },
-  { key: 'settings-source-order', label: 'Source order', where: ADMIN_SETTINGS, href: settings('source-order'), admin: true,
-    keywords: ['priority', 'preferred source'] },
-  { key: 'settings-notice', label: 'Notice chapters', where: ADMIN_SETTINGS, href: settings('notice-chapters'), admin: true,
-    keywords: ['notices', 'announcements', 'hiatus', 'short chapters'] },
-
-  // ---- Settings people ask for by name ----
-  { key: 'update-check', label: 'Check for updates', where: ADMIN_SETTINGS, href: settings('server'), admin: true,
-    keywords: ['updates', 'new version', 'release', 'github'] },
-  { key: 'registration', label: 'Open registration', where: ADMIN_SETTINGS, href: settings('server'), admin: true, desktopHidden: true,
-    keywords: ['sign up', 'signup', 'register'] },
-  { key: 'backup-time', label: 'Backup time', where: ADMIN_SETTINGS, href: settings('schedules'), admin: true,
-    keywords: ['backup', 'database backup', 'dump'] },
-  // v0.61.1 (#199): looked for and not found while it was only BACKUP_KEEP. The nightly's switch is the row above it.
-  { key: 'backups-keep', label: 'Backups to keep', where: ADMIN_SETTINGS, href: settings('schedules'), admin: true,
-    keywords: ['backup limit', 'retention', 'old backups', 'nightly backup', 'turn off backups'] },
-  // v0.61.0: the release radar's schedule switch, beside the update interval it bends.
-  { key: 'smart-checks', label: 'Smart update checks', where: ADMIN_SETTINGS, href: settings('schedules'), admin: true,
-    keywords: ['smart', 'quiet series', 'check less often', 'release radar', 'sweep'] },
-  { key: 'delete-read', label: 'Delete read chapters', where: ADMIN_SETTINGS, href: settings('housekeeping'), admin: true,
-    keywords: ['cleanup', 'free space', 'disk space'] },
-  { key: 'mihon-missing', label: 'Show missing chapters in Mihon', where: ADMIN_SETTINGS, href: settings('housekeeping'), admin: true,
-    desktopHidden: true, keywords: ['komga', 'ghost chapters', 'tachiyomi'] },
-  { key: 'slow-archive', label: 'Slow archive', where: ADMIN_SETTINGS, href: settings('downloads'), admin: true,
-    keywords: ['archive', 'older chapters', 'whole series'] },
+  // What was the Tasks tab (v0.88.0): Maintenance's Run now, under its settings.
+  { key: 'admin-tasks', label: 'Tasks', where: ADMIN_MAINTENANCE, href: '/admin/?tab=maintenance&section=tasks', admin: true,
+    keywords: ['jobs', 'scheduled', 'run now'] },
   // Health's cards, by the check they show (`check-<id>`, app/admin/page.tsx Health).
-  { key: 'solver', label: 'Cloudflare solver', where: ADMIN_HEALTH, href: '/admin/?tab=Health&section=check-solver', admin: true,
+  { key: 'solver', label: 'Cloudflare solver', where: ADMIN_HEALTH, href: '/admin/?tab=health&section=check-solver', admin: true,
     keywords: ['flaresolverr', 'byparr', 'trawl', 'captcha', 'cloudflare'] },
-  { key: 'version', label: 'Version', where: ADMIN_HEALTH, href: '/admin/?tab=Health&section=check-update', admin: true,
+  { key: 'version', label: 'Version', where: ADMIN_HEALTH, href: '/admin/?tab=health&section=check-update', admin: true,
     keywords: ['update', 'upgrade', 'release', 'changelog', 'about'] },
-  // Tasks' rows, by the task they run (`task-<id>`, app/admin/page.tsx Tasks). Rescan everything (v0.55.4, #150) is what
-  // Kedryn asked for by name, "rescan everything from scratch, removing from library what is no more on disk".
-  { key: 'rescan', label: 'Rescan everything', where: ADMIN_TASKS, href: '/admin/?tab=Tasks&section=task-rescan', admin: true,
+  // Maintenance's tasks, by the task they run (`task-<id>`, app/admin/page.tsx Tasks). Rescan everything (v0.55.4, #150) is
+  // what Kedryn asked for by name, "rescan everything from scratch, removing from library what is no more on disk".
+  { key: 'rescan', label: 'Rescan everything', where: ADMIN_MAINTENANCE, href: '/admin/?tab=maintenance&section=task-rescan', admin: true,
     keywords: ['rescan', 'scan from scratch', 'files gone', 'deleted files', 'missing files', 'remove from library', 'no longer on disk'] },
 
   // ---- The import (app/admin/import/page.tsx) ----
@@ -133,53 +82,69 @@ export const DESTINATIONS: readonly Destination[] = [
     keywords: ['import', 'mihon', 'tachiyomi', 'tachibk', 'backup', 'mangadex', 'anilist', 'myanimelist', 'mal', 'kitsu', 'mangaupdates',
       'migrate', 'move my library', 'paste titles'] },
 
-  // ---- The profile's tabs (app/profile/page.tsx), cards and settings ----
-  { key: 'profile-you', label: 'You', where: PROFILE, href: '/profile/', keywords: ['profile', 'me', 'my stats'] },
+  // ---- The profile's cards (app/profile/page.tsx) ----
   { key: 'profile-badges', label: 'Badges', where: PROFILE, href: '/profile/?section=badges', keywords: ['achievements'] },
   { key: 'profile-studio', label: 'Reading studio', where: PROFILE, href: '/profile/?section=reading-studio',
     keywords: ['stats', 'statistics', 'heatmap', 'calendar'] },
-  { key: 'profile-insights', label: 'Insights', where: PROFILE, href: '/profile/?tab=Insights',
-    keywords: ['my stats', 'backlog', 'unread', 'best day', 'genres', 'finish date', 'dropped'] },
-  { key: 'profile-settings', label: 'Settings', where: PROFILE, href: '/profile/?tab=Settings', keywords: ['my settings', 'preferences', 'options'] },
-  { key: 'appearance', label: 'Appearance', where: PROFILE_SETTINGS, href: '/profile/?tab=Settings&section=appearance',
-    keywords: ['theme', 'accent', 'colour', 'color', 'avatar'] },
-  { key: 'language', label: 'Language', where: PROFILE_SETTINGS, href: '/profile/?tab=Settings&section=appearance',
-    keywords: ['translation', 'locale'] },
-  { key: 'reduce-effects', label: 'Reduce effects', where: PROFILE_SETTINGS, href: '/profile/?tab=Settings&section=appearance',
-    keywords: ['motion', 'animations', 'blur'] },
-  { key: 'reading', label: 'Reading', where: PROFILE_SETTINGS, href: '/profile/?tab=Settings&section=reading',
-    keywords: ['reader', 'webtoon', 'paged', 'brightness', 'page gap'] },
-  { key: 'weekly-goal', label: 'Weekly goal', where: PROFILE_SETTINGS, href: '/profile/?tab=Settings&section=reading', keywords: ['goal'] },
-  { key: 'reading-direction', label: 'Reading direction', where: PROFILE_SETTINGS, href: '/profile/?tab=Settings&section=reading',
-    keywords: ['right to left', 'left to right', 'rtl'] },
-  { key: 'offline-downloads', label: 'Offline downloads', where: PROFILE_SETTINGS, href: '/profile/?tab=Settings&section=downloads',
-    desktopHidden: true, keywords: ['offline', 'keep favorites offline', 'storage'] },
-  { key: 'this-device', label: 'This device', where: PROFILE_SETTINGS, href: '/profile/?tab=Settings&section=device',
-    desktopHidden: true, keywords: ['install app', 'pwa'] },
-  { key: 'chapter-alerts', label: 'New-chapter alerts', where: PROFILE_SETTINGS, href: '/profile/?tab=Settings&section=device',
-    desktopHidden: true, keywords: ['push', 'notifications'] },
-  { key: 'profile-connections', label: 'Connections', where: PROFILE, href: '/profile/?tab=Connections', keywords: ['integrations'] },
-  { key: 'progress-tracking', label: 'Progress tracking', where: PROFILE_CONNECTIONS, href: '/profile/?tab=Connections&section=progress-tracking',
+  // The settings pages by the tab they sat in before v0.88.0: General is the first of them.
+  { key: 'profile-settings', label: 'Settings', where: PROFILE, href: '/profile/?tab=general', keywords: ['my settings', 'preferences', 'options'] },
+  // The weekly goal's one home since v0.86.0: the ring on the profile's card, which opens its dialog.
+  { key: 'weekly-goal', label: 'Weekly goal', where: PROFILE, href: '/profile/?section=weekly-goal', keywords: ['goal', 'chapters a week'] },
+  { key: 'progress-tracking', label: 'Progress tracking', where: PROFILE_CONNECTIONS, href: '/profile/?tab=connections&section=progress-tracking',
     keywords: ['anilist', 'myanimelist', 'mal', 'kitsu', 'mangaupdates', 'tracker', 'sync'] },
-  { key: 'opds', label: 'External readers (OPDS)', where: PROFILE_CONNECTIONS, href: '/profile/?tab=Connections&section=opds',
+  { key: 'opds', label: 'External readers (OPDS)', where: PROFILE_CONNECTIONS, href: '/profile/?tab=connections&section=opds',
     desktopHidden: true, keywords: ['opds', 'koreader', 'panels', 'chunky', 'e-reader'] },
-  { key: 'api-tokens', label: 'API tokens', where: PROFILE_CONNECTIONS, href: '/profile/?tab=Connections&section=api-tokens',
+  { key: 'api-tokens', label: 'API tokens', where: PROFILE_CONNECTIONS, href: '/profile/?tab=connections&section=api-tokens',
     desktopHidden: true, keywords: ['api', 'token', 'mihon', 'komga', 'scripts'] },
-  { key: 'profile-account', label: 'Account', where: PROFILE, href: '/profile/?tab=Account', desktopHidden: true,
-    keywords: ['security', 'sign out', 'log out'] },
-  { key: 'change-password', label: 'Change password', where: PROFILE_ACCOUNT, href: '/profile/?tab=Account&section=signed-in',
+  { key: 'change-password', label: 'Change password', where: PROFILE_ACCOUNT, href: '/profile/?tab=account&section=signed-in',
     desktopHidden: true, keywords: ['password'] },
-  { key: 'two-factor', label: 'Two-factor authentication', where: PROFILE_ACCOUNT, href: '/profile/?tab=Account&section=two-factor',
+  { key: 'two-factor', label: 'Two-factor authentication', where: PROFILE_ACCOUNT, href: '/profile/?tab=account&section=two-factor',
     desktopHidden: true, keywords: ['2fa', 'totp', 'authenticator', 'mfa', 'recovery codes'] },
-  { key: 'active-sessions', label: 'Active sessions', where: PROFILE_ACCOUNT, href: '/profile/?tab=Account&section=sessions',
+  { key: 'active-sessions', label: 'Active sessions', where: PROFILE_ACCOUNT, href: '/profile/?tab=account&section=sessions',
     desktopHidden: true, keywords: ['devices', 'signed in'] },
 ];
 
-/** Lower case with the accents off, so "parametres" finds "Paramètres" and "u" finds "ü". */
-export const fold = (s: string): string => s.normalize('NFKD').replace(/\p{M}+/gu, '').toLocaleLowerCase();
+/**
+ * Every page of a console and every row of its settings pages as a destination (v0.86.0; the pages since v0.88.0), from
+ * its registry (lib/settingsIndex*.ts). A page's place is the console and the group it is listed under; a row's, that
+ * and its page; `?tab=` opens the page and `?section=` the row, which the console opens and flashes
+ * (components/ConsoleLayout.tsx). The first page is the console's bare address. The pages and rows needing a server's
+ * web install are not offered on Uchiyomi Desktop; one that needs a mode or an engine this server may not have lands on
+ * its page, which is still the right place to look.
+ */
+export function consoleDestinations(index: SettingsIndex): Destination[] {
+  const admin = index.page === 'admin';
+  const path = admin ? '/admin/' : '/profile/';
+  const top = admin ? 'Admin' : 'Profile';
+  const first = index.categories[0]?.id;
+  const cats = new Map(index.categories.map((c) => [c.id, c]));
+  const web = (when?: readonly string[]) => !!when?.includes('web');
+  const aliasesOf = (label: string) => Object.entries(SETTINGS_NAME_ALIASES).filter(([, to]) => to === label).map(([from]) => from);
+  const out: Destination[] = index.categories.map((c) => ({
+    key: `${index.page}-cat-${c.id}`, label: c.label, where: c.group ? [top, c.group] : [top],
+    href: c.id === first ? path : `${path}?tab=${c.id}`,
+    admin: admin || undefined, desktopHidden: web(c.when) || undefined,
+    // A section's name before v0.86.0 finds the page it became.
+    keywords: [...(c.keywords ?? []), ...aliasesOf(c.label)],
+  }));
+  for (const e of index.entries) {
+    const cat = cats.get(e.cat);
+    if (!cat) continue;
+    out.push({
+      key: `${index.page}-${e.id}`, label: e.label, where: [top, ...(cat.group ? [cat.group] : []), cat.label],
+      href: `${path}?tab=${cat.id}&section=${e.id}`,
+      admin: admin || undefined, desktopHidden: web(e.when) || web(cat.when) || undefined,
+      keywords: [...(e.keywords ?? []), ...aliasesOf(e.label)],
+    });
+  }
+  return out;
+}
 
-const atWordStart = (text: string, word: string): boolean =>
-  new RegExp(`(^|[^\\p{L}\\p{N}])${word.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`, 'u').test(text);
+const CONSOLES = [...consoleDestinations(ADMIN_SETTINGS), ...consoleDestinations(PROFILE_SETTINGS)];
+const isPage = (d: Destination) => d.key.includes('-cat-');
+/** The consoles' pages, then the cards above, then every settings row: the order a tie is broken in. */
+export const DESTINATIONS: readonly Destination[] = [...CONSOLES.filter(isPage), ...PAGES, ...CONSOLES.filter((d) => !isPage(d))];
+
 
 /**
  * The destinations a query finds, best first, for this viewer: admins only for the admin's pages, none of Desktop's
@@ -189,24 +154,9 @@ const atWordStart = (text: string, word: string): boolean =>
  * and OPDS) -- except in Chinese and Japanese, written without spaces, where there is no word start to look for.
  */
 export function findDestinations(query: string, viewer: { admin: boolean; desktop: boolean; limit?: number; label?: (k: string) => string }): Destination[] {
-  const q = fold(query.trim()).replace(/\s+/g, ' ');
-  if (q.length < 2) return [];
-  const words = q.split(' ');
-  const inside = q.length >= 3 || /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}]/u.test(q);
+  if (fold(query.trim()).length < 2) return [];
   const label = viewer.label ?? ((k: string) => tr(k));
-  const rank = (d: Destination): number => {
-    const names = [fold(label(d.label)), fold(d.label)];
-    if (names.includes(q)) return 0;
-    if (names.some((n) => n.startsWith(q))) return 1;
-    if (names.some((n) => words.every((w) => atWordStart(n, w)))) return 2;
-    if (inside && names.some((n) => n.includes(q))) return 3;
-    const kws = (d.keywords ?? []).map(fold);
-    if (kws.some((k) => k === q || k.startsWith(q))) return 4;
-    const all = [...names, ...kws].join('\n');
-    if (words.every((w) => atWordStart(all, w))) return 5;
-    if (inside && words.every((w) => all.includes(w))) return 6;
-    return -1;
-  };
+  const rank = (d: Destination): number => rankMatch(query, [label(d.label), d.label], d.keywords ?? []);
   return DESTINATIONS
     .filter((d) => (!d.admin || viewer.admin) && !(d.desktopHidden && viewer.desktop))
     .map((d, i) => ({ d, i, r: rank(d) }))
@@ -224,19 +174,18 @@ export function whereText(d: Destination, rtl: boolean): string {
   return d.where.map((w) => tr(w)).join(rtl ? ' ← ' : ' → ');
 }
 
-/** The console a page's first tab is, when its address names none. */
-const FIRST_TAB: Readonly<Record<string, string>> = { '/admin/': 'Overview', '/profile/': 'You' };
+/** The page a console opens on when its address names none (lib/settingsIndex*.ts, the first of its pages). */
+const FIRST_TAB: Readonly<Record<string, string>> = { '/admin/': 'overview', '/profile/': 'you' };
 const slashed = (p: string): string => (p.endsWith('/') ? p : `${p}/`);
 
 /**
- * How to get to `href` from the page at `here`:
- *   * `push` -- another page: a client-side navigation, and that page reads its tab and section as it mounts;
+ * How to get to `href` from the page at `here`, when the console on screen does not open it itself
+ * (lib/consoleOnScreen.ts, asked first):
+ *   * `push` -- another page: a client-side navigation, and that page reads its page and section as it mounts;
  *   * `scroll` -- this page, with the section already on it: scroll there;
  *   * `none` -- this page and tab, and no section: already there;
- *   * `load` -- this page on another tab (or a section not drawn yet): a whole page load. ⚠️ The console reads `?tab=`
- *     ONCE (lib/useTabParam.ts, which must not re-read it -- settingsConsole.test.ts), so a client-side push to
- *     `/admin/?tab=Settings` while Admin is open changes the address and nothing on the screen: the precedent is Fix
- *     everything's Settings key, an `<a href>` for the same reason (lib/autofix.ts needsYouKey).
+ *   * `load` -- this page on another tab (or a section not drawn yet): a whole page load, which reads `?section=` as it
+ *     arrives. A console's pages are compared by name in any case (`?tab=Health` is `health`).
  */
 export function arrival(href: string, here: { pathname: string; search: string }, onPage: (id: string) => boolean): 'push' | 'scroll' | 'none' | 'load' {
   const to = new URL(href, 'http://x');
@@ -245,7 +194,7 @@ export function arrival(href: string, here: { pathname: string; search: string }
   const section = to.searchParams.get('section');
   if (section && onPage(section)) return 'scroll';
   const first = FIRST_TAB[path] ?? '';
-  const tabOf = (search: string) => new URLSearchParams(search).get('tab') || first;
+  const tabOf = (search: string) => (new URLSearchParams(search).get('tab') || first).toLowerCase();
   if (!section && tabOf(to.search) === tabOf(here.search)) return 'none';
   return 'load';
 }

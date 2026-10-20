@@ -28,6 +28,7 @@ import { scheduleAniListScores } from './lib/anilistScores';
 import { notifyAdmins } from './lib/push';
 import { runSourceCheck } from './lib/sourceWatchdog';
 import { runSweep } from './lib/updater';
+import { behindCount, finishDownloadsOn, nextCooldownEnd as finishCooldownEnd, wantQuiet, FINISH_MINUTES, FINISH_PER_SERIES, FINISH_SWEEP_MAX } from './lib/finishDownloads';
 import { refreshMissingRadars } from './lib/releaseRadar';
 import { runRepair, setRepairNext, REPAIR_HOURS } from './lib/repair';
 import { AFTER_NIGHTLY_AUTOFIX, autofixSettled, closeInterruptedAutofix, startAutofix } from './lib/autofix';
@@ -46,6 +47,8 @@ import { pruneAudit } from './lib/audit';
 import { startActivityLog, flushActivityLog } from './lib/activityLog';
 import { runBackup, backupDelay, backupSettings, stampDelay } from './lib/backup';
 import { firstRunFloor, DESKTOP_FLOORS } from './lib/desktop';
+import { scoutTick, storeLook, SCOUT_TICK_MS } from './lib/sourceScout';
+import { backupUpkeep, BACKUP_UPKEEP_MS } from './lib/backupExtensions';
 import { KomgaError } from './lib/komga';
 import { ZodError } from 'zod';
 import { registerWebRoot, webRootConfigured } from './lib/webRoot';
@@ -65,6 +68,9 @@ import sourceRoutes, { jobBusy } from './routes/sources';
 import opdsRoutes from './routes/opds';
 import komgaCompatRoutes from './routes/komgaCompat';
 import notifyRoutes from './routes/notify';
+import translateRoutes from './routes/translate';
+import { stopEngine } from './lib/translate/engine';
+import commentRoutes from './routes/comments';
 import { isDesktop } from './lib/desktop';
 import { installDesktopGuards } from './lib/desktopGuard';
 import { ensureDesktopUser } from './lib/desktopUser';
@@ -229,6 +235,11 @@ async function main() {
   await app.register(recommendationRoutes);
   await app.register(downloadRoutes);
   await app.register(sourceRoutes);
+  // Translated pages (v0.85.0): answers "off" until an admin downloads the engine and turns it on. Hidden on desktop
+  // (DESKTOP_HIDDEN_ROUTES), whose server runs inside the app, where the engine's processes cannot (docs/DESKTOP.md).
+  await app.register(translateRoutes);
+  // Chapter comments and reactions (v0.87.0): everywhere, as every plugin is; desktop answers 404 for them (lib/desktop.ts).
+  await app.register(commentRoutes);
   // Neither OPDS nor the Komga-compatible API exists on desktop: both are for OTHER devices reading this
   // library, and the desktop server is reachable from this PC only (they return with "Share with my phone").
   if (!isDesktop()) await app.register(opdsRoutes);
@@ -282,7 +293,18 @@ async function main() {
           // "Run now" button gets the same treatment as this tick -- and this tick can see the button's sweep.
           const run = smart ? runSweep({ maxNew: 5, smart }, app.log) : runSweep({ maxNew: 5 }, app.log);
           if (run) await run;
-          else app.log.info('updater: the previous sweep is still running, skipping this tick');
+          else if (runtime.finishing) {
+            // v0.79.0: the finishing sweep of the behind series holds the flag. Asked to give way at its next chapter
+            // (lib/finishDownloads.ts wantQuiet), it does, and the full sweep starts a minute on.
+            wantQuiet();
+            app.log.info('updater: the finishing downloads are giving way, trying again in a minute');
+            retryIn = 60 * 1000;
+          } else {
+            // Another sweep holds the flag (Run now, or a check). Ten minutes on, as beside a repair, not a whole
+            // interval: the full sweep must not lose six hours to it.
+            app.log.info('updater: another sweep is running, trying again in 10 minutes');
+            retryIn = 10 * 60 * 1000;
+          }
         }
       } catch (e) {
         app.log.error(e as any);
@@ -309,6 +331,60 @@ async function main() {
       app.log.info(`updater: first sweep in ${Math.round(delay / 60000)} min` + (last ? ` (last completed ${new Date(last).toISOString()})` : ' (no completed sweep on record)'));
       setTimeout(tick, delay).unref();
     })();
+    // "Finish downloads on their own" (lib/finishDownloads.ts, Admin -> Settings, ON by default): the series that are
+    // behind -- their source lists chapters they do not have yet -- are gone back to every FINISH_MINUTES by a sweep of
+    // those series alone, and right after the earliest cooldown of their sources ends, so a series a site rate-limited
+    // half-way through an add carries on by itself the minute the site said, instead of five chapters every six hours.
+    // It never runs beside the full sweep or a repair (runSweep refuses, and it simply tries again next time), and with
+    // nothing behind it starts nothing. The switch is read every tick, so turning it off stops it from the next one.
+    const finishTick = async () => {
+      let next = FINISH_MINUTES * 60_000;
+      try {
+        if (await finishDownloadsOn()) {
+          if ((await behindCount()) > 0 && !runtime.updating && !runtime.repairing) {
+            const run = runSweep({ maxNew: FINISH_PER_SERIES, sweepMax: FINISH_SWEEP_MAX, finishing: true }, app.log);
+            if (run) await run;
+          }
+          // A site's cooldown ending before the next quarter-hour brings the next pass forward to it (half a minute
+          // after, so the source is out of it), never closer than two minutes: a cooldown that keeps being renewed
+          // must not turn this into a loop. Read even with nothing behind now (v0.79.0): a series waiting only on a
+          // cooling source is not behind until that source can answer (`finish_after`), and this is its way back.
+          const cool = await finishCooldownEnd();
+          if (cool) next = Math.max(2 * 60_000, Math.min(next, cool.getTime() - Date.now() + 30_000));
+        }
+      } catch (e) {
+        app.log.error(e as any);
+      }
+      setTimeout(finishTick, next).unref();
+    };
+    setTimeout(finishTick, firstRunFloor(5 * 60 * 1000, 'finishDownloads')).unref();
+    // v0.80.0, the scout (lib/sourceScout.ts): every few minutes, one series whose own sources cannot get it its chapters
+    // -- every one cooling, refusing or broken for what it lacks -- is looked for on the other installed sources, and a
+    // source that is this series and has them is followed. The switch "Use other sources on their own", the hour's
+    // search budget and the series' own backoff decide whether a look searches anything at all.
+    const scoutLoop = async () => {
+      try {
+        await scoutTick();
+      } catch (e) {
+        app.log.error(e as any);
+      }
+      setTimeout(scoutLoop, SCOUT_TICK_MS).unref();
+    };
+    setTimeout(scoutLoop, firstRunFloor(10 * 60 * 1000, 'scout')).unref();
+    // v0.82.0, the backup extensions (lib/backupExtensions.ts): every half hour, the extensions Uchiyomi installed by
+    // itself to finish downloads are checked against what the series need, and one nothing has needed for three days
+    // is removed -- remembered, and put back by the scout when a series it carried is stuck again. v0.83.0: then, for the
+    // series no installed source has, one extension from the repository may be tried (at most one an hour, six a day).
+    const backupLoop = async () => {
+      try {
+        await backupUpkeep();
+        await storeLook();
+      } catch (e) {
+        app.log.error(e as any);
+      }
+      setTimeout(backupLoop, BACKUP_UPKEEP_MS).unref();
+    };
+    setTimeout(backupLoop, firstRunFloor(15 * 60 * 1000, 'backups')).unref();
     // v0.61.0, the release radar (lib/releaseRadar.ts): once, a minute after boot, every series with a source and no
     // radar yet is dated from what is already stored -- its listing and its chapters' arrivals, no source asked -- so
     // an upgrade's Releasing soon and Expected this week are not empty until each series' next check.
@@ -514,6 +590,12 @@ async function main() {
         const s = await pool.query('SELECT repair_enabled, nightly_mode FROM server_settings WHERE id = 1');
         if (s.rows[0]?.repair_enabled === false) {
           app.log.info('repair: switched off in settings, nothing to do');
+        } else if (runtime.updating && runtime.finishing) {
+          // v0.79.0: the finishing sweep of the behind series (lib/finishDownloads.ts) gives way when asked; a minute on,
+          // the nightly has its place instead of waiting out passes that come every quarter of an hour.
+          wantQuiet();
+          app.log.info('repair: the finishing downloads are giving way, trying again in a minute');
+          next = 60 * 1000;
         } else if (runtime.updating) {
           app.log.info('repair: a chapter sweep is running, trying again in 10 minutes');
           next = 10 * 60 * 1000;
@@ -524,8 +606,8 @@ async function main() {
           // everything it waits ten minutes, as for a sweep.
           const r = startAutofix(null, { origin: 'nightly', log: app.log });
           if ('busy' in r) {
-            app.log.info(`repair: Fix everything could not start beside a running ${r.busy}, trying again in 10 minutes`);
-            next = 10 * 60 * 1000;
+            app.log.info(`repair: Fix everything could not start beside a running ${r.busy}, trying again in ${r.busy === 'sweep' && runtime.finishing ? 'a minute' : '10 minutes'}`);
+            next = r.busy === 'sweep' && runtime.finishing ? 60 * 1000 : 10 * 60 * 1000;
           } else {
             await autofixSettled();
             // v0.60.1: then the repair steps Fix everything does not drive itself (lib/autofix.ts AFTER_NIGHTLY_AUTOFIX),
@@ -802,6 +884,8 @@ async function main() {
     process.once(sig, () => {
       runtime.stopping = true;
       app.log.info(`${sig}: finishing the current chapter, then stopping`);
+      // The translation engine's processes (lib/translate/engine.ts), if running: nothing of theirs is worth waiting for.
+      stopEngine();
       // The download log's last lines first: a chapter that finished a moment ago is written down, not lost. A Find
       // other sources run (v0.49.1) closes its own row meanwhile -- `interrupted`, with every series it never reached
       // listed as not tried, and its audit line -- given FIND_SHUTDOWN_MS at most; what it does not finish,

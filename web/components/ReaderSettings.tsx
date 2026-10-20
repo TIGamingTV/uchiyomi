@@ -10,7 +10,8 @@ import { Disclosure } from './settings';
 import { ReaderKeys } from './ReaderKeys';
 import { IcX } from './icons';
 import { Switch } from './Switch';
-import { t as tr } from '@/lib/i18n';
+import { LOCALES, t as tr } from '@/lib/i18n';
+import { activeLocale } from '@/lib/format';
 import { useLayer } from '@/lib/layers';
 import { INCOGNITO_TEXT } from '@/lib/incognito';
 import { useIncognito } from './IncognitoBanner';
@@ -50,11 +51,16 @@ function Row({ label, children }: { label: string; children: React.ReactNode }) 
 export function ReaderSettings({
   prefs,
   set,
+  spreadShift = false,
+  onSpreadShift,
+  translate = false,
+  onTranslate,
   device,
   setDevice,
   autoApplied,
   padConnected = false,
   rtlTrack = false,
+  spreadChoices = [],
   onClose,
   libraryName,
   onLibraryDefault,
@@ -64,6 +70,15 @@ export function ReaderSettings({
 }: {
   prefs: ReaderPrefs;
   set: (p: Partial<ReaderPrefs>) => void;
+  /** double spreads shifted by one page for this title, and how to change it (remembered per title). */
+  spreadShift?: boolean;
+  onSpreadShift?: (v: boolean) => void;
+  /**
+   * Translated pages (v0.85.0) for this title, and how to change it (remembered per title). Absent while the server does
+   * not offer it: an admin has not downloaded the engine, or it is off.
+   */
+  translate?: boolean;
+  onTranslate?: (v: boolean) => void;
   /** This device's own settings (v0.61.0, lib/readerDevice.ts): kept in this browser, never synced. */
   device: DevicePrefs;
   setDevice: (p: Partial<DevicePrefs>) => void;
@@ -73,6 +88,11 @@ export function ReaderSettings({
   padConnected?: boolean;
   /** Whether the paged track runs right to left now: its left edge then turns ON (the tap sketches say so). */
   rtlTrack?: boolean;
+  /**
+   * v0.89.0 (#262): what may be done about the page being read -- merge it with the page on its left or right, take a
+   * pair apart, give a pair back to the detector (lib/spreadMarks.ts). Empty where nothing may: the reader decides.
+   */
+  spreadChoices?: ReadonlyArray<{ key: string; label: string; side?: 'left' | 'right'; onSelect: () => void }>;
   onClose: () => void;
   /** The library the series is in, named for the admin's key (#235). Absent for a member: only an admin is told it. */
   libraryName?: string;
@@ -147,6 +167,20 @@ export function ReaderSettings({
           </p>
         )}
 
+        {/* v0.85.0: only on a server whose admin downloaded the translation engine and turned it on. This title only. */}
+        {onTranslate && (
+          <div className="py-3" data-reader-translate>
+            <div className="flex items-center justify-between gap-3">
+              <span className="text-sm font-medium text-fog-200">{tr('Translate pages')}</span>
+              <Switch on={translate} onChange={onTranslate} label={tr('Translate pages')} />
+            </div>
+            <p className="mt-1 text-[11px] leading-snug text-fog-500">
+              {tr('The server reads the speech bubbles and writes them in {language}, a page every few seconds from the one you are on. Remembered for this title.',
+                { language: LOCALES.find((l) => l.code === activeLocale())?.name ?? 'English' })}
+            </p>
+          </div>
+        )}
+
         <Row label={tr('Theme')}>
           <div className="grid grid-cols-3 gap-2">
             {(['amoled', 'sepia', 'gray'] as const).map((t) => (
@@ -199,6 +233,15 @@ export function ReaderSettings({
               <button onClick={() => set({ spread: true })}
                 className={`rounded-2xl border py-3 text-sm ${prefs.spread ? 'border-accent bg-accent-soft text-accent' : 'border-ink-700 text-fog-300'}`}>{tr('Double spread')}</button>
             </div>
+            {prefs.spread && onSpreadShift && (
+              <label data-spread-shift className="mt-3 flex items-start gap-3 text-sm text-fog-300">
+                <input type="checkbox" checked={spreadShift} onChange={(e) => onSpreadShift(e.target.checked)}
+                  className="mt-0.5 size-4 accent-[rgb(var(--accent))]" />
+                <span>{tr('Shift pairs by one page')}
+                  <span className="mt-0.5 block text-[11px] leading-relaxed text-fog-500">{tr('For chapters whose first page is not a cover: the first page is paired with the second, so the spreads line up. Remembered for this title.')}</span>
+                </span>
+              </label>
+            )}
           </Row>
         )}
 
@@ -237,6 +280,26 @@ export function ReaderSettings({
             <p className="mt-1 text-[11px] leading-snug text-fog-500">
               {tr('Shows two pages that a source cut from one double-page spread as that spread, in Paged mode. The server looks for them when a chapter is first opened, so they join a moment later. On a screen held upright, Wide pages applies to them.')}
             </p>
+            {/* v0.89.0 (#262): the page being read, by hand. The keys sit as the pages do -- the left one on the left in
+                any language, so the grid is laid out left to right and each label keeps its own direction. */}
+            {spreadChoices.length > 0 && (
+              <div className="mt-3 rounded-2xl border border-ink-700/70 bg-ink-850/60 p-3" data-spread-choices>
+                <p className="text-xs font-medium text-fog-300">{tr('This page')}</p>
+                {/* A key with no side takes the whole row; a merge takes the column of its side, alone or not. */}
+                <div dir="ltr" className="mt-2 grid grid-cols-2 gap-2">
+                  {spreadChoices.map((o) => (
+                    <button key={o.key} type="button" onClick={o.onSelect} data-spread-choice={o.key} data-side={o.side}
+                      className={`rounded-xl border border-ink-700 px-2 py-2.5 text-sm text-fog-200 transition hover:border-accent hover:text-accent ${
+                        o.side === 'right' ? 'col-start-2' : o.side === 'left' ? 'col-start-1' : 'col-span-2'}`}>
+                      <span dir="auto">{o.label}</span>
+                    </button>
+                  ))}
+                </div>
+                <p className="mt-2 text-[11px] leading-snug text-fog-500">
+                  {tr('For when the server joined two pages that are not one picture, or missed two that are. Saved for your account only.')}
+                </p>
+              </div>
+            )}
           </div>
         )}
 

@@ -203,7 +203,7 @@ this standing choice alone; the sheet marks a language you hid here *Hidden in e
 **Only 25 extension sources can be switched on at once** (`SUWAYOMI_MAX_SOURCES`, 25 by default), because every
 one of them is searched together. The engine's strip counts them (*v2.4.2366 · 12 of 25 sources on*); when more are
 switched on than that, the count turns amber, a line under the strip says how many were left out and how to get under
-the limit, and **Content → Health** lists them under *Extension source limit*. Hiding languages is the cheap way under it. On a Docker install, raising `SUWAYOMI_MAX_SOURCES` is the other;
+the limit, and **Admin → Health** lists them under *Extension source limit*. Hiding languages is the cheap way under it. On a Docker install, raising `SUWAYOMI_MAX_SOURCES` is the other;
 the desktop app has no setting for it. Since v0.55.0 the sources your series read through (as their main source or one
 they follow) take their places first, so switching another source on never pushes one your library depends on out.
 
@@ -258,7 +258,7 @@ numbers.
 Uchiyomi checks your repositories **every 6 hours** and installs new versions of the extensions you have
 installed. You do not have to press anything.
 
-The check is a task like any other: **Admin → Server → Tasks** shows when it last ran, what it did, and a
+The check is a task like any other: **Admin → Settings → Maintenance** shows when it last ran, what it did, and a
 **Run now** button. You get a notification when extensions are updated, and a separate one when an update
 fails — an extension whose download 404s stays on its old version, and that is worth knowing rather than
 silently living with.
@@ -277,10 +277,34 @@ What it does on its own:
   keeps working but will never update again. It is reported, never uninstalled — uninstalling would orphan
   every series routed through it.
 
-What it will not do: install extensions you did not ask for, uninstall anything, or reinstall something you
-removed yourself. Removing an extension in the engine's own interface is reported, not undone.
+What the check itself will not do: install extensions you did not ask for, uninstall anything, or reinstall something
+you removed yourself. Removing an extension in the engine's own interface is reported, not undone. (A wiped engine is
+the exception it always was: what was installed is put back. Backup extensions, below, are the one other thing that
+adds and removes extensions, and only its own.)
 
-**To turn it off:** **Admin → Settings → Updates & schedules** → *Update extensions automatically*. The check still runs and
+## Backup extensions
+
+To finish downloads, Uchiyomi sometimes installs an extension itself: *Fix everything* does when no installed source
+has a series, and since v0.83.0 so does the background search for a series stuck an hour with no installed source
+that has it. That search tries **a few at a time**: the best matches first (an extension named after a group that
+translates the series, as its chapters or MangaUpdates say, then the most downloaded), one install at a time, at most one an hour and six a day, never an 18+
+extension for a series that isn't, and never one you removed. Each install is asked about every waiting series in its
+language before it is kept or removed, and an extension that doesn't have a series isn't tried for it again for a
+month. Since v0.82.0 an extension Uchiyomi installed is a **backup**:
+
+- It isn't shown in Discover or anywhere you pick a source. You only see the sources you added.
+- It stays while a series needs it, and is removed after **3 days without use**. It is never removed while a series
+  uses it as its main source.
+- When a series it carried is stuck again (its sources refusing or missing chapters for an hour or more), it is put
+  back and the series picks up where it was.
+- At most 5 are installed at once (`BACKUP_EXTENSIONS_MAX`), so the engine's memory isn't spent on what nothing needs.
+
+They're listed under **Admin → Sources → Added by Uchiyomi**. Press **Keep** on one to make it yours: it shows in
+Discover and is never removed for being unused. Installing one yourself, switching its sources on, or choosing it for a
+series does the same. Remove one yourself and Uchiyomi never installs it again. Turning off **Finish downloads on their
+own** stops it adding or putting back any; the ones there still go when unused.
+
+**To turn it off:** **Admin → Settings → Maintenance** → *Update extensions automatically*. The check still runs and
 still tells you what is waiting; it just does not install anything. **Update all** in Admin → Sources' Needs attention
 remains the manual path, and it now refreshes the repositories first, so it no longer says
 "everything is already up to date" against a stale catalogue.
@@ -570,7 +594,7 @@ it starts, which only the app knows.
 | `SOURCE_LATEST_TIMEOUT_MS` | `8000` | How long one source gets to answer "what's new" on Discover before it is given up on and marked unhealthy. A source that keeps overrunning it is diagnosed *answers, but more slowly than it is given* — since v0.37.0 by the admin *Test* button and the daily source check too, not only Discover's health view — and the fix sentence names this budget. |
 | `SOURCE_LATEST_SOLVER_TIMEOUT_MS` | `45000` | Since v0.59.0, the same budget for a site this server opens through the Cloudflare solver (a site added by address, a built-in engine). An extension source is fetched by the engine, with the engine's own solver, so it keeps `SOURCE_LATEST_TIMEOUT_MS`. |
 
-The update check's own settings live in **Admin → Settings → Updates & schedules**, not here: *Update extensions
+The update check's own settings live in **Admin → Settings → Maintenance**, not here: *Update extensions
 automatically* (on by default) and *Extension check interval (hours)* (6). The switch saves as it flips; the interval saves when you leave the field or press Enter, and the row says *Saved*.
 
 **Adult sources.** Extensions declare whether they are adult, and Uchiyomi records that per source. A member
@@ -622,6 +646,11 @@ From then on, reading a chapter in Mihon marks it read in Uchiyomi for that acco
 Uchiyomi (or on any other device) are marked read in Mihon on its next refresh of the series. Tachimanga
 (iOS) runs the same Komga extension and its *enhanced tracking* is reported by a contributor to sync against
 this API as well; it is closed source and was not tested here — a report either way is welcome.
+
+The extension's **WebView** opens Uchiyomi itself, signed in once inside it: from the source, the library; from a
+series, its series page; from a chapter, the reader at that chapter. The extension opens Komga's own web addresses
+(`/series/<id>`, `/book/<id>`), and since v0.90.0 (#312, reported by TIGamingTV) Uchiyomi sends those to its own pages;
+before, all three opened the library.
 
 ### What the sync is, and is not
 

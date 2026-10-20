@@ -9,8 +9,10 @@ import { applyReduceEffects, restoreReduceEffects } from './effects';
 import { applyTone, restoreTone } from './tone';
 import { isDesktop, serverReachableHint, untilReachable } from './desktop';
 import { t as tr } from './i18n';
+import type { AvatarFrame } from './badges';
 
-export interface Avatar { emoji?: string; color?: string }
+/** `frame` since v0.89.0 (#267): the frame one of the account's badges unlocked (lib/badges.ts). */
+export interface Avatar { emoji?: string; color?: string; frame?: AvatarFrame }
 interface User {
   id: string;
   username: string | null;
@@ -22,6 +24,8 @@ interface User {
   perms?: Record<string, boolean>;
   avatar?: Avatar;
   settings: Record<string, any>;
+  /** v0.90.0: whether this server has chapter comments at all (bff lib/comments.ts talkOn), for Comments and reactions. */
+  talk?: boolean;
 }
 /**
  * ⚠️ `offline` is a distinct state, not `authed` with a flag beside it.
@@ -286,6 +290,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
           : body.error === 'totp_invalid' ? tr('Incorrect authentication code.')
           : body.error === 'disabled' ? tr('This account is disabled.')
           : body.error === 'locked' ? tr('Account locked — too many attempts. Try again later.')
+          // The per-address limit and the per-name one both answer 429; the address limit's body is the plugin's English.
+          : body.error === 'too_many_requests' || e?.status === 429 ? tr('Too many attempts. Wait a few minutes and try again.')
           : body.message || tr('Login failed — please try again.');
       return { ok: false, error: msg };
     }

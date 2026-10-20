@@ -57,6 +57,9 @@ export function useSectionArrival(): void {
       const el = document.getElementById(id);
       if (!el) return;
       finish();
+      // Anything in the Profile or Admin console is the console's to land on (v0.88.0): it opens the page and whatever folds
+      // the row, then brings it into view and flashes it (components/ConsoleLayout.tsx). Two scrolls would fight.
+      if (el.closest('[data-settings-layout]')) return;
       el.scrollIntoView({ block: 'start', behavior: still ? 'auto' : 'smooth' });
     };
     // Every change to the page restarts the wait, once the card is there.

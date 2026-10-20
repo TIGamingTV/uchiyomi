@@ -1,5 +1,6 @@
 import { verify, hash } from '@node-rs/argon2';
 import QRCode from 'qrcode';
+import rateLimit from '@fastify/rate-limit';
 import type { FastifyInstance, FastifyRequest } from 'fastify';
 import { z } from 'zod';
 import { env } from '../env';
@@ -37,6 +38,8 @@ import { desktopFailAudit, desktopSecretMatches, isDesktop, isLoopback } from '.
 import { desktopUserId, ensureDesktopUser } from '../lib/desktopUser';
 import { authMode, bootstrapSub, mayBootstrap, rescueAdmin, ssoOnly } from '../lib/authMode';
 import { applyMemberDefaults } from '../lib/memberDefaults';
+import { talkOn } from '../lib/comments';
+import { verifyLoginPassword } from '../lib/loginPassword';
 
 const loginBody = z.object({
   username: z.string().max(64).optional(),
@@ -91,6 +94,9 @@ async function userPayload(userId: string) {
     sso: !!user?.sso,
     perms: user?.perms ?? {},
     settings: settings?.data ?? {},
+    // v0.90.0: whether this server has chapter comments at all (lib/comments.ts talkOn: the owned library and two or more
+    // members), so Profile → Settings → Reading offers Comments and reactions only where there is talk to switch off.
+    talk: await talkOn(),
   };
 }
 
@@ -113,10 +119,11 @@ const SIGN_IN_LIMIT = { rateLimit: { max: 10, timeWindow: '5 minutes' } };
 const LOCKED_NOW = { error: 'locked', message: 'Account locked after too many failed attempts. Try again in 15 minutes.' };
 
 /**
- * The current password, asked for behind a session (v0.77.1): changing it, and turning two-factor on or off. Counted
- * and locked exactly as a sign-in's password is (recordFailedLogin), and not checked at all while the account is
+ * The current password, asked for behind a session: changing it, and turning two-factor on or off. These failures
+ * share the account-wide second-factor counter (recordFailedLogin), and are not checked while the account is
  * locked, so a session alone -- a borrowed phone, a stolen refresh cookie -- cannot guess its way to the password; the
- * routes carry SIGN_IN_LIMIT too. A right password clears the count, as a sign-in does. Null when it is right, else the
+ * routes carry SIGN_IN_LIMIT too. Public password failures instead use a source/name budget. A right password
+ * clears the authenticated-check count. Null when it is right, else the
  * refusal to send. Reintroduce by checking the password alone: "a session cannot guess the password" in
  * accountLock.int.test.ts is never locked.
  */
@@ -137,6 +144,13 @@ async function currentPasswordRefusal(req: FastifyRequest, password: string): Pr
 }
 
 export default async function authRoutes(app: FastifyInstance) {
+  if (!app.hasDecorator('createRateLimit')) await app.register(rateLimit, { global: false });
+  // Check failed attempts before looking up the account, for every name. A caller can exhaust only this
+  // (address, username) pair; merely knowing a username must never suspend its owner everywhere.
+  const signInPair = app.createRateLimit({
+    max: 5, timeWindow: '15 minutes',
+    keyGenerator: (req) => JSON.stringify([clientIp(req), (req.body as { username?: string })?.username?.trim() || 'admin']),
+  });
   /**
    * v0.63.0 (#208, lib/authMode.ts): in SSO-only mode the routes that take a password are not registered at all --
    * first-run setup, sign-up, password change, two-factor -- and sign-in only while AUTH_RESCUE_ADMIN names an admin.
@@ -194,6 +208,11 @@ export default async function authRoutes(app: FastifyInstance) {
     const username = (parsed.data.username || 'admin').trim();
     const ip = clientIp(req);
     const ua = (req.headers['user-agent'] as string) || null;
+    const budget = await signInPair(req, { increment: false });
+    if (!budget.isAllowed && budget.isExceeded) {
+      return reply.code(429).header('Retry-After', String(budget.ttlInSeconds))
+        .send({ error: 'too_many_requests', message: 'Too many sign-in attempts. Try again later.' });
+    }
 
     // SSO-only mode's way back in (lib/authMode.ts rescueAdmin): this route answers only while AUTH_RESCUE_ADMIN names
     // an admin, and then for that account alone. Any other name, or a rescue name that is no admin, is refused exactly
@@ -201,12 +220,25 @@ export default async function authRoutes(app: FastifyInstance) {
     // rescue opens one admin's password sign-in and nobody else's" in ssoRescue.int.test.ts signs a member in.
     const rescue = local ? null : rescueAdmin();
     const user = await one<FullUser>(`SELECT ${USER_AUTH_COLS} FROM users WHERE username = $1`, [username]);
-    if (!local && (username !== rescue || user?.role !== 'admin')) {
-      await logAudit('login.fail', { userId: user?.id, username, detail: { reason: 'sso_only' }, req });
-      return reply.code(401).send({ error: 'invalid_credentials' });
-    }
-    if (!user) {
-      await logAudit('login.fail', { username, detail: { reason: 'no_user' }, req });
+    const refusal = !local && (username !== rescue || user?.role !== 'admin') ? 'sso_only' : !user ? 'no_user' : null;
+    // Before a password is accepted every refusal is one answer, after one verification each (lib/loginPassword.ts): a
+    // name nobody has, a name SSO-only mode does not let in, and a wrong password. A disabled or locked account is
+    // checked against its own password, and only the right password is told why it cannot sign in -- someone who has
+    // it learns the account's state, nobody else does, and its owner is not told "wrong password" for the right one.
+    // Reintroduce by answering a disabled account before its password: "pre-password account states have uniform
+    // refusals" in uniformPasswordRefusal.int.test.ts sees a 403; by folding the states into the 401: "wrong
+    // second-step codes lock the account" in accountLock.int.test.ts sees the right password told it is wrong.
+    const ok = await verifyLoginPassword(!refusal && user ? user.password_hash : null, password);
+    if (!user || refusal || !ok) {
+      // Public password failures never increment the account-wide counter. Keep that counter for
+      // authenticated password checks and wrong second factors, where the attacker already has a credential.
+      const why = refusal ?? (user?.disabled ? 'disabled' : user && lockedUntil(user) ? 'locked' : 'bad_password');
+      await logAudit('login.fail', { userId: user?.id, username, detail: { reason: why }, req });
+      const failed = await signInPair(req);
+      if (!failed.isAllowed && failed.isExceeded) {
+        return reply.code(429).header('Retry-After', String(failed.ttlInSeconds))
+          .send({ error: 'too_many_requests', message: 'Too many sign-in attempts. Try again later.' });
+      }
       return reply.code(401).send({ error: 'invalid_credentials' });
     }
     if (user.disabled) {
@@ -215,16 +247,6 @@ export default async function authRoutes(app: FastifyInstance) {
     }
     const lock = lockedUntil(user);
     if (lock) return reply.code(423).send({ error: 'locked', until: lock.toISOString(), message: 'Account locked after too many attempts. Try again later.' });
-
-    let ok = false;
-    try { ok = await verify(user.password_hash, password); } catch { ok = false; }
-    if (!ok) {
-      const nowLocked = await recordFailedLogin(user.id);
-      await logAudit('login.fail', { userId: user.id, username, detail: { reason: 'bad_password', locked: nowLocked }, req });
-      if (nowLocked) return reply.code(423).send(LOCKED_NOW);
-      return reply.code(401).send({ error: 'invalid_credentials' });
-    }
-
     // second factor
     if (user.totp_enabled) {
       if (!code) return reply.code(401).send({ error: 'totp_required' });
@@ -244,6 +266,7 @@ export default async function authRoutes(app: FastifyInstance) {
         // account" in accountLock.int.test.ts is never locked.
         const nowLocked = await recordFailedLogin(user.id);
         await logAudit('login.totp_fail', { userId: user.id, username, detail: { locked: nowLocked }, req });
+        // At this point the caller proved the password; keep the second-step UX and its brute-force lock.
         if (nowLocked) return reply.code(423).send(LOCKED_NOW);
         return reply.code(401).send({ error: 'totp_invalid', message: 'Incorrect authentication code.' });
       }

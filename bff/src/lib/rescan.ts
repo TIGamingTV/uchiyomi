@@ -166,6 +166,7 @@ import { numberText } from './chapterRanges';
 import { matchCheckState } from './matchCheck';
 import { namesOfMany } from './altTitles';
 import { nameKey } from './onlineMatch';
+import { wantQuiet } from './finishDownloads';
 
 /** How many stats are in flight at once: a NAS answers a handful in parallel well and thousands badly (Verify's). */
 const CONCURRENCY = 16;
@@ -761,7 +762,8 @@ export interface ApplyOpts { held?: () => Promise<void>; renumbered?: () => Prom
  * applied one, and beside another job" in rescan.int.test.ts names the job that was let through.
  */
 function clashing(): ApplyRefusal | null {
-  if (runtime.updating) return 'sweep_running';
+  // v0.79.0: the finishing sweep (lib/finishDownloads.ts) is asked to give way, so Apply works a moment on.
+  if (runtime.updating) { wantQuiet(); return 'sweep_running'; }
   if (runtime.autofixing) return 'autofix_running';
   if (runtime.repairing) return 'repair_running';
   if (verifyState.running) return 'verify_running';
@@ -1090,8 +1092,10 @@ const EXT = /\.(cbz|cbr|zip|rar|pdf|epub)$/i;
 
 /**
  * Anything of anyone's on a chapter row (FOLLOW, the header): reading progress, reading events, a bookmark, a note, an
- * offline copy, a number or title set by hand, a page marked by hand. Page hashes the nightly job measured are not --
- * they are of the same bytes as the old row's, and go with the row (ON DELETE CASCADE).
+ * offline copy, a number or title set by hand, a page marked by hand, a comment or a reaction (v0.87.0). Page hashes the
+ * nightly job measured are not -- they are of the same bytes as the old row's, and go with the row (ON DELETE CASCADE).
+ * Reintroduce by dropping the comments arm: "a renamed file someone commented on since the scan is kept beside its old
+ * chapter" in rescan.int.test.ts finds the comment gone with the new row.
  */
 const HOLDS = `SELECT book_id AS id FROM read_progress WHERE book_id = ANY($1)
   UNION SELECT book_id FROM reading_events WHERE book_id = ANY($1)
@@ -1099,7 +1103,9 @@ const HOLDS = `SELECT book_id AS id FROM read_progress WHERE book_id = ANY($1)
   UNION SELECT book_id FROM notes WHERE book_id = ANY($1)
   UNION SELECT book_id FROM offline_downloads WHERE book_id = ANY($1)
   UNION SELECT book_id FROM book_overrides WHERE book_id = ANY($1)
-  UNION SELECT book_id FROM page_hashes WHERE book_id = ANY($1) AND override IS NOT NULL`;
+  UNION SELECT book_id FROM page_hashes WHERE book_id = ANY($1) AND override IS NOT NULL
+  UNION SELECT book_id FROM chapter_comments WHERE book_id = ANY($1)
+  UNION SELECT book_id FROM chapter_reactions WHERE book_id = ANY($1)`;
 
 interface PairRow {
   id: string; series_id: string; root: string; file: string; pruned_at: string | null; fingerprint: string | null;

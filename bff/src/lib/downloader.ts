@@ -3,13 +3,13 @@
 // session cookies for the binary image fetches (FlareSolverr itself can't return binaries).
 // eslint-disable-next-line @typescript-eslint/no-var-requires
 const AdmZip = require('adm-zip');
-import { mkdir, stat, statfs } from 'fs/promises';
+import { mkdir, readdir, stat, statfs } from 'fs/promises';
 import { join, dirname, posix } from 'path';
 import sharp from 'sharp';
 import { getSource, SourceAdapter, SourceChapter, SourceSeries } from './sources';
 import { cfSession } from './sources/flaresolverr';
 import { DL_ROOT, XML_FORBIDDEN } from './library';
-import { beginDownload, startedDownload, endDownload, holdPartial } from './downloadActivity';
+import { beginDownload, startedDownload, endDownload, holdPartial, pagesProgress } from './downloadActivity';
 import { classify, noteStage, reportOk, reportFail, SourceStatus } from './sourceHealth';
 import { withGate } from './gate';
 import { imageExt } from './imageExt';
@@ -22,6 +22,7 @@ import { adultContentRating } from './ageRating';
 import { MAX_PAGE_BYTES } from './archiveCaps';
 import { fetchFollowingPublic, readCapped } from './safeFetch';
 import { isSwAdapterId } from './sources/suwayomi/sources';
+import { numKey } from './postingOrder';
 import { onEngineOrigin } from './sources/suwayomi/client';
 
 /**
@@ -302,6 +303,27 @@ export function freeBytes(): Promise<number | null> {
  */
 export const chapterFileRel = (seriesFolder: string, number: number): string => posix.join(seriesFolder, `Chapter ${number}.cbz`);
 
+/** The downloader's own file name, and the number it spells: `Chapter 84.3.cbz`, `Chapter -1.cbz`. */
+const OWN_NAME = /^Chapter (-?\d+(?:\.\d+)?)\.cbz$/;
+
+/**
+ * Is chapter `number` already in the folder of `abs` under another spelling of its number: `Chapter
+ * 84.29999999999998.cbz` for 84.3. A source and the database spell some numbers differently (lib/chapterRanges.ts
+ * heldBy), so a task holding one spelling looked for a file named by it and missed the one another task had just
+ * written under the other: Standard of Reincarnation got chapter 84.3 twice, 49 s apart, before a scan had indexed the
+ * first. The file NAME is left alone (lib/repair.ts and the refetch routes recognise a file of ours by exactly it).
+ * Reintroduce by checking the one path alone: "a chapter saved under another spelling of its number is not fetched
+ * again" in chapterSpellings.test.ts finds 84.3 going on to be fetched.
+ */
+async function spelledOtherwise(abs: string, number: number): Promise<boolean> {
+  const key = numKey(number);
+  const names = await readdir(dirname(abs)).catch(() => [] as string[]);
+  return names.some((f) => {
+    const m = OWN_NAME.exec(f);
+    return !!m && numKey(parseFloat(m[1])) === key;
+  });
+}
+
 /**
  * The per-source chapter gate every download path runs under: at most DL_CONCURRENCY chapters at once and
  * a gap between their starts that doubles per pace level (1200 → 2400 → 4800 ms), so a source that has
@@ -342,8 +364,9 @@ export async function downloadChapter(
   await mkdir(DL_ROOT, { recursive: true });
   const abs = await realContainedPath(DL_ROOT, rel);
   if (!abs) throw new Error('unsafe download path outside the library root');
-  // A PATH check under DL_ROOT, and nothing more: is the file this very call would write already there.
-  // It is free, so it runs before queueing for a slot, and it catches the same chapter twice in one run.
+  // A PATH check under DL_ROOT, and nothing more: is the file this very call would write already there, under
+  // this spelling of its number or another (spelledOtherwise). It is cheap, so it runs before queueing for a
+  // slot, and it catches the same chapter twice in one run.
   //
   // ⚠️ It is not, and cannot be, the library's have-set. It sees one root and one filename convention, so
   // a chapter the scanner indexed under the READ-ONLY library root, or under any other name, is invisible
@@ -352,7 +375,7 @@ export async function downloadChapter(
   // `lib_books` across both roots: see the have-set in routes/sources.ts (addSeriesFromSource). Leaving
   // this here is deliberate; `replace` is what the admin refetch and the completion pass (lib/partial.ts)
   // use to write over a file they know to be stale or partial, and those paths never consult the have-set.
-  if (!opts.replace && await stat(abs).then(() => true).catch(() => false)) return null;
+  if (!opts.replace && (await stat(abs).then(() => true).catch(() => false) || await spelledOtherwise(abs, input.chapter.number))) return null;
   await assertFreeSpace();
 
   // Recorded HERE, the one function every download path ends in, so the downloads view sees all of them --
@@ -368,7 +391,7 @@ export async function downloadChapter(
       // waiting wins the race and the source is never contacted.
       await assertDownloadPreflight(opts.preflight);
       startedDownload(act);
-      return fetchChapter(src, input, rel);
+      return fetchChapter(src, input, rel, act);
     });
     endDownload(act, { status: 'done', pages: r.pages });
     return r;
@@ -403,6 +426,8 @@ export interface PageCtx {
    * are holes, and a 429 is still noted for the pace. Default true: the resume loop below.
    */
   retry?: boolean;
+  /** Called when another page is in hand, for live download progress. */
+  onPage?: (got: number) => void;
 }
 
 export interface PagesResult {
@@ -438,6 +463,7 @@ export async function fetchPages(src: SourceAdapter, urls: string[], indices: nu
     ? src.imageReferer(ctx.chapterSourceId)
     : src.imageReferer
       ?? (/^https?:/.test(ctx.chapterSourceId) ? `${new URL(ctx.chapterSourceId).origin}/` : '');
+  let got = 0; // Pages in hand; retries of a page do not count it twice.
   let worst = 0; // worst HTTP status seen on a failed page, or a sentinel below 400 (EMPTY_BODY, NET_ERROR)
 
   // Held by position rather than appended as they arrive, so a page fetched on the RETRY below still lands
@@ -495,6 +521,7 @@ export async function fetchPages(src: SourceAdapter, urls: string[], indices: nu
       if (buf.length < 256 && !(await isImage(buf))) { worst = Math.max(worst, EMPTY_BODY); failed.set(i, { index: i, status: r.status, type, bytes: buf.length }); return; }
       // Content-Type first: some sources (and any source proxied through an extension server) serve pages
       // from extension-less URLs, and a wrong extension makes the chapter read as zero pages.
+      if (!page[i]) ctx.onPage?.(++got);
       page[i] = buf;
       ext[i] = imageExt(u, ct);
       failed.delete(i);
@@ -652,6 +679,7 @@ async function fetchChapter(
   src: SourceAdapter,
   input: DownloadInput,
   rel: string,
+  act?: number,
 ): Promise<{ file: string; pages: number }> {
   const abs = join(DL_ROOT, rel);
   let urls: string[];
@@ -663,6 +691,15 @@ async function fetchChapter(
     // #115: evidence whatever classify() makes of it. An extension's own exception classifies as nothing, so
     // the cooldown never saw it and neither did Health; the stage note sees everything and escalates nothing.
     void noteStage(input.sourceId, 'pages', 'fail', { error: (e as Error)?.message || 'getPageUrls failed' });
+    // v0.79.0: a site saying "slow down" (429) or "no" (403) to a chapter's page list is the same refusal as saying it to
+    // the page images. The run stops asking that source, the ledger files it as a refusal (Finish downloads on their own
+    // gives one twelve tries, lib/finishDownloads.ts) and the pace slows. Rethrown bare, it read as a broken chapter:
+    // `error`, three tries, and the same source asked again for the next chapter of the run. Reintroduce by rethrowing
+    // `e` as it was: "a page list refused with 429 is a refusal" in downloadBlame.int.test.ts reads `error`.
+    if (s === 'rate_limited' || s === 'blocked') {
+      if (s === 'rate_limited') noteRateLimited(src.id);
+      throw Object.assign(e instanceof Error ? e : new Error(String(e)), { blockStatus: s, status: s });
+    }
     throw e;
   }
   if (!urls.length) throw new Error('no page urls');
@@ -671,8 +708,10 @@ async function fetchChapter(
   // pagePace, not paceFor: under withSlowPace this is where Suwayomi's gap 0 and its pool give way to the
   // archive's one worker and random gaps. Everywhere else the two are the same thing.
   const pace = pagePace(src, { gapMs: DL_PAGE_GAP_MS });
+  if (act != null) pagesProgress(act, 0, urls.length);
   const { page, ext, worst, failed, refusal } = await fetchPages(src, urls, urls.map((_, i) => i), {
     chapterSourceId: input.chapter.sourceId, gap: pace.gap, workers: pace.workers, jitter: pace.jitter, rand: pace.rand,
+    ...(act != null ? { onPage: (got: number) => pagesProgress(act, got, urls.length) } : {}),
   });
 
   const zip = new AdmZip();

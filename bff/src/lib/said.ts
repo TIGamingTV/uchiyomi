@@ -121,6 +121,13 @@ const EN = {
     `${n} missing before where you started (chapter ${start}) — ${ranges}`,
   'gaps.alsoBelowFloor': ({ n, start }: { n: number; start: number }) => `${n} more before where you started (chapter ${start})`,
   'gaps.beforeStart': ({ n }: { n: number }) => `${n} before where you started`,
+  // Holes none of the series' sources lists (lib/fill.ts splitListed): not counted as missing.
+  'gaps.notListed': ({ n, ranges }: { n: number; ranges: string }) =>
+    `${n} ${s(n, 'number', 'numbers')} none of its sources list — ${ranges}`,
+  'gaps.notListedSeries': ({ n }: { n: number }) => `${n} with numbers none of their sources list`,
+  'gaps.notListedNote': () =>
+    'Numbers none of a series\' sources list are not counted as missing: usually a source numbered the same chapters ' +
+    'another way, such as counting split parts as chapters. "Fill now" still asks other sources for them.',
 
   // ---- Chapter numbering (#116). `name` null: the source could not be named at all.
   'numbering.live': ({ n }: { n: number }) => `${n} series ${s(n, 'waits', 'wait')} for a numbering review`,
@@ -146,6 +153,13 @@ const EN = {
   'numbering.askedWaits': () => 'Numbering by posting order, as asked, waits to be applied.',
   'numbering.sourceWaits': ({ name }: { name: string | null }) => `Going back to ${name ?? 'its source'}'s own numbers waits to be applied.`,
   'numbering.since': ({ at }: { at: string }) => `numbered by posting order since ${day(at)}.`,
+
+  // ---- v0.81.0, the scout (lib/sourceScout.ts) on a Health row: when it last looked for the series on other sources,
+  // how many it asked, and what came of it. `source` is the source it followed, by name.
+  'scout.following': ({ n, at, source }: { n: number; at: string; source: string }) =>
+    `Searched ${n} other source${s(n, '', 's')} on ${day(at)}: now also using ${source}`,
+  'scout.notFound': ({ n, at }: { n: number; at: string }) =>
+    `Searched ${n} other source${s(n, '', 's')} on ${day(at)}: none has it yet`,
   'numbering.hint': () => 'they may be different chapters listed as versions of one.',
   'numbering.kept': () => "you chose to keep the source's own numbers.",
   'numbering.held': () => 'Nothing downloads for this series until then.',
@@ -177,6 +191,9 @@ const EN = {
     'until the nightly repair gives it another chance a week later; "Retry now" does that for this source at once, ' +
     'and "Find missing chapters" on the series still fetches it on purpose. ' +
     'A chapter saved with pages missing is listed on its series page and re-tried by the sweep, up to 10 a night.',
+  // v0.78.1: with "Finish downloads on their own" on, a refused chapter's own cap (lib/finishDownloads.ts).
+  'failures.noteRefusals': ({ cap }: { cap: number }) =>
+    `While "Finish downloads on their own" is on, a chapter a site refused (a rate limit or a block) is tried up to ${cap} times.`,
   // `status` is the ledger's (lib/chapterFailures.ts): incomplete, error, or the source's own status -- or, since v0.55.3,
   // moved (filed under the main source from one the series no longer uses); `reason` the downloader's own words.
   'failures.detail': ({ n, series, since, tries, capped, cap, title, number, status, reason }: {
@@ -300,6 +317,15 @@ const EN = {
     'reading history, and updates do not fetch them back.',
   'twice.detail': ({ n, numbers, more, source }: { n: number; numbers: number[]; more: number; source: string }) =>
     `${n} file${s(n, '', 's')} from ${source} saved again in another split: ${numbers.join(', ')}${more > 0 ? ` and ${more} more` : ''}`,
+  // Two files of one chapter in one series (lib/heldTwice.ts), the rows Keep one of each acts on.
+  'twice.heldLive': ({ n }: { n: number }) => `${n} series ${s(n, 'holds', 'hold')} the same chapter in two files`,
+  'twice.held': ({ n, numbers, more }: { n: number; numbers: number[]; more: number }) =>
+    `${n} chapter${s(n, ' is', 's are')} here twice: ${numbers.join(', ')}${more > 0 ? ` and ${more} more` : ''}`,
+  'twice.heldNote': () =>
+    'A series that holds two files of one chapter offers "Keep one of each": the first file saved stays, unless it is ' +
+    'incomplete. The other is deleted from the download folder, or set aside where Uchiyomi may not delete; reading ' +
+    'progress moves to the copy that stays, and a bookmarked copy is kept. A part or an extra filed under its chapter\'s ' +
+    'number (17e, 1053a) is never offered.',
 
   // ---- Cloudflare solver. ⚠️ On desktop the helper's address carries its access token: no `url` is sent there.
   'solver.down': ({ url, error }: { url?: string; error: string | null }) =>
@@ -531,6 +557,12 @@ const EN = {
   'job.stopped': ({ source }: { source: string }) => `${source} stopped part-way`,
   'job.stoppedRefusing': ({ source, status }: { source: string; status: string }) => `${source} stopped part-way: it is ${statusWord(status)} downloads`,
   'job.refusing': ({ source, status }: { source: string; status: string }) => `${source} is currently ${statusWord(status)} downloads.`,
+  // "Finish downloads on their own" (lib/finishDownloads.ts): the same stops, with what happens next.
+  'job.refusingWillFinish': ({ source, status }: { source: string; status: string }) =>
+    `${source} is currently ${statusWord(status)} downloads. The series is saved, and its chapters will download on their own when the site is ready.`,
+  'job.stoppedWillFinish': ({ source }: { source: string }) => `${source} stopped part-way. The rest will download on their own.`,
+  'job.stoppedRefusingWillFinish': ({ source, status }: { source: string; status: string }) =>
+    `${source} stopped part-way: it is ${statusWord(status)} downloads. The rest will download on their own when the site is ready.`,
   'job.undownloadable': () => 'No downloadable chapters here — this title may be licensed or hosted externally on this source.',
   'job.failed': ({ n, error }: { n: number; error: string }) => `${n} chapter${s(n, '', 's')} could not be saved: ${error}`,
   'job.cancelled': ({ done, total }: { done: number; total: number }) => `Cancelled after ${done} of ${total} chapter${s(total, '', 's')}.`,
@@ -604,6 +636,8 @@ const EN = {
   'detach.noMain': () => 'This series has no main source to detach.',
   // A source retired, or a site removed, while some series still has it as its main source (v0.54.0, lib/retireSource.ts).
   'retire.inUse': ({ n }: { n: number }) => `It is the main source of ${n} series. Replace it first.`,
+  // An install or removal while another one runs (v0.82.0, lib/sources/suwayomi/installLock.ts): one at a time.
+  'extension.busy': () => 'Another extension is being added or removed. Try again in a minute.',
   // Rating a source Adult only past the list's limit (v0.73.0, lib/visibility.ts MAX_ADULT_SOURCES).
   'rating.tooMany': ({ limit }: { limit: number }) => `At most ${limit} sources can be rated Adult only.`,
 
@@ -750,7 +784,7 @@ const EN = {
   'disk.noteFolders': () =>
     'A library or download folder that cannot be read, or that is empty while the library records chapters in it, is ' +
     'usually a share that is not mounted; nothing is marked missing because of it. Only the top of each folder is read ' +
-    'here: Verify chapter files (Admin → Tasks) checks every file.',
+    'here: Verify chapter files (Admin → Settings → Maintenance) checks every file.',
 
   // ---- Tracker sync (v0.72.0, lib/healthTrackers.ts, @Squeaks72's card from #253). `error` is the tracker's own.
   'trackers.refused': () => 'The tracker refused the saved sign-in',

@@ -26,18 +26,22 @@ import { numLabel } from '@/lib/numbering';
 import { useToast } from '@/components/Toast';
 import { deviceId } from '@/lib/device';
 import { ReaderEndLabel, ReaderEndRadar } from '@/components/ReaderEndRadar';
-import { getOfflineChapter, getPageBlob, queueProgress, noteOfflineProgress, listSeriesDownloads, setOfflinePageJunk } from '@/lib/downloads';
+import { getOfflineChapter, getPageBlob, queueProgress, noteOfflineProgress, listSeriesDownloads, setOfflinePageJunk, setOfflineSpreadMarks } from '@/lib/downloads';
+import { applyMarks, markOf, saveMark, spreadOptions, withMark, type SpreadMark, type SpreadOption } from '@/lib/spreadMarks';
 import { applyCover, clearCover } from '@/lib/theme';
 import { COLOR_FILTER, glide, loadDevicePrefs, saveDevicePrefs, type DevicePrefs } from '@/lib/readerDevice';
 import { ReaderPrefs, loadPrefs, savePrefs, loadSeriesPrefs, saveSeriesPrefs, syncPrefsFromServer, THEME_FILTER, loadSourcePrefs, saveSourcePrefs, clearSourcePrefs, globalPrefsChange, seriesPinChange, titleLook, mergePulled, rememberSeriesSource, seriesSourceOf, rememberSeriesType, seriesTypeOf, rememberLibraryLook, libraryLookOf, type LibraryLook } from '@/lib/readerPrefs';
 import { guessMode, type AutoGuess } from '@/lib/readerAuto';
+import { translatedSrc, translating, type TranslateStatus } from '@/lib/readerTranslate';
 import { ReaderSettings } from '@/components/ReaderSettings';
 import { SectionTitle, useImgRetry, useRtl } from '@/components/ui';
 import { PageGrid } from '@/components/PageGrid';
 import { ChapterSheet } from '@/components/ChapterSheet';
 import { SeriesCard } from '@/components/cards';
 import { NextInStory } from '@/components/RelatedRail';
-import { IcChevronLeft, IcChevronRight, IcSliders, IcGrid } from '@/components/icons';
+import { IcChevronLeft, IcChevronRight, IcSliders, IcGrid, IcComment } from '@/components/icons';
+import { SEAM_H, useChapterTalk, useTalkOn } from '@/lib/comments';
+import { ChapterTalkSheet, TalkKey, TalkStrip } from '@/components/ChapterTalk';
 import { ReaderImg, MissingCaption, ReaderPageRow, SlidePending, SlideRegion, SlideTurned, SlideTurnedPair, DIVIDER_H, measurePage } from '@/components/ReaderPage';
 import { CHAPTER_SAMPLE, LEFT_HALF, RIGHT_HALF, WHOLE, chapterSideCrop, halfCrop, pairCrop, type Region } from '@/lib/readerCrop';
 import { t as tr } from '@/lib/i18n';
@@ -47,7 +51,7 @@ import { useContextMenu, type MenuItem } from '@/components/ContextMenu';
 import { ReaderShortcuts, useHasKeyboard } from '@/components/ReaderShortcuts';
 import { capLabel } from '@/components/ReaderKeys';
 
-interface PageDim { number: number; width: number | null; height: number | null; junk?: boolean; missing?: boolean; join?: 'rtl' | 'ltr' }
+interface PageDim { number: number; width: number | null; height: number | null; junk?: boolean; missing?: boolean; join?: 'rtl' | 'ltr'; mark?: SpreadMark }
 /**
  * `sourceId`: the adapter the copy came from, for naming it on a missing page's caption. Unknown for a downloaded copy.
  * `spreads` (#229, Join split double pages): what the server said of the chapter's spreads when asked (`x-spreads`):
@@ -56,7 +60,7 @@ interface PageDim { number: number; width: number | null; height: number | null;
  */
 interface Chapter { id: string; seriesId: string; seriesTitle: string; title: string; pages: PageDim[]; offline: boolean; readingDirection?: string | null; pruned?: boolean; sourceId?: string | null; spreads?: 'done' | 'pending' | 'none' }
 interface ChapterRef { id: string; label: string }
-interface FlatItem { ci: number; number: number; width: number | null; height: number | null; key: string; firstOfChapter: boolean; junk?: boolean; join?: 'rtl' | 'ltr'; missing?: boolean; collapsed?: boolean }
+interface FlatItem { ci: number; number: number; width: number | null; height: number | null; key: string; firstOfChapter: boolean; junk?: boolean; join?: 'rtl' | 'ltr'; mark?: SpreadMark; forced?: boolean; missing?: boolean; collapsed?: boolean }
 
 /**
  * #229: when to ask again for a chapter whose spreads the server is still measuring, after each `pending`: then the
@@ -126,7 +130,7 @@ async function pageList(bookId: string, spreads: boolean): Promise<{ pages: Page
   const { data, headers } = await apiWithHeaders<PageInfo[]>(`/api/books/${bookId}/pages${spreads ? '?spreads=1' : ''}`);
   const said = headers.get('x-spreads');
   return {
-    pages: data.map((p) => ({ number: p.number, width: p.width ?? null, height: p.height ?? null, junk: p.junk, missing: p.missing, join: p.join })),
+    pages: data.map((p) => ({ number: p.number, width: p.width ?? null, height: p.height ?? null, junk: p.junk, missing: p.missing, join: p.join, mark: p.mark })),
     spreads: spreads ? (said === 'done' || said === 'pending' ? said : 'none') : undefined,
   };
 }
@@ -206,6 +210,19 @@ function ReaderInner() {
   const imgFilter = COLOR_FILTER[device.colorFilter];
   const behavior = glide(device.colorFilter);
   const [zoom, setZoom] = useState(1);
+  // Shift pairs by one page, the title's memory like the zoom (lib/readerSpread.ts pairSlides `shift`).
+  const [spreadShift, setSpreadShift] = useState(false);
+  // Translated pages (v0.85.0, lib/readerTranslate.ts): the title's memory like the shift, offered only while the server
+  // has the engine and the switch on. Each chapter's translated pages and their stamps, as the server last said.
+  const [translate, setTranslate] = useState(false);
+  const { data: trOffer } = useQuery({
+    queryKey: ['translate-available'],
+    queryFn: () => api<{ available: boolean }>('/api/translate'),
+    staleTime: 5 * 60_000,
+  });
+  const trOn = translate && !!trOffer?.available;
+  const trLang = activeLocale();
+  const [trStatus, setTrStatus] = useState<Record<string, TranslateStatus>>({});
   /**
    * One page of the pair on screen brought into frame (#232 by a tap, #261 by the `focus` key): the slide then shows that
    * page alone. Only ever a view of a slide that holds two pages, so nothing that counts pages -- progress, the counter,
@@ -227,6 +244,8 @@ function ReaderInner() {
   const laidOutMode = useRef<ReaderPrefs['mode'] | null>(null);
   /** Whether the paged track was last laid out with wide pages split in two (the split effect below). */
   const laidOutSplit = useRef<boolean | null>(null);
+  /** the pairing the paged track was laid out for: spreads on or off, shifted or not. */
+  const laidOutPairs = useRef<string | null>(null);
   /** The joined spreads the paged track was last laid out with (#229, the joins effect below), as the slides' first pages. */
   const laidOutJoins = useRef<string | null>(null);
   /** When the track last moved -- a scroll event, or a smooth scroll this code started. See untilStill. */
@@ -243,6 +262,9 @@ function ReaderInner() {
   /** Whether the right-click menu is open (it is made further down): the keys are its while it is, Escape included. */
   const menuOpen = useRef(false);
   const [showKeys, setShowKeys] = useState(false);
+  /** The chapter whose talk is open in its sheet (v0.87.0, components/ChapterTalk.tsx), by id; null while none is. */
+  const [talkFor, setTalkFor] = useState<string | null>(null);
+  const openTalk = useCallback((id: string) => setTalkFor(id), []);
   const hasKeyboard = useHasKeyboard();
   const [current, setCurrent] = useState(0);
   const { user } = useAuth();
@@ -326,6 +348,14 @@ function ReaderInner() {
       if (pin) saveSeriesPrefs(seriesId0, pin);
       return n;
     });
+  };
+  const applyShift = (v: boolean) => {
+    setSpreadShift(v);
+    if (seriesId0) saveSeriesPrefs(seriesId0, { spreadShift: v });
+  };
+  const applyTranslate = (v: boolean) => {
+    setTranslate(v);
+    if (seriesId0) saveSeriesPrefs(seriesId0, { translate: v });
   };
   const applyZoom = (z: number) => {
     const clamped = Math.max(1, Math.min(3, z));
@@ -487,6 +517,8 @@ function ReaderInner() {
       setPrefs(look.prefs);
       setAutoApplied(look.autoApplied);
       setZoom(memory.zoom && memory.zoom >= 1 ? memory.zoom : 1);
+      setSpreadShift(memory.spreadShift === true);
+      setTranslate(memory.translate === true);
       titleOpen.current = true;
       setReady(true);
     })();
@@ -532,9 +564,13 @@ function ReaderInner() {
   // removed: removing would give the two modes different flows, and switching mode mid-chapter would then land
   // on a different page, because nothing re-anchors `current` when the flow is rebuilt.
   const flowJunk = prefs.mode === 'paged' && prefs.junkPages === 'collapse' ? 'show' : prefs.junkPages;
+  // v0.89.0 (#262): the reader's own merges and splits (`mark` on a page, lib/spreadMarks.ts) applied over the detector's
+  // joins, so what pairs is decided in one place. A merge is drawn the way a spread reads: from the right on a
+  // right-to-left track, or for a right-to-left series read either way, as Wide pages -> Split orders a spread's halves.
+  const markDir = rtl || pagedRtl ? 'rtl' : 'ltr';
   const flat: FlatItem[] = useMemo(
-    () => buildFlow(chapters, flowJunk, expanded) as FlatItem[],
-    [chapters, flowJunk, expanded],
+    () => applyMarks(buildFlow(chapters, flowJunk, expanded) as FlatItem[], markDir),
+    [chapters, flowJunk, expanded, markDir],
   );
   /** Vertical + `collapse`: a repeated page is drawn as a band of itself instead of being removed. */
   const collapsing = prefs.junkPages === 'collapse';
@@ -590,9 +626,11 @@ function ReaderInner() {
   // #229, Join split double pages (account, off until chosen): two pages a source served as the halves of one spread are
   // one slide (lib/readerSpread.ts rule 4b). On a screen held upright Wide pages decides, as for a spread in one file:
   // Whole shows the spread, Split shows its two pages one by one (not joined), Rotate turns it on its side.
+  // and Shift pairs by one page (`shift`), in the dependencies too -- without it the Shift checkbox changed
+  // nothing until the pages did.
   const { slides, slideOf, half, joined } = useMemo(
-    () => pairSlides(flat, prefs.mode === 'paged' && !!prefs.spread, { split: splitTrack, rightFirst, joinSplit: prefs.joinSplit }),
-    [flat, prefs.mode, prefs.spread, splitTrack, rightFirst, prefs.joinSplit],
+    () => pairSlides(flat, prefs.mode === 'paged' && !!prefs.spread, { split: splitTrack, rightFirst, shift: spreadShift, joinSplit: prefs.joinSplit }),
+    [flat, prefs.mode, prefs.spread, splitTrack, rightFirst, spreadShift, prefs.joinSplit],
   );
   // A page brought into frame belongs to the slides it was brought out of: laid out again, they give the pair back.
   useEffect(() => { setFocus(null); }, [slides]);
@@ -704,6 +742,13 @@ function ReaderInner() {
   // wrong page from then on, with no symptom until the page counter disagrees with the screen.
   // Reintroduce by dropping `expanded` from the deps: expand a strip, then scroll -- the counter is off by
   // however much the page grew.
+  // v0.87.0: whether the household has talk to show (lib/comments.ts useTalkOn), asked with the chapter on screen. While it
+  // does, the line between two chapters is the strip where they meet, SEAM_H tall instead of DIVIDER_H -- in the model
+  // below as in the row that draws it (components/ReaderPage.tsx). Reintroduce by reserving DIVIDER_H whatever talkOn
+  // says: "the reader reserves the strip it draws" in comments.test.ts fails, and every page below a strip reads as
+  // another one.
+  const talkOn = useTalkOn(chapters[flat[current]?.ci ?? 0]?.id);
+  const dividerH = talkOn ? SEAM_H : DIVIDER_H;
   const { heights, tops } = useMemo(() => {
     // `buildFlow` owns the collapse decision. In particular, `missing` outranks a stale/manual `junk` flag:
     // a placeholder must keep its full page box so its explanation is never squeezed into a strip.
@@ -721,13 +766,13 @@ function ReaderInner() {
     const ts: number[] = [];
     let acc = 0;
     flat.forEach((p, i) => {
-      if (p.firstOfChapter && p.ci > 0) acc += DIVIDER_H;
+      if (p.firstOfChapter && p.ci > 0) acc += dividerH;
       ts.push(acc);
       acc += hs[i] + prefs.gap;
     });
     return { heights: hs, tops: ts };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [flat, colW, prefs.gap, collapsing, expanded, wideMode, prefs.cropBorders, sideVersion]);
+  }, [flat, colW, prefs.gap, collapsing, expanded, wideMode, prefs.cropBorders, sideVersion, dividerH]);
 
   /** Each page's place in the flow, by key (v0.61.0): the anchor, the downloaded pages' images and the page grid look
    *  a page up here. They used to scan the flow for it, once per page -- per blob, per grid tile, per page turn. */
@@ -855,9 +900,14 @@ function ReaderInner() {
     fitAsked.current.set(key, w);
     return w;
   };
-  /** An online page's address: as scanned -- the reader as it always was -- or under Fit pages to my screen, as wide as it is drawn. */
-  const onlineSrc = (ch: Chapter, i: number): string =>
-    (device.fitPages ? img.pageFit(ch.id, flat[i].number, fitFor(i)) : img.page(ch.id, flat[i].number));
+  /**
+   * An online page's address: as scanned -- the reader as it always was -- or under Fit pages to my screen, as wide as it
+   * is drawn; translated once the server has the page in the reader's language (v0.85.0), the original until then.
+   */
+  const onlineSrc = (ch: Chapter, i: number): string => {
+    const src = (device.fitPages ? img.pageFit(ch.id, flat[i].number, fitFor(i)) : img.page(ch.id, flat[i].number));
+    return translatedSrc(src, trLang, trOn ? trStatus[ch.id]?.pages[flat[i].number] : undefined);
+  };
 
   // ---- the webtoon column fetches ahead of its window, as bytes (v0.61.0) ----
   // The pages after the window are fetched and dropped: the server serves a page `private, max-age=31536000,
@@ -938,6 +988,7 @@ function ReaderInner() {
     laidOutSign.current = trackSign;
     laidOutMode.current = prefs.mode;
     laidOutSplit.current = splitTrack;
+    laidOutPairs.current = `${!!prefs.spread}:${spreadShift}`;
     laidOutJoins.current = joinedAt;
     didInitScroll.current = true;
     // The column's window and anchor from where it now stands: a resume on page 1 scrolls nowhere, so no scroll event
@@ -996,6 +1047,17 @@ function ReaderInner() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [splitTrack]);
 
+  // the same for turning spreads on or off and for Shift pairs by one page: every slide after the first
+  // changes which pages it holds, so the track's place pointed at another page and the counter followed it there.
+  useLayoutEffect(() => {
+    const el = scrollRef.current;
+    const pairs = `${!!prefs.spread}:${spreadShift}`;
+    if (!el || !didInitScroll.current || prefs.mode !== 'paged' || laidOutPairs.current === pairs) return;
+    laidOutPairs.current = pairs;
+    // Through placeTrack (v0.74.0's resize guard), so a resize after the pairs change keeps this slide, not the old one.
+    placeTrack(el, slideOf[current] ?? current);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [prefs.spread, spreadShift]);
   // #229: the same for joined spreads. A join the server finds while the chapter is open (the measure runs in the
   // background, and the reader asks again), or Join split double pages switched on or off, makes two slides one or one
   // two before the page being read, and the track's place then points at another page. Put it back on the page being
@@ -1005,9 +1067,27 @@ function ReaderInner() {
     const el = scrollRef.current;
     if (!el || !didInitScroll.current || prefs.mode !== 'paged' || laidOutJoins.current === joinedAt) return;
     laidOutJoins.current = joinedAt;
-    placeTrack(el, slideOf[current] ?? current);
+    // v0.89.0 (#262): a joined pair on screen taken apart -- Undo the merge, Show as two pages, or joining switched off on
+    // it -- shows the page it began with, the one being read: `current` is a slide's LAST page (completion fires on it),
+    // and the pair's second page was a page on. Anything else keeps the page being read, as before. Reintroduce by
+    // anchoring on `current` alone: "a pair taken apart shows its first page" in spreadMarks.test.ts fails.
+    // The slide on screen is read from the same render's slides (`shownAt`), never `pagedSlide`, which the Wide pages and
+    // pairs effects above may already have moved onto the new slides in this commit. And `current` follows the placing:
+    // the first page keeps the pair's slide index, so no scroll event comes to say so.
+    const was = shownSlides.current[shownAt.current];
+    const apart = !!was && was.length === 2 && !!shownJoined.current[shownAt.current] && slideOf[was[0]] !== slideOf[was[1]];
+    const anchor = apart ? was[0] : current;
+    const s = slideOf[anchor] ?? anchor;
+    placeTrack(el, s);
+    if (apart) { const on = slides[s]; setCurrent(on ? on[on.length - 1] : anchor); }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [joinedAt]);
+  // The slides on screen until this render's layout is done, and which of them was on screen: what the joins effect above
+  // compares with. A passive effect, so the layout effect still reads the previous render's.
+  const shownSlides = useRef<number[][]>([]);
+  const shownJoined = useRef<boolean[]>([]);
+  const shownAt = useRef(0);
+  useEffect(() => { shownSlides.current = slides; shownJoined.current = joined; shownAt.current = pagedSlide.current; });
 
   // ---- track current page on scroll ----
   // A resize that raises no scroll event (the offset still fits) leaves the track between two pages: snap it back too.
@@ -1261,6 +1341,44 @@ function ReaderInner() {
     staleTime: 5 * 60 * 1000,
   });
   const activeChapter = chapters[flat[current]?.ci ?? 0];
+  const { data: activeTalk } = useChapterTalk(talkOn ? activeChapter?.id : null);
+  /** On a chapter's last page (the last page of a slide, paged): where a paged track shows the chapter's talk. */
+  const atChapterEnd = !!flat[current] && (current === flat.length - 1 || flat[current + 1]?.ci !== flat[current].ci);
+
+  // ---- v0.89.0 (#262): merge two pages into one spread, or take one apart, for this account (lib/spreadMarks.ts) ----
+  // What the page being read allows, from what is on screen: a joined pair offers its way apart, a page on its own the
+  // neighbours it may join, on the sides of the screen they are on. Paged mode only -- the webtoon column has no pairs --
+  // and never under Wide pages -> Split, which shows a spread's halves one by one. The reader settings sheet and the
+  // right-click menu both offer these.
+  const spreadChoices = useMemo((): SpreadOption[] => {
+    if (prefs.mode !== 'paged' || splitTrack || !flat[current]) return [];
+    const s = slideOf[current] ?? -1;
+    return spreadOptions(flat, current, { slide: slides[s] ?? [], joined: !!joined[s], nextIsLeft: pagedRtl, detector: prefs.joinSplit });
+  }, [prefs.mode, prefs.joinSplit, splitTrack, flat, current, slides, slideOf, joined, pagedRtl]);
+  const spreadLabel = (o: SpreadOption): string =>
+    o.kind === 'merge' ? (o.side === 'left' ? tr('Merge with the page on the left') : tr('Merge with the page on the right'))
+    : o.kind === 'split' ? tr('Show as two pages')
+    : o.kind === 'unmerge' ? tr('Undo the merge')
+    : o.kind === 'pair' ? tr('Merge these two pages')
+    : tr('Join these two pages again');
+  /**
+   * Shown at once, saved on the account, and put back if the server refuses. The chapter's pages carry the marks, so the
+   * flow is built again and the joins effect above keeps the page being read in place; a downloaded copy is given the
+   * server's answer too (setOfflineSpreadMarks), as it reads its own pages first.
+   */
+  const applySpread = (o: SpreadOption) => {
+    const ch = chapters[flat[current]?.ci ?? -1];
+    if (!ch) return;
+    const mark = markOf(o);
+    const before = new Map(ch.pages.flatMap((p): Array<[number, SpreadMark]> => (p.mark ? [[p.number, p.mark]] : [])));
+    const put = (marks: ReadonlyMap<number, SpreadMark>) => setChapters((cs) => cs.map((c) => (c.id === ch.id
+      ? { ...c, pages: c.pages.map((p) => (p.mark === marks.get(p.number) ? p : { ...p, mark: marks.get(p.number) })) }
+      : c)));
+    put(withMark(before, o.first, mark));
+    saveMark(ch.id, o.first, mark, ch.pages.length)
+      .then((marks) => { put(marks); void setOfflineSpreadMarks(ch.id, marks); })
+      .catch(() => { put(before); toast(tr('Could not save'), 'error'); });
+  };
 
   // One place that knows how to move to a page, shared by the scrubber and the page grid. The initial-scroll
   // effect above deliberately does not use it: that one must also seed `lastSent` and run exactly once.
@@ -1350,12 +1468,17 @@ function ReaderInner() {
   // ⚠️ The first cut held off while `chapters[0]` was not the addressed chapter, and after the first crossing it never was
   // again (the first chapter stays chapters[0]): the address moved on once, and a refresh two chapters on reopened the
   // second. Reintroduce that test: walk263 "the address follows into the third chapter" fails.
+  // ⚠️ In place, never through the router. `router.replace` asked the server for the route again, and when that answer
+  // could not be used -- a deploy since the page was loaded, or a dropped connection -- Next loaded the whole page
+  // instead: crossing into the next chapter reloaded the reader on it, and the chapter before was gone from the track.
+  // Next keeps useSearchParams in step with history.replaceState. Reintroduce that test: walk263 "crossing into the next
+  // chapter never reloads the page" fails.
   const readingChapterId = ready && didInitScroll.current ? chapters[flat[current]?.ci ?? -1]?.id : undefined;
   useEffect(() => {
     if (!readingChapterId || readingChapterId === bookId || bookId !== addressed.current || !didInitScroll.current) return;
     addressed.current = readingChapterId;
     urlSynced.current = readingChapterId;
-    router.replace(`/reader/?book=${readingChapterId}`, { scroll: false });
+    window.history.replaceState(null, '', `/reader/?book=${readingChapterId}`);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [readingChapterId, bookId]);
   const goChapter = (cid?: string, atEnd = false) => { urlSynced.current = null; if (cid) router.replace(`/reader/?book=${cid}${atEnd ? '&page=last' : ''}`); };
@@ -1481,6 +1604,20 @@ function ReaderInner() {
   // ---- keyboard (desktop) ----
   // The keys in force: this mode's defaults with this device's own bindings (lib/readerKeys.ts reproduces v0.60's).
   const keyMap = useMemo(() => keyMapFor(prefs.mode, device.keys), [prefs.mode, device.keys]);
+  /**
+   * Whether the Escape being handled found a dialog open when it was pressed (v0.87.0). ⚠️ A sheet closes itself on
+   * Escape (components/ui.tsx Sheet listens on the document), and React renders that close between the document's
+   * listeners and the window's -- so the handler below, on the window, read every sheet as already shut and left the
+   * reader: Escape on the chapter list or a chapter's comments sent the reader back to the series. Noted in the capture
+   * phase, before anything has closed. Reintroduce by dropping the check in the Escape line: walkComments "Escape closes
+   * the comments, not the reader" ends on the series page.
+   */
+  const escFoundDialog = useRef(false);
+  useEffect(() => {
+    const note = (e: KeyboardEvent) => { if (e.key === 'Escape') escFoundDialog.current = !!document.querySelector('[role="dialog"]'); };
+    window.addEventListener('keydown', note, true);
+    return () => window.removeEventListener('keydown', note, true);
+  }, []);
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       // Alt+← is the browser's Back and Ctrl/Cmd+F its Find: a key with a modifier is never the reader's.
@@ -1491,8 +1628,8 @@ function ReaderInner() {
       // An open sheet (settings, page grid, chapter list, the key list) is what the keys are for: turning pages
       // underneath it, or leaving the reader on Escape, acted on the thing the reader was not looking at. None of
       // them listens for Escape itself, so it is handled here, and it closes the sheet.
-      if (showSettings || showPages || showChapters || showKeys) {
-        if (e.key === 'Escape') { setShowSettings(false); setShowPages(false); setShowChapters(false); setShowKeys(false); }
+      if (showSettings || showPages || showChapters || showKeys || talkFor) {
+        if (e.key === 'Escape') { setShowSettings(false); setShowPages(false); setShowChapters(false); setShowKeys(false); setTalkFor(null); }
         else if (e.key === '?' && showKeys && !e.repeat) setShowKeys(false);
         return;
       }
@@ -1502,8 +1639,8 @@ function ReaderInner() {
       if (e.key === '?' && !e.repeat && !/^(INPUT|TEXTAREA|SELECT)$/.test(t?.tagName ?? '') && !t?.isContentEditable
         && !READER_ACTIONS.some((a) => keyMap[a].includes('?'))) { e.preventDefault(); setShowKeys(true); return; }
       // Escape is reserved, never bound: it leaves the reader. ⚠️ Once a press -- Escape repeating called
-      // history.back() until it left the reader for wherever came before.
-      if (e.key === 'Escape') { if (!e.repeat) back(); return; }
+      // history.back() until it left the reader for wherever came before. And never the press that closed a sheet.
+      if (e.key === 'Escape') { if (!e.repeat && !escFoundDialog.current) back(); return; }
       // A focused control owns its keys: the page slider its arrows, a button or link its Space and Enter
       // (turning the page instead swallowed the click), a text field everything.
       const owned = !!t && (t.tagName === 'INPUT' || t.tagName === 'SELECT' || t.tagName === 'TEXTAREA' || t.isContentEditable
@@ -1517,12 +1654,12 @@ function ReaderInner() {
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [keyMap, seriesId, showSettings, showPages, showChapters, showKeys]);
+  }, [keyMap, seriesId, showSettings, showPages, showChapters, showKeys, talkFor]);
 
   // ---- a game controller (v0.61.0, lib/readerPad.ts) ----
   // Polled only while one is connected and the tab is visible; still while a sheet is open over the pages.
   const padMap = useMemo(() => padMapFor(device.pad), [device.pad]);
-  const padConnected = useGamepad((a) => performRef.current(a), padMap, showSettings || showPages || showChapters || showKeys);
+  const padConnected = useGamepad((a) => performRef.current(a), padMap, showSettings || showPages || showChapters || showKeys || !!talkFor);
 
   // ---- tap / double-tap / pinch (no overlay -> native scroll works) ----
   const onPointerDown = (e: React.PointerEvent) => {
@@ -1725,6 +1862,44 @@ function ReaderInner() {
   const total = flat.length;
   const pageInChapter = activeChapter ? (flat[current]?.number ?? 0) : 0;
 
+  // ---- translated pages (v0.85.0) ----
+  // The chapter being read is asked for from the page it is on, and the next one once it is done: the server does one
+  // page at a time, the latest ask first. While it still has pages of a chapter to do, the reader asks again every 5 s
+  // (only while the tab is in view) for the pages done since, and a done page's address changes to the translated one.
+  const trAsked = useRef<Set<string>>(new Set());
+  const askTranslation = (id: string, from: number) => {
+    if (trAsked.current.has(id)) return;
+    trAsked.current.add(id);
+    api<TranslateStatus>(`/api/books/${encodeURIComponent(id)}/translations`, { method: 'POST', json: { lang: trLang, from } })
+      .then((st) => setTrStatus((cur) => ({ ...cur, [id]: st })))
+      .catch(() => { trAsked.current.delete(id); });
+  };
+  useEffect(() => {
+    if (!trOn || !activeChapter || activeChapter.offline) return;
+    askTranslation(activeChapter.id, Math.max(1, pageInChapter));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [trOn, activeChapter?.id]);
+  const trHere = activeChapter ? trStatus[activeChapter.id] : undefined;
+  useEffect(() => {
+    if (!trOn || !nextId || !trHere || trHere.pending > 0) return;
+    askTranslation(nextId, 1);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [trOn, nextId, trHere?.pending]);
+  const trPendingIds = trOn ? Object.keys(trStatus).filter((id) => trStatus[id].pending > 0).join(' ') : '';
+  useEffect(() => {
+    if (!trPendingIds) return;
+    const t = setInterval(() => {
+      if (document.visibilityState !== 'visible') return;
+      for (const id of trPendingIds.split(' ')) {
+        api<TranslateStatus>(`/api/books/${encodeURIComponent(id)}/translations?lang=${encodeURIComponent(trLang)}`)
+          .then((st) => setTrStatus((cur) => ({ ...cur, [id]: st })))
+          .catch(() => {});
+      }
+    }, 5000);
+    return () => clearInterval(t);
+  }, [trPendingIds, trLang]);
+  const trLine = trOn && activeChapter ? translating(trHere, activeChapter.pages.length) : null;
+
   // ---- bookmarks ----
   // A bookmark is a note about a page, not a pointer to bytes, so it is keyed on (book, page) and survives
   // anything that happens to the file -- the same reasoning that keeps reading progress when a series' files
@@ -1769,8 +1944,11 @@ function ReaderInner() {
       { label: tr('Previous chapter'), onSelect: () => goChapter(prevId, true), disabled: !prevId },
     ];
     if (chapterRefs.length > 0) items.push({ label: tr('Chapters'), onSelect: () => setShowChapters(true) });
+    if (talkOn && activeChapter) items.push({ label: tr('Comments'), onSelect: () => setTalkFor(activeChapter.id) });
     if (prefs.mode === 'paged') {
       items.push({ label: prefs.spread ? tr('Read in single pages') : tr('Read in double spreads'), onSelect: () => setPref({ spread: !prefs.spread }), divider: true });
+      // v0.89.0 (#262): this page's merge or split, as the reader settings sheet offers it.
+      for (const o of spreadChoices) items.push({ label: spreadLabel(o), onSelect: () => applySpread(o) });
     }
     items.push(
       { label: tr('Full screen'), onSelect: () => toggleFullscreen(), divider: prefs.mode !== 'paged' },
@@ -1802,7 +1980,10 @@ function ReaderInner() {
         <span className="truncate">{activeChapter?.seriesTitle || tr('Reading')}</span>
         {seriesHref && <IcChevronRight width={14} height={14} className="shrink-0 text-fog-500 transition group-hover:text-accent" />}
       </p>
-      <p className="truncate text-[11px] text-fog-400">{activeChapter?.title}</p>
+      <p className="truncate text-[11px] text-fog-400">
+        {activeChapter?.title}
+        {trLine && <span data-translating>{` · ${tr('Translating… {done}/{total}', trLine)}`}</span>}
+      </p>
     </>
   );
 
@@ -1858,6 +2039,12 @@ function ReaderInner() {
       </p>
       <h2 className="mt-1.5 font-display text-2xl font-bold text-white">{activeChapter?.seriesTitle || tr('This series')}</h2>
       {!offlineEnd && <ReaderEndRadar seriesId={activeSeriesId} />}
+      {/* v0.87.0: no strip follows the last chapter, so its talk is here. */}
+      {talkOn && !offlineEnd && chapters.length > 0 && (
+        <div className="mt-5 flex flex-col items-center gap-2.5" data-talk-last>
+          <TalkStrip bookId={chapters[chapters.length - 1].id} seriesId={chapters[chapters.length - 1].seriesId} onOpen={openTalk} />
+        </div>
+      )}
       {offlineEnd && (
         <p className="mx-auto mt-2 max-w-sm text-sm text-fog-400">
           {tr('This is the last chapter you have offline. Reconnect to keep reading.')}
@@ -1911,6 +2098,10 @@ function ReaderInner() {
             {flat.map((p, i) => (
               <ReaderPageRow key={p.key} item={p} height={heights[i]} gap={prefs.gap}
                 divider={p.firstOfChapter && p.ci > 0 ? (chapters[p.ci]?.title || tr('Next chapter')) : null}
+                seam={talkOn && p.firstOfChapter && p.ci > 0 ? chapters[p.ci - 1]?.id ?? null : null}
+                seamLabel={p.firstOfChapter && p.ci > 0 ? chapters[p.ci - 1]?.title ?? null : null}
+                seamSeries={p.firstOfChapter && p.ci > 0 ? chapters[p.ci - 1]?.seriesId ?? null : null}
+                seamActive={activeSet.has(i) || activeSet.has(i - 1)} onSeam={openTalk}
                 src={activeSet.has(i) ? srcFor(i) : null}
                 stripSrc={p.collapsed ? stripSrc(i) : null}
                 recollapsible={collapsing && !!p.junk && !p.missing && expanded.has(p.key)}
@@ -2044,6 +2235,14 @@ function ReaderInner() {
         </div>
       )}
 
+      {/* v0.87.0: on a paged track, the chapter's talk on its last page -- the strip between chapters has no place there.
+          The focus label's spot, while the bars are away; the top bar's key does the same while they show. */}
+      {prefs.mode === 'paged' && talkOn && !chrome && !focus && atChapterEnd && activeChapter && !talkFor && (
+        <div dir={uiDir} className="pointer-events-none absolute inset-x-0 bottom-[max(0.9rem,calc(env(safe-area-inset-bottom)+0.4rem))] z-30 flex justify-center" data-talk-end>
+          <TalkKey bookId={activeChapter.id} onOpen={openTalk} />
+        </div>
+      )}
+
       {/* CHROME */}
       {/* ⚠️ Each bar's dark pane runs on past the screen edge (the `before:` above the top bar, the `after:` below the
           bottom one). The bars come in on framer's default spring for `y`, which overshoots by about 8 px around 170 ms,
@@ -2090,6 +2289,18 @@ function ReaderInner() {
                   <path d="M6 3h12a1 1 0 0 1 1 1v17l-7-4-7 4V4a1 1 0 0 1 1-1Z" />
                 </svg>
               </button>
+              {/* v0.87.0: the talk of the chapter on screen. A circle like its neighbours; the count is a squared tag. */}
+              {talkOn && activeChapter && (
+                <button onClick={() => setTalkFor(activeChapter.id)} aria-label={tr('Comments')} data-talk-open
+                  className="relative grid h-10 w-10 shrink-0 place-items-center rounded-full bg-black/45 text-white backdrop-blur">
+                  <IcComment width={20} height={20} />
+                  {!!activeTalk?.comments.length && (
+                    <span aria-hidden className="absolute -end-0.5 -top-0.5 rounded-[4px] bg-accent px-1 text-[10px] font-bold leading-4 text-black tabular-nums">
+                      {activeTalk.comments.length}
+                    </span>
+                  )}
+                </button>
+              )}
               {hasKeyboard && (
                 <button onClick={() => setShowKeys(true)} aria-label={tr('Keyboard shortcuts')} title={tr('Keyboard shortcuts')}
                   className="grid h-10 w-10 shrink-0 place-items-center rounded-full bg-black/45 text-white backdrop-blur">
@@ -2202,11 +2413,16 @@ function ReaderInner() {
           <ReaderSettings
             prefs={prefs}
             set={setPref}
+            spreadShift={spreadShift}
+            onSpreadShift={applyShift}
+            translate={translate}
+            onTranslate={trOffer?.available ? applyTranslate : undefined}
             device={device}
             setDevice={setDevice}
             autoApplied={autoApplied}
             padConnected={padConnected}
             rtlTrack={pagedRtl}
+            spreadChoices={spreadChoices.map((o) => ({ key: `${o.kind}:${o.first}`, label: spreadLabel(o), side: o.kind === 'merge' ? o.side : undefined, onSelect: () => { setShowSettings(false); applySpread(o); } }))}
             onClose={() => setShowSettings(false)}
             // The series' own source, by name. With no name there is no row at all: a raw source id is
             // never shown (an extension's is nineteen digits).
@@ -2257,6 +2473,20 @@ function ReaderInner() {
             </div>
           )} />
       )}
+
+      {talkFor && (() => {
+        const ch = chapters.find((c) => c.id === talkFor);
+        return (
+          <ChapterTalkSheet bookId={talkFor} seriesId={ch?.seriesId} title={ch?.title || tr('Comments')} subtitle={ch?.seriesTitle}
+            page={talkFor === activeChapter?.id ? pageInChapter || null : null}
+            onPage={(n) => {
+              const ci = chapters.findIndex((c) => c.id === talkFor);
+              setTalkFor(null);
+              if (ci >= 0) jumpTo(indexOfKey.get(`${talkFor}:${n}`) ?? startIndex(flat, ci, n));
+            }}
+            onClose={() => setTalkFor(null)} />
+        );
+      })()}
 
       {!ready && (
         <div className="absolute inset-0 z-50 flex items-center justify-center bg-ink-950">

@@ -66,6 +66,11 @@ const IS_DESKTOP_ALLOWED = new Set([
   'lib/health.ts',
   // v0.63.0 (#208): Uchiyomi Desktop signs its one person in through the app, so AUTH_MODE=oidc-only is ignored there.
   'lib/authMode.ts',
+  // v0.82.0: a PC's engine keeps fewer backup extensions installed at once (BACKUP_EXTENSIONS_MAX 3, not 5). A number,
+  // so not forDesktop, whose server arms are the words a Docker admin reads (desktopCopy.test.ts).
+  'lib/backupExtensions.ts',
+  // v0.85.0: translated pages are Docker only for now: the engine's processes do not run inside the desktop app.
+  'lib/translate/engine.ts',
 ]);
 
 test('UCHIYOMI_DESKTOP is read in lib/desktop.ts and nowhere else', () => {
@@ -191,6 +196,9 @@ test('every scheduler first run keeps its server literal inside firstRunFloor', 
     ['extension check', /Math\.max\(firstRunFloor\(10 \* 60 \* 1000, 'extensionCheck'\), last \+ hours \* 60 \* 60 \* 1000 - Date\.now\(\)\)/],
     ['cleanup', /setTimeout\(tick, firstRunFloor\(15 \* 60 \* 1000, 'cleanup'\)\)\.unref\(\);/],
     ['health summary', /setTimeout\(tick, firstRunFloor\(20 \* 60 \* 1000, 'healthSummary'\)\)\.unref\(\);/],
+    ['finish downloads', /setTimeout\(finishTick, firstRunFloor\(5 \* 60 \* 1000, 'finishDownloads'\)\)\.unref\(\);/],
+    ['scout', /setTimeout\(scoutLoop, firstRunFloor\(10 \* 60 \* 1000, 'scout'\)\)\.unref\(\);/],
+    ['backups', /setTimeout\(backupLoop, firstRunFloor\(15 \* 60 \* 1000, 'backups'\)\)\.unref\(\);/],
   ];
   for (const [what, re] of sites) assert.match(s, re, `${what}: the first run lost its server literal or its firstRunFloor`);
   assert.equal(s.match(/firstRunFloor\(/g)?.length, sites.length, 'a first-run site was added or removed; list it here');

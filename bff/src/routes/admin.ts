@@ -15,6 +15,7 @@ import { persistScan, libraryIdFor, libraryRows, LIBRARY_ROOT, DL_ROOT, setBookD
 import { applyMoves, heldElsewhere, lockLibrarySaves, previewMoves, setFolders, storedFolders, underSql, LIBRARY_MAX_FOLDERS } from '../lib/libraryFolders';
 import { containedPath, allWritable, realContainedPath } from '../lib/fsGuard';
 import { deleteSeries, restoreSeries, mergeSeries, mergeRefusal, MergeConflictError, getSeriesRow, deleteSeriesFiles, renameSeriesFolder, forgetSeries, diskSpelling, deleteChapterFiles } from '../lib/libraryAdmin';
+import { keepOneOfEach } from '../lib/heldTwice';
 import { editionFollowing, linkEdition, linkPair, unlinkEdition, workRows } from '../lib/editions';
 import { toStoredRel, trimTrailingSlashes } from '../lib/relPath';
 import { runFingerprintBackfill, fingerprintRemaining, fpState } from '../lib/fingerprintJob';
@@ -32,13 +33,16 @@ import { listRunRecords, runDigest, type RunTarget } from '../lib/repairRuns';
 import { worstCase } from '../lib/repairEstimate';
 import { authenticate, requireAdmin, userIdOf, roleOf, revokeAllSessions, revokeRefreshTokenById, passwordError } from '../lib/auth';
 import { logAudit, recentAudit } from '../lib/audit';
+import { markRemoved, forgetVerdict } from '../lib/scoutMemory';
 import { namesOf, recordAltTitles } from '../lib/altTitles';
 import { healthAllWithEvidence, setDisabled, clearBlock, pruneOrphanedHealth, isDisabled, blockedNow } from '../lib/sourceHealth';
 import { smokeTest } from '../lib/sourceProbe';
 import { startSourceCheck, checkRunning, checkProgress } from '../lib/sourceWatchdog';
 import { testSource } from '../lib/sourceCheck';
 import { currentFailures, stageLines } from '../lib/sourceEvidence';
-import { runExtensionMonitor, runExtensionCheck, extState, liveStore as extensionStore } from '../lib/extensionMonitor';
+import { runExtensionMonitor, runExtensionCheck, extState, liveStore as extensionStore, markInstalled } from '../lib/extensionMonitor';
+import { withInstallLock, BUSY } from '../lib/sources/suwayomi/installLock';
+import { adoptBackup, adoptBackupOfSource, backupRows, refuseBackup, dropLink } from '../lib/backupExtensions';
 import { readSites, writeSites } from '../lib/sources/customSites';
 import { reloadAll, listSources, getSource, sniffSite, listRemoteSources, suwayomiConfigured, suwayomiAbout, swAdapterId, isSwAdapterId, withTimeout } from '../lib/sources';
 import {
@@ -61,6 +65,7 @@ import { writePreflight } from '../lib/fsGuard';
 import { NO_LIBRARIES, SYSTEM_CTX, visibleToAll, sanitiseAdultList, sanitiseSourceIds, invalidateAdultFilter, applyAdultSources, rateSourceAdult, MAX_ADULT_SOURCES, browsableIds, nameableIds, viewCtxFor, hideAdult, ADULT_RATING } from '../lib/visibility';
 import { cleanSourceOrder, invalidateSourcePrefs } from '../lib/sourcePrefs';
 import { keepRestricted, memberDefaults, memberDefaultsShape, permsShape, saveMemberDefaults } from '../lib/memberDefaults';
+import { FOLLOW_LIMIT_MAX, followerLimit, forgetFollowerLimit } from '../lib/followLimit';
 import { borrowNamesFor, clearBorrowedNames } from '../lib/borrowNames';
 import { clearAutoDetails, fillDetailsFromSources, fillDetailsOn } from '../lib/autoDetails';
 import { lookupsChanged } from '../lib/discoverIdentity';
@@ -115,6 +120,7 @@ import { appVersion } from '../lib/appVersion';
 import { PING_URL, buildPayload, installFacts, monthlyId, newSecret, sendForget } from '../lib/installPing';
 import { withOrigin } from '../lib/downloadActivity';
 import { cleanLibraryReader } from '../lib/libraryReader';
+import { wantQuiet } from '../lib/finishDownloads';
 import {
   readBulkChapterDeleteRun, requestBulkChapterDeleteCancel, startBulkChapterDelete,
 } from '../lib/bulkChapterDelete';
@@ -621,7 +627,7 @@ export default async function adminRoutes(app: FastifyInstance) {
   const SETTINGS_COLS = 'server_name, allow_registration, updater_hours, extension_hours, extension_auto_update, '
     + 'update_check, install_ping, install_ping_last, scanlator_prefs, cleanup_read, cleanup_read_days, backup_hour, backup_enabled, auto_follow_on_failure, '
     + 'repair_enabled, komga_ghost_chapters, adult_genres, adult_sources, source_prefs, group_upgrade, borrow_names, fill_details, discover_lookups, '
-    + 'mangadex_langs, unstated_lang, hide_notice_types, deleted_as_ghosts, update_smart, '
+    + 'mangadex_langs, unstated_lang, hide_notice_types, deleted_as_ghosts, update_smart, finish_downloads, '
     + ARCHIVE_SETTINGS_COLS;
   // `extensions_configured` is not a column: extension_hours has a NOT NULL default, so its presence says
   // nothing about whether there is an engine to check. The settings page needs to know, or it offers two
@@ -657,6 +663,10 @@ export default async function adminRoutes(app: FastifyInstance) {
       // #208, item 6: what an account the server makes by itself starts with (lib/memberDefaults.ts), in the shape PATCH
       // takes it -- Admin → Members → When someone signs up.
       newMemberDefaults: await memberDefaults(),
+      // v0.89.0 (#305): how many other sources a series may follow -- the admin's choice, else MAX_FOLLOWED_SOURCES, else 3
+      // (lib/followLimit.ts) -- and the most the menu offers.
+      followerLimit: await followerLimit(),
+      followerLimitMax: FOLLOW_LIMIT_MAX,
     };
   };
   /**
@@ -791,6 +801,19 @@ export default async function adminRoutes(app: FastifyInstance) {
        */
       updateSmart: z.boolean().optional(),
       /**
+       * Finish downloads on their own (lib/finishDownloads.ts): a series still behind its sources is swept again every
+       * FINISH_DOWNLOADS_MINUTES or as a cooldown ends, a refused chapter is tried REFUSAL_RETRY_CAP times instead of
+       * CHAPTER_RETRY_CAP, and a Discover add whose first chapter was refused is kept to finish later. On by default.
+       */
+      finishDownloads: z.boolean().optional(),
+      /**
+       * v0.89.0 (#305): Other sources per series -- how many sources besides its main one a series may follow, by hand, by
+       * Find other sources and on its own (lib/followLimit.ts), 1 to 10. Each one is one more chapter list asked for at
+       * every library update. Lowering it unfollows nothing: a series over the new number keeps its sources and follows
+       * no more.
+       */
+      maxFollowedSources: z.number().int().min(1).max(FOLLOW_LIMIT_MAX).optional(),
+      /**
        * MangaDex in other languages (v0.52.0, #123): the languages besides English that are on, replaced whole, as
        * app codes from lib/lang.ts MANGADEX_LANGS ("es-419", "pt-BR"; MangaDex's own "es-la" is read as es-419).
        * Applied live: each language turned on becomes its own source, each turned off goes. English is always on,
@@ -847,7 +870,18 @@ export default async function adminRoutes(app: FastifyInstance) {
     if (b.updateCheck !== undefined) await q('UPDATE server_settings SET update_check = $1, updated_at = now() WHERE id = 1', [b.updateCheck]);
     // Read by the sweep's tick each time it fires (server.ts), so the switch applies to the next scheduled sweep.
     if (b.updateSmart !== undefined) await q('UPDATE server_settings SET update_smart = $1, updated_at = now() WHERE id = 1', [b.updateSmart]);
+    if (b.finishDownloads !== undefined) await q('UPDATE server_settings SET finish_downloads = $1, updated_at = now() WHERE id = 1', [b.finishDownloads]);
     if (b.autoFollowOnFailure !== undefined) await q('UPDATE server_settings SET auto_follow_on_failure = $1, updated_at = now() WHERE id = 1', [b.autoFollowOnFailure]);
+    if (b.maxFollowedSources !== undefined) {
+      const was = await followerLimit();
+      await q('UPDATE server_settings SET max_followed_sources = $1, updated_at = now() WHERE id = 1', [b.maxFollowedSources]);
+      forgetFollowerLimit();
+      // Raised: a series the scout set aside for a day as full (lib/sourceScout.ts SCOUT_BACKOFF.cap) has room now, so it
+      // is looked at again on the scout's next round instead of tomorrow.
+      if (b.maxFollowedSources > was) {
+        await q(`UPDATE series_scout SET next_at = now() WHERE verdict = 'cap' AND next_at > now()`).catch(() => {});
+      }
+    }
     if (b.installPing !== undefined) await setInstallPing(b.installPing);
     const nextGlobalSources = b.sourcePrefs === undefined
       ? undefined
@@ -1259,7 +1293,8 @@ export default async function adminRoutes(app: FastifyInstance) {
       // lib_books for what landed). runRepair refuses on its own, but it cannot say WHY, and "busy" on a
       // press the admin made while a sweep is running reads as "the repair is stuck". Answered separately
       // so the page can say "a chapter sweep is running; try again in a few minutes".
-      if (runtime.updating) return { ok: false, error: 'sweep_running' };
+      // v0.79.0: the finishing sweep (lib/finishDownloads.ts) is asked to give way, so a second press a moment on starts.
+      if (runtime.updating) { wantQuiet(); return { ok: false, error: 'sweep_running' }; }
       // Never awaited: a full repair opens two thousand archives and can download chapters. The panel polls
       // `running` and keeps the persisted result, exactly as the verify and the sweep do.
       // ⚠️ `userId` is always passed, even though it is the admin's own id: an explicit run ignores the
@@ -1856,7 +1891,12 @@ export default async function adminRoutes(app: FastifyInstance) {
          added_by = COALESCE(EXCLUDED.added_by, series_sources.added_by)`,
       [id, source, sourceSeriesId, cand.title || null, cand.coverage, userIdOf(req)],
     );
+    // An admin's own follow (v0.80.0): whatever the scout remembered about this source for this series, `removed`
+    // included, no longer applies (lib/scoutMemory.ts).
+    await forgetVerdict(id, source);
     await logAudit('series.follow_source', { userId: userIdOf(req), detail: { id, title: row.title, source, sourceSeriesId, coverage: cand.coverage }, req });
+    // A person chose it: a backup extension's source is theirs now (v0.82.0, lib/backupExtensions.ts adoptBackup).
+    await adoptBackupOfSource(source, userIdOf(req));
     // The answer is the list as the follow left it, read BEFORE the refresh below starts: a follow is not a check.
     // Read after it, the answer raced the refresh's own stamp on the new source (updater.ts writes
     // series_sources.checked_at as soon as the source answers) and said "never checked" or "checked just now" by
@@ -1899,6 +1939,8 @@ export default async function adminRoutes(app: FastifyInstance) {
         error: out.refused, message: out.said.text, messageSaid: saidOf(out.said), ...(out.edition ? { edition: out.edition } : {}),
       });
     }
+    // Made the main by a person: a backup extension's source is theirs now (v0.82.0, lib/backupExtensions.ts).
+    await adoptBackupOfSource(b.data.sourceId, userIdOf(req));
     // Read before the refresh starts, as the follow's answer is (above): the switch is not a check.
     const list = await seriesSourcesFor(id);
     // The listing again, through the new main: its chapters show on the series page now, not at the next sweep.
@@ -1935,6 +1977,8 @@ export default async function adminRoutes(app: FastifyInstance) {
       ctx: await viewCtxFor(userIdOf(req), roleOf(req)), userId: userIdOf(req), old: b.data.old, req,
     });
     if ('refused' in out) return refusedAttach(reply, out);
+    await forgetVerdict(id, b.data.source);
+    await adoptBackupOfSource(b.data.source, userIdOf(req));
     // Read before the refresh starts, as the follow's answer is (above): an attach is not a check.
     const list = await seriesSourcesFor(id);
     void updateSeries(id, 0).catch(() => {});
@@ -1949,6 +1993,7 @@ export default async function adminRoutes(app: FastifyInstance) {
     if (mainRow?.source_id && mainRow.source_id === sourceId) {
       const out = await detachMain(id, { ctx: await viewCtxFor(userIdOf(req), roleOf(req)), userId: userIdOf(req), req });
       if ('refused' in out) return refusedAttach(reply, out);
+      await markRemoved(id, sourceId);
       const list = await seriesSourcesFor(id);
       void updateSeries(id, 0).catch(() => {});
       return { ok: true, promoted: out.promoted, sources: list };
@@ -1956,6 +2001,12 @@ export default async function adminRoutes(app: FastifyInstance) {
     const gone = await q<{ source_id: string }>(
       'DELETE FROM series_sources WHERE series_id = $1 AND source_id = $2 RETURNING source_id', [id, sourceId]);
     if (!gone.length) return reply.code(404).send({ error: 'not_found' });
+    // v0.80.0: and nothing automatic follows it onto this series again -- not the scout, not the hunt -- until an admin
+    // does (lib/scoutMemory.ts). Reintroduce by dropping it: "a source an admin unfollowed is not followed again" in
+    // sourceScout.int.test.ts finds it followed.
+    await markRemoved(id, sourceId);
+    // And no parked backup puts it back for this series (v0.82.0, lib/backupExtensions.ts).
+    await dropLink(id, sourceId);
     // The listing rows this source carried go with it. A listing row is the authorisation for a manual
     // fetch (POST /api/sources/fetch, the refetch below), and the rows are otherwise rewritten only by the
     // series' next successful check -- a full sweep cycle away on a large install, never if auto_update is
@@ -2044,7 +2095,7 @@ export default async function adminRoutes(app: FastifyInstance) {
   // The library page's "Remove from library" over a selection: the single DELETE above, once per id, and
   // nothing more. ⚠️ Hide ONLY -- never the files. Deleting files is the irreversible step, it walks the
   // person's own read library too (libraryAdmin.ts), and it stays behind the per-title typed confirm on
-  // Content → Library; a bulk that did both would let "Select all" plus one tap wipe hand-curated folders
+  // Admin → Libraries; a bulk that did both would let "Select all" plus one tap wipe hand-curated folders
   // with no undo. A series that cannot be hidden is SKIPPED with the reason the single route would have
   // answered, rather than failing the whole batch: the rest of the selection is still what the person
   // asked for. One `series.delete` audit row per series, with its title, exactly as the single route
@@ -2594,6 +2645,26 @@ export default async function adminRoutes(app: FastifyInstance) {
       const r = await deleteChapterFiles(id, b.data.bookIds, { userId: userIdOf(req), req });
       if ('refused' in r) return reply.code(409).send({ error: 'refused', message: r.refused.reason, fix: r.refused.fix });
       return { ok: true, applied: r.applied, bytes: r.bytes, skipped: r.skipped };
+    } finally { claim.release(); }
+  });
+
+  /**
+   * Keep one of each: every chapter this series holds twice -- two files of one chapter, neither a part nor an extra
+   * (lib/heldTwice.ts) -- kept once, the rows Health's "The same chapter saved twice" lists. The series' pairs as they
+   * are now, by lib/extraCopies.ts's rules, as a merge runs them: reading progress moves to the copy that stays, a
+   * bookmarked copy stays, and a file is deleted only in the download folder (set aside anywhere else). A series merged
+   * away or deleted is refused: its chapters are another series' now, or nobody's.
+   */
+  app.post('/api/admin/series/:id/chapters/keep-once', async (req, reply) => {
+    const { id } = req.params as { id: string };
+    const row = await getSeriesRow(id);
+    if (!row) return reply.code(404).send({ error: 'not_found' });
+    if (row.deleted_at || row.merged_into) return reply.code(409).send({ error: 'gone', message: 'That series was deleted or merged into another.' });
+    const claim = claimSeriesWriter([id], [row.folder]);
+    if (!claim) return reply.code(409).send({ error: 'busy', message: 'Another task is changing that series.' });
+    try {
+      const r = await keepOneOfEach(id, { userId: userIdOf(req), req });
+      return { ok: true, removed: r.removed, deleted: r.deleted, bytes: r.bytes, setAside: r.setAside, left: r.left };
     } finally { claim.release(); }
   });
 
@@ -3597,8 +3668,12 @@ export default async function adminRoutes(app: FastifyInstance) {
       // installed first, then updatable, then alphabetical — the things you can act on float up
       .sort((a, b) => Number(b.installed) - Number(a.installed) || Number(b.hasUpdate) - Number(a.hasUpdate) || a.name.localeCompare(b.name));
     const langs = [...new Set(all.map((e) => e.lang).filter(Boolean))].sort() as string[];
+    // v0.82.0: the ones Uchiyomi installed by itself to finish downloads (lib/backupExtensions.ts) say so.
+    const backups = new Set([...(await backupRows())].filter(([, r]) => r.state === 'trial' || r.state === 'active').map(([k]) => k));
     // Serve icons through our own origin; the extension server is not reachable from a browser.
-    const page = filtered.slice(offset, offset + limit).map((e) => ({ ...e, iconUrl: e.iconUrl ? `/img/extensions/icon/${e.pkgName}` : null }));
+    const page = filtered.slice(offset, offset + limit).map((e) => ({
+      ...e, iconUrl: e.iconUrl ? `/img/extensions/icon/${e.pkgName}` : null, ...(backups.has(e.pkgName) ? { backup: true } : {}),
+    }));
     return {
       content: page,
       total: all.length,
@@ -3634,7 +3709,13 @@ export default async function adminRoutes(app: FastifyInstance) {
   app.post('/api/admin/extensions/update-all', async (req, reply) => {
     if (needExt(reply)) return;
     if (extState.running) return reply.code(409).send({ error: 'busy', message: 'An extension check is already running.' });
-    const r = await runExtensionCheck({ forceUpdate: true });
+    // Behind another install or removal (v0.82.0), as an install is: it waits for it, and says so past two minutes.
+    const got = await withInstallLock('admin', () => runExtensionCheck({ forceUpdate: true }), 2 * 60_000);
+    if (got === BUSY) {
+      const said = say('extension.busy');
+      return reply.code(409).send({ error: 'busy', message: said.text, messageSaid: saidOf(said) });
+    }
+    const r = got;
     await logAudit('extension.update_all', {
       userId: userIdOf(req), detail: { updated: r.updated.length, failed: r.failed.length, refreshed: r.refreshed }, req,
     });
@@ -3671,8 +3752,15 @@ export default async function adminRoutes(app: FastifyInstance) {
   app.post('/api/admin/extensions/catalog/:pkgName', async (req, reply) => {
     if (needExt(reply)) return;
     const { pkgName } = req.params as { pkgName: string };
-    const b = z.object({ action: z.enum(['install', 'uninstall', 'update', 'enable']) }).safeParse(req.body);
+    const b = z.object({ action: z.enum(['install', 'uninstall', 'update', 'enable', 'keep']) }).safeParse(req.body);
     if (!b.success) return reply.code(400).send({ error: 'bad_request' });
+
+    // Keep (v0.82.0): a backup extension Uchiyomi added for itself becomes the admin's -- in Discover, and never removed
+    // for being unused (lib/backupExtensions.ts adoptBackup). An extension that is not a backup is theirs already.
+    if (b.data.action === 'keep') {
+      const kept = await adoptBackup(pkgName, { userId: userIdOf(req) });
+      return { ok: true, kept, sources: 0 };
+    }
 
     // "Turn on its sources" (v0.53.0): an installed extension's sources switched on as its install would have, and the
     // engine asked for nothing but the list. An extension installed in the engine's own page showed as installed with
@@ -3689,38 +3777,66 @@ export default async function adminRoutes(app: FastifyInstance) {
       }
       const turned = await turnOnExtensionSources(provided);
       await logAudit('extension.enable', { userId: userIdOf(req), detail: { pkgName, on: turned.on }, req });
+      // Turning a backup's sources on is choosing it: it is the admin's now (v0.82.0).
+      await adoptBackup(pkgName, { userId: userIdOf(req), reload: false });
       const load = await reloadAll();
       return { ok: true, sources: provided.length, on: turned.on, hidden: turned.hidden, registered: load.suwayomi };
     }
 
-    // Ask which sources this extension provides BEFORE acting: once it is uninstalled it provides none, and
-    // we would leave the rows behind claiming sources that no longer exist.
-    const enable = b.data.action !== 'uninstall';
-    const priorSources = enable ? [] : await sourcesOfExtension(pkgName).catch(() => []);
+    // One install or removal at a time (v0.82.0, lib/sources/suwayomi/installLock.ts): behind Fix everything's, the
+    // extension check's or a backup's, this one waits for it, and says so past two minutes rather than running beside
+    // it. Reintroduce by acting at once: "an admin's install waits for one in progress" in extensionCatalog.int.test.ts
+    // finds two installs in the engine at the same moment.
+    const action = b.data.action;
+    const done = await withInstallLock('admin', async () => {
+      // Ask which sources this extension provides BEFORE acting: once it is uninstalled it provides none, and
+      // we would leave the rows behind claiming sources that no longer exist.
+      const enable = action !== 'uninstall';
+      const priorSources = enable ? [] : await sourcesOfExtension(pkgName).catch(() => []);
 
-    try {
-      await setExtensionState(pkgName, b.data.action);
-    } catch (e) {
-      return reply.code(502).send({ error: 'failed', message: (e as Error)?.message || 'The extension server refused that.' });
-    }
-    await logAudit(`extension.${b.data.action}`, { userId: userIdOf(req), detail: { pkgName }, req });
+      try {
+        await setExtensionState(pkgName, action);
+      } catch (e) {
+        return { failed: (e as Error)?.message || 'The extension server refused that.' };
+      }
+      await logAudit(`extension.${action}`, { userId: userIdOf(req), detail: { pkgName }, req });
 
-    // Installing an extension and then having to hunt for its sources in a second list is exactly the
-    // friction this feature exists to remove, so switch them on (or off) as part of the same action --
-    // except the ones in a language the operator has hidden, which stay off and are counted back.
-    const provided = enable ? await sourcesOfExtension(pkgName).catch(() => []) : priorSources;
-    const adopted = await adoptExtensionSources(provided, enable);
-    if (b.data.action === 'uninstall') {
-      // the sources are gone from the server too; don't leave rows implying otherwise
-      await q('DELETE FROM suwayomi_sources WHERE source_id = ANY($1)', [provided.map((s) => s.id)]).catch(() => {});
-      // ...and neither their health rows, which nothing else ever deletes. Live this had accumulated twelve
-      // orphans, three of them recording 404s from the very evening their extensions were pulled. A row whose
-      // source still has series is kept: it is the only record that source ever existed, and those series
-      // are frozen, not gone -- the health page says so.
-      await pruneOrphanedHealth(provided.map((s) => `sw:${s.id}`));
+      // Installing an extension and then having to hunt for its sources in a second list is exactly the
+      // friction this feature exists to remove, so switch them on (or off) as part of the same action --
+      // except the ones in a language the operator has hidden, which stay off and are counted back.
+      const provided = enable ? await sourcesOfExtension(pkgName).catch(() => []) : priorSources;
+      const adopted = await adoptExtensionSources(provided, enable);
+      if (action === 'install') {
+        // The admin's now, a backup's row or a refusal of theirs forgotten (v0.82.0); and the extension check's copy
+        // says installed, so its next look does not call the extension new.
+        await adoptBackup(pkgName, { userId: userIdOf(req), reload: false });
+        await markInstalled(pkgName, true);
+      }
+      if (action === 'uninstall') {
+        // Uchiyomi never installs it again (v0.82.0, `refused`), and a backup's own follows go with it: they were the
+        // server's, and a follow on a removed extension is a source nothing can ask. Before the rows below go, which
+        // are how its sources are found.
+        const wasBackup = (await backupRows()).get(pkgName);
+        await refuseBackup(pkgName, { why: 'by_admin', dropFollows: wasBackup?.state === 'trial' || wasBackup?.state === 'active' });
+        // the sources are gone from the server too; don't leave rows implying otherwise
+        await q('DELETE FROM suwayomi_sources WHERE source_id = ANY($1)', [provided.map((s) => s.id)]).catch(() => {});
+        // ...and neither their health rows, which nothing else ever deletes. Live this had accumulated twelve
+        // orphans, three of them recording 404s from the very evening their extensions were pulled. A row whose
+        // source still has series is kept: it is the only record that source ever existed, and those series
+        // are frozen, not gone -- the health page says so.
+        await pruneOrphanedHealth(provided.map((s) => `sw:${s.id}`));
+        // Removed here, so the extension check never reports it as removed in the engine's own page.
+        await markInstalled(pkgName, false);
+      }
+      const r = await reloadAll();
+      return { ok: true as const, sources: provided.length, on: adopted.on, hidden: adopted.hidden, registered: r.suwayomi };
+    }, 2 * 60_000);
+    if (done === BUSY) {
+      const said = say('extension.busy');
+      return reply.code(409).send({ error: 'busy', message: said.text, messageSaid: saidOf(said) });
     }
-    const r = await reloadAll();
-    return { ok: true, sources: provided.length, on: adopted.on, hidden: adopted.hidden, registered: r.suwayomi };
+    if ('failed' in done) return reply.code(502).send({ error: 'failed', message: done.failed });
+    return done;
   });
 
   // ---- extension repositories ----

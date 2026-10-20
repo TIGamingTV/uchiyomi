@@ -7,15 +7,15 @@
  * The rules, in the order they are applied:
  *
  *  1. **Not in spread mode** — one page per slide. Nothing else applies.
- *  2. **The first page of a chapter is solo.** The manga convention: page 1 is a cover, and pairing it with
- *     page 2 puts every later pair off by one relative to how the book was drawn.
+ *  2. **The first page of a chapter is solo unless shifted.** The manga convention: page 1 is a cover, and pairing it
+ *     with page 2 puts every later pair off by one. `shift` instead pairs from page 1 when it is a story page.
  *  3. **Pages never pair across chapters.** Continuous reading loads the next chapter into the same flat
  *     list, and a slide holding the last page of one chapter and the first of the next belongs to neither.
  *  4. **A wide page is solo**, and so is the page *before* it. A double-page spread scanned as one landscape
  *     image is already two pages wide; putting it beside a portrait page halves it. Giving the page before it
  *     its own slide is what keeps the rest of the chapter paired the way it was drawn -- without that, every
  *     pair after the first spread is off by one, which is the whole reason this rule exists.
- *  4b. **A joined pair is one slide** (#229, Join split double pages, `joinSplit`): two portrait pages the server found
+ *  4b. **A joined pair is one slide** (#229, Join split double pages, `joinSplit`, or the reader's own merge, `forced`, #262): two portrait pages the server found
  *     to be the halves of one spread a source served as two files (bff lib/spreadJoin.ts), next to each other in one
  *     chapter. Out of spread mode too -- they are one drawing -- and even as page 1 of a chapter; and the page before
  *     them is solo, for the reason a wide page's neighbour is. A pair is a wide page in all but its files: with Wide
@@ -38,6 +38,11 @@ export interface SpreadItem {
   join?: 'rtl' | 'ltr' | null;
   /** A placeholder for a page the source never served: never half of a joined pair. */
   missing?: boolean;
+  /**
+   * v0.89.0 (#262): the join is the reader's own (lib/spreadMarks.ts applyMarks): it holds with `joinSplit` off, since
+   * they asked for this one. Everything else about a join applies to it.
+   */
+  forced?: boolean;
 }
 
 /** A page wider than it is tall. Unknown or nonsensical dimensions are portrait -- see rule 5. */
@@ -62,7 +67,7 @@ export type Half = 'left' | 'right' | null;
 export function pairSlides(
   items: SpreadItem[],
   spread: boolean,
-  opts: { split?: boolean; rightFirst?: boolean; joinSplit?: boolean } = {},
+  opts: { split?: boolean; rightFirst?: boolean; shift?: boolean; joinSplit?: boolean } = {},
 ): { slides: number[][]; slideOf: number[]; half: Half[]; joined: boolean[] } {
   const slides: number[][] = [];
   const half: Half[] = [];
@@ -73,7 +78,7 @@ export function pairSlides(
   // Never under Split, which shows a spread's halves one by one: for a joined pair those halves are its two pages.
   const joinAt = (i: number): boolean => {
     const a = items[i], b = items[i + 1];
-    if (!opts.joinSplit || (opts.split && !spread) || !a?.join || !b || b.ci !== a.ci) return false;
+    if ((!opts.joinSplit && !a?.forced) || (opts.split && !spread) || !a?.join || !b || b.ci !== a.ci) return false;
     if (a.number !== undefined && b.number !== undefined && b.number !== a.number + 1) return false;
     return !a.missing && !b.missing && !isWide(a) && !isWide(b);
   };
@@ -97,8 +102,10 @@ export function pairSlides(
       const it = items[k];
       const nxt = items[k + 1];
       if (joinAt(k)) { slides.push([k, k + 1]); half.push(null); joined.push(true); k += 2; continue; }
+      // `shift`: a chapter file's page 1 is usually a story page, not a cover, and keeping it solo put
+      // every later pair one off from how the book was drawn. Shifted, rule 2 is off and page 1 pairs with page 2.
       const soloed =
-        it.firstOfChapter ||          // rule 2
+        (it.firstOfChapter && !opts.shift) ||  // rule 2
         !nxt || nxt.ci !== it.ci ||   // rule 3
         isWide(it) ||                 // rule 4, the wide page itself
         isWide(nxt) ||                // rule 4, the page before a wide one

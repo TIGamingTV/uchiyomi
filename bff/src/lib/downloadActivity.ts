@@ -51,6 +51,20 @@ export interface ActivityEntry {
   reasonSaid?: Said[];
   /** Arrived incomplete, and the caller has not yet decided whether to keep it (`holdPartial`). */
   heldAt?: number;
+  /**
+   * while it downloads, its pages in hand and its page count, and when its first page was asked for
+   * (`pagesProgress`). The Downloads view's ring moved per CHAPTER, so a one-chapter Fetch from a source its extension
+   * limits to two requests a second (MangaFire: 78 pages, ~50 s) sat at 0 until it was over.
+   */
+  pagesDone?: number;
+  pagesTotal?: number;
+  pagesSince?: number;
+  /**
+   * How long its pages have been coming in, in ms, as of the answer that lists it (listActivity). The time left is
+   * reckoned from this, never from `pagesSince` against the browser's clock: a device whose clock is a minute off
+   * read a rate a minute wrong.
+   */
+  pagesFor?: number;
 }
 
 const store = new AsyncLocalStorage<{ origin: Origin; by: string | null }>();
@@ -150,6 +164,14 @@ export function startedDownload(id: number): void {
   const x = live.get(id);
   if (x) x.status = 'downloading';
 }
+/** how far a chapter in flight has got, in pages (ActivityEntry.pagesDone). */
+export function pagesProgress(id: number, done: number, total: number): void {
+  const x = live.get(id);
+  if (!x || !(total > 0)) return;
+  if (x.pagesTotal == null) x.pagesSince = Date.now();
+  x.pagesTotal = total;
+  x.pagesDone = Math.min(done, total);
+}
 /**
  * The end of one download. `skipped` (the file was already there) leaves no trace: nothing came in, and a
  * sweep over a full library would otherwise list every chapter it did not fetch.
@@ -163,7 +185,7 @@ export function endDownload(
   if (outcome === 'skipped') return;
   // The same chapter, whole this time: written over the file an earlier download left with holes in it.
   if (outcome.status === 'done') healFinished(x.folder, x.number);
-  const { heldAt: _held, ...rest } = x;
+  const { heldAt: _held, pagesDone: _pd, pagesTotal: _pt, pagesSince: _ps, ...rest } = x;
   const done: ActivityEntry = { ...rest, ...outcome, finishedAt: Date.now() };
   finished[capClass(done.origin)].push(done);
   for (const fn of listeners) {
@@ -213,7 +235,11 @@ export function holdPartial(id: number, hold: {
 export function listActivity(now = Date.now()): { active: ActivityEntry[]; recent: ActivityEntry[] } {
   prune(now);
   return {
-    active: [...live.values()].sort((a, b) => a.startedAt - b.startedAt),
+    // `pagesFor`: the time its pages have taken so far, by this server's clock (ActivityEntry.pagesFor).
+    // Reintroduce by sending `pagesSince` alone: "the time left is the server's elapsed time, whatever the browser's
+    // clock says" in pageProgress.test.ts (web) reads a skewed clock's rate.
+    active: [...live.values()].sort((a, b) => a.startedAt - b.startedAt)
+      .map((x) => (x.pagesSince != null ? { ...x, pagesFor: Math.max(0, now - x.pagesSince) } : x)),
     // The classes merged back into one timeline. A stable sort of lists that are each oldest first, reversed:
     // with no archive entries this is exactly the one list reversed, as it always was.
     recent: [...finished.main, ...finished.archive].sort((a, b) => (a.finishedAt ?? 0) - (b.finishedAt ?? 0)).reverse(),

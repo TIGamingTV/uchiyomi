@@ -251,6 +251,10 @@ export interface SeriesPrefs {
   theme?: ReaderTheme;
   zoom?: number;
   spread?: boolean;
+  /** double spreads shifted by one page (page 1 pairs with page 2), remembered per title like the zoom. */
+  spreadShift?: boolean;
+  /** Translated pages (v0.85.0, lib/readerTranslate.ts): this title's pages in the reader's language, remembered per title. */
+  translate?: boolean;
   pagedDirection?: ReaderPrefs['pagedDirection'];
   /**
    * The direction above was CHOSEN for this title in the reader, rather than copied into its memory along

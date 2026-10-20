@@ -6,7 +6,7 @@
 openapi: 3.1.0
 info:
   title: Uchiyomi API
-  version: 0.77.1
+  version: 0.90.0
   description: "Everything the web app does, it does over this API. Session JWTs are for the browser; scripts
     use a personal API token (Profile -> Connections -> API tokens), sent as `Authorization: Bearer uy_...`.
     Scopes: read (every token; GET plus the library search POST, which is a query), write (anything that changes data), admin (the /api/admin surface, which also
@@ -32,6 +32,8 @@ tags:
     description: "Sources: find, browse and add series"
   - name: personal
     description: "Per-account data: favourites, collections, notes, tokens, trackers"
+  - name: comments
+    description: "A chapter's comments and reactions, for the members who may open its series (v0.87.0; not on Uchiyomi Desktop)"
   - name: downloads
     description: Offline downloads
   - name: images
@@ -263,6 +265,12 @@ components:
             connected tracker it is linked to as Plan to Read (AniList PLANNING, MyAnimeList plan_to_read, Kitsu
             planned), only where the account's list has no entry for it yet -- an existing entry is never changed --
             and never under Incognito reading.
+        comments:
+          type: boolean
+          description: >-
+            Since v0.90.0, Comments and reactions, on unless exactly false: false hides the household's chapter talk
+            for this account alone (the comments routes answer it `on: false`) and sends it no alert about a
+            conversation. What it already wrote stays.
         reader:
           type: object
           additionalProperties: true
@@ -673,6 +681,9 @@ components:
         auto: { type: boolean, description: "Followed by the add-time auto-follow (POST /api/sources/add alsoFollow) rather than by a person: the row has no author. Always false for the primary. A person confirming the same source through a fill-scan plan turns it false." }
         standing:
           $ref: "#/components/schemas/SourceStanding"
+        backup:
+          type: boolean
+          description: Since v0.82.0, a backup extension's source (bff lib/backupExtensions.ts) -- installed by Uchiyomi to finish downloads, removed again when unused.
     SourceStanding:
       type: string
       enum: [usable, cooling, failing, off, not_loaded]
@@ -814,8 +825,10 @@ components:
         number: { type: number }
         reason:
           type: string
-          enum: [not_listed, blocked_group, other_language, already_here, source_unavailable, cooldown, duplicate, hidden]
+          enum: [not_listed, blocked_group, other_language, already_here, source_unavailable, cooldown, later, duplicate, hidden]
           description: >-
+            `later` (since v0.79.0): the chosen copy's source is in a cooldown and no other followed source lists the
+            number; with Finish downloads on their own it downloads on its own when the source can answer.
             `duplicate` is a second pick for a number already picked in the same body: the first pick was
             handled, this one was not. `other_language` (since v0.62.0): every copy of the number is in another
             language than the series' -- a pick takes one anyway. `hidden` (since v0.76.0): an admin hid the number
@@ -1384,7 +1397,7 @@ paths:
     get:
       tags:
         - auth
-      summary: "The calling account: id, username, role, permissions."
+      summary: "The calling account: id, username, role, permissions, settings and, since v0.90.0, `talk`: whether this server has chapter comments."
       operationId: getAuthMe
       security:
         - bearer: []
@@ -2772,10 +2785,82 @@ paths:
                       description: >-
                         With `spreads=1`: this page and the next are one spread cut in two; which side the next page
                         sits on (`rtl` on its left).
+                    mark:
+                      type: string
+                      enum: [join, split]
+                      description: >-
+                        Since v0.89.0 (#262), the caller's own word on this page and the next (PUT
+                        /api/books/{id}/pages/{n}/spread): `join` shows them as one spread, `split` shows a pair the
+                        detector joined as two pages. Per account; never sent for a mark made on another file of the
+                        chapter (another page count).
         "401":
           description: Not authenticated
         "404":
           description: Not found, or not visible to this account
+  /api/books/{id}/pages/{n}/spread:
+    put:
+      tags:
+        - library
+      summary: Merge two pages into one spread, or take a spread apart, for the caller only.
+      description: >-
+        Since v0.89.0 (#262). `n` is the first page of the pair (1 to the page count minus 1). `join` shows the pair as
+        one double-page spread where the detector found none, `split` shows a pair the detector joined as two pages,
+        and `null` removes the caller's mark, so the detector's answer stands again. Per account: no other account's
+        reader changes. A page is in one spread only, so a `join` removes the caller's join on either neighbouring
+        pair. Answers the caller's marks on the chapter after the change.
+      operationId: putApiBooksIdPagesNSpread
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: n
+          in: path
+          required: true
+          schema:
+            type: integer
+            minimum: 1
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [mark]
+              properties:
+                mark:
+                  type: [string, "null"]
+                  enum: [join, split, null]
+                pages:
+                  type: integer
+                  minimum: 1
+                  description: >-
+                    The page count the caller is showing. When it differs from the chapter's file (a downloaded copy
+                    of an older file), the mark is refused with 409 `pages_changed`.
+      security:
+        - bearer: []
+      responses:
+        "200":
+          description: The caller's marks on the chapter, by the first page of each pair.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  marks:
+                    type: object
+                    additionalProperties:
+                      type: string
+                      enum: [join, split]
+        "400":
+          description: Not a mark, or a page that starts no pair (the last page, or past it)
+        "401":
+          description: Not authenticated
+        "404":
+          description: No such chapter, or one the caller may not see
+        "409":
+          description: "`pages_changed`: the caller's page count is not the chapter file's."
   /api/books/{id}/pages/{n}/junk:
     put:
       tags:
@@ -2963,6 +3048,14 @@ paths:
                                 name:
                                   type: string
                             - type: "null"
+                        backup:
+                          type: boolean
+                          enum: [true]
+                          description: >-
+                            Since v0.82.0: a backup extension's source -- one Uchiyomi installed by itself to finish
+                            downloads, and removes again once nothing has needed it for three days. Listed so a
+                            chapter's source can be named; never asked by search-all, search, latest, popular, find
+                            or edition-candidates. Absent for every other source.
         "401":
           description: Not authenticated
         "403":
@@ -5474,6 +5567,219 @@ paths:
           description: Not authenticated
         "404":
           description: Not found, or not visible to this account
+  /api/books/{id}/comments:
+    get:
+      tags:
+        - comments
+      summary: A chapter's comments, oldest first, and its reactions.
+      description: >-
+        `on` is false where there is nobody to talk to (one enabled member, the Komga backend), or, since v0.90.0, when
+        the caller switched Comments and reactions off (settings `comments: false`): the web then shows nothing. Each comment and reaction names its member as `{id, name, avatar}` and says whether it is the
+        caller's own (`mine`). A chapter in a series the caller may not open answers 404, as a missing one does.
+      operationId: getApiBooksIdComments
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      security:
+        - bearer: []
+      responses:
+        "200":
+          description: "{on, comments: [{id, user, body, page, createdAt, editedAt, mine}], reactions: [{user, emoji, mine}]}"
+        "401":
+          description: Not authenticated
+        "404":
+          description: Not found, or not visible to this account
+    post:
+      tags:
+        - comments
+      summary: Comment on a chapter.
+      description: >-
+        Plain text, 1 to 2000 characters after trimming. `page` is the page it was written on, when written in the
+        reader. Refused with 403 `incognito` while the account's Incognito reading is on. Members who commented on
+        the chapter before, and may still open the series, get a push on devices with alerts on (since v0.90.0, not
+        those who switched Comments and reactions off). Twenty a minute
+        per account.
+      operationId: postApiBooksIdComments
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - body
+              properties:
+                body:
+                  type: string
+                page:
+                  type: integer
+                  nullable: true
+      security:
+        - bearer: []
+      responses:
+        "201":
+          description: The comment, as GET lists it
+        "400":
+          description: Malformed body or parameter
+        "401":
+          description: Not authenticated
+        "403":
+          description: "`incognito`: Incognito reading is on"
+        "404":
+          description: Not found, or not visible to this account
+        "429":
+          description: Too many comments in a minute
+  /api/books/{id}/reaction:
+    put:
+      tags:
+        - comments
+      summary: React to a chapter, or change the reaction.
+      description: >-
+        One reaction a member a chapter, one of the six the app offers. Refused with 403 `incognito` while the
+        account's Incognito reading is on.
+      operationId: putApiBooksIdReaction
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - emoji
+              properties:
+                emoji:
+                  type: string
+                  enum: ["❤️", "😂", "😭", "😱", "🔥", "🤯"]
+      security:
+        - bearer: []
+      responses:
+        "200":
+          description: OK
+        "400":
+          description: Malformed body or parameter
+        "401":
+          description: Not authenticated
+        "403":
+          description: "`incognito`: Incognito reading is on"
+        "404":
+          description: Not found, or not visible to this account
+        "429":
+          description: Too many reactions in a minute
+    delete:
+      tags:
+        - comments
+      summary: Take your reaction to a chapter back.
+      operationId: deleteApiBooksIdReaction
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      security:
+        - bearer: []
+      responses:
+        "200":
+          description: OK
+        "401":
+          description: Not authenticated
+        "404":
+          description: Not found, or not visible to this account
+  /api/comments/{id}:
+    patch:
+      tags:
+        - comments
+      summary: Edit your own comment.
+      description: Its author only; anyone else's comment answers 404. The comment then shows as edited.
+      operationId: patchApiCommentsId
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - body
+              properties:
+                body:
+                  type: string
+      security:
+        - bearer: []
+      responses:
+        "200":
+          description: "{id, body, editedAt}"
+        "400":
+          description: Malformed body or parameter
+        "401":
+          description: Not authenticated
+        "404":
+          description: Not found, not visible to this account, or not yours
+    delete:
+      tags:
+        - comments
+      summary: Delete your own comment, or, as an admin, remove anyone's.
+      description: An admin removing someone else's comment is recorded in the audit log.
+      operationId: deleteApiCommentsId
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      security:
+        - bearer: []
+      responses:
+        "200":
+          description: OK
+        "401":
+          description: Not authenticated
+        "404":
+          description: Not found, not visible to this account, or not yours
+  /api/series/{id}/comments:
+    get:
+      tags:
+        - comments
+      summary: The chapters of a series that have comments or reactions, with their counts.
+      description: >-
+        For the series page's chapter rows. `top` is a chapter's most used reactions, at most two. `on` as for a
+        chapter's comments.
+      operationId: getApiSeriesIdComments
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      security:
+        - bearer: []
+      responses:
+        "200":
+          description: "{on, content: [{bookId, comments, reactions, top}]}"
+        "401":
+          description: Not authenticated
+        "404":
+          description: Not found, or not visible to this account
   /api/history:
     get:
       tags:
@@ -6192,7 +6498,10 @@ paths:
         `homeCollections` and `showAllChapters` (since v0.60.0 also `librarySortDir`, since v0.61.0 `incognito`, a
         boolean, and since v0.68.0 `trackerPlanOnAdd`, a boolean). Unknown keys remain accepted and retained for compatibility -- since v0.66.0 the web app's `homeRails`
         (`{order, hidden}`, Home's rails as the reader arranged them; null is the default order) and `tone` (`oled`,
-        `graphite` or `midnight`, the background) among them.
+        `graphite` or `midnight`, the background) among them. `avatar` is `{emoji, color, frame}` (since v0.69.1 a hex
+        colour; since v0.89.0 `frame`, one of `bronze`, `silver`, `ember`, `gold`, `moon` or `aurora`, the frame a badge
+        unlocks). A frame the caller has not earned is refused with 403 `frame_locked`, unless it is the one already worn;
+        leaving `frame` out takes it off.
       operationId: putApiSettings
       requestBody:
         required: false
@@ -6212,6 +6521,122 @@ paths:
           description: Malformed body or parameter
         "401":
           description: Not authenticated
+        "403":
+          description: "`frame_locked`: the avatar's frame comes with a badge the caller has not earned."
+  /api/translate:
+    get:
+      tags:
+        - library
+      summary: Whether the reader offers Translate pages (since v0.85.0).
+      operationId: getApiTranslate
+      description: >-
+        True when an admin has downloaded the translation engine and turned Translate pages on (Admin -> Settings).
+      security:
+        - bearer: []
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  available:
+                    type: boolean
+        "401":
+          description: Not authenticated
+  /api/books/{id}/translations:
+    get:
+      tags:
+        - library
+      summary: Which pages of a chapter are translated into a language (since v0.85.0).
+      operationId: getApiBooksIdTranslations
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: lang
+          in: query
+          required: true
+          description: The reader's language, e.g. `en` or `pt-BR`.
+          schema:
+            type: string
+      security:
+        - bearer: []
+      responses:
+        "200":
+          description: >-
+            `pages` maps each translated page (1-based) to its stamp, the `tv` of its image URL; `failed` lists pages
+            the engine could not translate; `pending` is how many pages of this request still wait. `problem` says why
+            the queue stopped (not enough free memory, say). `available` false: translated pages are off.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  available:
+                    type: boolean
+                  problem:
+                    type: [string, "null"]
+                  pages:
+                    type: object
+                    additionalProperties:
+                      type: string
+                  failed:
+                    type: array
+                    items:
+                      type: integer
+                  pending:
+                    type: integer
+        "400":
+          description: lang is not a language code
+        "401":
+          description: Not authenticated
+        "404":
+          description: Not found, or not visible to this account
+    post:
+      tags:
+        - library
+      summary: Translate a chapter into a language, from a page on (since v0.85.0).
+      operationId: postApiBooksIdTranslations
+      description: >-
+        Queues the chapter's pages from `from` to the end, ahead of anything asked before: the server translates one
+        page at a time, the most recent request first. Pages already translated are not done again.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [lang]
+              properties:
+                lang:
+                  type: string
+                from:
+                  type: integer
+                  minimum: 1
+                  default: 1
+      security:
+        - bearer: []
+      responses:
+        "202":
+          description: Queued; the body is the chapter's status, as GET answers it.
+        "400":
+          description: Bad lang or from
+        "401":
+          description: Not authenticated
+        "404":
+          description: Not found, or not visible to this account
+        "409":
+          description: Translated pages are off (translate_off)
   /api/books/{id}/download-manifest:
     get:
       tags:
@@ -6262,6 +6687,8 @@ paths:
                         mediaType: { type: [string, "null"] }
                         junk: { type: boolean }
                         missing: { type: boolean, description: True only for a repair placeholder. }
+                        join: { type: string, enum: [rtl, ltr], description: "v0.77.0 (#229): a spread already found, as on the page list." }
+                        mark: { type: string, enum: [join, split], description: "v0.89.0 (#262): the account's own word on this page and the next, as on the page list." }
         "401":
           description: Not authenticated
         "404":
@@ -6407,6 +6834,22 @@ paths:
             it is when it is already that narrow, animated, unreadable, or no smaller re-encoded. Ignored beside `w`.
           schema:
             type: integer
+        - name: tl
+          in: query
+          required: false
+          description: >-
+            Since v0.85.0: the page translated into this language (the reader's language, e.g. `en`, `pt-BR`), drawn
+            from its stored translation and cached like any page. A page with no translation by the installed engine,
+            or with translated pages off, is the original, `Cache-Control: no-store`. Ignored beside `w`; works with
+            `fit`. Owned library only.
+          schema:
+            type: string
+        - name: tv
+          in: query
+          required: false
+          description: The translation's stamp from GET /api/books/{id}/translations. Only a cache-buster; the server ignores it.
+          schema:
+            type: string
       security:
         - imgCookie: []
         - bearer: []
@@ -6595,6 +7038,22 @@ paths:
             it is when it is already that narrow, animated, unreadable, or no smaller re-encoded. Ignored beside `w`.
           schema:
             type: integer
+        - name: tl
+          in: query
+          required: false
+          description: >-
+            Since v0.85.0: the page translated into this language (the reader's language, e.g. `en`, `pt-BR`), drawn
+            from its stored translation and cached like any page. A page with no translation by the installed engine,
+            or with translated pages off, is the original, `Cache-Control: no-store`. Ignored beside `w`; works with
+            `fit`. Owned library only.
+          schema:
+            type: string
+        - name: tv
+          in: query
+          required: false
+          description: The translation's stamp from GET /api/books/{id}/translations. Only a cache-buster; the server ignores it.
+          schema:
+            type: string
       security:
         - imgCookie: []
         - bearer: []
@@ -7152,6 +7611,136 @@ paths:
           description: Not authenticated
         "403":
           description: "Forbidden: token scope, account permission or age limit"
+  /api/admin/translate:
+    get:
+      tags:
+        - admin
+      summary: The translation engine and the Translate pages switch (since v0.85.0).
+      operationId: getApiAdminTranslate
+      description: >-
+        `state`: unsupported (this install cannot run it: the desktop app, or a platform with no pack), missing,
+        downloading (`done` of `total` bytes), ready or failed (`error`). `pick` is the model size Download chooses
+        here (large on machines with 28 GB of memory or more), `need` the bytes it fetches and `free` the bytes free
+        where they go (TRANSLATE_DIR). `running`: the engine's processes are up.
+      security:
+        - bearer: []
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+                properties:
+                  enabled:
+                    type: boolean
+                  state:
+                    type: string
+                    enum: [unsupported, missing, downloading, ready, failed]
+                  size:
+                    type: [string, "null"]
+                    enum: [large, small, null]
+                  pick:
+                    type: string
+                    enum: [large, small]
+                  done:
+                    type: integer
+                  total:
+                    type: integer
+                  need:
+                    type: integer
+                  free:
+                    type: integer
+                  memGiB:
+                    type: integer
+                  running:
+                    type: boolean
+                  external:
+                    type: boolean
+                  error:
+                    type: string
+                  problem:
+                    type: [string, "null"]
+        "401":
+          description: Not authenticated
+        "403":
+          description: Not an admin
+    put:
+      tags:
+        - admin
+      summary: Turn Translate pages on or off (since v0.85.0).
+      operationId: putApiAdminTranslate
+      description: Off stops the engine and forgets the pages waiting. Translations already made are kept.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [enabled]
+              properties:
+                enabled:
+                  type: boolean
+      security:
+        - bearer: []
+      responses:
+        "200":
+          description: The status, as GET answers it.
+        "400":
+          description: enabled is not a boolean
+        "401":
+          description: Not authenticated
+        "403":
+          description: Not an admin
+    delete:
+      tags:
+        - admin
+      summary: Remove the translation engine's files (since v0.85.0).
+      operationId: deleteApiAdminTranslate
+      description: Stops a download or the running engine and deletes everything under TRANSLATE_DIR.
+      security:
+        - bearer: []
+      responses:
+        "200":
+          description: The status, as GET answers it.
+        "401":
+          description: Not authenticated
+        "403":
+          description: Not an admin
+  /api/admin/translate/download:
+    post:
+      tags:
+        - admin
+      summary: Download the translation engine (since v0.85.0).
+      operationId: postApiAdminTranslateDownload
+      description: >-
+        Starts the download in the background: the engine pack from this project's GitHub release `translate-v1`
+        and the model from Hugging Face, each file checked against its pinned SHA-256. A partial download resumes.
+        `size` overrides the model size this machine would pick.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                size:
+                  type: string
+                  enum: [large, small]
+      security:
+        - bearer: []
+      responses:
+        "202":
+          description: Started; the status, as GET /api/admin/translate answers it.
+        "400":
+          description: size is not large or small
+        "401":
+          description: Not authenticated
+        "403":
+          description: Not an admin
+        "409":
+          description: This install cannot run the engine (unsupported)
   /api/admin/settings:
     get:
       tags:
@@ -7163,7 +7752,8 @@ paths:
         includes scanlator_prefs, the server-wide release preferences (ScanlatorPrefs; the default is no
         priority, nothing blocked, two days of patience), backup_hour, the local hour (0-23) of the nightly
         backup, and auto_follow_on_failure, the on-by-default bounded source hunt after an ordinary scheduled
-        chapter failure. The hunt never runs for interactive Add/Fetch or after a 403/429 refusal. Since v0.61.0
+        chapter failure, and since v0.80.0 the scout, which follows another source in the background for a series
+        whose sources cannot get its chapters. An interactive Add/Fetch still never hunts while it runs. Since v0.61.0
         update_smart, the smart update checks (off by default; see updateSmart on PATCH). Since v0.61.1
         backup_enabled and backup_keep, the nightly backup's switch and how many runs it keeps. newMemberDefaults
         (#208), what a member who signs up starts with.
@@ -7232,7 +7822,9 @@ paths:
                     type: boolean
                     description: >-
                       Whether a scheduled sweep may find and follow another matching source after an
-                      ordinary failed chapter. On by default; bounded to one hunt per series per day.
+                      ordinary failed chapter, and (since v0.80.0) whether the scout may follow one for a series
+                      whose sources cannot get its chapters. On by default; bounded to one hunt per series per day
+                      and SCOUT_SEARCHES_PER_HOUR searches.
                   repair_enabled:
                     type: boolean
                     description: >-
@@ -7386,7 +7978,9 @@ paths:
                   type: boolean
                   description: >-
                     Allow the scheduled sweep to search for and follow a matching source after an ordinary
-                    chapter failure. Does not affect interactive requests or refusals.
+                    chapter failure, and (since v0.80.0) the scout to follow one for a series whose sources
+                    cannot get its chapters. Since v0.81.0 Admin → Settings writes it together with
+                    finishDownloads, as its one switch "Finish downloads on their own".
                 repairEnabled:
                   type: boolean
                   description: >-
@@ -9783,6 +10377,71 @@ paths:
           description: Not found, or not visible to this account
         "409":
           description: "`refused`: the download directory is not writable; `message` and `fix` say what to do"
+  /api/admin/series/{id}/chapters/keep-once:
+    post:
+      tags:
+        - admin
+      summary: Keep one of each chapter this series holds twice.
+      operationId: postApiAdminSeriesIdChaptersKeepOnce
+      description: >-
+        Requires an admin account and a token carrying the admin scope. Scopes only ever restrict. The rows Health's
+        "The same chapter saved twice" offers Keep one of each on (action `keep_one`): every number the series holds
+        exactly twice, in two files neither of whose names marks a part or an extra (`17e`, `1053a`, `47-5`) or names
+        another chapter. The copy that stays is the downloader's own file in the download directory, else the first one
+        saved, unless it is incomplete or its file is gone. The other copy leaves the chapter list: reading progress
+        moves to the copy that stays (completed when either was), notes and reading history follow it, and its file is
+        deleted when it is in the download directory and set aside anywhere else (it stays on disk and the scan skips
+        it). A copy somebody has a bookmark in is kept (`left.bookmarked`), and so is a pair whose folder cannot be
+        reached (`left.unreachable`). Acts on the series' pairs as they are when it runs; no body.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      security:
+        - bearer: []
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok, removed, deleted, bytes, setAside, left]
+                properties:
+                  ok:
+                    type: boolean
+                  removed:
+                    type: integer
+                    description: Copies taken off the chapter list.
+                  deleted:
+                    type: integer
+                    description: Of those, the files deleted from the download directory.
+                  bytes:
+                    type: integer
+                    description: The bytes those files held.
+                  setAside:
+                    type: integer
+                    description: Of those, the files left on disk and set aside.
+                  left:
+                    type: object
+                    description: Chapters still held twice, by why.
+                    properties:
+                      bookmarked:
+                        type: integer
+                      unreachable:
+                        type: integer
+                      busy:
+                        type: integer
+        "401":
+          description: Not authenticated
+        "403":
+          description: "Forbidden: token scope, account permission or age limit"
+        "404":
+          description: Not found
+        "409":
+          description: "`busy`: another task is changing that series; `gone`: it was deleted or merged into another"
   /api/admin/series/{id}/chapters/hide:
     post:
       tags:
@@ -11008,7 +11667,7 @@ paths:
       tags:
         - admin
       summary: Re-read the repositories, then update every installed extension with a newer version. 409 while a
-        check runs.
+        check runs, or (since v0.82.0, `busy`) while another install or removal still runs after two minutes.
       operationId: postApiAdminExtensionsUpdateAll
       description: Requires an admin account and a token carrying the admin scope. Scopes only ever restrict.
       security:
@@ -11079,7 +11738,11 @@ paths:
         asks the engine for nothing but the extension's sources and switches them on as an install would, never
         switching one off: for an extension installed in the engine's own page, which shows as installed with
         every source off. It answers 409 `no_sources` when the extension is not installed or provides no source,
-        and is audited as `extension.enable`."
+        and is audited as `extension.enable`. Since v0.82.0 `keep` makes a backup extension (one Uchiyomi installed
+        by itself to finish downloads) the admin's own, answering `{ok, kept}`; `install` and `enable` do the same,
+        and `uninstall` marks the package so Uchiyomi never installs it again. Installs, updates and removals run one
+        at a time: behind another, this waits up to two minutes, then answers 409 `busy` (`messageSaid`
+        `extension.busy`)."
 
       parameters:
         - name: pkgName
@@ -11098,7 +11761,7 @@ paths:
               properties:
                 action:
                   type: string
-                  enum: [install, uninstall, update, enable]
+                  enum: [install, uninstall, update, enable, keep]
       security:
         - bearer: []
       responses:
@@ -11113,7 +11776,7 @@ paths:
         "404":
           description: Not found, or not visible to this account
         "409":
-          description: "`enable` on an extension that is not installed, or provides no source (`no_sources`)"
+          description: "`enable` on an extension that is not installed, or provides no source (`no_sources`); or another install or removal still running after two minutes (`busy`)"
         "502":
           description: The extension engine did not answer, or refused the change
   /api/admin/extensions/repos:
@@ -12473,9 +13136,11 @@ paths:
         whose main source it is, `followed` the series that follow it without it being their main source, and
         `withBackup`, of `main`, the series a working follower would take over -- the Replace preview's own count.
         `offline`: a confirmed failure that is the site's own offline notice. `overLimit` (since v0.55.1): `{limit}` on
-        a source the extension engine's source limit left out. `attention` is what the section leads
+        a source the extension engine's source limit left out. `backup` (since v0.82.0): `{lastNeededAt, removesAt}` on
+        a backup extension's source, one Uchiyomi installed by itself to finish downloads; `removesAt` is null while a
+        series uses it as its main source. `attention` is what the section leads
         with: `replace` (off or failing, and some series' main source -- Health's replace_source rule), `failingUnused`
-        (Health's `unused` group: a finding on a source no series uses) and `updates` (installed extensions with an
+        (Health's `unused` group: a finding on a source no series uses, a backup's left out) and `updates` (installed extensions with an
         update waiting: the engine asked briefly and kept 30 s, else the last extension check's). Ordered: the
         sources in `attention` first, then by main + followed, most first, then by name; switched-off sources last.
         The extension engine's own state stays GET /api/admin/extensions/status's.

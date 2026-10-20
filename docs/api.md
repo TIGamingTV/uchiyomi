@@ -15,6 +15,17 @@ There are two ways in, and for scripts you want the second one.
 **Session tokens** are what the web app uses: `POST /auth/login` returns a JWT that expires after 15 minutes,
 refreshed with a rotating cookie. Fine for a browser, miserable for a cron job.
 
+A session token is checked against its account on every request (since v0.78.1): a disabled or deleted account's
+token stops working on its next request, and an admin whose role is taken away loses admin access at once. Signing out
+ends the refresh cookie; an access token already handed out still works until it expires, within 15 minutes.
+
+Password sign-in takes at most ten requests per address in five minutes, and five failed passwords for one username
+from one address in fifteen minutes. Past either it answers **429** with `Retry-After`. A wrong password never locks the
+account; wrong two-factor codes, and wrong current passwords behind a session, still do (five, for 15 minutes). Until a
+password is accepted, an unknown username, a wrong password and a disabled or locked account all get the same **401**
+`{ "error": "invalid_credentials" }`; the right password for a disabled account gets **403** `{ "error": "disabled" }`,
+and for a locked one **423** `{ "error": "locked" }`.
+
 **API tokens** are long-lived, revocable, and scoped. Create one under **Profile → Connections → API tokens → New token** (the form opens inline).
 The token is shown once, so copy it then. It looks like `uy_` followed by random characters.
 
@@ -36,6 +47,10 @@ admin API, and a token without `write` gets `403` on any non-`GET` request other
 ```json
 { "error": "forbidden", "message": "This token is read-only." }
 ```
+
+The same holds outside `/api/admin/*` (since v0.78.1): wherever an admin may do more than a member -- stop someone
+else's download or archive, or see a series' admin details -- a token needs the `admin` scope too. Without it, an
+admin's `read`/`write` token acts as an ordinary account there.
 
 Give a token the least it needs. A backup script that only reads your library should be `read`, so that a
 token accidentally committed to a repo cannot delete anything.
@@ -151,7 +166,20 @@ which also answers `chapters: 0`.
 `GET /api/sources` lists what you can reach: each entry carries `id`, `name`, `lang` (null when the source
 declares no single language, which means it belongs to every language group), `latest` (whether it can be
 browsed without a query), `popular` (whether it can offer its own popularity ranking), `used` (how many
-series in the library came from it), its health `status`, and `note`.
+series in the library came from it), its health `status`, and `note`. Since v0.82.0 a backup extension's source (one
+Uchiyomi installed by itself to finish downloads, removed again when unused) carries `backup: true`: it is listed so a
+chapter's source can be named, and left out of every route Discover uses -- `search-all`, `search`, `latest`,
+`popular`, `find` and `edition-candidates` never ask it.
+
+**Backup extensions** (since v0.82.0). Extensions Uchiyomi installed by itself are backups: a row of
+`GET /api/admin/extensions/catalog` carries `backup: true`, an `extension` source of
+`GET /api/admin/sources/overview` carries `backup: {lastNeededAt, removesAt}` (`removesAt` null while a series uses it
+as its main source), and a source of `GET /api/series/:id` (and the admin follow routes' `sources`) carries
+`backup: true`. `POST /api/admin/extensions/catalog/:pkgName` with `{action: "keep"}` makes one the admin's (`{ok,
+kept}`); `install`, `enable`, a person's follow, attach or Make main do the same. An `uninstall` there marks the
+package refused: Uchiyomi never installs it again. Installs, updates and removals run one at a time: `install`,
+`update`, `uninstall` and `POST /api/admin/extensions/update-all` wait up to two minutes for another, then answer
+**409** `busy` with `messageSaid` `extension.busy`.
 
 **MangaDex in other languages** (since v0.52.0, #123). `mangadex` is MangaDex in English, always on. Every other
 language an admin switches on (`mangadexLangs` on `PATCH /api/admin/settings`) is a source of its own, with the id
@@ -313,7 +341,8 @@ must agree **both ways** — at least 90% of the primary's numbers listed by the
 of the candidate's listed by the primary — else `numbering_differs`, so a sequel that continues past the
 primary ("Tokyo Ghoul:re" 1..60 for "Tokyo Ghoul" 1..20) is refused although it lists every number, while
 "(Official)" 1..22 for 1..20 (20 of 22 = 0.91) follows. The `coverage` reported for a two-way judgement is
-the lower of the two shares. At most `MAX_FOLLOWED_SOURCES` (default two) sources are followed per series, in the order
+the lower of the two shares. At most as many sources as **Other sources per series** allows (`maxFollowedSources` on PATCH
+/api/admin/settings since v0.89.0, 1 to 10; before it `MAX_FOLLOWED_SOURCES`, three by default) are followed per series, in the order
 given; a follower this path wrote has no author and reads `auto: true` on the series' sources. The results are not in the
 add's answer: they land on the series' job card (below), which a `none` add gets minted for the purpose.
 
@@ -600,7 +629,7 @@ into one outbound fetch. A failed lookup is never cached, so an immediate retry 
 curl -H "Authorization: Bearer $TOK" https://your-server/api/admin/health
 ```
 
-Returns the same checks as the admin Health tab: chapter gaps (since v0.55.0 counted between plausible numbers only:
+Returns the same checks as the admin Health page: chapter gaps (since v0.55.0 counted between plausible numbers only:
 a chapter numbered far beyond the rest is the impossible-number check's, never a gap of thousands -- the repair's gap
 step counts the same way), truncated downloads, duplicate series, impossible chapter numbers, failing sources, the last library scan (`library-scan`: folders it could not index,
 and since v0.48.2 folders it could not look into at all), and since v0.48.2 `downloads-missing`: every chapter
@@ -684,7 +713,7 @@ from before). What a run keeps of the packages it searched in vain, for the next
 was searched for), is in no route's answer.
 
 `GET /api/admin/health/summary` (since v0.48.0) is the cheap question the app's header asks: the last report
-boiled down to `{at, worst, count, headline, key, checks}`, answered from what the Health tab or the server's
+boiled down to `{at, worst, count, headline, key, checks}`, answered from what the Health page or the server's
 own six-hourly run stored, never by running the checks. `key` changes only when *which* checks found something
 changes, so an alert dismissed for one problem comes back for a new one. Since v0.49.1 each of `checks` (worst
 first) carries `summarySaid`: `headline` is `checks[0]`'s title and summary in English, and a client words it from
@@ -729,9 +758,11 @@ source is searched — or `archiving`, below.
 `fix_short`, `fill`, `retry` and `solver_reset` are `POST /api/admin/tasks/repair/run`
 with the matching `only` and target; `confirm_short` is `POST /api/admin/books/:id/confirm-short`, and on a
 row that already carries `fixed` it is the withdrawal (`{confirmed: false}`); `delete` is `POST
-/api/admin/series/:id/chapters/delete`, `merge` is `POST /api/admin/series/:id/merge`, and `test`/`unblock`/
-`disable` are the existing `POST /api/admin/sources/:id/...` routes. Nothing on this page acts on its own:
-the two destructive ones, `delete` and `merge`, are the two the nightly repair never does.
+/api/admin/series/:id/chapters/delete`, `merge` is `POST /api/admin/series/:id/merge`, `keep_one` is `POST
+/api/admin/series/:id/chapters/keep-once` (no body: the series' chapters held twice, paired as they are when it runs;
+the row's `pairs` is how many), and `test`/`unblock`/`disable` are the existing `POST /api/admin/sources/:id/...`
+routes. Nothing on this page acts on its own: the destructive ones, `delete`, `merge` and `keep_one`, are the ones the
+nightly repair never does.
 
 **Source health and the extension engine** (since v0.49.0). The `sources` check reads the per-stage evidence
 (#115): each of its items adds `evidence` (one line per stage, `search`, `chapters`, `pages`, `images`, each
@@ -974,6 +1005,25 @@ For a series that hides them, every notice is left out of everything:
 Nothing is deleted, and the listing keeps every number. Turning a switch off applies on the next request, and
 the next check downloads what it no longer hides.
 
+## Translated pages
+
+Since v0.85.0, opt-in. Nothing here runs until an admin downloads the translation engine and turns *Translate pages*
+on (Admin → Settings). The engine runs on the server itself, and pages never leave it.
+
+- **Admin.** `GET /api/admin/translate` is the engine and the switch: `enabled`, `state` (`unsupported`, `missing`,
+  `downloading` with `done` of `total` bytes, `ready`, `failed` with `error`), `pick` (the model size Download would
+  choose here: `large` with 28 GB of memory or more, else `small`), `need` and `free` (bytes). `POST
+  /api/admin/translate/download` `{size?}` starts the download in the background; `PUT /api/admin/translate
+  {enabled}` is the switch; `DELETE /api/admin/translate` removes the engine's files.
+- **Reading.** `GET /api/translate` answers `{available}`: whether the reader offers the switch. `POST
+  /api/books/:id/translations {lang, from}` asks for a chapter's pages from `from` on, in the reader's language;
+  the newest request goes first, one page at a time. `GET /api/books/:id/translations?lang=` answers `{available,
+  problem, pages, failed, pending}`, where `pages` maps each translated page to its stamp. Both are **404** for a
+  chapter the account cannot open; the POST is **409** `translate_off` while the feature is off.
+- **The pictures.** `GET /img/lib/books/:id/page/:n?tl=<lang>&tv=<stamp>` (and `/img/books/...`) is the page drawn in
+  that language, cached like any page. A page that is not translated yet is the original with `Cache-Control:
+  no-store`.
+
 ## Rate limiting
 
 The API isn't rate-limited for authenticated users, but for the two Test routes that ask someone else's service
@@ -1028,7 +1078,7 @@ signed in on that browser to an identity at the provider. The whole mode is unde
 [Single sign-on (OIDC)](#single-sign-on-oidc), below.
 
 **Signing up** (the form since v0.61.0). `POST /auth/register` `{username, password, displayName?, deviceId?,
-deviceName?}` works only while **Admin → Settings → Open registration** is on — `GET /auth/config` says so as
+deviceName?}` works only while **Admin → Settings → Server → Open registration** is on — `GET /auth/config` says so as
 `allowRegistration`, which the sign-in screen reads to offer *Create an account*, and which is always false on
 Uchiyomi Desktop — and is otherwise **403** `registration_disabled`. It makes a member (role `user`), with the
 new-member defaults (`newMemberDefaults` under [Admin](#admin)), and signs them in exactly as `/auth/login` does: the same body, cookies and session, named by `deviceId`/`deviceName` like a sign-in's.
@@ -1071,11 +1121,14 @@ GET    /api/books/:id             POST   /api/books/:id/refetch
 GET    /api/books/:id/pages
 GET    /api/books/:id/next        PUT    /api/books/:id/progress
 PUT    /api/books/:id/pages/:n/junk
+PUT    /api/books/:id/pages/:n/spread
 GET    /api/offline/plan             GET    /api/series/:id/listing
 GET    /api/series/:id/groups        GET    /api/series/:id/versions
 GET    /api/series/:id/gaps
 POST   /api/series/:id/listing-progress
 DELETE /api/series/:id/listing-progress
+GET    /api/translate             GET    /api/books/:id/translations
+POST   /api/books/:id/translations
 ```
 
 **Related works and More like this** (since v0.61.0). `GET /api/series/:id/related` answers `{lookups, content:
@@ -1373,7 +1426,10 @@ numbers the fill scan reports, which is what the Find missing chapters dialog se
 `{ok, started, folder, total, skipped: [{number, reason}]}` with `reason` one of `not_listed` (run
 **Check for new chapters** first), `blocked_group`, `other_language` (since v0.62.0: every copy of the number is in
 another language than the series' -- a pick takes one anyway), `already_here` (a live chapter, not a tombstone),
-`source_unavailable` (adapter not loaded or disabled, or a source the series no longer follows), `cooldown`,
+`source_unavailable` (adapter not loaded or disabled, or a source the series no longer follows), `cooldown`, `later`
+(since v0.79.0: the chosen copy's source is in a cooldown and no other followed source lists the number; with
+*Finish downloads on their own* on it downloads on its own when the source can answer -- a number another followed
+source lists is fetched from that one instead),
 `over_cap` (with `floored`, a chapter past the 300 the expansion reached — press again for the rest);
 **409** `nothing_to_fetch` (with `skipped`) when nothing is fetchable, **409** `busy` while a download for
 that series is running — since v0.37.0 that includes the series a bulk *Fetch newest* run is currently
@@ -1504,6 +1560,27 @@ DELETE /api/trackers/:provider
 GET    /api/push/key              POST   /api/push/subscribe
 POST   /api/push/unsubscribe
 ```
+
+### Chapter comments
+```
+GET    /api/books/:id/comments    POST   /api/books/:id/comments
+PATCH  /api/comments/:id          DELETE /api/comments/:id
+PUT    /api/books/:id/reaction    DELETE /api/books/:id/reaction
+GET    /api/series/:id/comments
+```
+
+A chapter's talk (v0.87.0), for the members who may open its series: a chapter in a series the caller may not open
+answers **404**, as a missing one does. `GET /api/books/:id/comments` answers `{on, comments, reactions}`: comments oldest
+first as `{id, user: {id, name, avatar}, body, page, createdAt, editedAt, mine}`, reactions as `{user, emoji, mine}`.
+`on` is false where there is nobody to talk to (one enabled member, or the Komga backend), and, since v0.90.0, for a
+caller who switched **Comments and reactions** off (`comments: false` in their settings; `/auth/me`'s `talk` says whether
+the server has talk at all, so the switch is offered only there). A comment is plain text, 1 to
+2000 characters; `page` is the page it was written on in the reader. Each member has one reaction a chapter, one of
+❤️ 😂 😭 😱 🔥 🤯: `PUT` sets or changes it, `DELETE` takes it back. While the account's Incognito reading is on, a
+comment or a reaction is refused with **403** `{ "error": "incognito" }`. Only its author edits a comment; its author
+or an admin deletes it (an admin's removal is audited). A new comment sends a push to the members who commented on that
+chapter before and may still open the series, unless they switched Comments and reactions off. `GET /api/series/:id/comments` lists the chapters with talk as
+`{bookId, comments, reactions, top}`. None of these exist on Uchiyomi Desktop.
 
 **Account settings.** `GET /api/settings` answers the caller's whole forwards-compatible object; `PUT /api/settings`
 takes top-level keys directly and merges them into that object (an object value is replaced whole). Unknown keys stay
@@ -1693,6 +1770,8 @@ GET    /api/admin/health/summary  POST   /api/admin/health/ignore
 POST   /api/admin/health/autofix  GET    /api/admin/health/autofix
 GET    /api/admin/health/autofix/:runId POST /api/admin/health/autofix/stop
 GET    /api/admin/settings        PATCH  /api/admin/settings
+GET    /api/admin/translate       PUT    /api/admin/translate
+DELETE /api/admin/translate       POST   /api/admin/translate/download
 GET    /api/admin/notify-targets  POST   /api/admin/notify-targets
 PATCH  /api/admin/notify-targets/:id DELETE /api/admin/notify-targets/:id
 POST   /api/admin/notify-targets/:id/test
@@ -1752,6 +1831,7 @@ POST   /api/admin/series/:id/delete-files
 POST   /api/admin/series/:id/forget
 POST   /api/admin/series/:id/rename-folder
 POST   /api/admin/series/:id/chapters/delete POST   /api/admin/series/:id/chapters/refetch
+POST   /api/admin/series/:id/chapters/keep-once
 POST   /api/admin/series/:id/chapters/hide POST   /api/admin/series/:id/chapters/unhide
 GET    /api/admin/series/:id/chapters/hidden
 GET    /api/admin/series/:id/copy-pages
@@ -1781,7 +1861,7 @@ series, as each series' `booksCount` counts them), `members`, `cacheBytes`, `las
 `database` (`embedded` or `external`) and each
 member's recent reading (`activity`). Since v0.55.4 ([#150](https://github.com/AngeloSha/uchiyomi/issues/150)) it also
 answers `version`, the running version as the server's own package.json says it, or null when that cannot be read; the
-foot of the admin menu prints it. Whether a newer one exists is Health's `update` check (`GET /api/admin/health`), which
+foot of the admin list prints it. Whether a newer one exists is Health's `update` check (`GET /api/admin/health`), which
 the page reads from its own copy of that answer: this route asks GitHub nothing.
 
 **Libraries.** A library is declared on one or more folders under the library root (since v0.55.1, #148): `POST
@@ -1823,8 +1903,12 @@ they are manual actions; clients should say that those actions may contact AniLi
 `repair_enabled`, `source_prefs`, `group_upgrade`, `borrow_names`, `mangadex_langs`, `unstated_lang`,
 `deleted_as_ghosts`, `update_smart` (since v0.61.0), `backup_enabled` and `backup_keep` (since v0.61.1),
 `newMemberDefaults` (below), plus `extensions_configured` and `mangadex_available` (computed). `auto_follow_on_failure` defaults to true and
-controls the bounded once-per-series-per-day source hunt after an ordinary scheduled-download failure; it
-never makes an interactive Add/Fetch hunt and never runs after a refusal. `PATCH
+controls the bounded once-per-series-per-day source hunt after an ordinary scheduled-download failure, and (since
+v0.80.0) the scout: in the background, a series whose sources cannot get its chapters -- cooling, refusing, broken, or
+chapters at their retry cap, whoever started the download -- is looked for on the other installed sources, within
+`SCOUT_SEARCHES_PER_HOUR`, and one that has them is followed (never made the main source). An interactive Add or Fetch
+still never hunts while it runs. Since v0.81.0 Admin → Settings shows one switch, *Finish downloads on their own*, and
+writes `finishDownloads` and `autoFollowOnFailure` together; the API still takes each on its own. `PATCH
 /api/admin/settings` takes any subset of `serverName` (1–64 chars), `allowRegistration`, `updaterHours`
 (1–168), `extensionHours` (1–168), `extensionAutoUpdate`, `updateCheck`, `installPing`, `cleanupRead`,
 `cleanupReadDays` (0–3650; 0 is a value, "at the next run"), `backupHour` (0–23, the local hour of the nightly
@@ -1856,7 +1940,7 @@ of sources and series that do not say which they are in (English by default, `un
 followed for a series automatically only when both are in the same language. Any one language is accepted and
 normalised (`pt-br` is `pt-BR`); `all`, `other` or an empty string is a **400** `unknown_language`. Each field is
 written on its own, an out-of-range value is a **400** and nothing is written, and
-the audit row `settings.update` carries the body. The admin console's Settings tab sends one
+the audit row `settings.update` carries the body. The admin console's settings pages send one
 row per PATCH as each row is changed (the read-chapter confirmation carries the day count with the switch).
 
 **New-member defaults** ([#208](https://github.com/AngeloSha/uchiyomi/issues/208); **Admin → Members → When someone
@@ -2213,7 +2297,7 @@ table is re-pointed to the chapter's current series first, deletes are keyed on 
 actually owns, and if a progress row or bookmark on another series' chapter is still filed here after that
 the whole transaction rolls back — **409** `refused` `stranded`, nothing changed. It refuses, **409**
 `refused` `{message, fix}`, in exactly four other cases: `live`, while the series is still in the library
-(*Remove the series first. Forgetting it is a third, separate step.*, fix *Content → Library → Remove, then
+(*Remove the series first. Forgetting it is a third, separate step.*, fix *Admin → Libraries → Remove, then
 Delete files, then Forget.*); `live_books`, while any chapter row still claims a file (*N chapter row(s)
 still claim(s) a file on disk. Delete the files first, or the next scan brings the series back under a new
 id with none of its history.*, fix *Delete files, then Forget.*); `missing_files`, only for a root that
@@ -2352,7 +2436,7 @@ false, error: 'busy'}`. `GET /api/admin/tasks` lists it as `{id: 'matches', name
 the links and pictures removed (up to 50 named).
 
 **Repair the library.** `POST /api/admin/tasks/repair/run` (since v0.41.0; the Tasks panel's *Repair
-library*, and the *Fix* / *Fill now* / *Retry now* keys and the *Reset the solver* action on the Health tab —
+library*, and the *Fix* / *Fill now* / *Retry now* keys and the *Reset the solver* action on the Health page —
 *It's fine* is the separate `confirm-short` route below) runs the nightly repair now. It is **detached**, like `update` and `verify`, and answers **200**
 `{ok: true, started: true}` (since v0.49.0 with the run's id, below); a full run's counts land on `GET
 /api/admin/tasks` as the `repair` entry's `lastResult`.
@@ -2913,7 +2997,7 @@ leading *The*, *A* or *An* is ignored only when at least six letters remain; oth
 containment, because a spin-off's name contains its parent's. An answer that is another work is stored as the miss a "no
 match" is, so it is not asked again on every view. `/img/series/:id/thumb` is an admin's cover, else the source's
 cover or a checked AniList one, else the series' first page. What was stored before v0.55.7 is held to the same rule
-by **Check online matches** (Admin → Tasks, above); Health's *Duplicate series* groups only links a person made or
+by **Check online matches** (Admin → Settings → Maintenance, above); Health's *Duplicate series* groups only links a person made or
 that were checked. `PUT /api/admin/series/:id/art {kind: 'cover', mode: 'first_page'}` makes the series' own first page
 its cover for good: the series payload's `overrides.cover` reads `'first_page'` (beside `'upload'` and a pasted URL),
 nothing found online is shown or looked up for it -- its banner is made from its pages unless an admin set one -- and

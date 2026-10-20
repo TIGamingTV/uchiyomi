@@ -31,7 +31,7 @@ import { REFETCH_BAK } from './fsAtomic';
 import { logAudit } from './audit';
 import { carries, standingsOf } from './sourceStanding';
 import { followGuard } from './seriesLang';
-import { MAX_FOLLOWERS } from './autoFollow';
+import { followerLimit } from './followLimit';
 import { removeMergeDuplicates } from './extraCopies';
 
 export interface SeriesRow {
@@ -194,6 +194,7 @@ export async function mergeSeries(
   // of unrelated merges cannot occupy every pool client and then deadlock waiting for another one. Core source facts
   // are compared again under the row locks below before this candidate may be carried.
   const carryCandidate = await carryable(fromId, intoId).catch(() => null);
+  const limit = await followerLimit();
   return tx(async (qq) => {
     if (fromId === intoId) throw new MergeConflictError({ refused: 'same_series' });
     // Stable lock order prevents two opposite/crossing merges from deadlocking. More importantly, the visibility and
@@ -345,7 +346,7 @@ export async function mergeSeries(
           WHERE (SELECT count(*) FROM series_sources WHERE series_id = $1 AND source_id <> $2) < $5::int
          ON CONFLICT (series_id, source_id) DO NOTHING
          RETURNING source_id`,
-        [intoId, carry.sourceId, carry.ref, carry.title, MAX_FOLLOWERS]);
+        [intoId, carry.sourceId, carry.ref, carry.title, limit]);
       carried = got[0]?.source_id ?? null;
     }
 
@@ -565,8 +566,14 @@ export async function deleteChapterFiles(
 
 /** Every table with a per-user row keyed on a book, and so re-pointed to the book's current series first. */
 const BOOK_KEYED_USER_TABLES = ['read_progress', 'reading_events', 'bookmarks', 'notes', 'offline_downloads'] as const;
-/** Every table with a per-book row, deleted strictly by the ids of the books this series owns. */
-const BOOK_KEYED_TABLES = [...BOOK_KEYED_USER_TABLES, 'book_overrides', 'page_hashes'] as const;
+/**
+ * Every table with a per-book row, deleted strictly by the ids of the books this series owns. v0.87.0: a chapter's
+ * comments and reactions, which have no series id to re-point -- they follow the chapter row wherever it goes -- and so
+ * are not in the list above.
+ */
+// v0.85.0: page_translations (lib/translate/pages.ts) cascades from lib_books; named for the same count. So, since v0.89.0,
+// does spread_marks (lib/spreadMarks.ts), a reader's own merges and splits of a chapter's pages.
+const BOOK_KEYED_TABLES = [...BOOK_KEYED_USER_TABLES, 'book_overrides', 'page_hashes', 'page_translations', 'chapter_comments', 'chapter_reactions', 'spread_marks'] as const;
 /** Every table keyed on the series id. lib_books and lib_series themselves come last, on their own. */
 const SERIES_KEYED_TABLES = [
   'favorites', 'collection_items', 'ratings', 'series_colors', 'series_art', 'series_seen', 'series_trackers',
@@ -589,6 +596,16 @@ const SERIES_KEYED_TABLES = [
   'series_radar',
   // v0.73.0: the details the server filled in for it (lib/autoDetails.ts). Cascades too; named for the same count.
   'series_auto_details',
+  // v0.80.0: the scout's request for it and what sources said about it (lib/sourceScout.ts, lib/scoutMemory.ts).
+  // Both cascade too; named for the same count.
+  'series_scout', 'scout_verdicts',
+  // v0.82.0: the follows a removed backup extension took with it (lib/backupExtensions.ts). Cascades too; named for the
+  // same count.
+  'backup_links',
+  // v0.83.0: the repository extensions the scout tried for it in vain (lib/backupExtensions.ts recordMiss). Cascades too.
+  'backup_misses',
+  // v0.85.0: the names its translated pages keep (lib/translate/pages.ts). Cascades too; named for the same count.
+  'translate_names',
 ] as const;
 
 export interface ForgetRefusal {
@@ -667,7 +684,7 @@ export async function forgetSeries(id: string): Promise<ForgetResult | ForgetRef
         ok: false,
         refused: 'live',
         message: 'Remove the series first. Forgetting it is a third, separate step.',
-        fix: 'Content → Library → Remove, then Delete files, then Forget.',
+        fix: 'Admin → Libraries → Remove, then Delete files, then Forget.',
       };
     }
 
@@ -779,7 +796,9 @@ export async function forgetSeries(id: string): Promise<ForgetResult | ForgetRef
     // lose history, not a NEW badge or a carried tracker floor" in forgetSeries.int.test.ts reads 1 too many.
     // A read mark on a chapter the server never held (#69) IS history -- "I read chapter 57" -- and goes with
     // the series. Reintroduce by dropping its arm: "forget deletes read marks and counts their owner" in
-    // forgetSeries.int.test.ts reads 0 members.
+    // forgetSeries.int.test.ts reads 0 members. So is a comment or a reaction on one of its chapters (v0.87.0): a
+    // member's own words. Reintroduce by dropping those arms: "forget deletes a chapter's comments and counts their
+    // authors" in forgetSeries.int.test.ts reads 0 members.
     const [{ n: users }] = await qq<{ n: number }>(
       `SELECT count(DISTINCT user_id)::int AS n FROM (
          SELECT user_id FROM read_progress     WHERE book_id = ANY($2)
@@ -791,6 +810,8 @@ export async function forgetSeries(id: string): Promise<ForgetResult | ForgetRef
          UNION SELECT user_id FROM ratings          WHERE series_id = ANY($1)
          UNION SELECT user_id FROM tracker_progress WHERE series_id = ANY($3)
          UNION SELECT user_id FROM listing_progress WHERE series_id = ANY($1)
+         UNION SELECT user_id FROM chapter_comments  WHERE book_id = ANY($2)
+         UNION SELECT user_id FROM chapter_reactions WHERE book_id = ANY($2)
          UNION SELECT c.user_id FROM collection_items ci JOIN collections c ON c.id = ci.collection_id
                 WHERE ci.series_id = ANY($1)
        ) u`,
