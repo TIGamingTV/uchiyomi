@@ -37,6 +37,9 @@ CREATE TABLE IF NOT EXISTS favorites (
   created_at timestamptz NOT NULL DEFAULT now(),
   PRIMARY KEY (user_id, series_id)
 );
+-- v0.97.0: the place a person gave a favourite in their own order (lib/favorites.ts), NULL until they move one. Every list
+-- of their favourites reads position first, then created_at, so nothing moves for anyone until they reorder.
+ALTER TABLE favorites ADD COLUMN IF NOT EXISTS position int;
 
 CREATE TABLE IF NOT EXISTS collections (
   id         uuid PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -1994,6 +1997,12 @@ CREATE TABLE IF NOT EXISTS spread_marks (
   PRIMARY KEY (user_id, book_id, page)
 );
 CREATE INDEX IF NOT EXISTS idx_spread_marks_book ON spread_marks (book_id);
+
+-- v0.91.0 (#314): when an admin last left an extension source's site after Open site (lib/sources/suwayomi/siteSessions.ts).
+-- A source whose site wanted that -- a sign-in, a check the engine's background browser cannot pass -- gets a quiet visit
+-- of its home page whenever it fails, at most once in half an hour: BatCave's guard pass lasts a day, and it fails with a
+-- plain 404 when it runs out. NULL for every other source. Additive: v0.90.x ignores the column.
+ALTER TABLE suwayomi_sources ADD COLUMN IF NOT EXISTS site_opened_at timestamptz;
 `;
 
 // Serialises migrate() across processes. CREATE TABLE IF NOT EXISTS is not safe to run concurrently:

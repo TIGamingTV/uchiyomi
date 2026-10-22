@@ -1,5 +1,249 @@
 # Changelog
 
+## v0.97.0 — 2026-10-21
+
+**Your favorites in your own order, chapters that failed every night on Natomanga and Mangakakalot now come from the
+image server the site itself uses, and the read-chapter cleanup no longer keeps a chapter of every series for its
+cover.** The last answers [#332](https://github.com/AngeloSha/uchiyomi/issues/332). Thank you.
+
+### Your favorites, in your order
+
+- **Manage on Home's *Your favorites* row opens your favorites as a list.** Drag one into place (on a phone, hold it a
+  moment first), move it a step with its arrows, or take it off with ×.
+- **Home shows them in that order**, and so do your other devices and the OPDS feed. A series you favorite later comes
+  first until you move it.
+- Until you move one, nothing changes: they stay newest first, as before.
+
+### Chapters that failed every night
+
+- **On Natomanga and Mangakakalot, some chapters pointed their pages at an image server that doesn't have the files.**
+  It answers "File with such name does not exist", with some "slow down" replies among them. Uchiyomi took the failure
+  for a busy site and tried again every night, up to twelve times, for weeks.
+- **The site's own reader takes those pages from another server listed on the same page.** Uchiyomi now reads that
+  list first, so the next check asks the server that has the files. Chapters that already downloaded are unaffected.
+
+### Read chapters go, covers stay
+
+- **Delete read chapters kept one chapter of every series for good:** the one its cover could be drawn from. The
+  `[cleanup]` lines from v0.96.0 showed it holding most of what was left, on series whose cover comes from their source
+  and not from that chapter at all.
+- **Now that chapter is deleted like the rest.** When a series' cover really is its first page (no cover picture of its
+  own, or *Use the first page* chosen), Uchiyomi keeps a copy of that page first, so the cover doesn't change.
+
+### Upgrading
+
+- Nothing to do.
+
+## v0.96.0 — 2026-10-21
+
+**Drag things into place, a search on one source keeps going as you scroll, Shift picks a run of series, and the
+read-chapter cleanup says why it keeps what it keeps.** Drag to reorder is **Squeaks72**'s work
+([#330](https://github.com/AngeloSha/uchiyomi/pull/330)); the rest answers
+[#331](https://github.com/AngeloSha/uchiyomi/issues/331), [#332](https://github.com/AngeloSha/uchiyomi/issues/332) and
+[#333](https://github.com/AngeloSha/uchiyomi/issues/333). Thank you.
+
+### Drag to reorder
+
+- **Every list you put in order can be dragged now**, beside its arrows:
+  - Home's rows in **Customize Home**;
+  - a list's series while you **Edit** it;
+  - the **Source order**;
+  - the **Default priority** of scanlation groups;
+  - a series' own ranked groups in *Sources & translations*.
+- **With a mouse,** press an item and move it; a bar in the accent colour shows where it will land.
+- **On a phone,** hold the item a moment until it lifts, then drag. A quick swipe still scrolls the page.
+- **Escape** cancels a drag. The arrows stay, for keyboards and screen readers.
+
+### Search past the first page
+
+- **A site answers its search a page at a time.** BatCave gives ten at a time and has 209 results for *Star Trek*, and
+  Discover showed only the first page.
+- **A search on one source now keeps going as you scroll.** Pick the source in the source chip (or have only one) and
+  search. The next page loads as you near the end of the wall, up to 30 pages. Every extension's search does this.
+- A search across all your sources still shows each source's first page.
+
+### Why a read chapter is still there
+
+- **Delete read chapters keeps a chapter for good reasons:** someone part-way through, a bookmark, the cover chapter,
+  the last copy the sources no longer list, and a few more. Nothing said which one was keeping yours.
+- **With `LOG_LEVEL=debug`, every run now says so.** Lines starting `[cleanup]` give how many read chapters are in the
+  download folder and how many are due, then how many each rule keeps, with a few by title.
+
+### Pick a run with Shift
+
+- **In the Library's select mode, Shift-click picks every series** between the last one you clicked and this one.
+  Shift-clicking a picked series unpicks the run instead.
+
+### Upgrading
+
+- Nothing to do.
+
+## v0.95.0 — 2026-10-21
+
+**A series whose files you deleted yourself can be forgotten, and Find other sources proposes a series a site lists under
+a name of its own** ([#328](https://github.com/AngeloSha/uchiyomi/issues/328),
+[#316](https://github.com/AngeloSha/uchiyomi/issues/316)). Thank you, **Keddyan** and **TIGamingTV**.
+
+### Forget what you deleted yourself
+
+- **A removed series whose folder you deleted yourself could not be forgotten.** On a library Uchiyomi may only read
+  (the default, with `PUID` unset), Delete files refused "not writable" before it looked, though nothing was left to
+  delete. On a library with little else in it, it could not be sure the files were really gone and said "Deleted 0
+  files". Either way the row stayed in **Admin → Libraries** and **Forget** was never offered.
+- **Delete files now needs write access only for files that are still there.** Files already gone are marked deleted,
+  and the row offers **Forget**.
+- **When Uchiyomi can't tell a folder you deleted from a drive that isn't connected,** it asks: *24 chapter files are
+  not on disk*. If you deleted or moved them yourself, press **Mark them gone**, and Forget is offered. A library folder
+  that is empty or can't be opened is refused: that is what a drive that isn't mounted looks like.
+- After **Forget**, putting the files back adds the series again as a new one.
+
+### A site's own name for a series
+
+- **Some sites list a series under a name it doesn't have here.** *Revenge of the Iron-Blooded Sword Hound* is *Revenge
+  of the Baskerville Bloodhound* on Atsumaru, Manga Ball and MangaFire, and Find other sources found nothing.
+- **Let me review each match first now proposes it**, in amber with its cover: a series a site gave first when searched
+  under two or more of the series' names, whose chapter numbers line up both ways. Follow it if the covers match.
+  Following it keeps that name as one of the series' other names, so later searches find it on other sites too.
+- **An automatic run never follows one.** Two series with the same number of chapters number them alike, so only a
+  person can say it is the same series.
+
+### Upgrading
+
+- Nothing to do.
+
+## v0.94.0 — 2026-10-21
+
+**Open site opens the sign-in link a site emails you, so BatCave's email sign-in works**
+([#314](https://github.com/AngeloSha/uchiyomi/issues/314)).
+
+### Open a link
+
+- **Sites that sign you in with a link they email you** (BatCave's *Email me a link*) sign in whichever browser opens
+  that link. Opened from your email, it signed in your own browser, not the extension engine's.
+- **Open site now has Open a link.** Ask the site for the link inside Open site, copy the link from the email without
+  opening it, press **Open a link**, paste it and press **Open**: the engine's browser opens it and is signed in. Then
+  press **Done**.
+- Only links on the extension's own site open there; anything else is refused, since the engine's browser sits inside
+  your server's network. The link is never logged.
+
+### Upgrading
+
+- Nothing to do.
+
+## v0.93.0 — 2026-10-21
+
+**A library or download disk that isn't connected is no longer taken for one that lost its chapters.** This is
+**globalteddy**'s work ([#323](https://github.com/AngeloSha/uchiyomi/pull/323)). Thank you.
+
+### A disk that isn't there
+
+- **When a network share or a removable drive isn't mounted**, the folder Uchiyomi sees is an empty mount point, or one
+  holding only what a download wrote there meanwhile. The nightly page count, the fingerprint and page-hash passes,
+  Verify chapter files and the read-chapter cleanup used to write what they saw back for good: chapters stamped as
+  broken or unreadable, marked missing and downloaded again over files that were fine, or marked deleted and never
+  fetched back.
+- **Now each of them first checks that the folder holds the chapters it is supposed to.** If none of them, or fewer than
+  one in ten, are there, the job leaves everything as it is and tries again once the disk is back. The read-chapter
+  cleanup says so on its Tasks line ("stopped: 26 of 27 chapter files in the download folder are missing; is the
+  download volume mounted?"). A chapter a job may not read (a folder whose permissions slipped) is left for later too, never
+  marked.
+- **The check is cheap on a disk that is there:** a few dozen files looked at, not every chapter, so a NAS is not woken
+  for it. And a disconnected library no longer holds up the nightly page count for the download folder.
+
+### Upgrading
+
+- Nothing to do.
+
+## v0.92.0 — 2026-10-21
+
+**Nothing you could not get back is deleted, Discover keeps up with the sources it asks, and Find other sources can say
+why it found nothing.** Most of this is **globalteddy**'s work ([#317](https://github.com/AngeloSha/uchiyomi/pull/317),
+[#319](https://github.com/AngeloSha/uchiyomi/pull/319), [#320](https://github.com/AngeloSha/uchiyomi/pull/320),
+[#321](https://github.com/AngeloSha/uchiyomi/pull/321), [#322](https://github.com/AngeloSha/uchiyomi/pull/322)), and the
+log setting is **TIGamingTV**'s idea ([#316](https://github.com/AngeloSha/uchiyomi/issues/316)). Thank you both.
+
+### Nothing you could not get back is deleted
+
+- **The read-chapter cleanup keeps the last copy.** A chapter the sources no longer list (taken down, deleted, dropped
+  by the site) could not be downloaded again, so its file stays even when everyone has read it. So does one listed only
+  from a group you blocked, or only as a link to the publisher, which is how MangaDex keeps a licensed chapter. A file
+  holding several chapters is kept if any one of them is missing.
+- **A file the server may not read is not a file already gone.** When the server lost permission to a series' folder,
+  Delete files marked its chapters deleted and said "Deleted 0 files", and Forget could then erase everyone's reading
+  history while the files were still there. Now those chapters are left as they are, and the message says how many could
+  not be checked: fix the permissions and run it again. The hourly read-chapter cleanup follows the same rule.
+
+### Discover follows the sources it asks
+
+- With **Show 18+** turned off, or a source switched off, the wall kept that source's covers and counted it, and a
+  source chosen alone stayed chosen and searched for nothing. The wall, its *{done} of {total} sources* count and the
+  chosen source now follow the sources asked. Flipping *Newest*/*Popular* keeps a source chosen when the other listing
+  has it, and an empty wall says no source could be reached only when none of the sources asked now could be.
+
+### Why a series found nothing
+
+- **`LOG_LEVEL`** sets how much the server log says: `info` by default (a line for every request, as before), `warn`
+  for problems only, or `debug`.
+- **At `debug`, a Find other sources run explains itself.** For each series the log says the names it searched each
+  source under, what each source answered (the first few titles), which result it took, and why a match was refused:
+  its own title was not this series', or its chapter numbers did not line up, with how many it compared. The lines
+  start with `[find]`. Set it back when you are done; the log is long at debug.
+
+### Building the image yourself
+
+- A new version no longer makes `Dockerfile.aio` reinstall all its packages from nothing. They stay cached until a
+  dependency really changes, which saves time and over a gigabyte of build cache per release on a machine that builds
+  its own. The published images are the same as before.
+
+### Upgrading
+
+- Nothing to do. For a run's details, add `LOG_LEVEL=debug` to `.env` and restart. The deploy compose files pass it
+  through from this version on.
+
+## v0.91.1 — 2026-10-20
+
+**Open site: what you type reaches the site, and the page keeps up with you.** v0.91.0's Open site could not fill in a
+sign-in form, and on a home server's connection what happened on the page showed up about twenty seconds late.
+
+### Typing on Open site, without the lag
+
+- **Typing reaches the site.** In v0.91.0 a click on the page moved the browser's focus away from the field that carries
+  your keys, so nothing you typed arrived. A click or a tap now keeps it there, and on a phone a tap on the page brings up
+  the keyboard.
+- **A phone's keyboard types as you meant it.** Corrections, Backspace and words the keyboard is still composing reach
+  the site as typed.
+- **The page keeps up.** Each picture of the page is a JPEG about a tenth of the size it was, and the next is sent only
+  once the last has arrived, so a slow connection shows the newest page a moment late instead of every page later and
+  later. What you type is sent at once, never queued behind mouse moves.
+
+### Upgrading
+
+- Nothing to do.
+
+## v0.91.0 — 2026-10-20
+
+**Open site: sign in on an extension's site, the way Mihon's *Open in WebView* does.** BatCave now shows *Sign in to keep
+reading* to anyone not signed in, so in Uchiyomi it listed nothing
+([#314](https://github.com/AngeloSha/uchiyomi/issues/314), reported by **langwire**); in Mihon you sign in once in its
+WebView. Uchiyomi had no such page until now.
+
+### Open site
+
+- In **Admin → Sources**, an extension's sheet has **Open site**: the site in the extension engine's own browser, live
+  and over the whole screen. Click, scroll and type as on the site: on a phone a tap is a click, a swipe scrolls, and
+  **Keyboard** brings up the keyboard. Sign in, or pass the site's check, and press **Done**: the engine keeps the
+  sign-in for that extension, and the sheet says whether the source answers now. **Start over** opens the home page
+  again.
+- **Kept working by itself.** A source you have done this for gets a quiet visit of its home page whenever it fails, at
+  most once in half an hour, and the call is tried again. BatCave's check lasts a day, so this keeps it going. An
+  extension that answers "Open in WebView…" gets the same visit.
+- Admins only, one site at a time, closed after ten minutes without input. It runs over ordinary HTTP, so a reverse proxy
+  needs no websocket setting for it. It needs the bundled extension engine, or your own Suwayomi from v2.4 on.
+
+### Upgrading
+
+- Nothing to do.
+
 ## v0.90.0 — 2026-10-20
 
 **Comments and reactions can be switched off, each for themselves, and the Komga extension's WebView opens the series or

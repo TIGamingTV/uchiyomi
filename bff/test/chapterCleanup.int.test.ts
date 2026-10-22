@@ -40,7 +40,7 @@ let app: any, adminTok: string;
 
 const S = 's_cc_series';
 const FOLDER = 'T!cc/Berserk';
-/** Chapter 1 is the series cover and is therefore never eligible; the tests use 2 and 3. */
+/** Chapter 1 is the series' cover chapter (cleanupCoverPage.int.test.ts is about that); the tests use 2 and 3. */
 const IDS = { cover: 'b_cc_1', two: 'b_cc_2', three: 'b_cc_3', lib: 'b_cc_lib' };
 const USERS = ['cc-alice', 'cc-bob'];
 const ADMIN = 'cc-admin';
@@ -246,11 +246,15 @@ test('a file in the read library is never touched, however thoroughly it was rea
   assert.equal(await exists(join(ROOT, FOLDER, 'own.cbz')), true);
 });
 
-test('the chapter the series draws its artwork from is left alone', { skip }, async () => {
+test('the chapter the series draws its artwork from goes like any other', { skip }, async () => {
+  // v0.97.0 (#332): it was left alone, so every series kept its lowest chapter for ever. Its page is kept where it is the
+  // cover (cleanupCoverPage.int.test.ts); this file is no archive, so there is no page, and it still goes.
+  // ⚠️ Read a day ago, after the file landed: this test read it a year ago, before the file's mtime, so the chapter was
+  // never due (`done_at >= mtime`) and its "left alone" passed with the cover veto dropped too.
   await enable(0);
-  await progress('cc-alice', IDS.cover, true, 365);
-  assert.equal((await runCleanupOnce()).deleted, 0);
-  assert.equal(await exists(join(DL, FOLDER, 'ch1.cbz')), true);
+  await progress('cc-alice', IDS.cover, true, 1);
+  assert.equal((await runCleanupOnce()).deleted, 1);
+  assert.equal(await exists(join(DL, FOLDER, 'ch1.cbz')), false);
 });
 
 test('a bookmarked chapter is left alone', { skip }, async () => {
@@ -469,6 +473,22 @@ test('a file that alone is gone, its folder still there, is marked', { skip }, a
   assert.equal(r.deleted, 1);
   assert.equal(r.stopped, undefined);
   assert.ok((await q('SELECT pruned_at FROM lib_books WHERE id = $1', [IDS.two]))[0].pruned_at);
+});
+
+test('a chapter in a folder the server may not look into is left unmarked, and counted as not removed', { skip: skip || (asRoot && 'root ignores mode bits') }, async () => {
+  // The folder's mode bits slipped (or a share dropped): stat on the file fails with EACCES, but the file is on disk.
+  // Marked deleted, it would vanish from every reader, and its deleted record would stop the sweep fetching it back.
+  // Reintroduce `stat(abs).catch(() => null)` in runCleanupOnce: the row reads pruned.
+  await enable(0);
+  await progress('cc-alice', IDS.two, true, 1);
+  const folder = join(DL, FOLDER);
+  await chmod(folder, 0o000);
+  let r;
+  try { r = await runCleanupOnce(); } finally { await chmod(folder, 0o755); }
+  assert.equal(r.deleted, 0);
+  assert.equal(r.failed, 1, 'counted as not removed, so the result says something was left');
+  assert.equal((await q('SELECT pruned_at FROM lib_books WHERE id = $1', [IDS.two]))[0].pruned_at, null, 'and its row is not marked deleted');
+  assert.ok(await stat(join(DL, FOLDER, 'ch2.cbz')), 'the file is still there');
 });
 
 test('the download root itself is never the file', { skip }, async () => {

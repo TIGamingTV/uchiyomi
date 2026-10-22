@@ -27,6 +27,7 @@ import { IcChevronLeft, IcSearch, IcSparkle, IcX } from '@/components/icons';
 import { forStrip } from '@/lib/jobs';
 import { downloadsHref, stripHref } from '@/lib/libraryView';
 import { useServerDownloads } from '@/lib/useServerDownloads';
+import { canSearchMore, freshCards, noMore, soloSource, type SearchMore } from '@/lib/searchMore';
 /**
  * One search card. Since v0.52.0 (#72) `inLibrary` means held in every provider's language, `libraryLangs` the
  * languages the library holds the title in, and each provider carries its own `lang` and `inLibrary`. Since v0.55.4
@@ -297,8 +298,10 @@ function DiscoverInner() {
   }, []);
 
   // How many sources have answered at all: the heading's "{done} of {total} sources", the picker's hairline and the
-  // skeletons. Counted within the current listing only, or switching modes would look already-finished.
-  const settled = order.filter((k) => k.startsWith(`${listMode}:`)).length;
+  // skeletons. Counted within the current listing only, or switching modes would look already-finished -- and among the
+  // sources asked NOW: one that has left the list (Show 18+ turned off hides every adult one) answered once and stays in
+  // `order`, and counting it read "done" while sources still on the list had not answered.
+  const settled = budget.filter((s) => order.includes(kOf(s.id))).length;
   // The concurrency gate. Four at a time; each settle releases the next -- on every page. Counted by the page being
   // fetched (v0.58.0): `settled` counts a source once, so from page 2 on it opened the gate to every source at once,
   // and with every source asked that would have been a burst of all of them.
@@ -393,6 +396,15 @@ function DiscoverInner() {
   // How many sources the search is still waiting on, from the latest answer; zero in every other mode and
   // on an older server that does not report it.
   const stillAsking = mode === 'search' ? (searchQ.data?.pending ?? 0) : 0;
+  // More of a search on one source (v0.96.0, #331, lib/searchMore.ts): a site pages its search -- BatCave answers ten
+  // at a time -- so a search on the chosen source, or on the only one there is, loads its next page as the wall is
+  // scrolled (below, under "more"). Keyed on the search, so another term, source or filter starts over.
+  const solo = mode === 'search' ? soloSource(selected, searchQ.data?.sources) : null;
+  const moreKey = solo ? [term, solo, ratingAsked, adultOn ? 'adult' : 'safe'].join('\u0000') : '';
+  const [moreState, setMore] = useState<SearchMore>(noMore());
+  const more = moreState.key === moreKey ? moreState : noMore(moreKey);
+  const [moreBusy, setMoreBusy] = useState(false);
+  const moreCards = useMemo(() => freshCards(searchHits, more.items), [searchHits, more.items]);
   /**
    * "3 of 8 sources answered · still asking MangaDex, Aqua Manga, Bato and 2 more": the wall is usable
    * from the first answer, and this is what says the rest is coming and who is slow. Three names, then a
@@ -424,12 +436,16 @@ function DiscoverInner() {
 
   const wall = useMemo(() => {
     // Search arrives already folded: the server grouped it, and searchGroups merges what it has placed since.
-    if (mode === 'search') return { items: searchHits, groups: searchProviders };
+    if (mode === 'search') return { items: moreCards.length ? [...searchHits, ...moreCards] : searchHits, groups: searchProviders };
     const seen = new Set<string>();
     const out: SourceItem[] = [];
+    // Only the sources asked now. Everything loaded stays loaded (nothing is cleared, as above), but a source that has
+    // left the list -- Show 18+ turned off hides every adult one -- kept its covers on the wall under a chip counting
+    // fewer sources than it showed. Turning it back on shows them again from what is already loaded.
+    const asked = new Set(budget.map((s) => kOf(s.id)));
     // Strict arrival order. Interleaving by rank would push already-read tiles down as a slow source lands.
     for (const key of order) {
-      if (!key.startsWith(`${listMode}:`)) continue;
+      if (!asked.has(key)) continue;
       // Filtering is display-only: everything stays loaded, this just decides what is shown. That is why
       // tapping a chip is instant and why it cannot strand the wall the way restarting it used to.
       if (selected && key !== `${listMode}:${selected}`) continue;
@@ -445,7 +461,7 @@ function DiscoverInner() {
     // ones only join its provider list, so its icons grow and the add dialog offers a choice without anything
     // on screen moving.
     return foldByWork(out, nameOf, rankOf, wallAdded);
-  }, [mode, listMode, selected, searchHits, searchProviders, order, rows, nameOf, rankOf, wallAdded]);
+  }, [mode, listMode, selected, searchHits, moreCards, searchProviders, order, rows, nameOf, rankOf, wallAdded, budget, kOf]);
   // What this visit added, in the keys of the view on screen: each view follows the works through its own answers.
   const shownAdded = mode === 'search' ? searchAdded : wallAdded;
   // Each card's icons: every provider behind it, with the extension it came out of, so MangaDex's languages are one
@@ -463,8 +479,9 @@ function DiscoverInner() {
 
   // The empty card for ONE source browsed alone says that source's own reason and wait, the way its sheet
   // row does -- "Rate-limited … · back in ~12 min", not the wall's "nothing new". `selected` names a
-  // budgeted source (the picker clears it on a mode change), but the row is looked up defensively for the
-  // same reason the picker's × is: a missing row must degrade to a sentence, not a crash.
+  // budgeted source (a mode change keeps it only where the new listing has it, and one that leaves the list is let
+  // go), but the row is looked up defensively for the same reason the picker's × is: a missing row must degrade to a
+  // sentence, not a crash.
   const alone = mode === 'newest' && selected
     ? aloneEmpty(budget.find((s) => s.id === selected) ?? { id: selected, name: selected, lang: null }, states[kOf(selected)] ?? 'idle')
     : null;
@@ -498,6 +515,13 @@ function DiscoverInner() {
   // `term` is kept: the query is disabled by the mode, and keeping its observer keeps the answer cached, so
   // searching the same title again after browsing is instant.
   const backToNewest = () => { setQ(''); setMode('newest'); writeQ(''); };
+  // A chosen source that has left the list -- Show 18+ turned off hides every adult one -- is let go. It stayed
+  // chosen: the chip read its raw id, the wall stayed empty, and a search asked only it and said "No results across
+  // your sources". Only once the list has answered, so nothing is let go before there is a list to look in.
+  useEffect(() => {
+    if (!sourcesData || !selected || budget.some((s) => s.id === selected)) return;
+    setSelected(null);
+  }, [sourcesData, budget, selected]);
 
   const open = (it: SourceItem) => {
     const key = workKey(it);
@@ -532,6 +556,34 @@ function DiscoverInner() {
     io.observe(el);
     return () => io.disconnect();
   }, [canPage]);
+  // A search on one source, its next page (#331): asked when the end of the wall comes near, one page at a time, until a
+  // page brings nothing new. A failure ends it too: a search typed again starts over.
+  const canMore = canSearchMore({
+    solo, pages: !!sources.find((s) => s.id === solo)?.searchPages, rating: ratingAsked,
+    pending: stillAsking, firstPage: searchHits.length, more, busy: moreBusy,
+  });
+  const loadMore = useCallback(async () => {
+    if (!solo) return;
+    const key = moreKey, next = more.page + 1, shown = [...searchHits, ...more.items];
+    setMoreBusy(true);
+    let fresh: SourceItem[] = [];
+    try {
+      const r = await api<{ content: SourceItem[] }>(`/api/sources/search?source=${encodeURIComponent(solo)}&q=${encodeURIComponent(term)}&page=${next}`);
+      fresh = freshCards(shown, r.content ?? []);
+    } catch { /* the end, as an empty page is */ }
+    setMore((m) => {
+      const base = m.key === key ? m : noMore(key);
+      return { key, items: [...base.items, ...fresh], page: next, done: fresh.length === 0 };
+    });
+    setMoreBusy(false);
+  }, [solo, moreKey, more, searchHits, term]);
+  useEffect(() => {
+    const el = sentinel.current;
+    if (!el || !canMore) return;
+    const io = new IntersectionObserver((e) => { if (e[0].isIntersecting) void loadMore(); }, { rootMargin: '800px' });
+    io.observe(el);
+    return () => io.disconnect();
+  }, [canMore, loadMore]);
 
   // ---------------------------------------------------------------- jobs
   // The shared jobs answer, read from the cache AppShell's one poller keeps fresh (lib/useServerDownloads.ts):
@@ -677,7 +729,12 @@ function DiscoverInner() {
         count={pool.length}
         selected={selected} onSelect={setSelected}
         mode={listMode}
-        onMode={(m) => { setListMode(m); setSelected(null); setPage(1); if (mode === 'search') backToNewest(); }}
+        // The source shown alone stays chosen when the other listing has it: flipping dropped it, so one source's Newest
+        // flipped to every source's Popular.
+        onMode={(m) => {
+          setListMode(m); setSelected(selected && budgetForMode(sources, m, Infinity).some((s) => s.id === selected) ? selected : null);
+          setPage(1); if (mode === 'search') backToNewest();
+        }}
       />
 
       {/* One mounted child per source asked -- every one in the pool -- and `enabled` only while the gate lets it
@@ -776,6 +833,11 @@ function DiscoverInner() {
             providers={stackOf(it)}
             onAdd={() => open(it)} eager={i < 12} />
         ))}
+        {/* The next page of a search on one source on its way (#331), after the cards: it is asked only once every source
+            has answered, so the still-loading card below is never beside it. */}
+        {mode === 'search' && moreBusy && Array.from({ length: 3 }).map((_, i) => (
+          <div key={`mk${i}`} className="skeleton aspect-[2/3] rounded-2xl" data-search-more />
+        ))}
         {!wall.items.length && Array.from({ length: Math.min(18, pending * 6) }).map((_, i) => (
           <div key={`sk${i}`} className="skeleton aspect-[2/3] rounded-2xl" />
         ))}
@@ -794,7 +856,9 @@ function DiscoverInner() {
               : budget.length === 0 ? (isAdmin ? tr('No sources are set up yet. Add one in Admin \u2192 Sources.') : tr('No sources are set up yet. Ask whoever runs this server.'))
               // One source alone: its reason, amber, before any sentence about the wall as a whole.
               : alone ? alone.text
-              : Object.values(states).every((s) => s === 'blocked')
+              // The sources asked now, as the wall and its count read them (#319): a source hidden since, or the other
+              // listing's, says nothing about whether these could be reached.
+              : budget.every((s) => states[kOf(s.id)] === 'blocked')
                 ? tr('No source could be reached right now.')
                 : tr('Nothing new from these sources right now.')}
           </p>
