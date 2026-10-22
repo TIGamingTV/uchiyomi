@@ -47,7 +47,8 @@ import { randomUUID } from 'crypto';
 import { q, one } from './db';
 import { runtime } from './runtime';
 import { logAudit } from './audit';
-import { containedPath } from './fsGuard';
+import { containedPath, statOrGone } from './fsGuard';
+import { catalogRootUnavailable } from './catalogRootGuard';
 import { countPages } from './pageCount';
 import { haveNumbers } from './libraryNumbers';
 import { atHiddenNumber } from './noticeChapters';
@@ -646,10 +647,28 @@ async function stepSolver(r: RepairResult, log?: Log): Promise<void> {
  * unknown size and take out every layout decision the reader makes.
  */
 async function stepCount(r: RepairResult, opts: RepairOpts, log?: Log): Promise<void> {
+  // ⚠️ NOT FROM A ROOT THAT IS NOT THERE. The stamp is for good (only a changed mtime clears it), and `pages = 0` with
+  // a stamp is what Health's Chapter files card lists as a file nobody can open. A root that cannot be opened, holds
+  // nothing, or holds only what a sweep wrote onto a bare mount point -- a network share or removable drive that isn't
+  // mounted -- would have every chapter in the queue stamped 0 and listed as broken once it is back. Its rows are left
+  // for a night the root is there (lib/catalogRootGuard.ts), and said. Reintroduce by counting every row: "the nightly
+  // page count with the library root missing" in libraryRootGone.int.test.ts finds the library's chapters stamped.
+  // The roots are asked BEFORE the batch is picked, and a root that is not there is left out of the batch itself, as
+  // the fingerprint and page-hash passes leave it: picked from the newest rows first, a root that is down with that
+  // many waiting would fill every night's batch and starve the root that is there. Reintroduce by choosing the batch
+  // first: "a root that is not there does not starve the one that is" in catalogRootGuard.int.test.ts counts nothing.
+  const down = new Map<string, string>();
+  const waiting = await q<{ root: string }>(
+    'SELECT DISTINCT root FROM lib_books WHERE pages = 0 AND pages_checked_at IS NULL AND pruned_at IS NULL');
+  for (const { root } of waiting) {
+    const why = await catalogRootUnavailable(root);
+    if (why) down.set(root, why);
+  }
+  for (const [root, why] of down) log?.warn(`repair: ${root} cannot be read (${why}) -- is the volume mounted? Its chapter files were not counted`);
   const rows = await q<{ id: string; root: string; file: string }>(
     `SELECT id, root, file FROM lib_books
-      WHERE pages = 0 AND pages_checked_at IS NULL AND pruned_at IS NULL
-      ORDER BY mtime DESC LIMIT $1`, [opts.autofix ? AUTOFIX_COUNT_MAX : REPAIR_COUNT_MAX],
+      WHERE pages = 0 AND pages_checked_at IS NULL AND pruned_at IS NULL AND root <> ALL($2::text[])
+      ORDER BY mtime DESC LIMIT $1`, [opts.autofix ? AUTOFIX_COUNT_MAX : REPAIR_COUNT_MAX, [...down.keys()]],
   );
   planned('count', rows.length);
   const cur = here({ kind: 'files', phase: 'counting', done: 0, of: rows.length })!;
@@ -658,7 +677,11 @@ async function stepCount(r: RepairResult, opts: RepairOpts, log?: Log): Promise<
     // A path that escapes its root is not a chapter to count; it is something for the health page. Left
     // unstamped as well as uncounted, exactly as the verify task leaves it out of `checked`.
     const abs = containedPath(b.root, b.file);
-    if (!abs) { cur.done!++; return; }
+    if (!abs || down.has(b.root)) { cur.done!++; return; }
+    // A file that is not there is still stamped 0 (lib/pageCount.ts); one the server may not look at (EACCES, an I/O
+    // error: statOrGone) says nothing about its pages, and is left for a night it can be read. Reintroduce by counting
+    // it: "the nightly page count does not stamp a chapter in a folder it may not read" in libraryRootGone.int.test.ts.
+    if (typeof (await statOrGone(abs)) === 'string') { cur.done!++; return; }
     const pages = await countPages(abs);
     const done = await q(
       'UPDATE lib_books SET pages = $1, pages_checked_at = now() WHERE id = $2 AND pages = 0 RETURNING id',

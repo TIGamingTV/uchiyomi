@@ -49,6 +49,9 @@
 // eye -- TI caught a wrong match by its cover that the automatic judgement would have followed. A proposal is then
 // followed (decideProposal: checked again, then followJudged under the cap) or dismissed, one at a time, and says
 // which it was. The mode is kept in the run's `scope` (`review: true`): no column, so v0.50.0 boots on the same rows.
+// A review also proposes, amber, a series a source files under a name the series does not have (v0.95.0, #316): the
+// result that source gave first under two or more of the series' names, when its numbers line up both ways. Only a
+// person can say that is the same series; following it keeps the name.
 //
 // Replace (v0.54.0): the same run over every series of one source, `mode: 'replace'`, MOVES them off it. The owner,
 // after a full Find run left all 195 aqua series on aqua: "i have to go one by one test and find replacement
@@ -81,7 +84,7 @@ import { effectivePrefsFor, readSeriesPrefs } from './scanlatorPrefs';
 import { assess, MIN_HAVE } from './fill';
 import { postingOrderSeries } from './numbering';
 import { haveNumbers } from './libraryNumbers';
-import { altTitlesFor, learnAltTitles, parseAltTitles, SEARCH_NAMES } from './altTitles';
+import { altTitlesFor, learnAltTitles, parseAltTitles, recordAltTitles, SEARCH_NAMES } from './altTitles';
 import { searchByNames, takeHuntSlot, releaseHuntSlot, rememberJudgement } from './sourceHunt';
 import { recordVerdict, forgetVerdict } from './scoutMemory';
 import { budgetFor } from './sources/budget';
@@ -90,6 +93,7 @@ import { runtime } from './runtime';
 import { checkRunning } from './sourceWatchdog';
 import { beginRun, endRun, stopRequested, type RunCard } from './downloadJobs';
 import { say, type Part } from './said';
+import { logLevel } from '../env';
 import { updateSeries } from './updater';
 import { PACE_MS } from './bulkNewest';
 import { scheduleHealthSummaryRefresh } from './healthSummary';
@@ -113,6 +117,39 @@ import { followerLimit } from './followLimit';
 export const FIND_SERIES_WALL_MS = 90_000;
 /** Sources that carry the title before a series stops asking more: the fill scan's SCAN_ENOUGH. */
 export const FIND_CARRIERS = 3;
+
+/**
+ * LOG_LEVEL=debug (#316): each series' run in the server log, one line a step -- the names it searched each source
+ * under, what each answered, the hit it took, the verdict with its numbers, and how the series ended -- for an admin
+ * asking why a run found nothing for a series another source plainly lists. Mutable for the tests alone.
+ */
+export const findLog = { on: logLevel === 'debug' || logLevel === 'trace' };
+const trace = (line: string) => { if (findLog.on) console.log(`[find] ${line}`); };
+const quoted = (t: string) => JSON.stringify(t);
+
+/** What a source's search brought back, in a log line: how many, the first few titles, and the hit taken. */
+function heardLine(term: string, results: readonly SourceSeries[] | null, hit: SourceSeries | null): string {
+  if (!results) return `${quoted(term)}: no answer`;
+  if (!results.length) return `${quoted(term)}: no results`;
+  const titles = results.slice(0, 5).map((r) => quoted(r.title)).join(', ') + (results.length > 5 ? ', …' : '');
+  return `${quoted(term)}: ${results.length} result${results.length === 1 ? '' : 's'} (${titles}), `
+    + (hit ? `took ${quoted(hit.title)}` : 'none of them is this title');
+}
+
+/** A candidate's verdict, in a log line, with the numbers it was judged by. */
+function judgementLine(j: Judgement, primary: PrimaryFacts, prefs: ReleasePrefs): string {
+  const theirs = quoted(j.theirTitle ?? '?');
+  const cover = j.coverage !== null ? `, coverage ${Math.round(j.coverage * 100)}%` : '';
+  if (j.why === 'ok') return `${theirs} lines up${cover}`;
+  if (j.why === 'title_differs') return `${theirs} refused: its own title is not ours (${quoted(primary.title)}) or one of its other names`;
+  if (j.why === 'numbering_differs') {
+    const nums = chooseReleases(j.chapters ?? [], prefs).releases.map((c) => c.number);
+    const whole = (xs: number[]) => new Set(xs.map((n) => Math.floor(n))).size;
+    return `${theirs} refused: its chapter numbers do not line up with ours -- ours ${assess(primary.numbers, nums).matched}`
+      + ` of ${whole(primary.numbers)} found there, theirs ${assess(nums, primary.numbers).matched} of ${whole(nums)} found here${cover}`;
+  }
+  return `${theirs} could not be judged: ${j.why}`;
+}
 /** How often a run waiting on a sweep, a repair or the daily check looks again. */
 export const FIND_QUIET_POLL_MS = 5_000;
 /** How long a series' main source may take to give its description, for the other names it lists. */
@@ -179,11 +216,12 @@ export interface FindProposal {
   coverage: number | null;
   verdict: 'green' | 'amber';
   /**
-   * Why a person should look first. A search's: the numbers do not line up though a name matches exactly, or it matched
-   * only under another name. A follower's (v0.54.0, Replace): it is cooling down, it lists under MIN_COVERAGE of the
-   * series' numbers, or it has not answered for its list within the week.
+   * Why a person should look first. A search's: the numbers do not line up though a name matches exactly, it matched
+   * only under another name, or (`their_name`, v0.95.0, #316) the source lists it under a name the series does not have,
+   * which the source gave first for two or more of the series' names. A follower's (v0.54.0, Replace): it is cooling
+   * down, it lists under MIN_COVERAGE of the series' numbers, or it has not answered for its list within the week.
    */
-  amber?: 'numbering' | 'other_name' | 'cooling' | 'coverage' | 'stale';
+  amber?: 'numbering' | 'other_name' | 'their_name' | 'cooling' | 'coverage' | 'stale';
   /** `promoted` (v0.54.0): made the series' main source. */
   state?: 'followed' | 'dismissed' | 'promoted';
   // ---- v0.54.0, a Replace run's review only.
@@ -558,14 +596,17 @@ async function learnNames(
 /**
  * A judgement as a review's proposal (v0.51.0), or null when it is not one to show. Green is exactly what an automatic
  * run follows -- `ok` -- on our own title (equal, or one inside the other, as titleMatch reads it). Amber is for a
- * person to look at: `ok` only because the candidate is equal to one of the series' OTHER names (`other_name`), or a
- * name matched EXACTLY and the chapter numbers do not line up (`numbering`). Out: a title that differs, a source that
+ * person to look at: `ok` only because the candidate is equal to one of the series' OTHER names (`other_name`), `ok`
+ * under a name only the source gives it (`their_name`, `tied`: findFor's #316 rule), or a name matched EXACTLY and the
+ * chapter numbers do not line up (`numbering`). Out: a title that differs, a source that
  * did not answer, and -- PR #133's rule -- numbers that do not line up under a title that merely contains ours, which
  * is what a sequel or a spin-off looks like. The line-up is counted as judgeCandidate counts it: one copy per number
  * under the series' release preferences, whole numbers, both ways.
  */
-function proposalOf(j: Judgement, hit: SourceSeries | null, primary: PrimaryFacts, prefs: ReleasePrefs): FindProposal | null {
+function proposalOf(j: Judgement, hit: SourceSeries | null, primary: PrimaryFacts, prefs: ReleasePrefs, tied = false): FindProposal | null {
   if (!j.theirTitle || (j.why !== 'ok' && j.why !== 'numbering_differs')) return null;
+  // A source's own name for it (#316, findFor): only numbers that line up both ways make it worth a look.
+  if (tied && j.why !== 'ok') return null;
   // Reintroduce by dropping this line: "a review-first run follows nothing" reads Kappa Story's sequel proposed.
   if (j.why === 'numbering_differs' && titleMatch(j.theirTitle, primary) !== 'exact') return null;
   const byTitle = titleMatch(j.theirTitle, { title: primary.title }) !== null;
@@ -581,8 +622,8 @@ function proposalOf(j: Judgement, hit: SourceSeries | null, primary: PrimaryFact
     ours: { lined: assess(primary.numbers, nums).matched, of: whole(primary.numbers) },
     theirs: { lined: assess(nums, primary.numbers).matched, of: whole(nums) },
     coverage: j.coverage,
-    verdict: green ? 'green' : 'amber',
-    ...(green ? {} : { amber: j.why === 'ok' ? 'other_name' as const : 'numbering' as const }),
+    verdict: green && !tied ? 'green' : 'amber',
+    ...(green && !tied ? {} : { amber: tied ? 'their_name' as const : j.why === 'ok' ? 'other_name' as const : 'numbering' as const }),
   };
 }
 
@@ -599,8 +640,10 @@ async function findFor(
   s: { id: string; title: string }, a: ActiveRun, progress: FoundSource[],
   replacing?: { dead: ReadonlyArray<{ sourceId: string; name: string }>; dropped: Array<{ sourceId: string; name: string }> },
 ): Promise<{ result: FindResult; asked: boolean }> {
-  const end = (why: FindWhy | undefined, asked: boolean) =>
-    ({ result: { seriesId: s.id, title: s.title, followed: [...progress], ...(why && !progress.length ? { why } : {}) }, asked });
+  const end = (why: FindWhy | undefined, asked: boolean) => {
+    trace(`${quoted(s.title)}: ${progress.length ? `followed ${progress.map((p) => p.name).join(', ')}` : why ?? 'nothing found'}`);
+    return { result: { seriesId: s.id, title: s.title, followed: [...progress], ...(why && !progress.length ? { why } : {}) }, asked };
+  };
   const row = await one<{ title: string; source_id: string | null; source_series_id: string | null; summary: string | null; numbering: string | null }>(
     `SELECT s.title, s.source_id, s.source_series_id, s.summary, s.numbering FROM lib_series s WHERE s.id = $1 AND ${visibleToAll('s')}`, [s.id]);
   // Hidden or merged away since the run started: nothing to follow onto, and nothing asked.
@@ -681,12 +724,16 @@ async function findFor(
   }
 
   const primary: PrimaryFacts = { title: row.title, altTitles: names, numbers, lang: lang.lang, exactLang: lang.sameBaseSibling };
+  trace(`${quoted(row.title)}: asking ${order.length} source${order.length === 1 ? '' : 's'} under ${[row.title, ...names].map(quoted).join(', ')}`
+    + ` -- ${new Set(numbers.map((n) => Math.floor(n))).size} chapter numbers of ours to line up`);
   const prefs = await effectivePrefsFor(await readSeriesPrefs(s.id), 0);
   const deadline = Date.now() + wallMs;
   const left = () => deadline - Date.now();
   const judged: Array<Judgement | null> = new Array(order.length).fill(null);
   // The search hit behind each judgement: its cover and page, for a review's proposal.
   const hits: Array<SourceSeries | null> = new Array(order.length).fill(null);
+  // Which judgements are of a name only the source gives the series (#316, below): proposed amber, never followed.
+  const tied = new Set<number>();
   let carriers = 0, ok = 0, answered = 0, asked = false, refused = false, unjudged = false, cut = false;
   const enough = () => ok >= free || carriers >= FIND_CARRIERS;
   // Scan order, under the hunt's slots (FIFO, so the order is the order sources are asked in). A source whose turn
@@ -699,10 +746,34 @@ async function findFor(
       if (!src) return;
       if (left() < MIN_TRY_MS) { cut = true; return; }
       asked = true;
-      const found = await searchByNames(src, row.title, names, left);
+      const found = await searchByNames(src, row.title, names, left, undefined, undefined,
+        findLog.on ? (term, results, hit) => trace(`${quoted(row.title)} · ${src.name}: ${heardLine(term, results, hit)}`) : undefined);
       if (found.answered) answered++;
       // v0.80.0: what it said is kept for the scout and the hunt (lib/scoutMemory.ts), as theirs is.
       if (found.answered && !found.hit) void recordVerdict(s.id, id, 'no_hit', { ourCount: numbers.length });
+      // ⚠️ A NAME ONLY THE SOURCE GIVES IT IS A PERSON'S CALL (#316). TIGamingTV's "Revenge of the Iron-Blooded Sword
+      // Hound" is "Revenge of the Baskerville Bloodhound" on three sites, each of which answered with it first for the
+      // title and the other names, and the run said it found nothing. Chapter numbers cannot say it is the same
+      // series -- any two 185-chapter series number 1..185 -- so a review-first Find run judges that result as though
+      // its name were one of the series' other names (both ways, PR #119's rule) and proposes it amber, with its
+      // cover; following it keeps the name (decide). An automatic run, the hunt and a Replace never take it. It is
+      // not a carrier, so it never stops the run from asking a source that carries the title. Reintroduce by
+      // following it in an automatic run: "an automatic run never follows a name only the source gives it" in
+      // findTheirName.int.test.ts finds it followed.
+      if (!found.hit && found.tied && a.review && !replacing) {
+        if (isStopped(a) || left() < MIN_TRY_MS) return;
+        const their = found.tied;
+        trace(`${quoted(row.title)} · ${src.name}: ${quoted(their.title)} came first under two of its names -- judged as another name of it`);
+        const j = await bounded(judgeCandidate({ ...primary, altTitles: [...primary.altTitles, their.title] },
+          { source: id, sourceId: their.sourceId }, { prefs, health }), left()).catch(() => null);
+        if (!j) return;
+        trace(`${quoted(row.title)} · ${j.name}: ${judgementLine(j, primary, prefs)}`);
+        if (j.why !== 'ok') return;
+        judged[i] = j;
+        hits[i] = their;
+        tied.add(i);
+        return;
+      }
       if (!found.hit || enough() || isStopped(a)) return;
       carriers++;
       if (left() < MIN_TRY_MS) { cut = true; return; }
@@ -710,6 +781,7 @@ async function findFor(
       const j = await bounded(judgeCandidate(primary, { source: id, sourceId: found.hit.sourceId }, { prefs, health }), left())
         .catch(() => null);
       if (!j) { cut = true; return; }
+      trace(`${quoted(row.title)} · ${j.name}: ${judgementLine(j, primary, prefs)}`);
       judged[i] = j;
       hits[i] = found.hit;
       void rememberJudgement(s.id, j, numbers.length);
@@ -728,7 +800,7 @@ async function findFor(
   // `not_tried` (below), as automatic mode's series in flight is: what was found so far is not the whole answer.
   if (a.review) {
     const proposals = isStopped(a) ? [] : judged.flatMap((j, i) => {
-      const p = j ? proposalOf(j, hits[i], primary, prefs) : null;
+      const p = j ? proposalOf(j, hits[i], primary, prefs, tied.has(i)) : null;
       return p ? [p] : [];
     });
     // Replace (v0.54.0): each is a source the search found, and the first green one is what the run would follow and
@@ -747,8 +819,8 @@ async function findFor(
   // Reintroduce by dropping the review branch above and this guard: "a review-first run follows nothing" in
   // findSources.int.test.ts finds its series following the sources it should have proposed.
   let capped = false, gone = false;
-  for (const j of a.review ? [] : judged) {
-    if (!j || j.why !== 'ok') continue;
+  for (const [i, j] of (a.review ? [] : judged).entries()) {
+    if (!j || j.why !== 'ok' || tied.has(i)) continue;
     if (progress.length >= free || isStopped(a)) break;
     if (replacing) await makeRoom(s.id, replacing.dead, replacing.dropped);
     const written = await followJudged(s.id, j, { addedBy: a.userId }).catch(() => 'gone' as const);
@@ -1069,6 +1141,10 @@ async function decide(
     if (written !== 'inserted') return { refused: 'not_found' };
     // An admin's own pick (v0.80.0): what the scout remembered about it for this series, `removed` included, is gone.
     await forgetVerdict(seriesId, sourceId);
+    // The name the source gives it (#316), kept as the admin's own: the next run, the hunt and every other source that
+    // files it under that name find it by the exact other-name rule, with nobody asked again. Reintroduce by dropping
+    // it: "following a source's own name keeps the name" in findTheirName.int.test.ts lists no new name.
+    if (p.amber === 'their_name') await recordAltTitles(seriesId, [p.title], 'admin', { userId }).catch(() => []);
     await logAudit('series.follow_source', {
       userId,
       detail: {

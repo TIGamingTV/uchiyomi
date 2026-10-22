@@ -165,8 +165,12 @@ which also answers `chapters: 0`.
 
 `GET /api/sources` lists what you can reach: each entry carries `id`, `name`, `lang` (null when the source
 declares no single language, which means it belongs to every language group), `latest` (whether it can be
-browsed without a query), `popular` (whether it can offer its own popularity ranking), `used` (how many
-series in the library came from it), its health `status`, and `note`. Since v0.82.0 a backup extension's source (one
+browsed without a query), `popular` (whether it can offer its own popularity ranking), `searchPages` (since v0.96.0,
+whether a search on it goes on past the first page: every extension's does), `used` (how many
+series in the library came from it), its health `status`, and `note`. `GET /api/sources/search?source=&q=&page=`
+searches one source; since v0.96.0 ([#331](https://github.com/AngeloSha/uchiyomi/issues/331)) `page` (1-based, at most
+30) asks a later page of the same search, as the site pages it, and a source without `searchPages` answers a later
+page with `{ content: [] }`, never its first page again. Since v0.82.0 a backup extension's source (one
 Uchiyomi installed by itself to finish downloads, removed again when unused) carries `backup: true`: it is listed so a
 chapter's source can be named, and left out of every route Discover uses -- `search-all`, `search`, `latest`,
 `popular`, `find` and `edition-candidates` never ask it.
@@ -1532,7 +1536,8 @@ between series; the rest read `skipped` *The server is shutting down.*
 ### Personal
 ```
 GET    /api/favorites             POST   /api/favorites
-DELETE /api/favorites/:seriesId   GET    /api/history
+DELETE /api/favorites/:seriesId   PUT    /api/favorites/order
+GET    /api/history
 GET    /api/stats                 GET    /api/wrapped
 GET    /api/stats/time            GET    /api/series/:id/reading-pace
 GET    /api/stats/insights
@@ -2157,7 +2162,9 @@ the cover moves to the
 lowest live chapter. A chapter somebody has a bookmark in is skipped (`bookmarked`), as the cleanup skips
 it: a bookmark names a page inside the file. A chapter whose file *and* folder are missing is skipped
 (`unlink_failed`) rather than marked — that is the download volume not being mounted, not a deleted
-chapter. It answers `{ok, applied, bytes, skipped: [{id, reason}]}` with `reason` one of `not_found`,
+chapter — and so is one the server may not look at (EACCES, an I/O error), whose file may well be on disk.
+The bulk delete's crash recovery leaves such a chapter live as well (`interrupted_unreadable` in its
+`chapterSkips`). It answers `{ok, applied, bytes, skipped: [{id, reason}]}` with `reason` one of `not_found`,
 `not_owned`, `already_pruned`, `bookmarked`, `outside_root`, `unlink_failed`, or **409** `refused` (with
 `message` and `fix`) when the download directory is not writable.
 
@@ -2255,7 +2262,7 @@ The v0.55.8 database changes behind these contracts are additive: `libraries.ani
 the existing text column and gains the `rescan_missing` provenance value plus the audited legacy backfill described
 above. Rolling the application back does not require dropping any of them; an older build simply does not name them.
 
-`POST /api/admin/series/:id/delete-files {confirm}` — `confirm` is the series' title, compared through the
+`POST /api/admin/series/:id/delete-files {confirm, gone?}` — `confirm` is the series' title, compared through the
 fold described under *Typing a title to confirm* below (**400** `confirm_mismatch` otherwise) — is the
 irreversible step and only ever after the hide: it removes the series'
 chapter files from every root it occupies (the read library included, which is why it takes the typed
@@ -2264,20 +2271,28 @@ pruned with `pruned_reason = 'deleted'` — the same tombstone `chapters/delete`
 restore afterwards lists those chapters as `pruned` (*Deleted from the server*, where `chapters/refetch`
 brings one back onto the same row — for the rows under the download folder; a read-library row is
 `not_owned` there and its file is the admin's to put back) instead of as openable chapters that 404, the updater's have-set keeps
-counting them as held, and `files` in the answer `{ok, files, bytes}` counts real unlinks, not rows (a
-second call reports 0). A row whose file is already absent is reconciled only when the root is provably
+counting them as held, and `files` in the answer `{ok, files, bytes, unchecked, gone, unproven}` counts real unlinks,
+not rows (a second call reports 0). A row whose file is already absent is reconciled only when the root is provably
 mounted — `stat(root)` works, at least one chapter file of any series is present under it (a present folder
 is not proof: the downloader `mkdir -p`s series folders on a bare mount point), and no more than 90 % of
 what was looked at is absent, the verify task's own rule; up to 200 other series' live rows on the root are
 stat'ed when none of this series' own is present. Under that proof a live row with no file is marked
 `pruned_reason = 'deleted'` and a `'missing'` tombstone becomes `'deleted'`; on an unproven root every row
 is left as it was, so an unmounted share leaves live rows, which Forget refuses on. `files` still counts
-unlinks only, so a series whose folder was removed by hand answers `files: 0` and its Removed row then
-offers Forget (`live_books` 0). Delete files on a merge survivor also removes the folders of the rows
-merged into it, and every folder is resolved on every root before anything is unlinked. It refuses,
+unlinks only, so a series whose folder was removed by hand answers `files: 0` with `gone` counting the rows it
+marked, and its Removed row then offers Forget (`live_books` 0). Since v0.95.0 (#328) the rows left live on an
+unproven root are counted in `unproven`, and the same call again with `gone: true` — the admin's word that they
+deleted or moved those files — marks them without the proof, except on a root that cannot be opened or opens
+empty (what a share that is not mounted looks like), which refuses **409** with *Mount it, then try again.* Delete files on a merge survivor also removes the folders of the rows
+merged into it, and every folder is resolved on every root before anything is unlinked. Only a file that is
+not there (ENOENT) is absent: one the server may not look at (EACCES from a folder's mode bits, an I/O error)
+is neither removed nor marked, its row stays live, the answer counts it in `unchecked`, and a root holding
+one keeps the series folder. It refuses,
 **409** `refused` `{message, fix}`, rather than half-applying: the series is not hidden yet, it has no
-chapter rows on any root (*That series has no files on disk.*), a folder resolves outside the library, or a
-root is not writable (`PUID`/`PGID` unset; `fix` names it). Nothing here deletes a series row or a chapter
+chapter rows on any root (*That series has no files on disk.*), a folder resolves outside the library, a root
+is not there at all, or a root that still holds one of its files is not writable (`PUID`/`PGID` unset; `fix` names
+it). A root the files have already left need not be writable (since v0.95.0, #328): nothing is written there, and
+its folder, if one is left, stays. Nothing here deletes a series row or a chapter
 row: `read_progress.book_id` is `ON DELETE RESTRICT` on purpose. The one route that does is the third step
 below.
 
@@ -2356,9 +2371,12 @@ Fetch newest — download those chapters again onto the same rows and the scan c
 series' `chapter_floor` is outside the sweep's want-list and comes back through `chapters/refetch` only. A
 row the cleanup already marked keeps its reason. It never runs at boot or on a schedule. `GET /api/admin/tasks`
 always lists it: `{id: 'verify', name: 'Verify chapter files', schedule: 'on demand · after a database-only
-restore', lastRun: number | null, lastResult: {ok: true, checked, missing, readLibraryMissing, unmounted:
-string[], roots, ms, stopped?: 'shutdown'} | null, running}` — `checked` is rows whose file was looked for
-under roots that were not skipped (both roots), `missing` the download-root rows marked this run. `lastRun`
+restore', lastRun: number | null, lastResult: {ok: true, checked, missing, readLibraryMissing, unchecked,
+unmounted: string[], roots, ms, stopped?: 'shutdown'} | null, running}` — `checked` is rows whose file was looked for
+under roots that were not skipped (both roots), `missing` the download-root rows marked this run, `unchecked` the
+rows whose file could not be looked at (a stat that failed with anything but ENOENT/ENOTDIR, such as EACCES or an
+I/O error: never marked, never counted as checked, and a root where every row was such is reported in
+`unmounted`). `lastRun`
 and `lastResult` are persisted in `server_settings.verify_last_run` / `verify_last_result`, so a restart does
 not turn the last run into "not run yet"; a run that threw stores a NULL result, so no stale healthy line
 comes back. A shutdown stops it between batches; what it had marked stays marked, because it was true.
@@ -2855,7 +2873,29 @@ GET    /api/admin/extensions/sources     POST   /api/admin/extensions/sources/:i
 POST   /api/admin/extensions/sources/bulk
 GET    /api/admin/extensions/sources/:id/preferences
 POST   /api/admin/extensions/sources/:id/preferences
+POST   /api/admin/extensions/sources/:id/site
+GET    /api/admin/extensions/site/:session/stream
+POST   /api/admin/extensions/site/:session/input
+POST   /api/admin/extensions/site/:session/open
+DELETE /api/admin/extensions/site/:session
 ```
+
+**Open site (v0.91.0, #314).** Mihon's "Open in WebView", for a source whose site wants a sign-in or a check the engine's
+background browser cannot pass. `POST /api/admin/extensions/sources/:id/site` with `{ width, height }` opens the source's
+home page (its `homeUrl`) in the extension engine's own browser (Suwayomi's WebView) and answers `{ session, name, site }`.
+`GET …/site/:session/stream` is the page live, one JSON object a line (`application/x-ndjson`): `frame` (a base64 JPEG
+since v0.91.1, a PNG before; at most five a second, the newest), `address`, `load`, `ping` every 15 s, and `closed` last.
+Read it with `fetch` and the bearer token. `POST …/site/:session/input` takes `{ input: [...] }`, 1 to 100 of `event`
+(mouse buttons, moves, wheel and keys, in the page's pixels), `paste`, `resize`, `home` or `seen` (since v0.91.1: `{ type:
+'seen', seq }` says frame `seq` arrived; the next frame goes out only then, or three seconds on, so a slow connection gets
+the newest picture rather than a growing queue). `POST …/site/:session/open` with `{ url }` (since v0.94.0) opens a link
+in the page: the sign-in link a site emails, which signs in whichever browser opens it. Only the source's own site and its
+subdomains (422 `other_site` otherwise), since the engine's browser sits inside the server's network; the link is not
+logged. `DELETE …/site/:session` is Done: the page is left, which is
+when the engine saves its cookies for its extensions, and the answer is `{ saved, test }`, the source's smoke test after.
+Admins only, one page at a time (409 `site_busy` while another admin's is in use), closed after ten minutes without
+input. A source an admin has done this for, and any source whose extension answers "Open in WebView…", gets a quiet
+visit of its home page when it fails, at most once in half an hour, and the call is tried once more.
 
 **An extension's own settings (v0.49.0, #116).** `GET /api/admin/extensions/sources/:id/preferences` reads the
 preference screen Mihon shows for one extension source, through the engine: `{ source { id, name, lang, pkgName,

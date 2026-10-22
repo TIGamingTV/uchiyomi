@@ -137,10 +137,16 @@ profile; **Check for new chapters** is a key on **Updates**. On a phone the bar 
 **Library**, **Search**, **Discover**, **Offline** and **You**.
 
 **Customize Home** (since v0.66.0): the key at the end of the greeting's line lists Home's rails — *Keep reading*,
-*For you*, *New episodes*, your lists and the rest — each with arrows to move it up or down and a switch to hide it.
+*For you*, *New episodes*, your lists and the rest — each with arrows to move it up or down (or drag a row to where it
+belongs, see *Dragging to reorder* below) and a switch to hide it.
 Home follows at once, and the arrangement is saved to your account, so your other devices open the same Home; **Reset**
 puts the original order back. Your lists move together as one rail, and which lists those are is still chosen on
 **Lists** (the sheet's **Choose lists** goes there). A hidden rail isn't fetched at all.
+
+**Your favorites in your order** (since v0.97.0): **Manage** at the end of the *Your favorites* row opens your favourites
+as a list. Drag one into place (on a phone, hold it a moment first), move it a step with its arrows, or take it off with
+its ×. Home shows them in that order, and so does every other device and the OPDS feed. A series you favourite later
+comes first until you move it.
 
 **Background** (since v0.66.0, **Profile → Settings → Appearance**): **OLED black**, the default and true black, or
 **Graphite**, a soft charcoal, or **Midnight**, a deep blue, for screens where true black is harsh. The whole app follows,
@@ -155,6 +161,14 @@ the default), **A–Z**, **Z–A**, **Last read** (what you read most recently f
 (the series whose newest chapter came most recently first). Each list remembers its own order, on your account, so it
 opens the same way on your other devices. **Edit** removes series from the list and moves them within your order with
 the arrows; a series added to a list goes to its end.
+
+**Dragging to reorder.** Wherever the app keeps something in an order you choose, you can drag it into place as well as
+use its arrows: Home's rails in **Customize Home**, the series of a list while you **Edit** it, the **Source order**,
+the **Default priority** of scanlation groups in **Admin → Settings → Downloads → Scanlation groups**, and a series' own ranked groups in
+its *Sources & translations* sheet. With a mouse, press an item and move it; a bar in the accent colour shows where it
+would land, and letting go there puts it in place. On a touch screen, **hold** the item for a moment until it lifts,
+then drag (a finger that moves at once scrolls the page, as usual). A key, field or link inside an item keeps its own
+press, **Escape** cancels a drag in progress, and the arrows stay for keyboards and screen readers.
 
 Each List card also has **Show on Home** (v0.55.8, the remaining part of
 [#164](https://github.com/AngeloSha/uchiyomi/discussions/164)). Pick zero to three and arrange their Home positions
@@ -390,7 +404,9 @@ Progress, favorites, and history are **per-user**, so each account has its own.
 removable tags above the grid, and they live in the URL, so you can share a filtered view.
 
 **Doing something to many series at once.** Hit **Select** on the Library page, tap the ones you want, and the
-bar at the bottom shows what can be done with them. **Select all**, beside *Done*, takes every series loaded
+bar at the bottom shows what can be done with them. With a keyboard, **Shift**-click picks every series between the
+last one you clicked and this one (since v0.96.0, [#333](https://github.com/AngeloSha/uchiyomi/issues/333)); on a
+picked one it unpicks the run instead. **Select all**, beside *Done*, takes every series loaded
 so far — the grid loads as you scroll, so scroll further and tap it again for more; the count on the bar
 says how many are in hand. The chips:
 
@@ -514,7 +530,8 @@ limits apply as everywhere else.
 When nobody chose a picture, a series is shown with:
 
 - **its cover**: the cover of the source it was added from; else AniList's, when AniList's entry carries the series'
-  name; else its own first page.
+  name; else its own first page. When the read-chapter cleanup (section 8) deletes the chapter that page is in, it keeps
+  a copy of the page first, so the cover stays.
 - **its banner**: AniList's (or its anime adaptation's) on the same condition; else one made from the series' own
   pages (*New banner* in *Edit details* picks another).
 
@@ -826,6 +843,19 @@ once, calmly. The idea is @TIGamingTV's ([#119](https://github.com/AngeloSha/uch
   tried*: the search was stopped, ran out of time or was interrupted by a restart before it got there (or the series
   was removed or merged meanwhile) — never *not found* — with **Search the {n} series not tried**. *Earlier searches* lists the runs before it; the server
   keeps the last 20.
+- **Why a series found nothing, in detail** (since v0.92.0, [#316](https://github.com/AngeloSha/uchiyomi/issues/316)).
+  Set `LOG_LEVEL=debug` in `.env` and restart, and the server log (`docker logs uchiyomi`) says for each series what
+  the run did: the names it searched each source under, what each source answered (the first few titles), which
+  result it took, and why a match was refused — its own title was not this series', or its chapter numbers did not
+  line up, with how many of yours it lists and how many of its yours does. The lines start `[find]`. Set it back
+  when you are done: the log is long at debug.
+- **A site's own name for a series** (since v0.95.0, [#316](https://github.com/AngeloSha/uchiyomi/issues/316)). A site
+  sometimes lists a series under a name it does not have here: *Revenge of the Iron-Blooded Sword Hound* is *Revenge of
+  the Baskerville Bloodhound* on three sites. A run started with **Let me review each match first** proposes such a
+  series, in amber with its cover, when the site gave it first for two or more of the series' names and its chapter
+  numbers line up both ways. Follow it if the covers show the same series: that also keeps the site's name as one of
+  the series' other names, so the next search finds it under that name on other sites too. An automatic run never
+  follows one: chapter numbers alone cannot tell two series of the same length apart.
 - **A restart** stops a run the way **Stop** does: what it followed stays followed, and the series it never reached
   are listed as not tried.
 
@@ -1740,7 +1770,10 @@ translated once per language and kept, so reading it again costs nothing.
   have not answered, a **Still loading** card at the end of the wall names them. A source that is only slow keeps
   its place in that order (since v0.59.0); one whose listing keeps coming back empty is asked last. Tap a row to
   browse that source alone; the chip
-  then shows its favicon and name, and its × goes back to all of them. Browsing a source that is in a
+  then shows its favicon and name, and its × goes back to all of them. Flipping *Newest*/*Popular* keeps it chosen
+  when it has that listing. A source that leaves the list (turning **Show 18+** off hides the adult ones) is let go,
+  and its covers leave the wall and its *{done} of {total} sources* count; turning it back on brings its covers and its
+  count back, but not the choice. Browsing a source that is in a
   cooldown shows its reason and *back in ~12 min* in place of an empty wall, not *Nothing new from these
   sources right now*. The (i) in the sheet's header is the same five-line explainer as on the series page.
 - **Search:** type a title once and Uchiyomi searches **all your sources at the same time**. Results are
@@ -1754,6 +1787,11 @@ translated once per language and kept, so reading it again costs nothing.
   With one source chosen in the chip, a search asks **only that source** and the chip stays on screen while
   the results are up, so you can see the search is narrowed and clear it with its × (which searches every
   source again). Switching the toggle to *Newest* or *Popular* goes back to browsing.
+  A search on one source (the one chosen, or the only one you have) **keeps going as you scroll** (since v0.96.0,
+  [#331](https://github.com/AngeloSha/uchiyomi/issues/331)): a site answers its search a page at a time (BatCave ten
+  at a time, 209 for *Star Trek*), and the next page loads as you near the end of the wall, up to 30 pages. Every
+  extension's search does this; a built-in source's search is its first page. With **Hide 18+** or **18+ only**
+  chosen, the search stays on its first page. A search across every source shows each source's first page.
 - **One card per series, nothing you have (v0.56.0):**
   - A series several sources carry is one card under any of the names they give it. The card's corner shows each
     source's icon (MangaDex once, whatever its languages).
@@ -2130,6 +2168,27 @@ and on the series page links an admin straight to the settings of the extension 
 settings**), and so does its row under Health's *Chapter numbering*. The details are in
 [extensions.md](extensions.md#an-extensions-own-settings).
 
+**Signing in on a site: Open site** (since v0.91.0, [#314](https://github.com/AngeloSha/uchiyomi/issues/314)). Some sites
+want you signed in, or a browser check passed, before an extension can read them: BatCave shows *Sign in to keep
+reading* to anyone not signed in. In Mihon that is the **Open in WebView** button; in Uchiyomi it is **Open site** in the
+same sheet. It opens the site in the extension engine's own browser, live and over the whole screen: click, scroll and
+type as on the site (on a phone, a tap is a click and brings up the keyboard, a swipe scrolls, and **Keyboard** brings
+the keyboard back), sign in, and press **Done**. The engine keeps the sign-in for that extension, and the sheet says
+whether the source answers now. **Start over** opens the site's home page again.
+
+**Signing in with a link the site emails you** (since v0.94.0). A sign-in link signs in whichever browser opens it, so
+opening it from your email signs in your own browser, not the engine's. Ask the site for the link inside **Open site**,
+then copy the link from the email without opening it (long-press it on a phone, right-click it on a computer, and
+**Copy link**), press **Open a link** at the top of Open site, paste it and press **Open**: it opens in the engine's
+browser, which is now signed in. Press **Done**. Only links on the extension's own site open there; anything else is
+refused, since the engine's browser sits inside your server's network.
+
+- Admins only, one site at a time, and it closes itself after ten minutes without input (what you did is kept).
+- A source you have done this for gets a quiet visit of its home page whenever it fails, at most once in half an hour,
+  and Uchiyomi tries again. BatCave's check lasts a day, so this is what keeps it working. An extension that answers
+  "Open in WebView…" gets the same visit.
+- It needs the bundled extension engine, or your own Suwayomi from v2.4 on.
+
 ### The other direction: Uchiyomi *inside* Mihon or Tachimanga
 
 If you would rather keep reading in Mihon (Android), a Tachiyomi fork, Tachimanga (iOS) or Suwayomi, there
@@ -2364,7 +2423,10 @@ everything**, which does what its key on Health does and can merge, delete and i
   the "could not be solved" marks and those sources' cooldowns; and it forgets any cooldown that lapsed more than
   a day ago. No site is contacted;
 * **counts the pages** of chapter files nobody has opened (2,000 a night), which is what makes the
-  short-chapter check see them at all; since v0.72.0 a file it finds no page in is listed under *Chapter files*;
+  short-chapter check see them at all; since v0.72.0 a file it finds no page in is listed under *Chapter files*.
+  A folder that looks unmounted is not counted at all — one that is not there, holds nothing, or where no chapter file
+  the library knows is there (or more than nine in ten are missing) — and neither is a file the server may not read:
+  they wait for a night they can be read, instead of being listed as broken once the share is back;
 * **gives chapters that ran out of retries another chance** a week later, when the site has had time to
   calm down (100 a night);
 * **replaces a one- or two-page chapter when another source has a longer copy** (20 a night; one copy from
@@ -2598,8 +2660,16 @@ A chapter whose file was already gone is marked *deleted from the server* too, b
 provably mounted — the same proof the *Verify chapter files* task in section 12 uses: at least one chapter
 file of any series is present under it (a folder is not proof) and no more than nine in ten of the files
 looked at are absent. That is what lets a series whose folder you removed by hand on the NAS be forgotten:
-the toast says *Deleted 0 file(s)*, and the row offers *Forget*. On a share that is not mounted every file looks gone,
-nothing is marked, and every row stays as it was. Deleting a merge survivor's files also removes the
+the toast says *Its files were already gone. Its chapters are marked deleted.*, and the row offers *Forget*. On a share
+that is not mounted every file looks gone, nothing is marked, and every row stays as it was. Since v0.95.0
+([#328](https://github.com/AngeloSha/uchiyomi/issues/328)) the dialog then asks, *24 chapter files are not on disk*,
+because a small library whose folders you deleted yourself looks the same: if you deleted or moved them, **Mark them
+gone** marks them, and the row offers *Forget*. It refuses when the library folder is empty or cannot be opened, which
+is what a share that is not mounted looks like. Only a folder that still holds one of the series' files must be
+writable, so a library Uchiyomi may only read (no `PUID`) no longer stops this. A file the server is not allowed to look at (a folder whose
+permissions slipped, a disk error) is not taken for gone either: it is left on disk, its chapter is not marked,
+the series folder on that root stays, and the toast says how many files could not be checked and asks you to
+check the folder's permissions. Deleting a merge survivor's files also removes the
 folders of the series merged into it. There is no bulk form of this on purpose: *Select all* plus one tap
 must never be able to wipe a hand-curated folder.
 
@@ -2651,7 +2721,10 @@ nothing left*.
   unpacked at the same moment), or a file renamed as well as moved, are not guessed at: the chapter is listed as gone,
   as before.
   Admin → Settings → Maintenance → **Fingerprint library files** says what its last pass did, including files left for the next pass
-  because they were still being written.
+  because they were still being written. A library folder that looks unmounted — not there, empty, or with no
+  chapter file the library knows there (or more than nine in ten missing), as a network share or removable drive that
+  isn't mounted leaves it — is skipped by this pass and by the page-fingerprint pass, and its files wait for a pass
+  that finds them, rather than being stamped unreadable for good.
 - **In the download folder**: chapters Uchiyomi downloaded are *Verify chapter files*' to mark, so that the sweep
   fetches them again; here they are only counted.
 - **Series with nothing left**: every chapter's file is gone. Each one is a link, and nothing is hidden or removed:
@@ -2710,9 +2783,18 @@ What it will not touch:
 * a chapter **somebody is partway through** -- one unfinished reader keeps it for everybody;
 * a chapter **nobody has read**;
 * a chapter anyone has **bookmarked** (a bookmark points at a page inside the file);
-* the chapter a series draws its **cover** from;
+* a chapter **the sources no longer list**, or list only in a way that cannot be downloaded (only from a group you
+  blocked, or only as a link to the publisher, as MangaDex keeps a licensed chapter): the file here is the last copy.
+  A file holding several chapters is kept if any one of them is missing. The list is the one from the last check that
+  found chapters: a series with no list yet is judged by the rest of these rules, and one removed from its source
+  altogether keeps its old list, so this rule does not cover it;
 * anything in a library you assembled yourself. Only Uchiyomi's own downloads folder is ever pruned. Your
   files are yours, and this job does not get an opinion about them.
+
+The chapter a series' **cover** comes from goes like the rest (since v0.97.0,
+[#332](https://github.com/AngeloSha/uchiyomi/issues/332); it used to be kept for good, one chapter in every series).
+When the cover really is that chapter's first page — the series has no cover picture of its own, or you chose *Use the
+first page* — the job keeps a copy of the page first, so the cover stays the same.
 
 What survives: the chapter itself, and everyone's reading history. The chapter stays listed on the series
 page, marked *Deleted from the server* (the same mark an admin's *Delete from server* leaves — the row does
@@ -2725,9 +2807,14 @@ file on disk, so old reading history never condemns a fresh download.
 
 If the downloads folder is not there when the job runs — a network share that is not mounted right now, so
 every chapter it was about to look at is missing along with its folder — the run stops and says so in the
-task's result instead of marking every chapter it could not find as deleted. A single series whose files
-you removed by hand is different: with the rest of the folder present, its chapters are marked as gone and
-the run carries on. A series you have hidden is never examined at all — *Delete files* is the way to drop
+task's result instead of marking every chapter it could not find as deleted. The same goes for a bare mount
+point a chapter sweep has written new downloads onto while the share was down: before it marks any chapter
+whose file it did not find, the job looks for every chapter file in the downloads folder, and when none is
+there or more than nine in ten are missing it stops, marks and deletes nothing, and says how many (*stopped:
+26 of 27 chapter files in the download folder are missing; is the download volume mounted?*). A single
+series whose files you removed by hand is different: with the rest of the folder present, its chapters are
+marked as gone and the run carries on. A chapter whose file the server may not look at (a folder it has no
+permission to read, an I/O error) is never marked: it is counted as failed and tried again on the next run. A series you have hidden is never examined at all — *Delete files* is the way to drop
 its chapters.
 
 That same comparison is why the first run takes fewer chapters than you might expect on a downloads folder
@@ -2736,6 +2823,13 @@ job fails toward keeping. It corrects itself as chapters are read again.
 
 **Admin → Settings → Maintenance → Delete read chapters** shows the last run, how much it freed, and how many chapters are
 waiting. **Run now** is there if you would rather not wait for the hour.
+
+**Why a read chapter is still there** (since v0.96.0, [#332](https://github.com/AngeloSha/uchiyomi/issues/332)): with
+`LOG_LEVEL=debug` in `.env` (and a restart), every run writes lines starting `[cleanup]` to the server log
+(`docker logs uchiyomi`). They give the day count, how many read chapters are in the downloads folder and how many are
+due, and then, for the rest, how many each rule above keeps, with a few of them by title and number: *12 kept: the
+sources no longer list it as one they could fetch again, so it is the last copy -- e.g. "Hound" 7, …*. With the switch
+off, the line says that instead.
 
 **Show missing chapters in Mihon** (**Admin → Settings → Series & chapters → More options**, off by default, since
 v0.42.0) is for libraries that deliberately hold less than the sources list. Mihon works out how many
@@ -3694,6 +3788,9 @@ downloaded that are gone as *deleted from the server* — the row and everyone's
   share is down, and one stray download on a bare mount must not turn "unmounted" into "mark everything
   else". Check the mount and run it again. If the disk really is empty, add the series again from a source,
   or use *Fetch again* on the series page.
+- Only a file that is not there counts as missing. One the server may not look at — a folder it has no
+  permission to read, an I/O error from the NAS — is left as it is, and a folder where nothing could be looked
+  at is reported as *looked unmounted*. Fix the permissions (or the share) and run it again.
 - Chapters the read-chapter cleanup, *Delete from server* or *Delete files* removed are not touched by this:
   they were let go on purpose and are not fetched back.
 - A chapter below a series' *latest N* floor — one you fetched through the fill dialog's *older* — comes back
@@ -3718,7 +3815,7 @@ delete in the app is deliberately smaller than it sounds, so here is exactly wha
   to put back by hand, and a chapter below a series' *latest N* floor comes back through *Fetch again* only,
   never the sweep. *Delete
   files* is admin-only, only after a remove, asks for the title, and refuses rather than half-applying when
-  the folder is not writable (that is `PUID`/`PGID` unset — the refusal names the fix) or when the series has
+  a folder that still holds its files is not writable (that is `PUID`/`PGID` unset — the refusal names the fix) or when the series has
   no chapter rows on any root (*That series has no files on disk*). On a mounted library it also marks
   chapters whose files were removed by hand (section 8), so a series deleted on the NAS can still reach
   *Forget*.

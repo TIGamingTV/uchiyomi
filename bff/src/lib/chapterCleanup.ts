@@ -47,22 +47,62 @@
  *
  * ZERO DAYS IS A REAL SETTING and means "at the next run", not "off". `cleanup_read` is the off switch.
  *
- * TWO VETOES, both for things that point INTO the file rather than at the chapter:
- *   - a bookmark names a page number inside it, so deleting the pages turns it into a pointer at nothing.
- *     Progress survives a prune (it is a count); a bookmark does not.
- *   - the series' cover_book_id. Every cover, thumbnail and backdrop in the product falls back to the first
- *     page of that chapter when there is no artwork to fetch, so pruning it takes the art off the series,
- *     the library grid and the home rails. It is one chapter per series, and it is always the lowest number
- *     -- so this costs almost nothing and cannot drift, because persistScan recomputes it the same way.
+ * ONE VETO, for a thing that points INTO the file rather than at the chapter: a bookmark names a page number inside
+ * it, so deleting the pages turns it into a pointer at nothing. Progress survives a prune (it is a count); a bookmark
+ * does not.
+ *
+ * THE COVER'S CHAPTER GOES TOO, AND ITS PAGE STAYS (v0.97.0, #332). A series with no cover picture of its own -- or
+ * whose admin chose Use the first page -- shows its first page as its cover, its tile and its backdrop. That chapter
+ * (cover_book_id) used to be vetoed outright, whatever the cover was, so every series kept its lowest chapter for ever:
+ * @TIGamingTV's 30 of 34 read chapters, on series whose cover comes from their source and not from that chapter at all.
+ * Now the job keeps the page itself before the chapter goes, once per series and only where the cover IS that page
+ * (lib/seriesArt.ts coverPageBooks, keepCoverPage), and the cover route reads it ahead of any chapter. A page that
+ * cannot be read is no cover to keep, and the chapter goes; one that cannot be written leaves the chapter for the next
+ * run. Reintroduce the veto: "the cover's chapter goes, and its page stays the cover" in cleanupCoverPage.int.test.ts
+ * finds the chapter still there; drop the keep and the same test finds no page.
+ *
+ * AND NEVER THE LAST COPY. "We could fetch it again" is a claim about the sources, and their last listing
+ * (series_listing, lib/seriesListing.ts) is where it can be checked. Once a series has a listing, a chapter whose
+ * number is no longer in it -- a takedown, a deleted post, a source that dropped it -- is a file nothing could
+ * replace, so it stays. For a file holding a range (lib/chapterRanges.ts) that is every whole number it holds, not
+ * only its start. A series with no listing at all says nothing either way and is judged as before.
+ *     Listed means fetchable (FETCHABLE): a number listed only from blocked groups or in another language, or only
+ *     as an external link -- MangaDex keeps a licensed chapter as a zero-page link to the publisher -- could not be
+ *     downloaded again either, so it counts as not listed.
  */
-import { rm, stat } from 'fs/promises';
+import { rm } from 'fs/promises';
 import { dirname, resolve } from 'path';
 import { q, one } from './db';
-import { DL_ROOT } from './library';
-import { allWritable, containedPath } from './fsGuard';
+import { DL_ROOT, LIBRARY_ROOT, cbzPageAt } from './library';
+import { allWritable, containedPath, rootUnavailable, statOrGone } from './fsGuard';
+import { catalogFileCounts, looksUnmounted } from './catalogRootGuard';
 import { REFETCH_BAK } from './fsAtomic';
 import { runtime, type CleanupResult } from './runtime';
 import { atHiddenNumber, hiddenNumbersActive } from './noticeChapters';
+import { rangeEnd } from './chapterRanges';
+import { logLevel } from '../env';
+import { coverPageBooks, keepCoverPage } from './seriesArt';
+
+/**
+ * A listing row the sweep could fetch again (see the header): not `blocked` -- every copy from a blocked group or in
+ * another language (lib/releases.ts) -- and not a zero-page external link, which cannot be downloaded (repair.ts skips
+ * them for the same reason). A row whose page count is unknown counts as fetchable, as before.
+ */
+const FETCHABLE = `sl.status <> 'blocked' AND (sl.chosen->>'pages') IS DISTINCT FROM '0'`;
+
+/**
+ * "Never the last copy" (the header) over the lib_books row `b` and its LEFT JOINed book_overrides row `ov`: true when the
+ * series has a listing and some number the file holds is not in it as a row the sweep could fetch again. One fragment
+ * for the job (dueSql) and for its explanation (keptReasons), so the two cannot drift.
+ */
+const lastCopy = `(EXISTS (SELECT 1 FROM series_listing sl WHERE sl.series_id = b.series_id)
+                      AND (NOT EXISTS (SELECT 1 FROM series_listing sl
+                                        WHERE sl.series_id = b.series_id AND sl.number = COALESCE(ov.number, b.number)
+                                          AND ${FETCHABLE})
+                           OR EXISTS (SELECT 1 FROM generate_series(floor(b.number)::numeric + 1, floor(${rangeEnd('b', 'ov')})::numeric) held(n)
+                                       WHERE NOT EXISTS (SELECT 1 FROM series_listing sl
+                                                          WHERE sl.series_id = b.series_id AND sl.number = held.n::real
+                                                            AND ${FETCHABLE}))))`;
 
 /**
  * Most chapters one run will delete. Not a performance limit -- unlink is cheap -- but a blast radius:
@@ -107,6 +147,7 @@ export function dueSql(limit: number | null): string {
               HAVING bool_and(rp.completed AND (lb.pages <= 1 OR rp.page >= lb.pages - 1))
                  AND max(rp.updated_at) <= now() - make_interval(days => $2)
             ) done ON done.book_id = b.id
+            LEFT JOIN book_overrides ov ON ov.book_id = b.id
            WHERE b.root = $1
              AND b.pruned_at IS NULL
              -- a series the admin has hidden is not this job's business: its files go through Delete files,
@@ -115,7 +156,12 @@ export function dueSql(limit: number | null): string {
              -- the last reader finished the copy that is on disk now, not the one this file replaced
              AND done.done_at >= to_timestamp(b.mtime / 1000.0)
              AND NOT EXISTS (SELECT 1 FROM bookmarks bm WHERE bm.book_id = b.id)
-             AND NOT EXISTS (SELECT 1 FROM lib_series s WHERE s.cover_book_id = b.id)${hiddenNumbersActive() ? `
+             -- never the last copy (see the header): once the series has a listing, every number the file holds is
+             -- in it. The number is override-aware, as the listing's are under posting order; an admin's number
+             -- cancels a range (rangeEnd is NULL, and generate_series gives nothing). Reintroduce by dropping the
+             -- clause: "a chapter the sources no longer list is never deleted" in lastCopyGuard.int.test.ts finds
+             -- the file gone.
+             AND NOT ${lastCopy}${hiddenNumbersActive() ? `
              -- a chapter at a number an admin hid (#240) is left exactly as it is: Restore brings back what was there
              AND NOT ${atHiddenNumber('b')}` : ''}
            ORDER BY done.done_at ASC` + (limit === null ? '' : `\n           LIMIT ${limit}`);
@@ -146,6 +192,95 @@ export async function dueCountCached(days: number): Promise<number> {
   const n = await dueCount(d);
   cached = { days: d, at: Date.now(), n };
   return n;
+}
+
+/**
+ * LOG_LEVEL=debug (#332): `[cleanup]` lines in the server log on every run, saying why each read chapter on the download
+ * disk stays. @TIGamingTV's read chapters stopped going and the log said only "0 read chapter(s) deleted": each rule
+ * above that keeps a file is right on its own, and nothing said which one was holding his. Mutable for the tests.
+ */
+export const cleanupLog = { on: logLevel === 'debug' || logLevel === 'trace' };
+const trace = (line: string) => { if (cleanupLog.on) console.log(`[cleanup] ${line}`); };
+
+/** Why a read chapter on the download disk stays this run: the first rule that holds it, in dueSql's order. */
+export type KeptWhy = 'reading' | 'recent' | 'changed' | 'removed' | 'bookmarked' | 'last_copy' | 'hidden';
+
+export interface KeptReasons {
+  /** Chapters on the download disk somebody opened, not deleted yet. */
+  read: number;
+  /** Of them, the ones the job would delete now: dueSql's count, by the same rules. */
+  due: number;
+  /** The rest, by the first rule that keeps each, with a few of them by series title and number. */
+  kept: Array<{ why: KeptWhy; n: number; examples: string[] }>;
+}
+
+/**
+ * What keeps each read chapter on the download disk: the first rule that applies, as dueSql applies them. A chapter
+ * nobody opened is not this job's business and is not counted. The last-copy rule is dueSql's own fragment; the rest
+ * are its clauses turned round. Reintroduce a rule dueSql has and this lacks: "every read chapter is either due or
+ * kept for a reason" in cleanupWhy.int.test.ts finds a chapter in neither.
+ */
+export async function keptReasons(days: number): Promise<KeptReasons> {
+  const rows = await q<{ why: KeptWhy | null; title: string; number: string }>(
+    `WITH done AS (
+       SELECT rp.book_id, max(rp.updated_at) AS done_at,
+              bool_and(rp.completed AND (lb.pages <= 1 OR rp.page >= lb.pages - 1)) AS finished
+         FROM read_progress rp
+         JOIN lib_books lb ON lb.id = rp.book_id
+        WHERE lb.root = $1 AND lb.pruned_at IS NULL
+        GROUP BY rp.book_id
+     )
+     SELECT CASE
+              WHEN NOT COALESCE(done.finished, false) THEN 'reading'
+              WHEN done.done_at > now() - make_interval(days => $2) THEN 'recent'
+              WHEN done.done_at < to_timestamp(b.mtime / 1000.0) THEN 'changed'
+              WHEN s.deleted_at IS NOT NULL THEN 'removed'
+              WHEN EXISTS (SELECT 1 FROM bookmarks bm WHERE bm.book_id = b.id) THEN 'bookmarked'
+              WHEN ${lastCopy} THEN 'last_copy'
+              WHEN ${atHiddenNumber('b')} THEN 'hidden'
+            END AS why,
+            s.title, COALESCE(ov.number, b.number)::text AS number
+       FROM lib_books b
+       JOIN done ON done.book_id = b.id
+       JOIN lib_series s ON s.id = b.series_id
+       LEFT JOIN book_overrides ov ON ov.book_id = b.id
+      WHERE b.root = $1 AND b.pruned_at IS NULL
+      ORDER BY done.done_at ASC`,
+    [DL_ROOT, clampDays(days)],
+  );
+  const kept = new Map<KeptWhy, { why: KeptWhy; n: number; examples: string[] }>();
+  let due = 0;
+  for (const r of rows) {
+    if (!r.why) { due++; continue; }
+    const k = kept.get(r.why) ?? { why: r.why, n: 0, examples: [] };
+    k.n++;
+    // As stored, as text: a real cast to float8 read 202.2 as 202.1999969482422 (#332's first lines).
+    if (k.examples.length < 3) k.examples.push(`${JSON.stringify(r.title)} ${r.number}`);
+    kept.set(r.why, k);
+  }
+  return { read: rows.length, due, kept: [...kept.values()].sort((a, b) => b.n - a.n) };
+}
+
+/** Each rule in words, for the `[cleanup]` lines. */
+const KEPT_LINE: Record<KeptWhy, (days: number) => string> = {
+  reading: () => 'someone who opened it has not finished it',
+  recent: (days) => `finished less than ${days} day${days === 1 ? '' : 's'} ago`,
+  changed: () => 'the file on disk is newer than the last read of it (fetched again since)',
+  removed: () => 'its series is removed (Delete files is for those)',
+  bookmarked: () => 'it has a bookmark',
+  last_copy: () => 'the sources no longer list it as one they could fetch again, so it is the last copy',
+  hidden: () => 'its number is hidden by hand',
+};
+
+/** The `[cleanup]` lines for one run, before it looks at any file. Best effort: never fails the run. */
+async function explainRun(days: number): Promise<void> {
+  try {
+    const r = await keptReasons(days);
+    trace(`on, after ${days} day${days === 1 ? '' : 's'}: ${r.read} read chapter${r.read === 1 ? '' : 's'} under ${DL_ROOT}, ${r.due} due now`);
+    for (const k of r.kept) trace(`${k.n} kept: ${KEPT_LINE[k.why](days)} -- e.g. ${k.examples.join(', ')}`);
+  } catch (e) {
+    trace(`could not say why chapters are kept: ${(e as Error)?.message || e}`);
+  }
 }
 
 /**
@@ -218,6 +353,17 @@ export async function unpruneRestored(root: string, files: string[]): Promise<nu
 }
 
 /**
+ * Is the download share there, judged by every live chapter row under DL_ROOT -- Verify's two whole-root rules
+ * (lib/verifyFiles.ts, shared through lib/catalogRootGuard.ts), asked before this job marks any row whose file it
+ * did not find. Only a file the catalog knows is proof, and one in ten is not enough. Null when the share answers for
+ * its files, or what was seen when it does not.
+ */
+async function shareMissing(): Promise<{ missing: number; of: number } | null> {
+  const c = await catalogFileCounts(DL_ROOT, LIBRARY_ROOT);
+  return looksUnmounted(c) ? { missing: c.missing, of: c.present + c.missing } : null;
+}
+
+/**
  * One pass. Returns what it did; never throws for a file it could not remove.
  *
  * The order per chapter is delete-then-mark, deliberately. Marking first and then failing to unlink would
@@ -232,8 +378,10 @@ export async function runCleanupOnce(): Promise<CleanupResult> {
   const { on, days } = await cleanupSettings();
   // Consent is re-read here rather than passed in, so the off switch stops a run that is about to start as
   // well as one that is scheduled -- and so the manual button cannot route around it.
-  if (!on) return empty('disabled');
+  // At debug the off switch is said too: a disabled tick records nothing anywhere else (runChapterCleanup).
+  if (!on) { trace('switched off (Admin → Settings → Downloads → Delete read chapters): nothing is looked at'); return empty('disabled'); }
   if (runtime.stopping) return empty('shutdown', days);
+  if (cleanupLog.on) await explainRun(days);
 
   const due = await q<Due>(dueSql(MAX_PER_RUN), [DL_ROOT, days]);
   if (!due.length) return empty(undefined, days);
@@ -255,12 +403,22 @@ export async function runCleanupOnce(): Promise<CleanupResult> {
   // take the whole download directory with it. One comparison against the entire library is a cheap guard.
   // Reintroduce by dropping the `abs === root` check: "the download root itself is never the file" in
   // chapterCleanup.int.test.ts finds the directory gone.
+  // A file it may not look at (EACCES from a folder whose mode bits slipped, a dropped share's ENOTCONN) is NOT a
+  // file already gone (statOrGone, #321's rule): it is left, row and all, and counted as not removed. Marked on that
+  // evidence it would vanish from every reader while its bytes sit on disk, and its deleted record would stop the
+  // sweep from fetching it back. Reintroduce `stat(abs).catch(() => null)`: "a chapter in a folder the server may not
+  // look into is left unmarked" in chapterCleanup.int.test.ts finds it marked.
+  // And a folder is proof of a mount only when it holds something (#323): the downloader mkdir -p's a series folder
+  // before it writes, so a sweep that ran while the share was down leaves EMPTY folders on the bare mount point
+  // (Verify says the same). Reintroduce `stat(dirname(abs))` for the folder: "... on a bare mount point with an empty
+  // folder a sweep left" in libraryRootGone.int.test.ts finds the chapters tombstoned.
   const looked = await Promise.all(due.map(async (b) => {
     const abs = containedPath(b.root, b.file);
-    if (!abs || abs === root) return { b, abs: null, st: null, folder: true };
-    const st = await stat(abs).catch(() => null);
-    const folder = st ? true : !!(await stat(dirname(abs)).catch(() => null));
-    return { b, abs, st, folder };
+    if (!abs || abs === root) return { b, abs: null, st: null, folder: true, unreadable: null };
+    const seen = await statOrGone(abs);
+    if (typeof seen === 'string') return { b, abs, st: null, folder: true, unreadable: seen };
+    const folder = seen ? true : !(await rootUnavailable(dirname(abs)));
+    return { b, abs, st: seen, folder, unreadable: null };
   }));
   // ⚠️ WHEN EVERY DUE CHAPTER'S FOLDER IS MISSING, THE VOLUME IS NOT THERE. A NAS share that is not mounted
   // right now leaves an empty, writable mount point behind, so the preflight above passes and every stat
@@ -275,13 +433,46 @@ export async function runCleanupOnce(): Promise<CleanupResult> {
   // folder stops the run instead of marking chapters deleted" in chapterCleanup.int.test.ts finds pruned_at
   // set; drop the "every" and make it per-row again: "a removed series does not wedge the cleanup" finds
   // the live series' chapter still on disk.
+  // ⚠️ AND A FOLDER THAT HOLDS SOMETHING IS NOT PROOF EITHER, when what it holds is what a sweep fetched onto the bare
+  // mount point while the share was down: a new chapter of a known series fills that series' folder, the check above
+  // passes, and every other due chapter -- on the share, intact -- would be tombstoned 'deleted', which is held, so
+  // the sweep never fetches it back. So before any row is marked without its file, the whole download root answers
+  // (shareMissing above): no catalogued file present, or more than nine in ten missing, is the share not being there,
+  // and nothing is marked or deleted. Only such a run pays for the walk (one stat per live row); an ordinary run
+  // finds every due file and never asks. A series removed by hand is a few rows in many and is still marked.
+  // Reintroduce by dropping the shareMissing() call: "... a sweep wrote a new chapter of a KNOWN series into marks
+  // nothing" in cleanupBareMount.int.test.ts finds four chapters tombstoned; drop the 90 % rule and "... after a
+  // scan indexed the new chapter" does.
+  let share: { missing: number; of: number } | null = null;
   if (looked.every((x) => x.abs && !x.st && !x.folder)) {
     stopped = 'unmounted';
+  } else if (looked.some((x) => x.abs && !x.st && !x.unreadable) && (share = await shareMissing())) {
+    stopped = 'unmounted';
   } else {
-    for (const { b, abs, st } of looked) {
+    // Which of these chapters a series' cover is drawn from (the header): asked once, before any file goes.
+    const coverOf = await coverPageBooks(looked.map((x) => x.b.id));
+    for (const { b, abs, st, unreadable } of looked) {
       if (runtime.stopping) break; // between files, never mid-unlink
       if (!abs) continue;
+      if (unreadable) {
+        console.warn(`[cleanup] ${b.file} could not be looked at (${unreadable}) -- left as it is`);
+        failed++;
+        continue;
+      }
       if (st) {
+        // The cover's page first. A chapter with no page to read gives none and still goes; a page that cannot be
+        // written keeps the chapter until the next run, as a failed delete does.
+        const series = coverOf.get(b.id);
+        if (series) {
+          try {
+            const kept = await keepCoverPage(series, () => cbzPageAt(abs, 0).then((p) => p?.bytes ?? null, () => null));
+            if (kept === 'kept') trace(`kept the first page of ${b.file} as its series' cover`);
+          } catch (e) {
+            console.warn(`[cleanup] ${b.file} holds its series' cover, and the page could not be kept (${(e as Error)?.message || e}) -- left for the next run`);
+            failed++;
+            continue;
+          }
+        }
         try {
           await rm(abs, { recursive: true, force: true });
         } catch {
@@ -313,7 +504,7 @@ export async function runCleanupOnce(): Promise<CleanupResult> {
   // Warm the panel's memo with what the run just measured, so the badge is right on the next poll instead
   // of showing the pre-run backlog for another half minute.
   cached = { days: clampDays(days), at: Date.now(), n: remaining };
-  return { deleted, bytes, remaining, failed, ms: Date.now() - t0, days, ...(stopped ? { stopped } : {}) };
+  return { deleted, bytes, remaining, failed, ms: Date.now() - t0, days, ...(stopped ? { stopped } : {}), ...(share ? { share } : {}) };
 }
 
 /**
@@ -342,7 +533,8 @@ export function runChapterCleanup(log?: { info: (m: string) => void; warn: (m: s
         ).catch(() => {});
         log?.info(summarise(r));
       }
-      if (r.stopped === 'unmounted') log?.warn(`cleanup: every due chapter's folder under ${DL_ROOT} is missing -- is the volume mounted? Nothing was marked; ${r.remaining} chapter(s) wait for the next run`);
+      if (r.stopped === 'unmounted' && r.share) log?.warn(`cleanup: ${r.share.missing} of ${r.share.of} chapter files under ${DL_ROOT} are missing -- is the volume mounted? Nothing was marked or deleted; ${r.remaining} chapter(s) wait for the next run`);
+      else if (r.stopped === 'unmounted') log?.warn(`cleanup: every due chapter's folder under ${DL_ROOT} is missing -- is the volume mounted? Nothing was marked; ${r.remaining} chapter(s) wait for the next run`);
       else if (r.failed) log?.warn(`cleanup: ${r.failed} chapter file(s) could not be deleted; they will be retried`);
       return r;
     } catch (e) {
@@ -366,4 +558,5 @@ const summarise = (r: CleanupResult): string =>
       : `cleanup: ${r.deleted} read chapter(s) deleted, ${r.bytes} bytes freed`
         + (r.remaining ? `, ${r.remaining} still due` : '')
         + (r.failed ? `, ${r.failed} failed` : '')
-        + (r.stopped === 'unmounted' ? ' (stopped: every due chapter\'s folder is missing, is the volume mounted?)' : '');
+        + (r.stopped === 'unmounted' && r.share ? ` (stopped: ${r.share.missing} of ${r.share.of} chapter files are missing, is the volume mounted?)`
+          : r.stopped === 'unmounted' ? ' (stopped: every due chapter\'s folder is missing, is the volume mounted?)' : '');

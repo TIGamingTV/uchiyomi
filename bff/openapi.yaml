@@ -6,7 +6,7 @@
 openapi: 3.1.0
 info:
   title: Uchiyomi API
-  version: 0.90.0
+  version: 0.97.0
   description: "Everything the web app does, it does over this API. Session JWTs are for the browser; scripts
     use a personal API token (Profile -> Connections -> API tokens), sent as `Authorization: Bearer uy_...`.
     Scopes: read (every token; GET plus the library search POST, which is a query), write (anything that changes data), admin (the /api/admin surface, which also
@@ -3070,6 +3070,9 @@ paths:
         Since v0.42.0 an adult source answers `{ content: [] }` without being asked while the 18+ reveal is
         off — an empty page, deliberately not a 403, because the hide is a preference and the same account
         with `adult=1` gets the results. A source above the caller's age cap is still refused with 403.
+        Since v0.96.0 (#331) `page` (1-based, clamped to 30) asks a later page of the same search, as the site
+        pages it; a source whose `searchPages` is false (GET /api/sources) answers a later page with
+        `{ content: [] }`, never its first page again.
       parameters:
         - name: source
           in: query
@@ -5044,6 +5047,40 @@ paths:
           description: Not authenticated
         "404":
           description: Not found, or not visible to this account
+  /api/favorites/order:
+    put:
+      tags:
+        - personal
+      summary: Put your favourites in an order (since v0.97.0).
+      operationId: putApiFavoritesOrder
+      description: >-
+        Home's Favourites sheet. `seriesIds` go first, in the order given; every other favourite of yours follows in the
+        order it was listed in, so one the page could not show keeps its place. An id that is not your favourite is
+        ignored. Every list of your favourites -- Home's rail, GET /api/favorites, the OPDS feed -- reads this order;
+        a favourite made since you last ordered them comes first, newest first, until it is moved.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [seriesIds]
+              additionalProperties: false
+              properties:
+                seriesIds:
+                  type: array
+                  maxItems: 5000
+                  items:
+                    type: string
+      security:
+        - bearer: []
+      responses:
+        "200":
+          description: "{ ok: true, placed } -- how many of your favourites now have a place."
+        "400":
+          description: bad_request
+        "401":
+          description: Not authenticated
   /api/collections:
     get:
       tags:
@@ -8202,12 +8239,14 @@ paths:
         Requires an admin account and a token carrying the admin scope. Scopes only ever restrict. Since
         v0.37.0 the list always carries `verify` ("Verify chapter files", schedule "on demand · after a
         database-only restore") with `lastRun` (epoch ms or null) and `lastResult` {ok, checked, missing,
-        readLibraryMissing, unmounted: string[], roots, ms, stopped?: 'shutdown'} or null -- it never runs by
+        readLibraryMissing, unchecked, unmounted: string[], roots, ms, stopped?: 'shutdown'} or null -- it never runs by
         itself, so it is listed even when it never has. Its run is detached (see the run route), so this
         entry is where the counts appear: `checked` is rows whose file was looked for under roots that were
         not skipped (both roots), `missing` the download-root rows marked this run, `readLibraryMissing` the
-        read-library rows whose file is gone (counted, never marked), `unmounted` the roots left alone (a
-        bare path: no file at all under it; "<root> (95 % of 20 chapter files missing)": the 90 % rule).
+        read-library rows whose file is gone (counted, never marked), `unchecked` the rows whose file could not
+        be looked at (EACCES, an I/O error: never marked, never counted as checked), `unmounted` the roots left
+        alone (a bare path: no file at all under it, or none that could be looked at; "<root> (95 % of 20
+        chapter files missing)": the 90 % rule).
         Both are persisted in server_settings (verify_last_run / verify_last_result) and survive a restart;
         a run that threw stores a null result rather than an older healthy one.
         Since v0.41.0 the list also always carries `repair` ("Repair library"), the nightly library repair,
@@ -10206,7 +10245,11 @@ paths:
         live rows, which Forget refuses on). `files` still counts unlinks only, so a series whose folder was
         removed by hand answers `files: 0` and its Removed row then offers Forget (`live_books` 0). Delete
         files on a merge survivor also removes the folders of the rows merged into it, and every folder is
-        resolved on every root before anything is unlinked. Refuses rather than half-applies.
+        resolved on every root before anything is unlinked. Refuses rather than half-applies. Since v0.95.0
+        (#328) only a root that still holds one of the series' files must be writable -- one its files have
+        left is only reconciled, which writes nothing there -- and the rows left live on an unproven root are
+        counted in `unproven`: the same call with `gone: true`, the admin's word that they deleted or moved
+        those files, marks them without the proof, except on a root that cannot be opened or opens empty.
       parameters:
         - name: id
           in: path
@@ -10228,11 +10271,17 @@ paths:
                     compared (docs/api.md, "Typing a title to confirm"): one layer of HTML entities, NFKC,
                     curly quotes and dashes folded to ASCII, invisibles and emoji dropped, every Unicode
                     space collapsed to one, ends trimmed. Case is NOT folded.
+                gone:
+                  type: boolean
+                  description: >-
+                    Since v0.95.0 (#328). The admin says the files the last answer counted as `unproven` were
+                    deleted or moved by hand: their rows are marked deleted without the mounted-root proof. A root
+                    that cannot be opened or opens empty still refuses (409, "Mount it, then try again.").
       security:
         - bearer: []
       responses:
         "200":
-          description: "{ ok: true, files, bytes } -- files actually unlinked this call (0 for a series whose files were removed by hand; its absent rows are marked when the root is provably mounted)."
+          description: "{ ok: true, files, bytes, unchecked, gone, unproven } -- files actually unlinked this call (0 for a series whose files were removed by hand; its absent rows are marked when the root is provably mounted, and `gone` counts them). `unproven` (since v0.95.0) counts live rows whose file is absent on a root nothing proves is there, left as they were; the same call with `gone: true` marks them. `unchecked` counts chapter files the server could not look at (EACCES, an I/O error): only a file that is not there (ENOENT) is absent, so those rows stay live, and a root holding one keeps its series folder."
         "400":
           description: "bad_request, or confirm_mismatch when `confirm` is not the series' title."
         "401":
@@ -10242,7 +10291,7 @@ paths:
         "404":
           description: Not found, or not visible to this account
         "409":
-          description: "refused { message, fix }: not hidden yet, no chapter rows on any root, a folder that resolves outside the library, or a root that is not writable (PUID/PGID unset; fix names it)."
+          description: "refused { message, fix }: not hidden yet, no chapter rows on any root, a folder that resolves outside the library, a root that is not there at all, a root that still holds one of its files and is not writable (PUID/PGID unset; fix names it), or -- with `gone` -- a root that cannot be opened or opens empty."
   /api/admin/series/{id}/forget:
     post:
       tags:
@@ -10315,7 +10364,8 @@ paths:
         DL_ROOT only: a chapter the scanner found in the read library is skipped (`not_owned`), on the same
         footing as the read-chapter cleanup, and so is one somebody has a bookmark in (`bookmarked`) -- a
         bookmark names a page inside the file. A chapter whose file AND folder are missing is skipped
-        (`unlink_failed`) rather than marked: that is the download volume not being mounted. The row survives
+        (`unlink_failed`) rather than marked: that is the download volume not being mounted. So is one the
+        server may not look at (EACCES, an I/O error): its file may well be on disk. The row survives
         with `pruned` set so reading progress and the updater's have-set do; the cover moves to the lowest
         live chapter. No typed confirmation -- the client confirms with the count.
       parameters:
@@ -11499,6 +11549,199 @@ paths:
           description: "Forbidden: token scope, account permission or age limit"
         "404":
           description: Not found, or not visible to this account
+  /api/admin/extensions/sources/{id}/site:
+    post:
+      tags:
+        - admin
+      summary: "Open site (v0.91.0, #314): the source's site in the extension engine's own browser, for an admin to sign in or pass a check."
+      operationId: postApiAdminExtensionsSourcesIdSite
+      description: >-
+        Requires an admin account and a token carrying the admin scope. Scopes only ever restrict. Opens the source's home
+        page (its `homeUrl`) in the engine's browser (Suwayomi's WebView) at `width` x `height` CSS pixels and answers
+        `{ session, name, site }`. One page at a time, as the engine has one browser: another admin's page in use answers
+        409 `site_busy`, the caller's own earlier page is left for this one. 422 `no_site` for a source that names no
+        site; 502 `no_browser` when the engine has no browser to open (Suwayomi before v2.4). Audited (`source.site_open`).
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [width, height]
+              properties:
+                width: { type: integer, minimum: 200, maximum: 4000 }
+                height: { type: integer, minimum: 200, maximum: 4000 }
+      security:
+        - bearer: []
+      responses:
+        "200":
+          description: "{ session, name, site }"
+        "400":
+          description: Malformed body or parameter
+        "401":
+          description: Not authenticated
+        "403":
+          description: "Forbidden: token scope, account permission or age limit"
+        "404":
+          description: The engine has no such source
+        "409":
+          description: "`site_busy`: another admin has a site open in the engine"
+        "422":
+          description: "`no_site`: the source names no site"
+        "502":
+          description: "`no_browser`: the engine could not open its browser"
+        "503":
+          description: "`engine_unreachable`: the engine is not answering"
+  /api/admin/extensions/site/{session}/stream:
+    get:
+      tags:
+        - admin
+      summary: "Open site's page, live: one JSON object a line until it closes (v0.91.0)."
+      operationId: getApiAdminExtensionsSiteSessionStream
+      description: >-
+        Requires an admin account and a token carrying the admin scope, and the page must be the caller's. `application/x-ndjson`:
+        `{type: 'frame', seq, jpeg}` (base64 JPEG since v0.91.1, a PNG before; at most five a second, the newest, and the next
+        only once the input route has `{type: 'seen', seq}` for this one, or three seconds on), `{type: 'address', url, title}`,
+        `{type: 'load', url, title, status, error}`, `{type: 'ping'}` every 15 s, and `{type: 'closed', reason}` (`done`,
+        `idle` after ten minutes without input, `replaced`, `engine`) last. Sent with `x-accel-buffering: no`.
+      parameters:
+        - name: session
+          in: path
+          required: true
+          schema:
+            type: string
+      security:
+        - bearer: []
+      responses:
+        "200":
+          description: The page, a line at a time
+        "401":
+          description: Not authenticated
+        "403":
+          description: "Forbidden: token scope, account permission or age limit"
+        "404":
+          description: No such page, or not the caller's
+  /api/admin/extensions/site/{session}/input:
+    post:
+      tags:
+        - admin
+      summary: "Open site: the admin's clicks, keys, wheel and paste for the page, in order (v0.91.0)."
+      operationId: postApiAdminExtensionsSiteSessionInput
+      description: >-
+        Requires an admin account and a token carrying the admin scope, and the page must be the caller's. `input` is 1 to 100
+        of: `{type: 'event', eventType: mousedown | mouseup | mousemove | wheel | keydown | keyup, clickX, clickY, button?,
+        ctrlKey?, shiftKey?, altKey?, metaKey?, key?, clientX?, clientY?, deltaY?}` in the page's pixels, `{type: 'paste',
+        data}` (up to 4000 characters), `{type: 'resize', width, height}`, `{type: 'home'}` (the source's home page
+        again), or `{type: 'seen', seq}` (since v0.91.1: the stream's picture `seq` has arrived, so the next may be sent; it
+        is not input, and does not keep the page open). Nothing else reaches the page: an unknown kind or field is 400.
+      parameters:
+        - name: session
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [input]
+              properties:
+                input:
+                  type: array
+                  minItems: 1
+                  maxItems: 100
+                  items: { type: object, additionalProperties: true }
+      security:
+        - bearer: []
+      responses:
+        "200":
+          description: OK
+        "400":
+          description: Malformed body or parameter
+        "401":
+          description: Not authenticated
+        "403":
+          description: "Forbidden: token scope, account permission or age limit"
+        "404":
+          description: No such page, or not the caller's
+  /api/admin/extensions/site/{session}/open:
+    post:
+      tags:
+        - admin
+      summary: "Open site: open a link on the source's own site in the page, such as the sign-in link it emailed (v0.94.0)."
+      operationId: postApiAdminExtensionsSiteSessionOpen
+      description: >-
+        Requires an admin account and a token carrying the admin scope, and the page must be the caller's. A sign-in link a
+        site emails signs in whichever browser opens it, so it is opened in the extension engine's. `url` must be http(s),
+        with no login in it, on the source's home page's host (a leading www. aside) or a subdomain of it: the engine's
+        browser sits inside the server's network, so no other site is opened. The link is not logged.
+      parameters:
+        - name: session
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [url]
+              additionalProperties: false
+              properties:
+                url: { type: string, minLength: 1, maxLength: 4000 }
+      security:
+        - bearer: []
+      responses:
+        "200":
+          description: Opened
+        "400":
+          description: Malformed body or parameter
+        "401":
+          description: Not authenticated
+        "403":
+          description: "Forbidden: token scope, account permission or age limit"
+        "404":
+          description: No such page, or not the caller's
+        "422":
+          description: "`other_site`: the link is not on the source's own site."
+  /api/admin/extensions/site/{session}:
+    delete:
+      tags:
+        - admin
+      summary: "Open site's Done: leave the page, which is when the engine saves the sign-in, and try the source (v0.91.0)."
+      operationId: deleteApiAdminExtensionsSiteSession
+      description: >-
+        Requires an admin account and a token carrying the admin scope, and the page must be the caller's. Answers `{ saved,
+        test }`, `test` being the source's smoke test after (null for a source not switched on). The source is remembered
+        (`site_opened_at`): from then on any failure of it earns a quiet visit of its home page, at most once in half an hour.
+        Audited (`source.site_close`).
+      parameters:
+        - name: session
+          in: path
+          required: true
+          schema:
+            type: string
+      security:
+        - bearer: []
+      responses:
+        "200":
+          description: "{ saved, test }"
+        "401":
+          description: Not authenticated
+        "403":
+          description: "Forbidden: token scope, account permission or age limit"
+        "404":
+          description: No such page, or not the caller's
   /api/admin/extensions/sources/{id}/preferences:
     get:
       tags:
