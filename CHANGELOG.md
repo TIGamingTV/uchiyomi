@@ -1,5 +1,529 @@
 # Changelog
 
+## v0.108.1 — 2026-11-14
+
+**Title logos arrive without the written title flashing first, and Find missing chapters writes chapter numbers as they are.**
+
+### Title logos without the flash
+
+- On a computer, a hero with a title logo drew the written title while the logo downloaded, then swapped it out: in every hero and at every turn of Home's carousel. The written title now keeps its place (and stays readable to screen readers) without being drawn while the logo downloads, and is drawn if the logo fails or takes longer than 1.5 seconds. Home's carousel also fetches the next slide's logo with its backdrop.
+
+### Chapter numbers as they are written
+
+- **Find missing chapters** said "You have 170 chapters, 0–80.19999694824219" for a series with decimal chapters ([#439](https://github.com/AngeloSha/uchiyomi/issues/439), **brettohland**). Chapter numbers are stored compactly, and read back for this dialog they kept the stored value's last binary digits. The dialog, its gaps and its chapter chips now write each number as it was written: 0–80.2. Display only: nothing it compares or sends changes.
+
+### Upgrading
+
+- No database change. The Umbrel package pins the published v0.108.0.
+
+## v0.108.0 — 2026-11-13
+
+**Reading progress comes along with an import, a page streamed to the end in Panels counts as read, a deleted chapter can come back from any source, and the iPhone app fits the Duo.**
+
+### Reading progress comes with your import
+
+- **Mark chapters I've read** ([#433](https://github.com/AngeloSha/uchiyomi/issues/433), **himsin**): one checkbox on the import page, on by default. The chapters a Mihon or Suwayomi backup has marked read, and every chapter up to how far your AniList, MyAnimeList or Kitsu list says you got, are marked read here as the titles land: at once on the ones you already have, the rest as they are imported. The review rows say how far each one is read, and the import says how many chapters it marked.
+- Nothing is marked unread, a chapter already finished here keeps its own date, and nothing is sent to your trackers. Imported reads add no reading time, streaks or Wrapped entries, and never make a file due for the read-chapter cleanup. A series numbered by posting order or by its chapter titles is left alone, since its numbers are not another app's.
+
+### External readers
+
+- **A chapter paged through to the end in Panels counts as read** ([#377](https://github.com/AngeloSha/uchiyomi/issues/377), **farewell-ladmin**). With **Track reading from OPDS page streaming** on (Profile → Connections, off by default), Uchiyomi remembers the page you reach, and a chapter you page through to the end is marked read here and on your trackers. It never fired before: OPDS readers fill in our own `maxWidth` template, and every such request was skipped as a thumbnail. Pages at reading size count; thumbnail-size requests do not.
+- **A preload is not a read.** A chapter counts only when its last page is first reached after at least half of it was paged forward, and not faster than half a second a page (20 seconds at least), so a reader that loads a chapter ahead never completes it. A chapter counted this way is never deleted by the read-chapter cleanup until you read it in a way that is not a guess (the web reader, Mark read, KOReader). Incognito keeps the place and nothing else.
+
+### Deleted chapters come back from any source
+
+- **Fetch on a deleted chapter uses the sources the series follows now** ([#437](https://github.com/AngeloSha/uchiyomi/issues/437), **dfpmola**). It used to ask only the source the chapter first came from, even after the series had moved to another one, and then said only "Could not start." The copy you pick under **Versions** is the one fetched, Select → Fetch sends a deleted stretch as one job, and every refusal says why and what to do. The chapter comes back on its own row, so reading progress is kept. The stamped copy is still used when no followed source lists the number, and a deleted chapter caught in a cooldown is never promised to come on its own.
+
+### Imports keep your own sources
+
+- **Your backup's own source comes first** ([#425](https://github.com/AngeloSha/uchiyomi/issues/425), **Kedryn**). A suggestion held on the source a backup entry came from (its title found, at an address that does not prove the entry) was quietly replaced by another source's exact title, ready to import from a source the person never used. Another source can still become the suggestion when it ranks higher, held the same way.
+- **Moved addresses are found.** When a site changes its address format but keeps the same slug or id, the entry is found on its own source by that slug and suggested for confirmation. A title search under another name ("Enen no Shouboutai" for "Fire Force") could not find it, which is how "Fire!" won.
+- **Confirm selected** accepts the held suggestions among the selected rows, as **Confirm this match** does for one; rows with nothing held are left as they are.
+
+### Sources
+
+- **A Test loads one image** ([#426](https://github.com/AngeloSha/uchiyomi/issues/426), **Kedryn**, **Calvin-Davidson**). The Test button now loads the first page's image the way a download does, so a source whose downloads recovered no longer reads "Failing since — Images" until the next download or for a week. A 429 there is shown, never counted; the daily check still fetches no bytes.
+- **Only failures that count now read as failures.** One failure in normal use, one more than a week old, or a cooldown is history, not *Failing*, in Details as everywhere else.
+
+### Clearer errors
+
+- **Failed actions say what went wrong** ([#435](https://github.com/AngeloSha/uchiyomi/pull/435), **Calvin-Davidson**): uploads, library moves, list and library actions, admin tasks, imports, the archive queue, download cancels and two-factor setup now give a specific message in all eight languages. The action and its reason are said together, and a server's own reason for a 502/503 is shown rather than "temporarily unavailable".
+
+### Library
+
+- **Moving between shared and private** keeps a record that a series was shared, so its owner is never offered the Delete that would erase other members' progress. A series that absorbed a merge (chapters in another folder) is refused before anything moves; a storage folder that only held deleted chapters no longer blocks a move; the confirmation says the files move on the server; the audit log names the series again. With **Calvin-Davidson**'s namespace tests and clash check from [#432](https://github.com/AngeloSha/uchiyomi/pull/432); the move picker's current library ([#428](https://github.com/AngeloSha/uchiyomi/pull/428)) was already in.
+- **Pages in one order everywhere** ([#436](https://github.com/AngeloSha/uchiyomi/pull/436), **Calvin-Davidson**): a folder every page shares (`Series [3948394]/10.png`) no longer puts 10 before 2, in every archive format, and page cleanup counts pages the same way the reader does. Page sizes saved earlier are read in the new order.
+- **Chapter names from Edit chapter** ([#438](https://github.com/AngeloSha/uchiyomi/pull/438), **Calvin-Davidson**): a title you type is the chapter's name (the number in front of it dropped); a number-only edit keeps the chapter's own name.
+- **18+ uploads** ([#434](https://github.com/AngeloSha/uchiyomi/pull/434), **Calvin-Davidson**): an upload made while 18+ titles are shown is accepted.
+- **Admin dates are dates again.** Since v0.107.0 every timestamp an admin screen showed read "Invalid Date" (removed series, members, sessions, the audit log, import batches).
+
+### The iPhone and iPad app
+
+- **Fits the Duo** ([#430](https://github.com/AngeloSha/uchiyomi/pull/430), **nVitius**'s idea): when iOS asks for a side bar, the app shows Uchiyomi's own rail, with its icons and accent colour, and the heroes' words clear it; the series page shows one reading button. Server controls are in **Profile → This device**, Discover puts its hero first with compact filters, and the wrapper's fallback **Servers** button no longer flashes over the splash or covers a chapter.
+- **IPA builds in CI** ([#431](https://github.com/AngeloSha/uchiyomi/pull/431), **nVitius**): every relevant pull request builds and checks an unsigned IPA. Publishing a GitHub prerelease or the AltStore feed stays off until switched on; build numbers continue from the private builds already on phones.
+
+### Upkeep and upgrading
+
+- Dependabot [#423](https://github.com/AngeloSha/uchiyomi/pull/423): React Query, Motion and Tailwind patch updates. Dependabot can update postcss again (its override conflicted with the direct dependency).
+- Browser tests wait for a proven reconnect before counting a request as online.
+- Additive database changes only. The Umbrel package pins the published v0.107.0.
+
+## v0.107.0 — 2026-11-10
+
+**Private copies for each account, image folders as chapters, explicit external-reader progress, and a clearer import review.**
+
+- **Private libraries** ([#371](https://github.com/AngeloSha/uchiyomi/issues/371), **Calvin-Davidson**): choose shared or private when adding or uploading, with a per-account default that starts off. Owners can pause, remove, restore or deliberately share eligible copies. Private additions have independent files and identity; other accounts, including admins using content APIs, cannot browse them. Private reading history stays private after sharing. AniList privacy is enforced separately from progress changes; trackers without a supported private-entry operation do not receive private writes.
+- **Images as one chapter** ([#375](https://github.com/AngeloSha/uchiyomi/issues/375), **Calvin-Davidson**): select loose images or a folder, review their order, and upload one validated CBZ. Streaming validation, upload limits, disk-floor checks and atomic publication preserve existing files.
+- **External readers** ([#377](https://github.com/AngeloSha/uchiyomi/issues/377), **farewell-ladmin**): a local KOReader sync endpoint maps the original downloaded file by its partial MD5, checks visibility on every request, and accepts explicit progress. OPDS page-streaming requests can optionally save an estimated bookmark; fetching pages never marks a chapter complete. Both options are described under Profile → Connections.
+- **Optional external chapter counts** ([#378](https://github.com/AngeloSha/uchiyomi/issues/378), **farewell-ladmin**): newly reported KOReader/Komga completions may appear in personal chapter counts. Initial linking, bulk reports and retries do not fabricate reading sessions. External counts add no reading time, badges, streaks or household rankings. Off by default.
+- **Import review** ([#410](https://github.com/AngeloSha/uchiyomi/issues/410), **julieminer**): filter by state and source, select or skip visible rows, inspect match provenance and ambiguity, retain supported Mihon tracker links, and continue a large saved import in subsequent batches. Exact alternate titles precede weak matches, including non-Latin titles. Batches and skip decisions belong to their account and library scope; private tracker entries remain private in mixed imports.
+- **Privacy on shared devices:** private API/image responses bypass implicit caches; account changes clear runtime caches and prevent stale requests or forms from acting as the newly selected account. Explicit offline downloads remain keyed to their owner. Account changes reload the app, and delayed work stays bound to its original account. Notification details require a matching recipient; older workers receive generic text. Server headers also prevent older browser workers from caching private images during an upgrade.
+- **Desktop startup:** finish loading the shell before opening the app, so an interrupted loading screen cannot replace a successfully opened app with an error. A stalled notification service no longer blocks worker startup, reader requests or account changes.
+- **Upgrade:** additive database migrations preserve existing shared defaults and artwork. After upgrading, older versions do not enforce the new private-content permissions: use a forward fix rather than rolling an older image back against this database. Back up before upgrading. The optional extraction service keeps its existing models and limits; the Umbrel package pins published v0.106.0.
+
+## v0.106.0 — 2026-11-09
+
+**Find individual sites inside large extensions, inspect errors on a phone, and connect to Suwayomi's newer login modes.**
+
+### Sources and error details
+
+- Extensions containing several sites in the same language show each site's name and language, with a searchable
+  source list and the extension's own heading and counts ([#421](https://github.com/AngeloSha/uchiyomi/pull/421),
+  **Calvin-Davidson**). Search accepts site names and language names or codes. Opening a site from a multi-site
+  extension asks which site to open; each site's settings stay separate.
+  Large multi-site extensions start with their sites off so you can choose them; updates preserve those choices.
+- Failed extension actions show a short explanation and **Details** ([#418](https://github.com/AngeloSha/uchiyomi/issues/418),
+  **Calvin-Davidson**). Technical details remain open while you scroll, select or copy them. **Copy error** copies the
+  diagnostic; when automatic copying is unavailable, the text can be selected and copied using the device's controls.
+
+### Suwayomi authentication
+
+- External Suwayomi servers can use **Simple Login** or **UI Login**, as well as Basic Auth or no authentication
+  ([#419](https://github.com/AngeloSha/uchiyomi/issues/419), **himsin**). Set `SUWAYOMI_AUTH_MODE` to `simple` or `ui_login`
+  and keep the engine's user name and password in the existing variables. Uchiyomi manages sessions and token renewal
+  on the server for searches, images, downloads and the engine browser.
+- The default, `auto`, preserves existing behavior: Basic Auth when an engine user name is configured, otherwise no
+  authentication. This setting does not change the engine's own configuration or readers' Uchiyomi accounts.
+
+### Upkeep and upgrading
+
+- Dependency updates from Dependabot [#416](https://github.com/AngeloSha/uchiyomi/pull/416),
+  [#417](https://github.com/AngeloSha/uchiyomi/pull/417) and [#420](https://github.com/AngeloSha/uchiyomi/pull/420):
+  Next.js 16.4.5, React Query, Motion, Electron 45.2.3, Fastify plugins and Undici 8.12.4.
+- The import/resume concurrency test holds the resolver at an explicit boundary and stubs unrelated public-network
+  searches, preserving its checks that concurrent requests start only one loop.
+- No database migration. Existing artwork and extraction settings keep their behavior; title extraction models are
+  unchanged. The Umbrel package pins the published v0.105.0 image.
+
+## v0.105.0 — 2026-11-07
+
+**Looking for one series' sources searches every source, a server only adults use can stop hiding 18+, an import never
+adds a second copy of what you have, and the series page keeps its order.**
+
+### Every source, when you look for a series' sources
+
+- **Add more sources** on a series and **Change** in an import search every source your account may use
+  ([#405](https://github.com/AngeloSha/uchiyomi/issues/405), **StrayaJake**; [#412](https://github.com/AngeloSha/uchiyomi/issues/412),
+  **Wolf92s**; with **Baine**'s [#407](https://github.com/AngeloSha/uchiyomi/pull/407)). With **Show 18+** on, the request
+  carried the 18+ flag twice, which hid every source an extension calls adult — on many servers nearly all of them — and
+  with it off they were hidden on purpose, so these tools often searched four sources of twenty-five and found nothing.
+  An account's age limit still applies.
+- **Up to 25 sources per series** ([#413](https://github.com/AngeloSha/uchiyomi/issues/413), **Wolf92s**), ten before:
+  **Admin → Settings → Downloads → More options → Other sources per series**. The first three are asked at every library
+  update; the rest are backups, asked once a day while the series has nothing missing, so a long list of them does not make
+  every update longer. A series that is missing chapters asks them all, and so does **Check now**. When a series is full,
+  the message says where the number is set.
+- A title an extension rates only with a genre tag counts as 18+ when the tag says **Erotica** or **Pornographic**, the
+  way a MangaDex title rated so does: for **Show 18+**, for age limits, in listings, by link and on add, where it is stored
+  18+ (thanks to **globalteddy**).
+
+### A server only adults use
+
+- **Admin → Settings → Series & chapters → Hide 18+ until someone shows it** ([#406](https://github.com/AngeloSha/uchiyomi/issues/406),
+  **StrayaJake**). On by default, as every server has been. Switched off, nothing is hidden for anyone — in the web app,
+  OPDS readers and the Komga API alike — and **Show 18+**, the line above the page and the 18+ filter's genres go away.
+  Age limits on accounts still apply: they are a permission, not this switch.
+
+### Importing
+
+- **No second copy of a tracker entry** ([#410](https://github.com/AngeloSha/uchiyomi/issues/410), **julieminer**). An
+  entry a series here is already linked to — by you, by an earlier import or by the online check — is that series, even
+  under another title: it reads *Already in your library* and is not added again. Before, a series added from a source
+  that spells it differently was offered again by the next import of the same list, and added twice.
+- **How many are left.** A list with more than 500 titles not in your library says how many come after them —
+  *(first 500 not in your library kept; 312 more after them: import again for those)*.
+- **Tracker lists are read up to 2,000 entries** (501 before), so importing a long AniList, MyAnimeList or Kitsu list
+  again reaches the titles after the first 500, as a backup's import does.
+- **A skipped title stays skipped** the next time you import the same list; picking a match for it in **Change**
+  un-skips it.
+- **Back** on an import's review goes back to the import list, in the page and in the browser
+  ([#409](https://github.com/AngeloSha/uchiyomi/issues/409), **julieminer**).
+
+### Series page, reader and uploads
+
+- **Oldest / Newest** on the series page is kept for every series, on every device you sign in on
+  ([#408](https://github.com/AngeloSha/uchiyomi/issues/408), **julieminer**).
+- **Title artwork** settings (automatic title logos and cover titles) are on **Admin → Art**, above the covers and
+  banners they sit beside ([#411](https://github.com/AngeloSha/uchiyomi/issues/411), **julieminer**).
+- In paged **Fit width**, going back a page opens it at its foot, where you left it
+  ([#401](https://github.com/AngeloSha/uchiyomi/pull/401), **Forgitusername**).
+- Uploads ([#375](https://github.com/AngeloSha/uchiyomi/issues/375)): the files that could not be stored stay in the list
+  for another try, the series page and the Library show what landed at once, the page names the series the files go
+  into, and every refusal is said in your language.
+
+### Upkeep
+
+- Dependency updates from Dependabot [#403](https://github.com/AngeloSha/uchiyomi/pull/403) (Fastify 5.12.8 and its
+  plugins, with the @fastify/cors security release 11.4.0) and [#404](https://github.com/AngeloSha/uchiyomi/pull/404)
+  (Next.js 16.4.4, React Query, Motion and Tailwind CSS).
+- Four tests that a slow or small CI runner could fail now wait for what they check, or say what disk they need.
+- Dependabot no longer proposes Python versions the optional title extractor cannot build on
+  ([#395](https://github.com/AngeloSha/uchiyomi/pull/395)).
+
+### Upgrading
+
+- Nothing to do. The new columns and table are additive (the server's 18+ switch, on by default; an import's count of
+  what is left; the remembered skips), and v0.104.0 runs on the new schema if you roll back.
+- The Umbrel package pins v0.104.0.
+
+## v0.104.0 — 2026-11-05
+
+**Upload new series or missing chapters, keep artwork beside your files, and improve the reader, lists and source controls.**
+
+### Chapter uploads and local artwork
+
+- **Upload a series**, or use **More → Upload chapters** on an existing series ([#375](https://github.com/AngeloSha/uchiyomi/issues/375),
+  building on **Calvin-Davidson**'s [#384](https://github.com/AngeloSha/uchiyomi/pull/384)). Admins can upload; members need the
+  new **Can upload series** permission, off by default, and may only add files to series they can open. Files stream to
+  the download folder, are checked as readable archives, and never overwrite existing files. Later files are bound to
+  the series the first upload created. Interrupted uploads leave no partial chapter; pending indexing is reported.
+- **Local covers and banners** ([#389](https://github.com/AngeloSha/uchiyomi/issues/389), **OnePieceSunny**): put `cover.jpg`,
+  `banner.jpg` or supported WebP/PNG/JPEG/AVIF equivalents beside the chapters, or in their `artwork/` folder. A library
+  scan validates and caches them, including from read-only libraries, and notices replacements or removals. An explicit
+  artwork choice keeps priority; local files take priority over automatic artwork. Original files are left intact.
+
+### Reader and list controls
+
+- **Paged → Page fit → Fit width** fills the slide and scrolls vertically within the page, including cropped, split,
+  rotated and paired pages. Vertical reading keys finish tall pages before turning, including a focused page of a
+  spread. Zoom keeps the reading position after panning, including when zooming out. **Whole page** remains the default
+  and the webtoon Fit setting keeps its own choice ([#398](https://github.com/AngeloSha/uchiyomi/issues/398),
+  with keyboard/zoom improvements building on [#401](https://github.com/AngeloSha/uchiyomi/pull/401), **Forgitusername**).
+- **List** on a series now ticks the lists it belongs to. Tick to add, untick to remove, then press **Done**; the sheet
+  stays open for several changes. Only your hand-picked lists appear. Failed writes keep the previous membership
+  ([#399](https://github.com/AngeloSha/uchiyomi/issues/399), **Forgitusername**).
+- Typed confirmations show titles in their real casing ([#381](https://github.com/AngeloSha/uchiyomi/pull/381)), and opening
+  a menu stops smooth-scroll momentum so it stays open ([#388](https://github.com/AngeloSha/uchiyomi/pull/388)), both from
+  **Calvin-Davidson**. A real scroll still dismisses the menu.
+- Mobile sheet actions and pinned footers clear the navigation through the full mobile/tablet breakpoint, including
+  safe-area insets ([#391](https://github.com/AngeloSha/uchiyomi/pull/391), **nVitius**).
+
+### Health and download controls
+
+- Titled Q&As, giveaways, author notes and other short specials are left out of **Suspiciously short chapters** and
+  unattended short-chapter repair ([#386](https://github.com/AngeloSha/uchiyomi/issues/386),
+  [#387](https://github.com/AngeloSha/uchiyomi/pull/387), **Calvin-Davidson**). Story titles that merely mention a special's
+  word remain checked. Detection uses title wording, so a real episode named only “Announcement” without a creator
+  number can still be treated as a special; **Fix** on an individual chapter remains available.
+- A deleted chapter whose every known source copy is blocked leaves the chapter shelf
+  ([#396](https://github.com/AngeloSha/uchiyomi/issues/396), **TIGamingTV**). Reading history and progress stay intact,
+  a saved offline copy remains readable, and unblocking a copy makes the row available again.
+- **Dismiss** and **Cancel** work for source jobs with long encoded folder names
+  ([#397](https://github.com/AngeloSha/uchiyomi/pull/397), **Baine**).
+- Dependency patches from Dependabot [#392](https://github.com/AngeloSha/uchiyomi/pull/392),
+  [#393](https://github.com/AngeloSha/uchiyomi/pull/393) and [#394](https://github.com/AngeloSha/uchiyomi/pull/394):
+  Fastify compression/cookies/JWT/static, motion, IndexedDB test support and Electron 45.1.0.
+- Patch the static server's `glob` dependency to 14.0.2, fixing cancellation that could continue filesystem traversal
+  after a timeout ([GHSA-3g3m-2fjr-6pw4](https://github.com/advisories/GHSA-3g3m-2fjr-6pw4)).
+
+### Upgrading
+
+- Existing members keep upload permission off. Uploads respect `MIN_FREE_GB`; ZIP/CBZ/EPUB use `UPLOAD_MAX_MB`
+  (2 GB by default), while PDF and RAR/CBR are capped at 128 MiB. Uploads go to the writable download folder.
+- Split-container installs stream chapter uploads through nginx without its ordinary 1 MiB API limit; application
+  size, disk-space and permission checks still apply.
+- New artwork-cache metadata and upload permission storage are additive. Existing manual artwork and reader choices
+  retain priority. The optional title extractor keeps Python 3.12 and its existing models.
+- The Umbrel package pins the already published v0.103.1 image until this release's verified digest is available.
+
+## v0.103.1 — 2026-10-31
+
+**A special no longer shifts the chapter numbers after it, and a series is no longer linked to an AniList entry that
+only lists its name among its synonyms.**
+
+### Specials stay out of the chapter numbers
+
+- **A special no longer takes a chapter's number** ([#379](https://github.com/AngeloSha/uchiyomi/issues/379), reported
+  by **Calvin-Davidson**). Some sources count every post as a chapter, specials included: on Tapas, *24. The Other
+  Side* comes after three specials, so it was numbered 27. Such a series is now numbered by its chapter titles: each
+  chapter at the number in its title, and each special just after the chapter before it (*Caption Contest!* is 24.01).
+- **A series you add is numbered this way at once**, and the add dialog says so (*Numbered by the chapter titles*).
+  **Keep the source's numbers** adds it the old way.
+- **One already in your library is never renamed on its own.** Its page says *Chapter numbers need a review*, and
+  nothing new downloads for it until an admin opens **Review renumbering**, checks the plan and confirms it (Health's
+  *Chapter numbering* lists it too). Files are renamed in place, and reading progress stays with each chapter. **Keep
+  the source's numbers** leaves it as it is, and **Use the source's numbers** undoes it later.
+- **Other sources keep working with such a series**, and one that counts its specials the same way is read by its
+  titles too, so its new chapters line up.
+
+### The right AniList entry
+
+- **A synonym gives way to an entry's own title.** AniList's synonyms are anyone's to add, and an anthology lists every
+  story in it: *Pick Me Up* was linked to an 18+ anthology with a story of that name, so it showed the anthology's cover
+  and banner and read right to left. When the search's first answer matches only by a synonym, the lookup now looks at
+  the next few answers (one more request, only then) and takes the first one that has the name as its own title. The
+  synonym's entry is kept only when none does.
+- **Links made before are corrected after the upgrade.** The background check holds every automatic link to the new
+  rule once and moves the ones it applies to. The cover and banner the old entry gave the series become the new
+  entry's, a reading direction and type that AniList had set are learned again from the new entry, and the progress
+  recorded for the old entry no longer counts for the new one. A link a person made is never touched. Admin → Tasks
+  says how many moved. On the project's own server that was *Pick Me Up* and *Overgeared* (linked to an earlier,
+  finished adaptation).
+
+### Upgrading
+
+- Nothing to do. Chapter numbering needs no database change. The AniList check runs a couple of minutes after the
+  server starts; a link that matches only by a synonym costs one AniList search, paced in the background (about 130
+  on a 215-link library, a few minutes).
+
+## v0.103.0 — 2026-10-31
+
+**Title logos from the Uchiyomi logo library: picked and cut out by hand, one per manga, for every server.**
+
+### The Uchiyomi logo library
+
+- **Automatic title logos come first from the [Uchiyomi logo library](https://github.com/AngeloSha/uchiyomi-title-logos)**:
+  title logos picked and cut out by hand from official covers, one per AniList manga. A server with one of those manga
+  shows its logo on computers without any cover processing. Wikidata and Wikimedia Commons are still asked for manga
+  the library does not have.
+- **Every file is checked before it is used.** The library's index names each logo's SHA-256; a file that does not match
+  is never shown.
+- **Logos keep up with the library.** A manga that gains a library logo gets it on the next background check, even
+  after an earlier search found nothing or found a Wikimedia logo, and a logo reworked in the library replaces the old
+  copy. An admin's own logo, or a choice of text, is never replaced.
+- **Same switch as before:** Admin → Settings → Series & chapters → Automatic title logos (off by default), and a
+  library's online-lookup opt-out still applies. The series editor names the library as the logo's source, with a link.
+
+### Upgrading
+
+- Nothing to do. `TITLE_LOGO_LIBRARY_URL` reads the library from a mirror, or, set empty, turns it off
+  ([CONFIGURATION.md](docs/CONFIGURATION.md#what-leaves-your-server)).
+
+## v0.102.2 — 2026-10-31
+
+**Title logos are a computer's: on a phone the cover is the hero, so it shows the title instead.**
+
+### Title logos on computers only
+
+- **A phone's hero shows the readable title over the cover, never the title logo.** On a phone the cover is the hero and
+  already carries its own lettering, so a logo on top of it said the title twice. Home and series heroes on a computer
+  keep their logos as before. This applies to any screen under 1024 pixels wide, where the cover replaces the banner.
+- **A phone no longer downloads title logos** or keeps checking for one that is still being looked up.
+
+### Also
+
+- **Discover hides *Newest* and *Popular* while search results are up** ([#376](https://github.com/AngeloSha/uchiyomi/pull/376),
+  from @Calvin-Davidson). Results come in each source's own order, so the toggle did nothing but throw the search away.
+  Searching with an empty box now goes back to browsing, like the ×.
+
+### Upgrading
+
+- Nothing to do.
+
+## v0.102.1 — 2026-10-30
+
+- Nightly cover-title processing waits for the online logo search for each checked manga before extracting a cover. Pending searches and provider retry pauses remain queued.
+- Canonical manga titles are fetched before cover-title verification and retry decisions, so a missing metadata cache no longer prevents otherwise valid results from being automatically applied. Existing checks, manual artwork and review corrections remain protected.
+- The automatic-title panel shows the auto-apply state, online-search progress and the reasons previews need review, with translations in every supported language.
+
+## v0.102.0 — 2026-10-29
+
+**Manga title artwork, cover extraction with precise corrections, and optional nightly library processing.**
+
+### Manga title artwork
+
+- Home and series heroes show cached transparent title logos when available, with readable captions for original-language
+  artwork. Genre and cover-colour title styles provide a fallback, with the same layout on phones and computers.
+- Title logos occupy more of the Home and series heroes, with proportional sizing for small originals and
+  compact layouts that keep reading controls clear on short screens.
+- Optional automatic lookup uses confirmed AniList manga identities to find Wikimedia artwork. Existing online-lookup
+  opt-outs remain effective; lookups run in the background and do not delay opening a page.
+- Edit details offers logo upload, image links, refresh, styled titles and reset to automatic. Manual choices take priority,
+  and artwork source information stays available with the preview.
+- Automatic discovery scans the eligible library without opening every manga, resumes after restarts, and honors
+  provider-wide retry pauses. The admin progress panel distinguishes unchecked titles from completed no-match results.
+- Logo matching also accepts transparent PNG originals and verifies bounded Commons discovery against the exact manga's
+  canonical identity, recovering artwork absent from the direct logo field.
+- Action, fantasy and science-fiction titles retain their distinctive typography when Comedy is a secondary genre.
+- Administrators can extract lettering from the current cover, adjust the title region and exclude credits, preview
+  the transparent result on a hero, and explicitly apply or discard it. Changed covers and newer artwork choices
+  invalidate old drafts. The optional model service remains isolated from the application and library files.
+- Cover selection reruns detection on overlapping title-line views and refines missed letters using the existing
+  local SAM weights. Automatic selection groups neighboring lines and separated characters. Edited regions immediately
+  hide the previous preview, and detected bounds remain separate from the administrator's requested selection.
+- Cover extraction can retain dark outlines and shadow strokes next to detected lettering when source-image
+  contrast, text-model support and bounded component checks agree. Original colors and previously detected ink
+  remain intact; ambiguous results still require visual review.
+- Title previews offer precise Restore and Erase brushes, zoom, pan, undo and reset. Corrections replay against an
+  immutable cover and alpha mask, save as a private revision, and require review before Apply. Revision checks prevent
+  older tabs from applying unseen corrections; manual corrections never inherit automatic quality approval.
+- Opt-in nightly cover extraction processes existing and newly added manga through a persistent queue. Manual
+  requests take priority; unchanged covers are skipped and uncertain previews remain available for 14 days.
+- A separate opt-in can apply results that pass the available canonical-title and image checks. Existing manual
+  artwork, styled titles and provider logos are preserved. Both options are off by default; missing identity,
+  unavailable recognition, incomplete titles and other failed checks leave results for review. Empirical calibration
+  remains separate from these runtime checks and is never inferred from an extraction score.
+
+## v0.101.0 — 2026-10-29
+
+**Search creators on sources, manage pages with undo, and preview source cleanup before deleting anything.**
+
+### Creator searches and local profiles
+
+- Discover offers Title, Author and Artist searches. MangaDex and Suwayomi extensions with declared creator
+  text filters use their actual creator fields. Unsupported fields are left out; role, exact spelling and
+  page remain separate through shared caches and pagination (#338).
+- The author-filtered library links to Discover. A selected provider retains its full first hundred works
+  before another page is requested.
+- Optional managed profiles can open on explicitly configured local networks. Local-only credentials stay
+  restricted on every request, including refresh, image cookies and remembered-profile switching (#351).
+- Local-only tokens use a separate cryptographic domain, so an older app image rejects them after rollback.
+  Existing credential sessions keep their format. Public-proxy defaults continue to require credentials.
+
+### Reversible page cleanup
+
+- Admins can manage a writable local CBZ from the reader's **Pages** sheet: preview and select images,
+  remove them, and restore their exact original bytes. Original page numbers, progress and bookmarks stay
+  in place. Unsupported formats and incomplete chapters keep the existing Skip control (#354).
+- Removed originals stay in server trash until explicitly deleted. Separate confirmations permanently
+  delete selected originals or unused retained images; shared originals still needed by another removed
+  page are kept. Backups and separately saved offline copies are unaffected.
+- Optional GIF skip rules apply to one series or every chapter from its recorded source, with a preview
+  of the scope. A series rule overrides its source rule, and a per-page rescue overrides both. Rules skip
+  images while reading and never delete files automatically.
+- Edited page images get fresh cache identities. An offline download refuses a chapter that changes
+  midway, preventing a saved copy from mixing old and new pages.
+
+### Deliberate source cleanup and installation fixes
+
+- Removing a source keeps downloaded chapters by default. Optional cleanup requires a fresh, account-bound
+  preview and a separate confirmation; source references/listings are checked under writer and database locks.
+  An empty, unavailable or shorter remaining listing cannot authorize deleting chapters (#339).
+- To clean up a main source, first promote its replacement and keep the old source as a follower. Explicit
+  cleanup removes that follower atomically so it cannot immediately download the unwanted chapters again.
+- Fresh development databases initialize with the existing Supabase PostgreSQL 15 image and its required
+  bootstrap identity. Existing volumes keep their data, extensions and configuration; SQL readiness also
+  detects an interrupted initialization with no application database (#363).
+- Security dependency patches update fast-uri and the desktop build's undici (#367, #368).
+- Open site is optional when an extension already searches and downloads normally. A verification loop in
+  that manual browser view is assessed separately from whether the extension works (#352).
+
+### Upgrading
+
+- No PostgreSQL major-version change is included. Existing authentication settings remain in effect.
+- Local profile picking and destructive cleanup require explicit configuration or confirmation.
+
+## v0.100.0 — 2026-10-29
+
+### Library, reader and source improvements
+
+- Source identity wins over a title match: different entries on one source remain separate even when their
+  titles are identical or normalize alike. Same-title additions receive separate download folders (#357).
+- The series chapter toolbar has **Select all** and **Clear selection**, respecting the current group and
+  missing-chapter filters across chapter pages (#364).
+- Import matching and **Add more sources…** keep slower sources' answers, retain more than twelve matches,
+  offer **More** for paged sources, and show author metadata when available (#353).
+- The reader can pan a zoomed page and offers a **Paper** tone. Touch taps distinguish catching a fling,
+  turning pages and double-tapping. Paged chapter changes show a brief chapter label.
+- Series menus offer **Move library**. Home's **Keep reading** row can hide and restore a series.
+- Alternate AniList titles appear on series pages; correcting the AniList link invalidates their cached identity.
+- An optional account setting filters new-chapter notifications to the next chapter the person would read,
+  including files that landed before indexing finished.
+- Phone Search can open the command palette. Admin settings show download limits and blocked sources.
+- Renaming a missing folder identifies an existing spelling that differs only in case.
+- Dependency updates cover the server, web app and desktop tooling, including Electron 45.
+
+**Tap an author on a series page to see everything of theirs in your library, and the library's search finds authors
+too.**
+
+### Find more by an author
+
+- **Each name in the *by …* line under a series' title is a link** to your library showing every series by that person,
+  with a tag above the grid to clear it ([#338](https://github.com/AngeloSha/uchiyomi/issues/338), from @sonikvvv). A
+  series with several authors shows each name on its own.
+- **A name finds every way it is written.** *Chugong (추공)* also finds a series that only says *추공*, and
+  *Gi So-Ryeong* finds *Gi So Ryeong*. Only whole names match, so *Oh* is not every name with "oh" in it.
+- **Search your library finds authors as well as titles.**
+- **Save as list keeps the author,** so a list of someone's work fills itself as you add more of it.
+
+### Also
+
+- **A library the sign-in limits read addresses with is updated** (ip-address 10.7.4). On a server that trusts every
+  proxy (`TRUST_PROXY=true`), one crafted address could stall it.
+
+### Upgrading
+
+- Nothing to do.
+
+## v0.99.0 — 2026-10-22
+
+**Your picks on Discover get a spotlight of their own, right after the first row of covers, and Discover's rows line up
+with the page again.**
+
+### Your picks get the spotlight
+
+- ***Recommended for you* is a band of its own across the page,** right after the first row of covers. It used to be
+  one more row of covers inside the wall, easy to scroll past.
+- **The top pick is a big card** that says why it is there, with **Find and add**. The rest follow in a row you swipe.
+- **The top pick's art glows behind the band.** On a computer the glow takes the art of the card you point at. Under
+  *Reduce effects* or reduced motion it changes without fading.
+- **The covers of the series you read sit beside *Because you read…***, so you can see where your picks come from.
+
+### Rows that line up
+
+- **Discover's rows start on the page's edge again.** Their first card used to snap to the edge of a phone's screen, and
+  under the sidebar on a computer, which cut off the "1" of the Top 10.
+
+### Upgrading
+
+- Nothing to do.
+
+## v0.98.0 — 2026-10-22
+
+**Discover's hero is always there and quick on a phone, your picks are one full row, and the newest from your sources
+comes first.**
+
+### A hero that always loads
+
+- **The trending titles are kept on the server.** After every restart or update, Discover used to wait on AniList for
+  them; when AniList was busy, a phone showed no hero at all and never asked again. Now the hero comes from the kept
+  copy at once, and the copy is refreshed in the background every six hours.
+- **The hero's space is held while it loads**, so nothing below it jumps when it appears.
+- **On a phone each slide's picture loads once, and sharper.** It used to be fetched twice at two sizes, and was the
+  small cover stretched across the screen.
+- **It moves as Home's hero does:** slides crossfade, a phone's cover drifts slowly, bars show where the slides are, and
+  a **Pause** key holds it. Under *Reduce effects* or reduced motion it stays still.
+
+### One full row of picks
+
+- ***Recommended for you* and *Because you read* are one row.** Each card says why it is there: the service that
+  suggested it, or a small cover of the series you read. A title named by both is one card.
+- **Because you read uses your last five reads, not one**, a pick from each in turn. On a big library it often showed
+  four cards, because the rest were titles you already have.
+- **Your connected trackers can suggest up to eight titles per series you rated**, up from five. These come from
+  suggestions the server already stores, so it makes no extra requests.
+
+### The newest from your sources comes first
+
+- **The wall starts right under the search.** Your picks row comes after its first two rows of covers.
+- **The trending manhwa, manga and manhua rows come every four rows after that,** with the first ten numbered as on
+  Home's Top 10. They used to sit at the very end of the wall, where almost nobody scrolled.
+- A row waits at the end until the wall has filled up to its place, so nothing you are looking at moves.
+
+### Upgrading
+
+- Nothing to do. The server stores the trending lists in a new table, created on start.
+
 ## v0.97.0 — 2026-10-21
 
 **Your favorites in your own order, chapters that failed every night on Natomanga and Mangakakalot now come from the

@@ -45,13 +45,13 @@ test('every document is valid on every engine from the oldest supported up, with
   // Reintroduce by selecting a deprecated member again (`isNsfw` beside `contentWarning` in OPS.sources): "uses
   // deprecated SourceType.isNsfw" fails. Select one an engine does not have (`codename` in aboutServer): its
   // FieldUndefined fails, naming the engine.
-  const { ALL_OPS } = await import('../src/lib/sources/suwayomi/operations');
+  const { ALL_OPS, AUTH_OPS } = await import('../src/lib/sources/suwayomi/operations');
   const list = await schemas();
   assert.ok(list.length >= 2, `PREMISE: the v2.3.2243 and v2.4.2366 captures are both here (${list.map((s) => s.file).join(', ')})`);
   if (process.env.SUWAYOMI_EXTRA_SCHEMA) assert.ok(list.some((s) => s.file.endsWith(process.env.SUWAYOMI_EXTRA_SCHEMA!.split('/').pop()!)), 'SUWAYOMI_EXTRA_SCHEMA was not read');
   assert.ok(ALL_OPS.length >= 20, `PREMISE: the registry holds every document (${ALL_OPS.length})`);
   for (const { file, schema, version } of list) {
-    for (const op of ALL_OPS) {
+    for (const op of [...ALL_OPS, ...Object.values(AUTH_OPS)]) {
       const deprecated: string[] = [];
       const errors = validate(schema, parse(op.doc), deprecated).map((e: { message: string }) => e.message);
       assert.deepEqual(errors, [], `${op.name} is refused by ${version} (${file})`);
@@ -70,8 +70,8 @@ test('the registry is one document per name, and the names are unique', async ()
   assert.equal(new Set(ALL_OPS.map((o) => o.doc)).size, ALL_OPS.length, 'two operations share a document');
   for (const [key, op] of Object.entries(OPS)) assert.equal(op.name, key, `OPS.${key} is named ${op.name}`);
   for (const op of ALL_OPS) assert.equal(opOf(op.doc), op);
-  // The two reads that may be missing on an engine, and only those (a refusal of either is an answer).
-  assert.deepEqual(ALL_OPS.filter((o) => o.optional).map((o) => o.name).sort(), ['extensionFacts', 'solverSettings']);
+  // The optional reads that may be missing or fail independently (their refusal is an answer).
+  assert.deepEqual(ALL_OPS.filter((o) => o.optional).map((o) => o.name).sort(), ['extensionFacts', 'solverSettings', 'sourceCreatorFilters']);
 });
 
 /** A transport that records every document it is sent and answers each with a plausible shape for its operation. */
@@ -86,11 +86,13 @@ async function recorder() {
     pref('ListPreference', 'ls', { str: 'a', strDefault: 'a', entries: ['A', 'B'], entryValues: ['a', 'b'] }),
     pref('MultiSelectListPreference', 'ms', { strs: [], strsDefault: [], entries: ['A'], entryValues: ['a'] }),
   ];
-  const manga = { id: 1, title: 'T', thumbnailUrl: '/t', realUrl: null, url: '/t', description: null, author: null, artist: null, genre: [], status: 'ONGOING' };
+  const manga = { id: 1, sourceId: '1', title: 'T', thumbnailUrl: '/t', realUrl: null, url: '/t', description: null, author: null, artist: null, genre: [], status: 'ONGOING' };
   const answers: Record<string, unknown> = {
     aboutServer: { aboutServer: { name: 'Suwayomi-Server', version: 'v2.3.2243', buildType: 'Stable' } },
     sources: { sources: { nodes: [{ id: '1', name: 'S', lang: 'en', contentWarning: 'SAFE', supportsLatest: true }] } },
+    sourceCreatorFilters: { sources: { nodes: [{ id: '1', filters: [{ __typename: 'TextFilter', name: 'Author' }] }] } },
     fetchSourceManga: { fetchSourceManga: { mangas: [manga] } },
+    mangaIdentity: { mangas: { nodes: [manga] } },
     fetchManga: { fetchMangaAndChapters: { manga } },
     fetchChapters: { fetchMangaAndChapters: { chapters: [{ id: 1, chapterNumber: 1, name: 'One', uploadDate: '1704067200000', sourceOrder: 1, url: '/1' }] } },
     fetchChapterPages: { fetchChapterPages: { pages: ['/p/0'] } },
@@ -133,9 +135,12 @@ test('every adapter function sends documents from the registry, and every docume
   const [remote] = await sources.listRemoteSources(run);
   const a = sources.makeSuwayomiAdapter(remote, run);
   await a.search('t');
+  await sources.enrichCreatorSearch([a], run);
+  await a.searchCreator!('Someone', 'author', 2);
   await a.latest!(1);
   await a.popular!(1);
   await a.getSeries('1');
+  await a.lookupByPath!('/t', 1000);
   await a.listChapters('1');
   await a.getPageUrls('1');
   await ext.listExtensions(run);

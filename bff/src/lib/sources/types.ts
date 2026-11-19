@@ -34,7 +34,8 @@ export interface SourceSeries {
   /**
    * How the source itself rates the title, when it does (v0.55.4, #158): MangaDex's `contentRating`. Discover's search
    * reads it for its 18+ filter (lib/searchAll.ts ratingOf): erotica and pornographic are 18+, safe and suggestive are
-   * not. Absent for every scraped site and extension, which say nothing per title.
+   * not. Absent for every scraped site; an engine extension's own rating tag among its genres is read as one
+   * (lib/ageRating.ts taggedContentRating).
    */
   contentRating?: 'safe' | 'suggestive' | 'erotica' | 'pornographic';
 }
@@ -99,6 +100,8 @@ export const unnumberedOf = (list: unknown): number => {
   return typeof n === 'number' && n > 0 ? n : 0;
 };
 
+export type CreatorField = 'author' | 'artist';
+
 export interface SourceAdapter {
   id: string; // 'mangadex'
   name: string; // 'MangaDex'
@@ -109,6 +112,16 @@ export interface SourceAdapter {
    * first page alone, and GET /api/sources reports which can go further (`searchPages`).
    */
   searchPage?(query: string, page: number): Promise<SourceSeries[]>;
+  /** Search the provider's creator fields, never its title field. Absent means unsupported. */
+  searchCreator?(name: string, kind: CreatorField, page?: number): Promise<SourceSeries[]>;
+  /** Supported creator roles; absent on an adapter with searchCreator means both (e.g. MangaDex). */
+  creatorFields?: readonly CreatorField[];
+  /**
+   * Bounded lookup in the provider's already-known catalogue by its OWN path, not a request to that URL.
+   * For backup identity recovery after a rename. Multiple distinct ids mean ambiguity, never first wins.
+   * A cold catalogue or an unsupported adapter returns no identity proof; title search still follows.
+   */
+  lookupByPath?(path: string, timeoutMs: number): Promise<SourceSeries[]>;
   getSeries(id: string): Promise<SourceSeries | null>;
   listChapters(seriesId: string): Promise<SourceChapter[]>;
   getPageUrls(chapterId: string): Promise<string[]>;
@@ -134,7 +147,7 @@ export interface SourceAdapter {
   /** Referer to send when fetching page/cover images (string, or derived from the chapter url). */
   imageReferer?: string | ((chapterUrl: string) => string);
   /** Extra headers for page/cover image fetches — e.g. auth for a source that proxies its own images. */
-  imageHeaders?: Record<string, string> | ((imageUrl: string) => Record<string, string>);
+  imageHeaders?: Record<string, string> | ((imageUrl: string, signal?: AbortSignal) => Record<string, string> | Promise<Record<string, string>>);
   /**
    * How many pages of one chapter may be in flight at once. Default 1.
    *
@@ -218,4 +231,9 @@ export interface SourceHost {
   cfGet(url: string): Promise<string>;
   cfPost(url: string, postData: string): Promise<string>;
   cfSession(url: string): Promise<{ cookie: string; userAgent: string }>;
+}
+
+/** A creator method may implement only the fields the extension actually declares. */
+export function supportsCreatorSearch(source: SourceAdapter, field: CreatorField): boolean {
+  return typeof source.searchCreator === 'function' && (!source.creatorFields || source.creatorFields.includes(field));
 }

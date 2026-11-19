@@ -21,7 +21,8 @@ import { q, one } from '../db';
 import { open, seal } from '../secretbox';
 import { withGate } from '../gate';
 import { notifyAdmins } from '../push';
-import { browsableIds, SYSTEM_CTX, viewCtxFor, type ViewCtx } from '../visibility';
+import { browsableIds, SHARED_CTX, viewCtxFor, type ViewCtx } from '../visibility';
+import { wantsNews } from '../nextUp';
 import { buildRequest, discordText, type Kind, type Message, type TargetConfig, type TargetSecret } from './kinds';
 import { REASON_TEXT, sendRequest, type SendOptions, type SendResult } from './send';
 import { renderDigest } from './template';
@@ -181,7 +182,7 @@ async function serverName(): Promise<string> {
   return s?.server_name?.trim() || 'Uchiyomi';
 }
 
-export interface Landed { id: string; title: string; added: number }
+export interface Landed { id: string; title: string; added: number; /** The numbers that landed, for an account's "only my next chapter" filter (lib/nextUp.ts). */ numbers?: number[] }
 
 /**
  * The digest's text for one target. Discord renders markdown, and a title is scraped from a third-party site,
@@ -228,11 +229,16 @@ export async function sendDigest(landed: ReadonlyArray<Landed>, opts: SendOption
         'SELECT series_id FROM favorites WHERE user_id = $1 AND series_id = ANY($2)', [t.user_id, moved.map((s) => s.id)]).catch(() => []);
       const mine = new Set(fav.map((f) => f.series_id));
       series = moved.filter((s) => mine.has(s.id));
+      // An account that asked to hear only about the chapter it would read next (lib/nextUp.ts): a series whose new
+      // chapters are not it is left out of this person's message.
+      const keep: typeof series = [];
+      for (const s of series) if (await wantsNews(t.user_id, s.id, s.numbers)) keep.push(s);
+      series = keep;
     }
     if (!series.length) return;
     let ctx: ViewCtx;
     try {
-      const who = t.user_id ? await viewCtxFor(t.user_id, t.user_role ?? 'user') : SYSTEM_CTX;
+      const who = t.user_id ? await viewCtxFor(t.user_id, t.user_role ?? 'user') : SHARED_CTX;
       ctx = { ...who, hideAdultLibraries: !t.include_adult };
     } catch { return; }
     const allowed = await browsableIds(series.map((s) => s.id), ctx); // empty on a failed query: sends nothing

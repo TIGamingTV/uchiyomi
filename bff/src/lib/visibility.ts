@@ -14,6 +14,8 @@ import { noticeBook } from './noticeChapters';
 import { genresByIdOf } from './autoDetailsSql';
 
 export interface ViewCtx {
+  /** Only trusted background code receives SYSTEM_CTX. Authentication never creates this capability. */
+  readonly system?: boolean;
   /** null only for background work that legitimately sees everything: the scanner, the hero pre-warmer. */
   readonly userId: string | null;
   /**
@@ -76,7 +78,16 @@ export class Params {
 /** The predicate. `alias` is the lib_series alias in the query being built. */
 export function visible(alias: string, ctx: ViewCtx, p: Params): string {
   const parts = [`${alias}.deleted_at IS NULL`, `${alias}.merged_into IS NULL`];
-  if (ctx.libraryIds) parts.push(`${alias}.library_id = ANY(${p.add([...ctx.libraryIds])})`);
+  const own = ctx.userId && (!ctx.system || ctx.libraryIds) ? `${alias}.owner_user_id=${p.add(ctx.userId)}::uuid` : 'FALSE';
+  if (!ctx.system) {
+    parts.push(`(NOT ${alias}.is_private OR ${own})`);
+    parts.push(`NOT EXISTS (SELECT 1 FROM libraries private_lib WHERE private_lib.id=${alias}.library_id AND private_lib.managed_private
+      AND private_lib.owner_user_id IS DISTINCT FROM ${ctx.userId ? p.add(ctx.userId) + '::uuid' : 'NULL::uuid'})`);
+  }
+  if (ctx.libraryIds) {
+    const granted = `${alias}.library_id = ANY(${p.add([...ctx.libraryIds])})`;
+    parts.push(!ctx.libraryIds.length || ctx.libraryIds.includes(NO_LIBRARIES) ? granted : `(${granted} OR (${alias}.is_private AND ${own}))`);
+  }
   if (ctx.maxAgeRating !== null) {
     // The admin's override wins over what the scan read, like every other piece of series metadata. This is
     // a correlated subquery rather than a join because `visible()` is applied wherever `lib_series` appears
@@ -123,11 +134,14 @@ export function visible(alias: string, ctx: ViewCtx, p: Params): string {
 export const NO_LIBRARIES = '';
 
 export const SYSTEM_CTX: ViewCtx = {
+  system: true,
   userId: null, libraryIds: null, maxAgeRating: null,
   // Background work and admin reporting count what is there, not what someone wants on screen.
   hideAdultLibraries: false,
   adultGenres: [], adultSources: [],
 };
+/** Public egress/background notifications deliberately have no private-content capability. */
+export const SHARED_CTX: ViewCtx = { ...SYSTEM_CTX, system: false };
 
 /**
  * The configured genre list, tidied: trimmed, de-duplicated case-blind, at most 60 characters each, no control
@@ -180,11 +194,12 @@ const ADULT_CACHE_MS = 15_000;
 export function invalidateAdultFilter(): void { adultCache = null; }
 export async function adultFilter(): Promise<{ genres: string[]; sources: string[] }> {
   if (adultCache && Date.now() - adultCache.at < ADULT_CACHE_MS) return adultCache;
-  const row = await one<{ adult_genres: unknown; adult_sources: unknown }>(
-    'SELECT adult_genres, adult_sources FROM server_settings WHERE id = 1').catch(() => null);
+  const row = await one<{ adult_genres: unknown; adult_sources: unknown; adult_hiding: unknown }>(
+    'SELECT adult_genres, adult_sources, adult_hiding FROM server_settings WHERE id = 1').catch(() => null);
   // The same column is the Adult only rating that `sourceAllowedFor` refuses by (v0.73.0): every read refreshes that
-  // copy too, so it cannot drift from what is stored. A failed read leaves it as it was, never empty.
-  if (row) applyAdultSources(row.adult_sources);
+  // copy too, so it cannot drift from what is stored. A failed read leaves it as it was, never empty. So does the
+  // server's own switch (#406).
+  if (row) { applyAdultSources(row.adult_sources); applyAdultHiding(row.adult_hiding); }
   adultCache = {
     at: Date.now(),
     genres: sanitiseAdultList(row?.adult_genres),
@@ -217,9 +232,22 @@ export function applyAdultSources(stored: unknown): void {
 
 /** Read the stored list into the in-memory copy. Throws when the read fails, so boot can say so; the copy is then kept. */
 export async function loadAdultSources(): Promise<void> {
-  const row = await one<{ adult_sources: unknown }>('SELECT adult_sources FROM server_settings WHERE id = 1');
+  const row = await one<{ adult_sources: unknown; adult_hiding: unknown }>('SELECT adult_sources, adult_hiding FROM server_settings WHERE id = 1');
   applyAdultSources(row?.adult_sources);
+  applyAdultHiding(row?.adult_hiding);
 }
+
+/**
+ * Whether this server hides 18+ until someone shows it (#406, @StrayaJake): `server_settings.adult_hiding`, on unless an
+ * admin turned it off. Off is for a server only adults use: every request is answered as though Show 18+ were on -- the
+ * web app, OPDS readers and the Komga API alike -- and the web app drops the Show 18+ button. An age limit still holds,
+ * because that is a permission (`maxAgeRating`, `sourceAllowedFor`) and never read from here. Held in memory, as the
+ * Adult only rating beside it, because `hideAdult` is synchronous: loaded at boot, replaced on every write and on every
+ * read of the 18+ lists. Anything but a stored `false` hides, so a boot that could not read it keeps hiding.
+ */
+let adultHiding = true;
+export function applyAdultHiding(stored: unknown): void { adultHiding = stored !== false; }
+export function adultHidingOn(): boolean { return adultHiding; }
 
 /** Whether the admin rated this source Adult only. By id, lowercased, as the list is stored. */
 export function sourceRatedAdult(src: { id?: string } | null | undefined): boolean {
@@ -321,8 +349,14 @@ export function browsable(alias: string, ctx: ViewCtx, p: Params): string {
  * Absent means hidden. That is the default for anything that cannot ask -- an OPDS reader, a bare curl --
  * and it is the right default: a client that does not know about the filter should not defeat it.
  */
-export const hideAdult = (req: { query?: unknown }): boolean =>
-  (req.query as { adult?: string } | undefined)?.adult !== '1';
+export const hideAdult = (req: { query?: unknown }): boolean => {
+  // A server that does not hide 18+ (#406) answers every request as revealed. Reintroduce by reading the query alone:
+  // "with the server's 18+ hiding off" in adultFilter.int.test.ts finds the adult source hidden.
+  if (!adultHiding) return false;
+  const adult = (req.query as { adult?: string | string[] } | undefined)?.adult;
+  // A duplicate `?adult=1` parses as an array; an old client sends one because it wrapped the URL twice.
+  return !(adult === '1' || (Array.isArray(adult) && adult.includes('1')));
+};
 
 /**
  * Which of these series ids may be listed to this viewer.
@@ -376,7 +410,7 @@ export async function nameableIds(ids: readonly string[], ctx: ViewCtx): Promise
   const p = new Params();
   const arr = p.add(list);
   const rows = await q<{ id: string }>(
-    `SELECT s.id FROM (SELECT id, library_id, age_rating, genres, NULL::timestamptz AS deleted_at, NULL::text AS merged_into
+    `SELECT s.id FROM (SELECT id, library_id, owner_user_id, is_private, age_rating, genres, NULL::timestamptz AS deleted_at, NULL::text AS merged_into
                          FROM lib_series WHERE id = ANY(${arr})) s
       WHERE ${browsable('s', ctx, p)}`,
     p.values as any[],
@@ -488,7 +522,9 @@ export async function viewCtxFor(
    */
   opts?: { hideAdult?: boolean },
 ): Promise<ViewCtx> {
-  const hideAdultLibraries = !!opts?.hideAdult;
+  // Through the server's switch too (#406), for the callers that decide without a request's query: OPDS's own
+  // Show 18+, /api/adult-filter's question.
+  const hideAdultLibraries = !!opts?.hideAdult && adultHiding;
   // Komga mode has its own libraries and its own restrictions, enforced by Komga. Do not pretend to enforce
   // a model this backend does not have. Only an EXPLICIT 'komga' takes this branch: with `!== 'owned'` an
   // unset or misspelled variable handed every account an unrestricted context on the path that governs page
@@ -501,7 +537,7 @@ export async function viewCtxFor(
   const { genres: adultGenres, sources: adultSources } = hideAdultLibraries
     ? await adultFilter()
     : { genres: [] as string[], sources: [] as string[] };
-  if (!userId || role === 'admin') {
+  if (!userId) {
     return { userId, libraryIds: null, maxAgeRating: null, hideAdultLibraries, adultGenres, adultSources };
   }
   // Deliberately NOT caught. Both restrictions are expressed by a NON-null value, so any fallback here is a
@@ -522,6 +558,7 @@ export async function viewCtxFor(
   // sees nothing. Without this a vanished row read as null for BOTH restrictions -- the same "fallback to
   // unrestricted" as above, with the deleted grants widening the viewer to every library and no age cap.
   if (!cap || cap.disabled) return { userId, libraryIds: [], maxAgeRating: 0, hideAdultLibraries, adultGenres, adultSources };
+  if (role === 'admin') return {userId,libraryIds:null,maxAgeRating:null,hideAdultLibraries,adultGenres,adultSources};
   // A capped account is refused the sources rated Adult only from the in-memory copy (sourceRatedAdult). A boot that
   // could not read it leaves it empty, which would let this account in: read it first, and fail as the reads above do.
   if (cap.max_age_rating !== null && cap.max_age_rating < ADULT_RATING && !ratedAdultRead) await loadAdultSources();
@@ -543,13 +580,14 @@ export async function viewCtxFor(
  * deleted. OPDS's file download had the same shape. One resolver now guards both.
  *
  * Returns null when the book does not exist OR the viewer may not see it. The caller must not distinguish
- * the two: "no such chapter" and "not yours" should look identical from outside.
+ * the two: "no such chapter" and "not yours" should look identical from outside. The page count and series come along
+ * for OPDS page streaming, which records where a reader got to (routes/opds.ts).
  */
-export async function visibleBookFile(bookId: string, ctx: ViewCtx): Promise<{ file: string; root: string } | null> {
+export async function visibleBookFile(bookId: string, ctx: ViewCtx): Promise<{ file: string; root: string; pages: number; series_id: string } | null> {
   const p = new Params();
   const id = p.add(bookId);
-  return (await one<{ file: string; root: string }>(
-    `SELECT b.file, b.root FROM lib_books b
+  return (await one<{ file: string; root: string; pages: number; series_id: string }>(
+    `SELECT b.file, b.root, b.pages, b.series_id FROM lib_books b
        JOIN lib_series s ON s.id = b.series_id
       WHERE b.id = ${id} AND ${visible('s', ctx, p)}
         -- A notice chapter the admin hides (lib/noticeChapters.ts) has no pages to give, as booksSrc has no row.

@@ -6,7 +6,7 @@
 openapi: 3.1.0
 info:
   title: Uchiyomi API
-  version: 0.97.0
+  version: 0.108.1
   description: "Everything the web app does, it does over this API. Session JWTs are for the browser; scripts
     use a personal API token (Profile -> Connections -> API tokens), sent as `Authorization: Bearer uy_...`.
     Scopes: read (every token; GET plus the library search POST, which is a query), write (anything that changes data), admin (the /api/admin surface, which also
@@ -58,6 +58,16 @@ components:
         HTTP Basic where the password is the OPDS token from POST /api/opds/token. Refused (401) while the
         account is disabled, like every other credential of a disabled account; the token is not revoked and
         works again once the account is re-enabled.
+    kosyncUser:
+      type: apiKey
+      in: header
+      name: x-auth-user
+      description: A personal API token used as the KOReader username, only below /api/v1/kosync.
+    kosyncKey:
+      type: apiKey
+      in: header
+      name: x-auth-key
+      description: KOReader sends the MD5 of its dummy password; the API token in x-auth-user authenticates the account.
     imgCookie:
       type: apiKey
       in: cookie
@@ -251,6 +261,13 @@ components:
         showAllChapters:
           type: boolean
           description: Show one unpaged chapter list, including all grey rows and unfolded older runs.
+        notifyOnlyNext:
+          type: boolean
+          description: >-
+            "Only tell me about my next chapter": this account's web push, and the messages of the notification targets
+            aimed at this account, mention a series' new chapters only when one of them is the chapter the series page's
+            reading button would open for this account (caught up, nothing older unread, nothing half read). Off by
+            default. Announcements that name no chapter are unaffected.
         incognito:
           type: boolean
           description: >-
@@ -290,13 +307,14 @@ components:
         own search for whoever opens the list.
       properties:
         v: { type: integer, enum: [1] }
-        q: { type: string, minLength: 1, maxLength: 200, description: Title search. }
+        q: { type: string, minLength: 1, maxLength: 200, description: "Title search (and, since v0.100.0, author)." }
         read: { type: string, enum: [UNREAD, IN_PROGRESS, READ] }
         status: { type: string, minLength: 1, maxLength: 40 }
         genres: { type: array, maxItems: 20, items: { type: string, minLength: 1, maxLength: 60 } }
         lib: { type: string, minLength: 1, maxLength: 120, description: Library id. }
         src: { type: string, minLength: 1, maxLength: 120, description: "Main source id; '-' is No source." }
         anysrc: { type: string, minLength: 1, maxLength: 120, description: Any source id. }
+        author: { type: string, minLength: 1, maxLength: 200, description: "Since v0.100.0, one author by name (authorName in POST /api/series/search)." }
         sort: { type: string, enum: [updated, read, new, soon, popular, score, rating, chapters, unread, az] }
         dir: { type: string, enum: [asc, desc] }
     AdminBulkDeleteResult:
@@ -411,6 +429,169 @@ components:
         strictly (LocalDateTime.parse) and a trailing `Z` or `.sss` would date every chapter at the epoch.
         A required date that is not known is `1970-01-01T00:00:00`.
       example: "2026-09-20T12:34:56"
+    TitleArt:
+      type: object
+      description: Cached title-logo metadata on enriched series. Pending/error may retain a usable cached logoUrl.
+      required: [mode, style, status, version, logoUrl, language, showReadableTitle, attribution]
+      properties:
+        mode: { type: string, enum: [automatic, custom, text] }
+        style: { type: string, enum: [auto, action, fantasy, scifi, soft, noir, plain] }
+        status: { type: string, enum: [ready, pending, missing, error, disabled] }
+        version: { type: integer }
+        logoUrl: { type: [string, "null"], description: Authenticated local image URL; never an external image address. }
+        language: { type: [string, "null"], enum: [en, original, null] }
+        showReadableTitle: { type: boolean }
+        attribution:
+          type: [object, "null"]
+          properties:
+            source: { type: string, enum: [Uchiyomi logo library, Wikimedia Commons, Cover lettering] }
+            sourceUrl: { type: [string, "null"] }
+            artist: { type: [string, "null"] }
+            license: { type: [string, "null"] }
+            licenseUrl: { type: [string, "null"] }
+    ExtractionRect:
+      type: object
+      required: [left, top, width, height]
+      additionalProperties: false
+      description: Normalized image coordinates; nonempty and entirely within the displayed immutable cover.
+      properties:
+        left: { type: number, minimum: 0, maximum: 1 }
+        top: { type: number, minimum: 0, maximum: 1 }
+        width: { type: number, exclusiveMinimum: 0, maximum: 1 }
+        height: { type: number, exclusiveMinimum: 0, maximum: 1 }
+    TitleMaskStroke:
+      type: object
+      additionalProperties: false
+      required: [mode, radius, points]
+      properties:
+        mode: { type: string, enum: [restore, erase] }
+        radius: { type: number, minimum: 0.0005, maximum: 0.05, description: Radius relative to the immutable full-source canvas short side. }
+        points:
+          type: array
+          minItems: 1
+          maxItems: 8192
+          items:
+            type: object
+            additionalProperties: false
+            required: [x, y]
+            properties:
+              x: { type: number, minimum: 0, maximum: 1 }
+              y: { type: number, minimum: 0, maximum: 1 }
+    TitleExtractionBatchStatus:
+      type: object
+      required: [enabled, applyEnabled, available, checkedApplyAvailable, running, schedule, run, retentionDays, reviewCount, reviewSeries, online, reviewReasons]
+      properties:
+        enabled: { type: boolean, description: Nightly local generation opt-in; false by default. }
+        applyEnabled: { type: boolean, description: Separate available-checks publication opt-in; false by default. }
+        available: { type: boolean }
+        checkedApplyAvailable: { type: boolean, description: Worker and pinned OCR available; independent of optional calibration approval. }
+        running: { type: boolean, description: Includes persisted pending work waiting for retry or the manual worker. }
+        retentionDays: { type: integer }
+        nextRetryAt: { type: [string, "null"], format: date-time }
+        pausedReason: { type: [string, "null"] }
+        schedule:
+          type: object
+          properties:
+            hour: { type: integer, enum: [3] }
+            timezone: { type: string }
+            nextRunAt: { type: [string, "null"], format: date-time }
+        run:
+          type: [object, "null"]
+          properties:
+            id: { type: string, format: uuid }
+            origin: { type: string, enum: [manual, nightly] }
+            status: { type: string, enum: [running, completed, cancelled, error] }
+            startedAt: { type: string, format: date-time }
+            finishedAt: { type: [string, "null"], format: date-time }
+            currentSeries:
+              type: [object, "null"]
+              properties:
+                id: { type: string }
+                title: { type: string }
+            counts:
+              type: object
+              description: Total equals the sum of all seven disjoint item states. Ready is a private review draft, not a successful automatic application.
+              properties:
+                total: { type: integer }
+                pending: { type: integer }
+                processing: { type: integer }
+                ready: { type: integer }
+                applied: { type: integer }
+                skipped: { type: integer }
+                failed: { type: integer }
+                cancelled: { type: integer }
+        online:
+          type: object
+          required: [waitingOnline, needsLink, optedOut]
+          description: Latest-run diagnostics. Needs-link and opted-out are live eligibility counts and may overlap; they do not claim an online search occurred. No run yields zero counts.
+          properties:
+            waitingOnline: { type: integer, minimum: 0, description: Pending items awaiting provider completion or backoff. }
+            needsLink: { type: integer, minimum: 0, description: Automatic non-first-page series without a checked canonical identity; local previews remain allowed. }
+            optedOut: { type: integer, minimum: 0, description: Automatic non-first-page series with global online lookup or library external lookup disabled. }
+        reviewReasons:
+          type: array
+          maxItems: 6
+          description: Distinct ready batch drafts per product group, across the latest 2048 visible unexpired previews. Groups can overlap; calibration-only diagnostics are omitted.
+          items:
+            type: object
+            required: [code, count]
+            properties:
+              code: { type: string, enum: [title_not_verified, text_unclear, lettering_incomplete, low_contrast, checks_unavailable, other] }
+              count: { type: integer, minimum: 1 }
+        reviewCount: { type: integer }
+        reviewSeries:
+          type: array
+          maxItems: 10
+          items:
+            type: object
+            properties:
+              id: { type: string }
+              title: { type: string }
+              jobId: { type: string, format: uuid }
+    TitleExtractionJob:
+      type: object
+      description: Private, owner-bound local extraction draft. Originals remain unchanged until Apply or a calibrated automatic pass.
+      properties:
+        id: { type: string, format: uuid }
+        seriesId: { type: string }
+        automatic: { type: boolean }
+        status: { type: string, enum: [queued, running, ready, rejected, error, expired, applied] }
+        createdAt: { type: string, format: date-time }
+        expiresAt: { type: string, format: date-time }
+        coverFingerprint: { type: string }
+        previewUrl: { type: [string, "null"], description: Authenticated admin WebP; private and never externally hosted. }
+        coverPreviewUrl: { type: [string, "null"], description: Authenticated immutable cover PNG used for this job. }
+        selectionMode: { type: string, enum: [manual, automatic, legacy], description: Legacy drafts lost the original request intent and must not silently become manual selections. }
+        region: { oneOf: [{ $ref: "#/components/schemas/ExtractionRect" }, { type: "null" }], description: Exact requested rectangle for manual drafts; null for automatic or legacy drafts. Inference never overwrites it. }
+        resultRegion: { oneOf: [{ $ref: "#/components/schemas/ExtractionRect" }, { type: "null" }], description: Worker selection in full prepared-source coordinates, separate from request intent. }
+        candidateRegion: { oneOf: [{ $ref: "#/components/schemas/ExtractionRect" }, { type: "null" }], description: Tight cutout bounds in full prepared-source coordinates. }
+        modelFingerprint: { type: [string, "null"], description: Inference algorithm provenance; older reviewed drafts remain manually applicable. }
+        mask:
+          type: [object, "null"]
+          description: Available on new ready drafts with verified raw-candidate placement. Old drafts require a new extraction.
+          properties:
+            revision: { type: integer, minimum: 0 }
+            strokes: { type: array, maxItems: 128, items: { $ref: "#/components/schemas/TitleMaskStroke" } }
+            previewRegion: { oneOf: [{ $ref: "#/components/schemas/ExtractionRect" }, { type: "null" }], description: Tight edited alpha bounds before final title-logo trim/resize. }
+            canvas:
+              type: object
+              properties:
+                width: { type: integer, minimum: 1, maximum: 2400 }
+                height: { type: integer, minimum: 1, maximum: 2400 }
+                sourceUrl: { type: string, description: Private immutable PNG used for every RGB pixel. }
+                baselineUrl: { type: string, description: Private immutable lossless full-canvas baseline alpha. }
+        exclusions: { type: array, maxItems: 8, items: { $ref: "#/components/schemas/ExtractionRect" } }
+        reasons: { type: array, items: { type: string } }
+        error: { type: [string, "null"] }
+        quality:
+          type: [object, "null"]
+          description: OCR/geometry review evidence. A mask score is not proof of a complete or correct title.
+          properties:
+            policyVersion: { type: string }
+            safeToApply: { type: boolean }
+            availableChecksPassed: { type: boolean, description: Actual complete-title and image checks passed; independent of optional calibration approval. Legacy missing values mean false. }
+            manualApplyAllowed: { type: boolean }
+            needsReview: { type: boolean }
     KomgaAuthor:
       type: object
       required: [name, role]
@@ -1367,6 +1548,110 @@ paths:
           description: Not authenticated
         "403":
           description: The account has been disabled; every session was revoked
+  /auth/pick:
+    get:
+      tags:
+        - auth
+      summary: The profiles the sign-in screen offers at home without a password.
+      operationId: getAuthPick
+      description: >-
+        When an admin turned it on (`localPick` on PATCH /api/admin/settings) and the caller is inside LOCAL_NETWORKS:
+        the enabled profiles that open at home, as `{id, displayName, avatar}`. Otherwise, and on desktop, none.
+      security: []
+      responses:
+        "200":
+          description: "`{content: [{id, displayName, avatar}]}`"
+  /auth/profile-login:
+    post:
+      tags:
+        - auth
+      summary: Sign in from the sign-in screen as a profile that opens at home, without a password.
+      operationId: postAuthProfileLogin
+      description: >-
+        Under the same conditions as GET /auth/pick. The session holds at home only (401 `local_only` from outside on
+        every request) and makes no credential (403 `credential_required`); it ends REFRESH_TTL_DAYS after the pick, however
+        often it is refreshed. Every refusal is 401 `invalid_credentials`.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [profileId]
+              properties:
+                profileId:
+                  type: string
+                deviceId:
+                  type: string
+                deviceName:
+                  type: string
+      responses:
+        "200":
+          description: Signed in as the profile
+        "400":
+          description: Malformed body
+        "401":
+          description: "`invalid_credentials`"
+        "429":
+          description: Too many attempts
+  /auth/ring:
+    get:
+      tags:
+        - auth
+      summary: The accounts this device remembers (Remember on this device).
+      operationId: getAuthRing
+      security: []
+      description: >-
+        By the device's own `yomi_dev` cookie, set by a sign-in with `remember: true`; no session needed. Each entry
+        whose session is still live, as `{id, displayName, avatar}`. A session entered without a password is listed from
+        the home network only (LOCAL_NETWORKS). Empty on desktop.
+      responses:
+        "200":
+          description: "`{content: [{id, displayName, avatar}]}`"
+  /auth/resume:
+    post:
+      tags:
+        - auth
+      summary: Take up an account this device remembers, without its password.
+      operationId: postAuthResume
+      security: []
+      description: >-
+        Answers like a sign-in and sets the account's cookies. `reauth` when the account is an admin remembered for more
+        than twelve hours (the entry is forgotten); `local_only` for a session entered without a password, from outside.
+        A session the device held and did not remember is ended.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [profileId]
+              properties:
+                profileId:
+                  type: string
+      responses:
+        "200":
+          description: Signed in as the remembered account
+        "400":
+          description: Malformed body
+        "401":
+          description: "`not_remembered`, `reauth` or `local_only`"
+        "429":
+          description: Too many attempts
+  /auth/leave:
+    post:
+      tags:
+        - auth
+      summary: Sign in as someone else, keeping this account remembered on this device.
+      operationId: postAuthLeave
+      security: []
+      description: >-
+        Clears the session cookies. A session this device remembers stays live for POST /auth/resume
+        (`remembered: true`); any other is ended, as POST /auth/logout ends it.
+      responses:
+        "200":
+          description: "`{ok, remembered}`"
   /auth/logout:
     post:
       tags:
@@ -1397,7 +1682,7 @@ paths:
     get:
       tags:
         - auth
-      summary: "The calling account: id, username, role, permissions, settings and, since v0.90.0, `talk`: whether this server has chapter comments."
+      summary: "The calling account: id, username, role, permissions, settings, `talk` (since v0.90.0: whether this server has chapter comments) and `kind`: `password` for every account until profiles that open without a password exist (`open`, `hybrid`), `desktop-owner` for the desktop app's own account."
       operationId: getAuthMe
       security:
         - bearer: []
@@ -1406,6 +1691,57 @@ paths:
           description: OK
         "401":
           description: Not authenticated
+  /auth/profiles:
+    get:
+      tags:
+        - auth
+      summary: The profiles this session may switch to, from home.
+      operationId: getAuthProfiles
+      description: >-
+        Profiles that open at home without a password that this account manages --
+        every one, for an admin. `zone` is `local` when the caller is inside LOCAL_NETWORKS; outside, and for a session
+        that was itself entered without a password, the list is empty.
+      security:
+        - bearer: []
+      responses:
+        "200":
+          description: "`{zone, content: [{id, displayName, avatar}]}`"
+        "401":
+          description: Not authenticated, or `local_only`
+  /auth/switch:
+    post:
+      tags:
+        - auth
+      summary: Switch this device to a profile that opens at home, without its password.
+      operationId: postAuthSwitch
+      description: >-
+        From the session of the account that manages the profile, or of an admin, at home: the device's refresh cookie
+        and its access token, both entered with a credential. Answers like a sign-in and sets the profile's cookies. The
+        profile's session ends when the caller's does, lasts no longer, holds at home only (401 `local_only` from
+        outside on every request) and makes no credential (403 `credential_required`).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [profileId]
+              properties:
+                profileId:
+                  type: string
+      security:
+        - bearer: []
+      responses:
+        "200":
+          description: Signed in as the profile
+        "400":
+          description: Malformed body
+        "401":
+          description: "Not authenticated, `no_session` (no refresh cookie of this account) or `local_only`"
+        "403":
+          description: "`switch_denied`, or `credential_required`"
+        "429":
+          description: Too many attempts
   /auth/password:
     post:
       tags:
@@ -1615,7 +1951,9 @@ paths:
         `configured` is true when Admin → Settings → 18+ filter lists at least one genre or source
         (adult_genres / adult_sources), i.e. when "Show 18+" would reveal something even on an install with
         no library rated 18+. Only the flag is returned, never the lists. Always false for an account whose
-        age limit is below 18, which is never offered the reveal. Does not depend on `adult`.
+        age limit is below 18, which is never offered the reveal. Does not depend on `adult`. `hiding` is the
+        server's own switch (adultHiding on PATCH /api/admin/settings): false when this server hides nothing, so
+        a client offers no reveal at all; `configured` is then false too.
       security:
         - bearer: []
       responses:
@@ -1625,9 +1963,11 @@ paths:
             application/json:
               schema:
                 type: object
-                required: [configured]
+                required: [configured, hiding]
                 properties:
                   configured:
+                    type: boolean
+                  hiding:
                     type: boolean
         "401":
           description: Not authenticated
@@ -1841,7 +2181,9 @@ paths:
         (when the caller last read in the series): the chapter to pick a series back up at, for series last read 90
         days to two years ago in which the caller finished at least one chapter (never a series `onDeck` holds); and
         `gems`, up to 20 series with an AniList score of at least 75 that nobody on the server has read in any
-        language edition, one per work, best score first (empty on a Komga backend).
+        language edition, one per work, best score first (empty on a Komga backend). `keepReadingHidden` is how many
+        series the caller removed from Keep reading and has not read since (PUT /api/keep-reading/{seriesId}); `onDeck`
+        leaves them out.
       operationId: getApiHome
       parameters:
         - name: adult
@@ -1868,8 +2210,10 @@ paths:
         `genre`, `author`, and -- owned library only, since v0.49.2 -- `mainSource` (the source a series was added
         from, by id) and `anySource` (that, or a source it follows as a fallback); since v0.55.1 (#149)
         `hasMainSource` in Komga's boolean shape (`{operator: isTrue|isFalse}`, no value), `isFalse` being the series
-        with no main source at all, whatever they follow. An unknown key is 400 `unsupported_filter`, and so is
-        `hasMainSource` with any other operator."
+        with no main source at all, whatever they follow. Since v0.100.0 (#338) `authorName`: the series whose author
+        line names the same person, a whole name in any spelling it gives (Komga is asked `author` with `{name}`); a
+        search's `query` matches the author line as well as the title. An unknown key is 400 `unsupported_filter`, and
+        so is `hasMainSource` or `authorName` with any other operator."
       operationId: postApiSeriesSearch
       parameters:
         - name: adult
@@ -1950,6 +2294,8 @@ paths:
                 type: object
                 additionalProperties: true
                 properties:
+                  titleArt:
+                    $ref: "#/components/schemas/TitleArt"
                   autoHero:
                     description: >-
                       Since v0.51.0, on every series in a payload: `{seed}` once the banner made from its own pages
@@ -2253,6 +2599,32 @@ paths:
           description: Not authenticated
         "404":
           description: Not found, or not visible to this account
+  /api/series/{id}/other-titles:
+    get:
+      tags:
+        - library
+      summary: The English, romanised and Japanese titles of the series' AniList entry.
+      operationId: getApiSeriesIdOtherTitles
+      description: >-
+        `{titles: {english, romaji, native} | null}`, each name null when AniList has none. `titles` is null for a
+        series with no checked AniList link, in a library whose AniList lookups are off, or whose entry has no names.
+        Kept by the server and asked again after a month (a day when it had no names), so most reads ask AniList
+        nothing; when AniList is busy or down, the kept names are answered.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      security:
+        - bearer: []
+      responses:
+        "200":
+          description: OK
+        "401":
+          description: Not authenticated
+        "404":
+          description: Not found, or not visible to this account
   /api/series/{id}/books:
     get:
       tags:
@@ -2294,8 +2666,9 @@ paths:
         ticked read without it being here (POST /api/series/{id}/listing-progress). A chapter matches its
         listing number by its override-aware number, so a chapter an admin renumbered is not also a ghost.
         `numbering` (v0.49.0, #116) says how the series is numbered and why: { mode (null = automatic, source,
-        posting_order), by (auto, manual), pending (posting_order, source, remap: a change waiting for an
-        admin), note (the detector's last verdict), changedAt, sourceName, extSourceId? }.
+        posting_order, titles since #379), by (auto, manual), pending (posting_order, titles, source, remap: a
+        change waiting for an admin), note (the detector's last verdict; `titles` { posts, specials, moved,
+        example } when the source counts its specials as chapters), changedAt, sourceName, extSourceId? }.
       parameters:
         - name: id
           in: path
@@ -2320,6 +2693,10 @@ paths:
                     type: array
                     items:
                       $ref: "#/components/schemas/Ghost"
+                  blockedDeletedBookIds:
+                    type: array
+                    items: { type: string }
+                    description: Deleted chapter ids whose current listing copies are all blocked; their progress rows remain stored.
                   archive:
                     type: [object, "null"]
                     description: >-
@@ -2687,14 +3064,17 @@ paths:
       summary: Restore one visible chapter that Uchiyomi deliberately deleted, by its stable book id.
       operationId: postApiBooksIdRefetch
       description: >-
-        Available to a member who may download. The server derives the only permitted copy from the tombstone:
-        its canonical download-root path, stored source and stored source chapter id. It accepts no client-supplied
-        source, chapter number or path. The exact historical source need not still be followed: the tombstone's
-        book id, series, stored source, stored source chapter id and canonical download-root path are its authority.
-        That source must still have an installed adapter, be enabled, be outside cooldown and be allowed by the
-        caller's age boundary. The copy is pinned, so this explicit choice may override a scanlator block, but it
-        never falls back to another copy. Ranges, manual/read-library files, missing evidence and a copy whose stored
-        identity or canonical path changed are not refetchable. Progress stays attached to the same book id.
+        Available to a member who may download. It accepts no client-supplied source, chapter number or path: the
+        server derives them from the tombstone (its series, number and canonical download-root path) and the listing.
+        Since #437 the copy is the one `POST /api/sources/fetch` takes for that number -- after the same listing
+        refresh, by the same rules, from a source the series follows now -- and it is not pinned, so a copy that fails
+        is taken from another followed source. Only when no followed source lists the number is the copy stamped on the
+        tombstone used (its stored source and source chapter id): that source need not still be followed, but it must
+        still have an installed adapter, be enabled, be outside cooldown and be allowed by the caller's age boundary,
+        and the copy is pinned, so this explicit choice may override a scanlator block but never falls back to another
+        copy, and a change of the tombstone's stored identity or canonical path while the job waits refuses it.
+        Ranges, manual/read-library files and chapters not deleted on purpose are not refetchable. Progress stays
+        attached to the same book id.
       parameters:
         - name: id
           in: path
@@ -2718,14 +3098,37 @@ paths:
         "401":
           description: Not authenticated
         "403":
-          description: Download permission is disabled for this account.
+          description: >-
+            Download permission is disabled for this account, or (`forbidden`) the copy a Fetch would take is on a
+            source outside the caller's age boundary.
         "404":
-          description: No such visible tombstone, or it is outside the caller's library or age boundary.
+          description: >-
+            No such visible tombstone, or it is outside the caller's library or age boundary -- as is a stored copy,
+            asked when no followed source lists the number, on a source outside that boundary.
         "409":
           description: >-
-            `not_refetchable`: the row is not a deliberate canonical owned tombstone, its exact stored copy is
-            unsafe or unavailable, a renumber is pending, or the download root is not writable; `busy`: another
-            writer owns this series folder.
+            `not_refetchable`, with `reason` naming the rule and `message` saying why and what to do (and, for this
+            route's own sentences, `messageSaid`, its code for the reader's language): `not_deleted` (not deleted on
+            purpose), `already_here`, `not_in_place` (a range, a manual/read-library file or a path the downloader did
+            not write), `renumber_pending`, `posting_order`, `hidden`, the copy's rule from `POST /api/sources/fetch`
+            (`blocked_group`, `other_language`, `source_unavailable`, `cooldown`), `not_listed` (no followed source
+            lists the number and the stored copy is missing or its source unloaded or switched off) or `not_writable`
+            (with `fix`); `busy` (with `message`): another writer owns this series folder.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [error, message]
+                properties:
+                  error: { type: string, enum: [not_refetchable, busy] }
+                  reason: { type: string }
+                  message: { type: string }
+                  messageSaid:
+                    type: object
+                    properties:
+                      code: { type: string }
+                      params: { type: object }
+                  fix: { type: string }
   /api/books/{id}/pages:
     get:
       tags:
@@ -2778,6 +3181,9 @@ paths:
                     height: { type: [integer, "null"] }
                     sizeBytes: { type: [integer, "null"] }
                     junk: { type: boolean }
+                    removed: { type: boolean, description: The original image is retained in page trash; its numbered slot is a placeholder. }
+                    restorable: { type: boolean, description: Present on removed slots; false after explicit purge or when this installation has no original trash. }
+                    contentVersion: { type: string, description: Opaque file identity. Append as cv to image URLs; a changed file answers 409 instead of mixing offline versions. }
                     missing: { type: boolean, description: True only for a repair placeholder in a partial chapter. }
                     join:
                       type: string
@@ -3029,6 +3435,13 @@ paths:
                       type: object
                       additionalProperties: true
                       properties:
+                        creatorSearch:
+                          type: boolean
+                          description: Whether this source declares at least one creator search field.
+                        creatorFields:
+                          type: array
+                          items: { type: string, enum: [author, artist] }
+                          description: The exact creator roles this source supports; unsupported roles are never queried.
                         extension:
                           description: >-
                             For an extension source (`sw:` id): the installed extension package it came
@@ -3073,7 +3486,14 @@ paths:
         Since v0.96.0 (#331) `page` (1-based, clamped to 30) asks a later page of the same search, as the site
         pages it; a source whose `searchPages` is false (GET /api/sources) answers a later page with
         `{ content: [] }`, never its first page again.
+        `creator=author|artist` searches creator relationships instead of titles, only on a source whose
+        `creatorSearch` capability is true and `creatorFields` includes that role. `page` continues the same creator query.
       parameters:
+        - name: creator
+          in: query
+          schema:
+            type: string
+            enum: [author, artist]
         - name: source
           in: query
           required: false
@@ -3355,6 +3775,8 @@ paths:
       summary: Search every enabled source at once, answering before the slow ones do.
       operationId: getApiSourcesSearchAll
       description: >-
+        `creator=author|artist` searches only sources that declare creator-search support. Creator, artist
+        and title searches have separate cache entries, and all existing visibility and age filters apply.
         By default groups results by normalized title (one card, every provider that has it — what Discover
         uses). With `groupBy=source`, groups by provider instead (one rail per source, mirroring Mihon's
         global search) — used by the import review sheet's manual-search screen, where which specific source
@@ -3386,6 +3808,11 @@ paths:
         An account capped below 18, and any request without `adult=1`, is held to `safe` -- so with Show 18+ off an
         18+ title from a source that is not adult itself (MangaDex's erotica) no longer shows.
       parameters:
+        - name: creator
+          in: query
+          schema:
+            type: string
+            enum: [author, artist]
         - name: q
           in: query
           required: false
@@ -3969,10 +4396,13 @@ paths:
       summary: Trending titles from AniList for the Discover page.
       operationId: getApiDiscoverTrending
       description: >-
-        `{content: [{id, title, cover, banner, description, genres, score, chapters, status}]}`, up to 36, never one
-        the server already holds, never 18+ on AniList and never a light novel. Since v0.61.0 by `country` of origin,
-        each cached six hours; while Show 18+ is off, a title carrying a genre the admin named as adult is left out of
-        the answer.
+        `{content: [{id, title, cover, coverXL, banner, description, genres, score, chapters, status}], pending}`, up
+        to 36, never one the server already holds, never 18+ on AniList and never a light novel. Since v0.61.0 by
+        `country` of origin; while Show 18+ is off, a title carrying a genre the admin named as adult is left out of
+        the answer. Since v0.98.0 each country's list is stored and answered from that copy at once (after a restart
+        too), refreshed in the background once six hours old; `coverXL` is the same cover at its largest. `pending:
+        true`, with an empty `content`, only while a server that has never stored a copy is still fetching one: ask
+        again in a few seconds.
       parameters:
         - name: country
           in: query
@@ -3999,11 +4429,12 @@ paths:
       summary: Discover's "Because you read" -- AniList's recommendations after a series the caller read (v0.61.0).
       operationId: getApiDiscoverBecause
       description: >-
-        `{seed: {id, title} | null, content}`: `content` in the trending shape, at most 20. The seed is the caller's most
-        recently read series with a finished chapter, that they may list, in a library whose AniList lookups are on and
-        with a checked AniList link -- the first of five that leaves at least four recommendations once what the server
-        holds (by AniList entry or any name) and what is 18+ for the caller are left out. `seed` null and nothing to show
-        otherwise. Read from the server's stored copy; a request never asks AniList.
+        `{seed, seeds, content}`: `content` in the trending shape plus `because: {id, title}`, at most 30. Since v0.98.0
+        the recommendations after each of the caller's five most recently read series with a finished chapter -- that
+        they may list, in a library whose AniList lookups are on and with a checked AniList link -- one from each in
+        turn, once per AniList entry, less what the server holds (by AniList entry or any name) and what is 18+ for the
+        caller. `because` is the series an item came from, `seeds` those series, `seed` the first of them (null, with
+        nothing to show, when there is none). Read from the server's stored copy; a request never asks AniList.
       security:
         - bearer: []
       responses:
@@ -4040,6 +4471,100 @@ paths:
           description: Not authenticated
         "403":
           description: This account may not add series
+  /api/discover/state:
+    get:
+      tags: [sources]
+      summary: Read this account's Discover tab, saved cards and hidden work keys.
+      operationId: getApiDiscoverState
+      security: [{bearer: []}]
+      description: >-
+        Returns {tab, saved, hidden}. The default tab is for-you. Saved cards contain trusted cached title/art/known
+        metadata and are filtered for the caller's current adult settings. Hidden contains canonical keys and known
+        title aliases. Authentication and the add-series permission are required. Private, no-store; Vary:*.
+      responses:
+        "200": {description: Account-owned Discover state}
+        "401": {description: Not authenticated}
+        "403": {description: This account may not add series}
+    patch:
+      tags: [sources]
+      summary: Remember this account's Discover tab without replacing other settings.
+      operationId: patchApiDiscoverState
+      security: [{bearer: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [tab]
+              properties:
+                tab: {type: string, enum: [for-you, sources]}
+      responses:
+        "200": {description: The remembered tab}
+        "400": {description: Invalid tab or body}
+        "401": {description: Not authenticated}
+        "403": {description: This account may not add series or the API token is read-only}
+  /api/discover/items/{key}:
+    parameters:
+      - name: key
+        in: path
+        required: true
+        description: AniList key al:id or Unicode-normalized title fallback t:titlekey.
+        schema: {type: string, minLength: 3, maxLength: 602}
+    put:
+      tags: [sources]
+      summary: Save or hide a Discover work for this account only.
+      operationId: putApiDiscoverItem
+      security: [{bearer: []}]
+      description: >-
+        At least one saved/hidden boolean is required. They are independent. The optional item title is a hint only;
+        authoritative metadata/rating comes from existing catalog caches. No external call, library addition or
+        download occurs. Up to 1000 saved/hidden choices per account.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              minProperties: 1
+              properties:
+                saved: {type: boolean}
+                hidden: {type: boolean}
+                item:
+                  type: object
+                  required: [title]
+                  additionalProperties: true
+                  properties:
+                    title: {type: string, minLength: 1, maxLength: 600}
+      responses:
+        "200": {description: Updated key and saved/hidden booleans}
+        "400": {description: Invalid key or body}
+        "401": {description: Not authenticated}
+        "403": {description: This account may not add series or the API token is read-only}
+        "404": {description: The title is unknown or not permitted to save}
+        "409": {description: This account's Discover list is full}
+    delete:
+      tags: [sources]
+      summary: Clear both saved and hidden choices for one work in this account.
+      operationId: deleteApiDiscoverItem
+      security: [{bearer: []}]
+      responses:
+        "200": {description: Choice removed or already absent}
+        "400": {description: Invalid key}
+        "401": {description: Not authenticated}
+        "403": {description: This account may not add series or the API token is read-only}
+  /api/discover/hidden:
+    delete:
+      tags: [sources]
+      summary: Reset this account's hidden Discover picks while retaining saved titles.
+      operationId: deleteApiDiscoverHidden
+      security: [{bearer: []}]
+      responses:
+        "200": {description: Hidden choices reset}
+        "401": {description: Not authenticated}
+        "403": {description: This account may not add series or the API token is read-only}
   /api/discover/works:
     get:
       tags:
@@ -4159,7 +4684,9 @@ paths:
         chapter list (no second source call), with `onDisk` 0 since nothing is on disk yet; `versions` is how
         many numbers the source lists in more than one copy. `numbering` (v0.49.0, #116) is the detector's word
         on the listing: { verdict (strong, hint, none), applied (posting_order when the add will number the
-        posts 1..K in posting order, else source), ordered, posts, numbers, biggest { number, posts }, examples,
+        posts 1..K in posting order; titles when the source counts its specials as chapters and the add numbers
+        each chapter by its title, each special just after the chapter before it, #379; else source), ordered,
+        posts, numbers, biggest { number, posts }, examples, titles? { specials, moved, example { title, from, to } },
         alt { count, first, last } (the other reading, for the dialog's switch), extSourceId? }; `count`,
         `first` and `last` follow `applied`. Since v0.49.1, when the source and id are some series' main source,
         the other names its description lists are kept for that series (GET /api/admin/series/{id}/alt-titles).
@@ -4192,6 +4719,7 @@ paths:
                   sourceId: { type: string }
                   title: { type: string }
                   summary: { type: string, description: "Plain text: HTML and Markdown (MangaDex describes in Markdown) are stripped, link text kept." }
+                  author: { type: string, description: "The source's author name when supplied, otherwise an empty string." }
                   coverUrl: { type: [string, "null"] }
                   genres: { type: array, items: { type: string } }
                   status: { type: string }
@@ -4424,11 +4952,13 @@ paths:
                   type: boolean
                 numbering:
                   type: string
-                  enum: [auto, source, posting_order]
+                  enum: [auto, source, posting_order, titles]
                   description: >-
                     How to number the series (v0.49.0, #116). `auto` (the default) numbers by posting order when
-                    the source gives many different posts one number; `source` keeps the source's numbers;
-                    `posting_order` numbers the posts 1..K whatever the detector says. `alsoFollow` is ignored
+                    the source gives many different posts one number, and by the chapter titles when it counts its
+                    specials as chapters (#379); `source` keeps the source's numbers; `posting_order` numbers the
+                    posts 1..K whatever the detector says; `titles` numbers each chapter by its title, each special
+                    just after the chapter before it. `alsoFollow` is ignored
                     under posting order. A folder that already holds chapters is never renumbered by an add: it
                     is added in the source's numbers with a renumbering pending, for an admin to review (unless
                     the series kept an assignment for this source, when it was removed and is added back).
@@ -4697,6 +5227,120 @@ paths:
           description: Not authenticated
         "404":
           description: Not found, or not visible to this account
+  /api/profiles:
+    get:
+      tags:
+        - personal
+      summary: The profiles this account manages -- profiles that open at home without a password.
+      operationId: getApiProfiles
+      description: >-
+        Each with `kind` (`open`: no password, opens from LOCAL_NETWORKS only; `hybrid`: no password at home, its password
+        from anywhere else).
+      security:
+        - bearer: []
+      responses:
+        "200":
+          description: OK
+        "401":
+          description: Not authenticated
+    post:
+      tags:
+        - personal
+      summary: Make a profile that opens at home, managed by this account.
+      operationId: postApiProfiles
+      description: >-
+        For an admin, or a member whose `perms.canManageProfiles` an admin set. The profile starts with this account's
+        own library access, age limit and download permission, never more, and at most six are managed by one account.
+        With a `password` it is a hybrid. Refused with 403 `credential_required` from a session that was itself entered
+        without a password, and a `password` with 403 `sso_only` in SSO-only mode.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [displayName]
+              properties:
+                displayName:
+                  type: string
+                password:
+                  type: string
+      security:
+        - bearer: []
+      responses:
+        "200":
+          description: The profile made
+        "400":
+          description: Malformed body, or `weak_password`
+        "401":
+          description: Not authenticated
+        "403":
+          description: Not allowed to manage profiles, or `credential_required`
+        "409":
+          description: "`too_many_profiles`, or `username_taken`"
+  /api/profiles/{id}:
+    patch:
+      tags:
+        - personal
+      summary: Rename one of this account's profiles, give it a password, or stop it opening at home.
+      operationId: patchApiProfilesId
+      description: >-
+        A password makes it a hybrid; `localOpen: false` needs one (400 `no_way_in` otherwise). Either ends the profile's
+        sessions. Refused with 403 `credential_required` from a session entered without a password.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                displayName:
+                  type: string
+                password:
+                  type: string
+                localOpen:
+                  type: boolean
+      security:
+        - bearer: []
+      responses:
+        "200":
+          description: The profile as it is now
+        "400":
+          description: Malformed, `no_way_in` or `weak_password`
+        "401":
+          description: Not authenticated
+        "403":
+          description: Not allowed to manage profiles, or `credential_required`
+        "404":
+          description: Not one of this account's profiles
+    delete:
+      tags:
+        - personal
+      summary: Delete one of this account's profiles, with everything it read.
+      operationId: deleteApiProfilesId
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      security:
+        - bearer: []
+      responses:
+        "200":
+          description: OK
+        "401":
+          description: Not authenticated
+        "403":
+          description: Not allowed to manage profiles, or `credential_required`
+        "404":
+          description: Not one of this account's profiles
   /api/push/key:
     get:
       tags:
@@ -4984,6 +5628,59 @@ paths:
           description: Not found, or not visible to this account
         "429":
           description: More than five Tests in a minute from this admin
+  /api/keep-reading/{seriesId}:
+    put:
+      tags:
+        - library
+      summary: Take a series out of Keep reading, or put it back.
+      operationId: putApiKeepReadingSeriesid
+      description: >-
+        Home's "Remove from Keep reading". `hidden: true` takes the series out of the caller's Keep reading row (and the
+        OPDS Keep reading shelf, and Pick back up) without touching the library, their progress or anyone else's Home; it
+        stays out until the caller reads in the series again (a progress write newer than the removal), then returns by
+        itself. `hidden: false` puts it back at once. Removing a series the caller may not see is a 404.
+      parameters:
+        - name: seriesId
+          in: path
+          required: true
+          schema:
+            type: string
+      security:
+        - bearer: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [hidden]
+              additionalProperties: false
+              properties:
+                hidden:
+                  type: boolean
+      responses:
+        "200":
+          description: "`{ ok: true, hidden }`"
+        "401":
+          description: Not authenticated
+        "404":
+          description: Not found, or not visible to this account
+  /api/keep-reading/hidden:
+    get:
+      tags:
+        - library
+      summary: The series the caller removed from Keep reading and has not read since.
+      operationId: getApiKeepReadingHidden
+      description: >-
+        `content`: `{ seriesId, title, hiddenAt }`, newest removal first, only series the caller may see. Home's Hidden
+        list; `GET /api/home` carries the count as `keepReadingHidden`.
+      security:
+        - bearer: []
+      responses:
+        "200":
+          description: OK
+        "401":
+          description: Not authenticated
   /api/favorites:
     get:
       tags:
@@ -5097,6 +5794,12 @@ paths:
         series THIS caller may see, at most four, in the list's own order -- the covers its card shows.
       operationId: getApiCollections
       parameters:
+        - name: seriesId
+          in: query
+          required: false
+          description: Add contains=true/false for this visible series to the caller's own manual lists only.
+          schema:
+            type: string
         - name: adult
           in: query
           required: false
@@ -5121,7 +5824,7 @@ paths:
       summary: Create a collection (a List), hand-picked or smart, private or shared.
       description: >-
         Since v0.61.0 `query` makes a smart list -- a saved Library search, the Library's own URL words
-        `{v: 1, q?, read?: UNREAD|IN_PROGRESS|READ, status?, genres?, lib?, src? ('-' is No source), anysrc?, sort, dir?:
+        `{v: 1, q?, read?: UNREAD|IN_PROGRESS|READ, status?, genres?, lib?, src? ('-' is No source), anysrc?, author?, sort, dir?:
         asc|desc}`, `sort` one of updated, read, new, soon, popular, score, rating, chapters, unread, az -- answered afresh for
         whoever opens it; a list's kind is fixed when it is made. `shared: true` lets the rest of the household read it
         (never change it). An unknown or oversized query key is 400.
@@ -6533,7 +7236,7 @@ paths:
         reader's edges) and, since v0.55.7, `listSorts` (list id to `az`, `za`, `read`, `unread` or `latest`: the order
         each list is shown in; a list's own order is not stored). Since v0.55.8 the validated keys are `librarySort`,
         `homeCollections` and `showAllChapters` (since v0.60.0 also `librarySortDir`, since v0.61.0 `incognito`, a
-        boolean, and since v0.68.0 `trackerPlanOnAdd`, a boolean). Unknown keys remain accepted and retained for compatibility -- since v0.66.0 the web app's `homeRails`
+        boolean, since v0.68.0 `trackerPlanOnAdd`, a boolean, and `notifyOnlyNext`, a boolean). Unknown keys remain accepted and retained for compatibility -- since v0.66.0 the web app's `homeRails`
         (`{order, hidden}`, Home's rails as the reader arranged them; null is the default order) and `tone` (`oled`,
         `graphite` or `midnight`, the background) among them. `avatar` is `{emoji, color, frame}` (since v0.69.1 a hex
         colour; since v0.89.0 `frame`, one of `bronze`, `silver`, `ember`, `gold`, `moon` or `aurora`, the frame a badge
@@ -6898,6 +7601,28 @@ paths:
           description: Not authenticated
         "404":
           description: Not found, or not visible to this account
+  /img/series/{id}/logo:
+    get:
+      tags: [images]
+      operationId: getImgSeriesIdLogo
+      summary: The series' local transparent title logo, if one is selected.
+      description: >-
+        Uses the standard image authentication and viewer visibility rules. Hidden, merged, restricted or missing
+        logos return 404; there is no cover fallback. Bytes are sanitized WebP, privately cached; v is the TitleArt
+        version cache-buster. This read never starts an online lookup.
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+        - { name: v, in: query, schema: { type: integer } }
+      security: [{ bearer: [] }, { imgCookie: [] }, { opdsBasic: [] }]
+      responses:
+        "200":
+          description: Local logo retaining its alpha channel.
+          content:
+            image/webp:
+              schema: { type: string, format: binary }
+        "401": { description: Not authenticated }
+        "403": { description: Token scope disallows images }
+        "404": { description: No selected logo, or series not visible }
   /img/series/{id}/backdrop:
     get:
       tags:
@@ -7463,6 +8188,12 @@ paths:
       tags:
         - opds
       summary: One page for OPDS-PSE readers. ZERO-based; ?maxWidth (64-2000) returns a JPEG no wider than asked.
+      description: Since v0.108.0, with the account's opdsEstimatedBookmarks on, a GET answered 200 at reading size
+        (maxWidth absent, blank, the unfilled {maxWidth}, or 600 and up) keeps the reader's estimated place, and the
+        fetch that first reaches the last page completes the chapter (read_progress, trackers) when its sitting -- the
+        chapter's counted fetches with no six-hour gap -- reached at least half the pages going forward and began at
+        least max(20 s, 0.5 s per page) earlier. Pages before the end stay estimates. Under Incognito the place and the
+        completion are kept privately, with no reading event or tracker write.
       operationId: getOpdsBookIdPageN
       parameters:
         - name: id
@@ -7512,6 +8243,109 @@ paths:
           description: Not authenticated
         "404":
           description: Not found, or not visible to this account
+  /api/admin/books/{id}/page-cleanup:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { type: string }
+    get:
+      tags: [admin]
+      summary: Preview a local CBZ's original page slots and retained images.
+      operationId: getApiAdminBookPageCleanup
+      security: [{ bearer: [] }]
+      description: >-
+        Admin account and admin token scope required. Returns revision (SHA256 of archive digest and cleanup state),
+        contentVersion (image URL identity), pages (number, name, bytes, gif, removed, restorable), retainedBytes,
+        unusedRetainedBytes and unusedRetainedImages. Storage counts cover all physical retained original blobs,
+        including restored or interrupted operations; duplicates share a verified content-addressed blob.
+        Full writable local CBZ only; partial chapters,
+        unsupported formats, duplicate names and archives exceeding safe limits are refused.
+      responses:
+        "200": { description: Preview with current archive revision and page slots }
+        "401": { description: Not authenticated }
+        "403": { description: Admin permission required }
+        "404": { description: Chapter not found or not visible }
+        "409": { description: Unsupported or externally replaced archive }
+    post:
+      tags: [admin]
+      summary: Remove images reversibly, restore originals or explicitly purge retained trash.
+      operationId: postApiAdminBookPageCleanup
+      security: [{ bearer: [] }]
+      description: >-
+        Keeps original ZIP names and page positions. Removed images are retained under CONFIG_DIR/page-trash;
+        no automatic expiry or purge is performed. A durable journal precedes atomic archive replacement.
+        Explicit purge marks selected originals permanently unavailable before unlinking unreferenced blobs;
+        shared blobs remain while another restorable slot needs them. purge-unused clears only blobs no active
+        restorable slot needs. These actions never alter separate backups or existing offline copies.
+        Re-checks preview revision while holding writer/scan claims. Progress, bookmarks and manual marks stay.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [action, pages, revision, confirm]
+              properties:
+                action: { type: string, enum: [remove, restore, purge, purge-unused] }
+                pages: { type: array, maxItems: 500, description: "One to 500 slots, or an empty array for purge-unused.", items: { type: integer, minimum: 1 } }
+                revision: { type: string, pattern: '^[a-f0-9]{64}$' }
+                confirm: { type: boolean, const: true }
+      responses:
+        "200": { description: Updated preview and archive revision }
+        "400": { description: Invalid selection or confirmation missing }
+        "401": { description: Not authenticated }
+        "403": { description: Admin permission required }
+        "404": { description: Chapter not found or not visible }
+        "409": { description: Busy writer, stale preview, unsupported file, all pages selected or unavailable/corrupt trash }
+  /api/admin/books/{id}/page-rules:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { type: string }
+    get:
+      tags: [admin]
+      summary: Preview GIF pages and existing source/series skip rules.
+      operationId: getApiAdminBookPageRules
+      security: [{ bearer: [] }]
+      description: >-
+        Returns stable sourceId (null when unknown), sourceName, seriesId, current chapter's matching pages
+        (number, name and rescued exception flag),
+        sourceRule/seriesRule (boolean or null), chapters and seriesChapters. Unknown provenance never inherits
+        the series' primary source. The GIF rule matches .gif page names and never removes bytes.
+      responses:
+        "200": { description: Current chapter preview, scope counts and saved rules }
+        "401": { description: Not authenticated }
+        "403": { description: Admin permission required }
+        "404": { description: Chapter not found or not visible }
+    put:
+      tags: [admin]
+      summary: Explicitly enable, disable or clear a source/series GIF skip rule.
+      operationId: putApiAdminBookPageRules
+      security: [{ bearer: [] }]
+      description: >-
+        Applies to existing and future reads of chapters stamped with this exact source ID. Absent rules are
+        disabled; a series rule overrides its source rule, including false. Null removes the scoped rule.
+        A page's explicit junk=false rescue always wins. Rules never alter a downloaded file.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [scope, skipGif, confirm]
+              properties:
+                scope: { type: string, enum: [series, source] }
+                skipGif: { type: [boolean, "null"] }
+                confirm: { type: boolean, const: true }
+      responses:
+        "200": { description: Rule saved or cleared }
+        "400": { description: Invalid rule or confirmation missing }
+        "401": { description: Not authenticated }
+        "403": { description: Admin permission required }
+        "404": { description: Chapter not found or not visible }
+        "409": { description: Chapter has no recorded stable source }
   /api/admin/library/scan:
     post:
       tags:
@@ -7576,6 +8410,69 @@ paths:
           description: "Conflict: `busy` -- a sweep or a library repair is running"
         "500":
           description: The sweep itself failed; the server log has the details
+  /api/admin/network:
+    get:
+      tags:
+        - admin
+      summary: The home network and the trusted proxies in force, and how this server sees the caller.
+      operationId: getApiAdminNetwork
+      description: >-
+        `ip` is the address the server resolved under the trusted proxies, `peer` the address that connected, `viaProxy`
+        whether that came through a trusted proxy, `zone` `local` when `ip` is in the home network (where profiles
+        without a password open) and `remote` otherwise. `localNetworks` and `trustedProxies` are `{value, source}`, the
+        source being `env` (LOCAL_NETWORKS / TRUST_PROXY, which the settings page cannot change), `settings` or
+        `default` (the private networks; loopback, link-local and private proxies); `defaults` names both defaults.
+        `suggestion` is the caller's own /24 when it is a private address, else null. `warnings` are codes: `trust_all`
+        (every peer trusted, so nobody is at home), `via_cloudflare` (this request came through Cloudflare, where
+        nobody is at home), `home_default_proxy` (through a proxy, with home still the private networks), `proxy_at_home`
+        with `ip`, and `proxy_unnamed` with `ip`, the
+        proxy this request came through that only loopback/linklocal/uniquelocal trust (nobody behind it is at home). `recent` is the address of up to ten
+        live sessions, newest first, with `lastSeen`, the account's `name` and its `zone`. Requires an admin account and a
+        token carrying the admin scope.
+      security:
+        - bearer: []
+      responses:
+        "200":
+          description: OK
+        "401":
+          description: Not authenticated
+        "403":
+          description: Not an admin
+    patch:
+      tags:
+        - admin
+      summary: Save the home network or the trusted proxies (Admin -> Settings -> Server -> Home network).
+      operationId: patchApiAdminNetwork
+      description: >-
+        Either or both. `localNetworks`: null (or blank) for the default, the private networks; `none` for no network;
+        or a comma list of addresses and CIDR ranges. `trustedProxies`: null (or blank) for the default, or a comma list
+        of addresses, CIDR ranges and loopback / linklocal / uniquelocal -- never true, false, none or a bare number. In
+        force at the next request, no restart. A value LOCAL_NETWORKS or TRUST_PROXY sets in the environment is a 409
+        set_by_env naming it; a value boot would refuse is a 400 bad_network or bad_proxy with a sentence. The answer is
+        the GET's. Audit row settings.network. Not on the desktop app (404). Requires an admin account and a token
+        carrying the admin scope.
+      security:
+        - bearer: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                localNetworks: { type: [string, "null"], maxLength: 2000 }
+                trustedProxies: { type: [string, "null"], maxLength: 2000 }
+      responses:
+        "200":
+          description: OK
+        "400":
+          description: bad_network or bad_proxy
+        "401":
+          description: Not authenticated
+        "403":
+          description: Not an admin
+        "409":
+          description: set_by_env
   /api/admin/users:
     get:
       tags:
@@ -7602,7 +8499,10 @@ paths:
       operationId: postApiAdminUsers
       description: >-
         Requires an admin account and a token carrying the admin scope. Scopes only ever restrict. Refused with 403
-        `sso_only` in SSO-only mode (since v0.63.0): accounts come from the sign-on provider.
+        `sso_only` in SSO-only mode (since v0.63.0): accounts come from the sign-on provider -- except a profile that
+        opens at home with no password (`localOpen: true`, no `password`). `localOpen` makes a profile that opens
+        without a password from LOCAL_NETWORKS (with a `password` too, a hybrid), never an admin (400
+        `local_open_admin`); one with neither is 400 `no_way_in`. `managedBy` names the account that may switch to it.
       requestBody:
         required: false
         content:
@@ -7639,6 +8539,26 @@ paths:
         Requires an admin account and a token carrying the admin scope. Scopes only ever restrict. Returns
         the collector url and the literal payload, produced by the same function the background job uses, so
         the settings page cannot show something other than what is sent. Previewing does not opt in.
+      security:
+        - bearer: []
+      responses:
+        "200":
+          description: OK
+        "401":
+          description: Not authenticated
+        "403":
+          description: "Forbidden: token scope, account permission or age limit"
+  /api/admin/limits:
+    get:
+      tags:
+        - admin
+      summary: The environment-only numeric knobs and what this server is running on.
+      operationId: getApiAdminLimits
+      description: >-
+        Requires an admin account and a token carrying the admin scope. Scopes only ever restrict. Read-only:
+        returns {limits: [{key, value, unit}], note} for SUWAYOMI_PAGE_CONCURRENCY, SOURCE_LATEST_TIMEOUT_MS,
+        SOURCE_TEST_TIMEOUT_MS, SCAN_CONCURRENCY, BACKUP_KEEP and CACHE_MAX_BYTES. Numbers only; no secret is
+        ever returned. Change them with environment variables and a restart.
       security:
         - bearer: []
       responses:
@@ -7817,6 +8737,21 @@ paths:
                     description: Since v0.55.3 (#147), the notice switches' rule (PATCH hideNoticeShortOnly); true unless set off.
                   newMemberDefaults:
                     $ref: "#/components/schemas/NewMemberDefaults"
+                  automatic_title_logos:
+                    type: boolean
+                    description: >-
+                      Automatic linked-manga logo lookups: the Uchiyomi logo library first (TITLE_LOGO_LIBRARY_URL,
+                      since v0.103.0), then Wikidata and Wikimedia Commons. Off by default;
+                      library lookup opt-outs and first-page-only art choices also suppress automatic requests.
+                  automatic_cover_title_generation:
+                    type: boolean
+                    description: Default-off nightly local cover-title generation at03:00 server time. Existing manual/text choices and provider logos remain protected; uncertain results remain private review drafts.
+                  automatic_cover_title_apply:
+                    type: boolean
+                    description: Default-off available-checks publication. Requires generation enabled and actual title/image checks passed; optional calibration approval is a separate legacy policy.
+                  automatic_cover_titles:
+                    type: boolean
+                    description: Default-off local cover title fallback. Calibrated complete-title matches may apply; uncertain results remain review drafts.
                   cleanup_read:
                     type: boolean
                     description: Whether the opt-in read-chapter cleanup is on. Off by default.
@@ -7878,6 +8813,9 @@ paths:
                     items:
                       type: string
                     description: The source ids rated Adult only, lowercased. See adultSources on PATCH.
+                  adult_hiding:
+                    type: boolean
+                    description: Whether this server hides 18+ until someone shows it. See adultHiding on PATCH.
                   source_prefs:
                     $ref: "#/components/schemas/SourceOrder"
                   group_upgrade:
@@ -7943,6 +8881,18 @@ paths:
                   type: string
                 allowRegistration:
                   type: boolean
+                automaticTitleLogos:
+                  type: boolean
+                  description: Enable automatic exact linked-manga logo discovery. Default false; cached art remains usable when disabled.
+                automaticCoverTitleGeneration:
+                  type: boolean
+                  description: Enable nightly local cover-title generation; worker must be available. Disabling stops a nightly run without discarding completed previews.
+                automaticCoverTitleApply:
+                  type: boolean
+                  description: Separately opt in to applying outputs whose measured available checks pass. Requires worker and pinned OCR; publication also requires generation enabled. No calibration approval is implied.
+                automaticCoverTitles:
+                  type: boolean
+                  description: Enable calibrated local cover title fallbacks after a checked provider miss. Enabling requires the pinned OCR pack and validated profile.
                 updaterHours:
                   type: integer
                 extensionHours:
@@ -8084,6 +9034,14 @@ paths:
                     type: string
                     minLength: 1
                     maxLength: 120
+                adultHiding:
+                  type: boolean
+                  description: >-
+                    Whether this server hides 18+ until someone shows it. On by default: 18+ libraries, titles
+                    and sources stay off the listings of a request without adult=1. Off, for a server only adults
+                    use: every request is answered as though it carried adult=1 (the web app, OPDS readers and
+                    the Komga API alike), and /api/adult-filter answers hiding false so the web app drops Show
+                    18+. An account's age limit still holds: it is a permission, not this switch.
                 sourcePrefs:
                   description: >-
                     The server-wide source order, replaced whole. When a series follows more than one
@@ -8585,8 +9543,10 @@ paths:
             a preview -- a scan, then a look for every live chapter's own file -- and changes nothing; its
             progress and plan are on GET /api/admin/tasks/rescan/status. `matches` (since v0.55.7, "Check online
             matches") holds every automatic AniList link and every cover and banner found by a title search to the
-            title check again, detached; its last run is the `matches` entry of GET /api/admin/tasks
-            ({matches, removed, links, art, unanswered, stopped?, ms}), audited as `library.match_check`.
+            title check again, detached -- since v0.103.1 a link named as its series only by a synonym moves to the
+            entry a title search names so by its own title; its last run is the `matches` entry of GET
+            /api/admin/tasks ({matches, removed, moved, links, art, unanswered, stopped?, ms}), audited as
+            `library.match_check`.
           schema:
             type: string
             enum: [scan, update, backup, fingerprint, pagehash, cleanup, extensions, verify, repair, rescan, matches]
@@ -9572,6 +10532,113 @@ paths:
           description: "Forbidden: token scope, account permission or age limit"
         "404":
           description: The series was not following that source
+  /api/admin/series/{id}/sources/{sourceId}/leftovers:
+    get:
+      tags:
+        - admin
+      summary: Preview optional follower cleanup with a fresh confirmation.
+      operationId: getApiAdminSeriesIdSourcesSourceIdLeftovers
+      description: >-
+        Requires an admin account and a token carrying the admin scope. Scopes only ever restrict. The downloaded
+        chapters only this follower lists, every unique chapter number, and how many readers have progress.
+        The confirmation is account-bound and expires after five minutes. Every remaining source must return a
+        fresh nonempty complete listing. Plain DELETE keeps downloads. A main with followers is primary_source:
+        first make its replacement main and keep this source as a follower. The last source's files always stay.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: sourceId
+          in: path
+          required: true
+          schema:
+            type: string
+      security:
+        - bearer: []
+      responses:
+        "200":
+          description: The preview.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [chapters, numbers, readers, lastSource, confirmation]
+                properties:
+                  chapters: { type: integer }
+                  numbers: { type: array, items: { type: number } }
+                  readers: { type: integer }
+                  lastSource: { type: boolean }
+                  confirmation: { type: string }
+        "401":
+          description: Not authenticated
+        "403":
+          description: "Forbidden: token scope, account permission or age limit"
+        "404":
+          description: The series does not use that source
+        "409":
+          description: listing_unavailable, primary_source, numbering_pending, or busy.
+  /api/admin/series/{id}/sources/{sourceId}/cleanup:
+    post:
+      tags: [admin]
+      summary: Explicitly delete a follower's unique downloads and stop following it.
+      operationId: postApiAdminSeriesIdSourcesSourceIdCleanup
+      description: >-
+        Requires an admin account and admin token scope. Rechecks the fresh leftovers preview while holding the
+        series writer claim and source/listing locks. Deletes only downloaded chapter files uniquely supplied
+        by this follower, their rows and progress, and its unique by-number marks. The source is removed in the
+        same operation. A partial filesystem failure returns ok false with purged.left and keeps the source.
+        The current main must first be replaced, keeping it as a follower. Last-source files always stay.
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+        - { name: sourceId, in: path, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [confirmation]
+              additionalProperties: false
+              properties:
+                confirmation: { type: string, minLength: 1, maxLength: 2048 }
+      security:
+        - bearer: []
+      responses:
+        "200":
+          description: Cleanup result. Files named in left were kept; the follower stays when any could not be removed.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok, purged]
+                properties:
+                  ok: { type: boolean }
+                  purged:
+                    type: object
+                    required: [removed, bytes, left]
+                    properties:
+                      removed: { type: integer }
+                      bytes: { type: integer }
+                      left:
+                        type: array
+                        items:
+                          type: object
+                          required: [id, reason]
+                          properties:
+                            id: { type: string }
+                            reason: { type: string, enum: [unlink_failed, outside_root, unreachable] }
+        "400":
+          description: A preview confirmation is required.
+        "401":
+          description: Not authenticated.
+        "403":
+          description: Admin permission or token scope required.
+        "404":
+          description: The series or followed source no longer exists.
+        "409":
+          description: preview_changed, listing_unavailable, primary_source, numbering_pending, busy, or refused.
   /api/admin/series/{id}/check:
     post:
       tags:
@@ -9661,7 +10728,7 @@ paths:
           required: false
           schema:
             type: string
-            enum: [posting_order, source, remap]
+            enum: [posting_order, titles, source, remap]
       security:
         - bearer: []
       responses:
@@ -9684,7 +10751,7 @@ paths:
       operationId: postApiAdminSeriesIdNumbering
       description: >-
         Requires an admin account and a token carrying the admin scope. Scopes only ever restrict. `auto` hands the
-        series back to the detector. `posting_order` and `source` without `confirm` answer `needs_confirm` with
+        series back to the detector. `posting_order`, `titles` (#379) and `source` without `confirm` answer `needs_confirm` with
         the plan and change nothing; with it they rename the files in place (book ids, reading progress,
         bookmarks and notes are kept) and answer `applied`. Choosing the numbering the series already has
         (Keep the source's numbers on a series waiting for review) renames nothing and answers `unchanged`.
@@ -9710,7 +10777,7 @@ paths:
               type: object
               required: [mode]
               properties:
-                mode: { type: string, enum: [auto, source, posting_order, remap] }
+                mode: { type: string, enum: [auto, source, posting_order, titles, remap] }
                 confirm: { type: boolean }
       security:
         - bearer: []
@@ -10427,6 +11494,60 @@ paths:
           description: Not found, or not visible to this account
         "409":
           description: "`refused`: the download directory is not writable; `message` and `fix` say what to do"
+  /api/admin/series/{id}/chapters/unlisted:
+    post:
+      tags:
+        - admin
+      summary: Which chosen chapters no followed source lists.
+      operationId: postApiAdminSeriesIdChaptersUnlisted
+      description: >-
+        Requires an admin account and a token carrying the admin scope. Scopes only ever restrict. Of the chosen
+        chapters, the ones whose number (an admin's override too, and every number of a range) no source the series
+        follows lists in its stored listing: once deleted, nothing can fetch them again. Read-only; the Delete from
+        server confirmation warns with it.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [bookIds]
+              properties:
+                bookIds:
+                  type: array
+                  minItems: 1
+                  maxItems: 500
+                  items:
+                    type: string
+      security:
+        - bearer: []
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [unlisted]
+                properties:
+                  unlisted:
+                    type: array
+                    items:
+                      type: string
+        "400":
+          description: Malformed body or parameter
+        "401":
+          description: Not authenticated
+        "403":
+          description: "Forbidden: token scope, account permission or age limit"
+        "404":
+          description: Not found
   /api/admin/series/{id}/chapters/keep-once:
     post:
       tags:
@@ -10840,7 +11961,13 @@ paths:
         - admin
       summary: Move a series to another library.
       operationId: postApiAdminSeriesIdLibrary
-      description: Requires an admin account and a token carrying the admin scope. Scopes only ever restrict.
+      description: >-
+        Requires an admin account and admin token scope. Shared filing keeps files in place.
+        A visibility change into the actor's own private library or into shared storage requires
+        confirmVisibilityChange after a 409 visibility_confirmation_required response; the entire
+        selection is checked before any mutation. Automatic (null) preserves privacy. Other accounts'
+        private copies remain unavailable. Confirmed moves preserve identities and roll folders back
+        on database failure. Linked editions and conflicting destinations are refused.
       parameters:
         - name: id
           in: path
@@ -10848,17 +11975,24 @@ paths:
           schema:
             type: string
       requestBody:
-        required: false
+        required: true
         content:
           application/json:
             schema:
               type: object
+              additionalProperties: false
+              required: [libraryId]
               properties:
                 libraryId:
-                  type: string
+                  type: [string, "null"]
+                confirmVisibilityChange:
+                  type: boolean
+                  default: false
       security:
         - bearer: []
       responses:
+        "409":
+          description: Visibility confirmation required (visibility and count supplied), busy reader/writer, conflicting destination, or refused file operation. No changes occur before confirmation.
         "200":
           description: OK
         "400":
@@ -10875,23 +12009,38 @@ paths:
         - admin
       summary: Move many series to a library.
       operationId: postApiAdminSeriesLibrary
-      description: Requires an admin account and a token carrying the admin scope. Scopes only ever restrict.
+      description: >-
+        Requires an admin account and admin token scope. Shared filing keeps files in place.
+        A visibility change into the actor's own private library or into shared storage requires
+        confirmVisibilityChange after a 409 visibility_confirmation_required response; the entire
+        selection is checked before any mutation. Automatic (null) preserves privacy. Other accounts'
+        private copies remain unavailable. Confirmed moves preserve identities and roll folders back
+        on database failure. Linked editions and conflicting destinations are refused.
       requestBody:
-        required: false
+        required: true
         content:
           application/json:
             schema:
               type: object
+              additionalProperties: false
+              required: [seriesIds, libraryId]
               properties:
                 seriesIds:
                   type: array
+                  minItems: 1
+                  maxItems: 500
                   items:
                     type: string
                 libraryId:
-                  type: string
+                  type: [string, "null"]
+                confirmVisibilityChange:
+                  type: boolean
+                  default: false
       security:
         - bearer: []
       responses:
+        "409":
+          description: Visibility confirmation required (visibility and count supplied), busy reader/writer, conflicting destination, or refused file operation. No changes occur before confirmation.
         "200":
           description: OK
         "400":
@@ -11272,7 +12421,7 @@ paths:
     put:
       tags:
         - admin
-      summary: Set a series' cover or banner (upload, URL, or a candidate).
+      summary: Set a series' cover, banner or transparent title logo.
       operationId: putApiAdminSeriesIdArt
       description: >-
         Requires an admin account and a token carrying the admin scope. Scopes only ever restrict. `upload` takes an
@@ -11284,6 +12433,9 @@ paths:
         `source` (the cover only) takes the cover a followed source has for the series: only the source's id is sent, the
         picture's address is read from the source's own record of the series, and the server keeps its own copy.
         Automatic art is kept from an online entry only when it is named as the series is (v0.55.7).
+        For `kind: logo`, `upload` and `url` validate and keep a local alpha WebP copy; raw SVG is refused.
+        `text` selects styled text, `style` changes the fallback preset, and `reset` selects automatic mode/style.
+        Failed imports preserve the previous logo. Responses to logo changes also include TitleArt.
       parameters:
         - name: id
           in: path
@@ -11300,10 +12452,14 @@ paths:
               properties:
                 kind:
                   type: string
-                  enum: [cover, banner]
+                  enum: [cover, banner, logo]
                 mode:
                   type: string
-                  enum: [url, upload, reset, first_page, source]
+                  enum: [url, upload, reset, first_page, source, text, style]
+                style:
+                  type: string
+                  enum: [auto, action, fantasy, scifi, soft, noir, plain]
+                  description: Required for kind logo and mode style.
                 source:
                   type: string
                   description: For `source` (the cover only), the id of a source this series follows; see GET /api/admin/series/{id}/cover-candidates.
@@ -11329,6 +12485,494 @@ paths:
           description: Not found, or not visible to this account
         "413":
           description: The body is over the limit (a picture over 11 MB)
+  /api/library/upload:
+    post:
+      tags:
+        - library
+      summary: Upload a chapter into a new or visible existing series.
+      operationId: postApiLibraryUpload
+      description: >-
+        Requires an admin account, or a member an admin gave `canUploadManually`. The body is the file itself (.cbz, .cbr,
+        .zip, .rar, .pdf or .epub), streamed into `Uploads/<title>` under the download folder, then the library is scanned;
+        start a new series with `title` and `fresh=1`, then send its returned `seriesId` for later files.
+        An existing series requires `seriesId` and current viewer access. Files are published atomically without
+        replacing existing files, under the shared writer claim. The archive index and its first page are validated.
+        PDF/RAR uploads are also capped at 128 MiB. At most two uploads run together.
+      parameters:
+        - name: images
+          in: query
+          schema: {type: string, enum: ['1']}
+          description: Send ordered multipart pages as one validated CBZ chapter.
+        - name: visibility
+          in: query
+          schema: {type: string, enum: [shared, private]}
+          description: New series only; defaults to the authenticated account preference.
+        - name: libraryId
+          in: query
+          schema: {type: string}
+          description: Allowed shared destination for a new series; private owners are inferred.
+        - name: fresh
+          in: query
+          required: false
+          description: '`1` on a run''s first file: refuse with 409 `taken` when a series by that title is already here.'
+          schema:
+            type: string
+            enum: ['1']
+        - name: seriesId
+          in: query
+          required: false
+          description: Existing visible series to receive chapters; cannot be combined with title/fresh.
+          schema:
+            type: string
+        - name: title
+          in: query
+          required: false
+          schema:
+            type: string
+        - name: name
+          in: query
+          required: true
+          description: The file's name, extension included; the chapter number is read from it.
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [pages]
+              properties:
+                pages:
+                  type: array
+                  minItems: 1
+                  maxItems: 2000
+                  items: {type: string, format: binary}
+            encoding:
+              pages: {style: form, explode: true}
+          application/octet-stream:
+            schema:
+              type: string
+              format: binary
+      security:
+        - bearer: []
+      responses:
+        "200":
+          description: OK. `file` is where it was stored, relative to the download folder; `bookId` and `number` are the chapter the scan made of it.
+        "202":
+          description: File stored, but indexing is pending (`indexed=false`). Run a library scan before retrying.
+        "400":
+          description: >-
+            Malformed parameter, a name the scanner would not read as a chapter (`bad_type`), bytes that are not the
+            archive the name says (`bad_file`), or an empty body (`empty`)
+        "401":
+          description: Not authenticated
+        "403":
+          description: "Forbidden: token scope, account permission or age limit"
+        "404":
+          description: Existing series not found or not visible to this account.
+        "409":
+          description: A file of that name is already there (`exists`), or the series cannot take one now
+        "429":
+          description: Two uploads are already active.
+        "413":
+          description: The file is over UPLOAD_MAX_MB or its format-specific reader limit (`too_large`)
+        "415":
+          description: Send application/octet-stream archives or multipart/form-data with images=1; JSON is not accepted.
+        "507":
+          description: The download disk is at its MIN_FREE_GB floor (`disk_full`)
+  /api/admin/title-extraction/capabilities:
+    get:
+      tags: [admin]
+      operationId: getApiAdminTitleExtractionCapabilities
+      summary: Check local title extraction and calibrated automatic availability.
+      security: [{ bearer: [] }]
+      responses:
+        "200":
+          description: available, reason, automaticAvailable, automaticApplyAvailable, automaticReason, maxExclusions, timeoutSeconds, maskCorrection, maxMaskStrokes, maxMaskPoints, checkedApplyAvailable and checkedApplyReason. Checked apply requires worker and pinned OCR, while legacy automaticApplyAvailable still requires calibration. No secrets or model paths.
+        "401": { description: Not authenticated }
+        "403": { description: Not an admin or admin scope missing }
+  /api/admin/title-extraction/batch/status:
+    get:
+      tags: [admin]
+      operationId: getApiAdminTitleExtractionBatchStatus
+      summary: Read durable nightly cover-title progress and retained review previews.
+      description: Read-only; never starts inference or performs metadata lookup. Returned review titles and current series honor the admin's current visibility.
+      security: [{ bearer: [] }]
+      responses:
+        "200":
+          description: Generation/publication switches, next server-local03:00 run, disjoint counts, retry wait and bounded retained review list.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/TitleExtractionBatchStatus" }
+        "401": { description: Not authenticated }
+        "403": { description: Not an admin or admin scope missing }
+  /api/admin/title-extraction/batch/run:
+    post:
+      tags: [admin]
+      operationId: postApiAdminTitleExtractionBatchRun
+      summary: Start or resume one durable local cover-title run.
+      description: >-
+        Explicit Run now may prepare previews while nightly generation is off; it cannot publish while generation
+        is off. An existing running batch is reused. Manual jobs have worker priority. Unchanged source/model
+        fingerprints are skipped even after review expiry; retryErrors explicitly retries prior failures.
+        Custom/text choices, manual drafts, selected first-page art and usable provider logos are skipped.
+        No AniList link or external lookup consent is required for local generation; batch processing never warms metadata.
+      security: [{ bearer: [] }]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                retryErrors: { type: boolean, default: false }
+      responses:
+        "202":
+          description: Current durable run and progress.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/TitleExtractionBatchStatus" }
+        "400": { description: Invalid request }
+        "401": { description: Not authenticated }
+        "403": { description: Not an admin or admin scope missing }
+        "503": { description: Local extraction worker unavailable }
+  /api/admin/title-extraction/batch/cancel:
+    post:
+      tags: [admin]
+      operationId: postApiAdminTitleExtractionBatchCancel
+      summary: Stop only the named run, retaining its completed private previews.
+      description: Cancels pending work and this run's active private job. Existing manual jobs, artwork and completed review drafts remain. A later nightly run can discover new or changed covers.
+      security: [{ bearer: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [runId]
+              properties:
+                runId: { type: string, format: uuid }
+      responses:
+        "200":
+          description: Current durable progress after stopping.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/TitleExtractionBatchStatus" }
+        "400": { description: Invalid run ID }
+        "401": { description: Not authenticated }
+        "403": { description: Not an admin or admin scope missing }
+        "404": { description: Run not found }
+  /api/admin/series/{id}/title-extraction/cover:
+    get:
+      tags: [admin]
+      operationId: getApiAdminSeriesIdTitleExtractionCover
+      summary: Read the current actual cover as a bounded PNG for region selection.
+      description: Reuses the cover pipeline. The x-cover-fingerprint header binds a later job to these exact bytes and stored cover selection.
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      security: [{ bearer: [] }]
+      responses:
+        "200": { description: Private PNG; x-cover-fingerprint identifies the immutable input. }
+        "401": { description: Not authenticated }
+        "403": { description: Not an admin or admin scope missing }
+        "404": { description: Series not visible }
+        "422": { description: No readable bounded cover }
+  /api/admin/series/{id}/title-extraction:
+    get:
+      tags: [admin]
+      operationId: getApiAdminSeriesIdTitleExtraction
+      summary: Read the latest own or shared automatic title draft.
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      security: [{ bearer: [] }]
+      responses:
+        "200": { description: An object with job, either a TitleExtractionJob or null. Reading queues nothing. }
+        "401": { description: Not authenticated }
+        "403": { description: Not an admin or admin scope missing }
+        "404": { description: Series not visible }
+    post:
+      tags: [admin]
+      operationId: postApiAdminSeriesIdTitleExtraction
+      summary: Create a private local cover title preview without changing artwork.
+      description: >-
+        The current cover is resolved by the server; callers cannot supply URLs or file paths. Normalized region and
+        exclusions refer to the exact cover fingerprint. One bounded worker handles queued jobs. Candidates expire
+        after thirty minutes; a timeout, worker failure or rejected quality check never replaces the original.
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      security: [{ bearer: [] }]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                coverFingerprint: { type: string, pattern: '^[a-f0-9]{64}$' }
+                region: { $ref: "#/components/schemas/ExtractionRect" }
+                mask:
+          type: [object, "null"]
+          description: Available on new ready drafts with verified raw-candidate placement. Old drafts require a new extraction.
+          properties:
+            revision: { type: integer, minimum: 0 }
+            strokes: { type: array, maxItems: 128, items: { $ref: "#/components/schemas/TitleMaskStroke" } }
+            previewRegion: { oneOf: [{ $ref: "#/components/schemas/ExtractionRect" }, { type: "null" }], description: Tight edited alpha bounds before final title-logo trim/resize. }
+            canvas:
+              type: object
+              properties:
+                width: { type: integer, minimum: 1, maximum: 2400 }
+                height: { type: integer, minimum: 1, maximum: 2400 }
+                sourceUrl: { type: string, description: Private immutable PNG used for every RGB pixel. }
+                baselineUrl: { type: string, description: Private immutable lossless full-canvas baseline alpha. }
+        exclusions: { type: array, maxItems: 8, items: { $ref: "#/components/schemas/ExtractionRect" } }
+      responses:
+        "202": { description: Object with queued TitleExtractionJob in job. }
+        "400": { description: Invalid selection or unexpected body field }
+        "401": { description: Not authenticated }
+        "403": { description: Not an admin or admin scope missing }
+        "404": { description: Series not visible }
+        "409": { description: Cover changed; reload the selection image }
+        "422": { description: No readable bounded cover }
+        "429": { description: Bounded private queue or storage limit reached }
+        "503": { description: Local worker unavailable }
+  /api/admin/series/{id}/title-extraction/{jobId}:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string } }
+      - { name: jobId, in: path, required: true, schema: { type: string, format: uuid } }
+    get:
+      tags: [admin]
+      operationId: getApiAdminSeriesIdTitleExtractionJobId
+      summary: Read an owned or shared automatic extraction job.
+      security: [{ bearer: [] }]
+      responses:
+        "200": { description: Object with TitleExtractionJob in job. }
+        "401": { description: Not authenticated }
+        "403": { description: Not an admin or admin scope missing }
+        "404": { description: Job not owned, expired and cleaned, or series not visible }
+    delete:
+      tags: [admin]
+      operationId: deleteApiAdminSeriesIdTitleExtractionJobId
+      summary: Discard a preview and cancel its queued or running work.
+      security: [{ bearer: [] }]
+      responses:
+        "200": { description: Discarded; title artwork remains unchanged. }
+        "401": { description: Not authenticated }
+        "403": { description: Not an admin or admin scope missing }
+        "404": { description: Job not owned or series not visible }
+  /api/admin/series/{id}/title-extraction/{jobId}/cover:
+    get:
+      tags: [admin]
+      operationId: getApiAdminSeriesIdTitleExtractionJobIdCover
+      summary: Read the exact private PNG used to create a draft.
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+        - { name: jobId, in: path, required: true, schema: { type: string, format: uuid } }
+      security: [{ bearer: [] }]
+      responses:
+        "200": { description: Private PNG with x-cover-fingerprint; never changes during the draft. }
+        "401": { description: Not authenticated }
+        "403": { description: Not an admin or admin scope missing }
+        "404": { description: Job not owned or image unavailable }
+        "410": { description: Draft expired }
+  /api/admin/series/{id}/title-extraction/{jobId}/preview:
+    get:
+      tags: [admin]
+      operationId: getApiAdminSeriesIdTitleExtractionJobIdPreview
+      summary: Read a ready transparent title cutout for visual review.
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+        - { name: jobId, in: path, required: true, schema: { type: string, format: uuid } }
+      security: [{ bearer: [] }]
+      responses:
+        "200": { description: Private WebP; no-store and owner-authorized. }
+        "401": { description: Not authenticated }
+        "403": { description: Not an admin or admin scope missing }
+        "404": { description: Job not owned or image unavailable }
+        "409": { description: Preview not ready }
+        "410": { description: Draft expired }
+  /api/admin/series/{id}/title-extraction/{jobId}/mask/baseline:
+    get:
+      tags: [admin]
+      operationId: getApiAdminSeriesIdTitleExtractionJobIdMaskBaseline
+      summary: Read the immutable full-source correction baseline.
+      description: Private lossless zero-RGB RGBA PNG at exactly the immutable cover snapshot dimensions. Alpha is projected from the original raw worker PNG; compose it with RGB from the separate immutable source snapshot. Admin ownership and current visibility are required.
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+        - { name: jobId, in: path, required: true, schema: { type: string, format: uuid } }
+      security: [{ bearer: [] }]
+      responses:
+        "200": { description: Private no-store full-canvas zero-RGB RGBA PNG. }
+        "401": { description: Not authenticated }
+        "403": { description: Not an admin or admin scope missing }
+        "404": { description: Job not owned, series not visible or baseline unavailable }
+        "409": { description: Draft not ready or baseline bytes changed }
+        "410": { description: Draft expired }
+  /api/admin/series/{id}/title-extraction/{jobId}/mask:
+    patch:
+      tags: [admin]
+      operationId: patchApiAdminSeriesIdTitleExtractionJobIdMask
+      summary: Replace the whole correction stroke list and save a private preview revision.
+      description: >-
+        Always replays from the immutable original alpha. Strokes use normalized full-source coordinates,
+        with hard round caps and joins, evaluated at pixel centers. Restore sets alpha to 255 and erase to 0;
+        every visible RGB pixel comes from the immutable source PNG. An empty stroke list resets the mask.
+        Allows at most 128 strokes, 8192 total points, and 40 million bounded raster pixel visits.
+        Rejects empty/opaque output, stale cover/title/link, stale revision, changed files and concurrent cancellation.
+        Changes only the expiring draft; Apply remains explicit and corrected output is never automatically certified.
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+        - { name: jobId, in: path, required: true, schema: { type: string, format: uuid } }
+      security: [{ bearer: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [expectedRevision, strokes]
+              properties:
+                expectedRevision: { type: integer, minimum: 0, maximum: 2147483646 }
+                strokes: { type: array, maxItems: 128, items: { $ref: "#/components/schemas/TitleMaskStroke" } }
+      responses:
+        "200":
+          description: Saved a new revision; returns job with revision-versioned final normalized previewUrl.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  job: { $ref: "#/components/schemas/TitleExtractionJob" }
+        "400": { description: Invalid strokes or raster work limit exceeded }
+        "401": { description: Not authenticated }
+        "403": { description: Not an admin or admin scope missing }
+        "404": { description: Job not owned or series not visible }
+        "409": { description: Draft not ready, stale mask/source/title/link, missing baseline or changed bytes }
+        "410": { description: Draft expired }
+        "422": { description: Empty or fully opaque mask }
+  /api/admin/series/{id}/title-extraction/{jobId}/apply:
+    post:
+      tags: [admin]
+      operationId: postApiAdminSeriesIdTitleExtractionJobIdApply
+      summary: Apply a visually reviewed draft as a protected custom title.
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                expectedMaskRevision: { type: integer, minimum: 0, maximum: 2147483646, description: Required after any saved correction. Prevents publishing edits unseen by an older tab. }
+      description: >-
+        The server rechecks the current cover bytes/selection, title-art version, checked identity, ownership and
+        visibility before publishing atomically. A concurrent cover or title edit wins. Returns ok and TitleArt;
+        the readable title remains visible and attribution records Cover lettering without an external source URL.
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+        - { name: jobId, in: path, required: true, schema: { type: string, format: uuid } }
+      security: [{ bearer: [] }]
+      responses:
+        "200": { description: Applied as custom artwork; returns ok and titleArt. }
+        "401": { description: Not authenticated }
+        "403": { description: Not an admin or admin scope missing }
+        "404": { description: Job not owned or series not visible }
+        "409": { description: Draft not ready, bytes changed, or current cover/title/identity no longer matches }
+        "410": { description: Draft expired }
+  /api/admin/title-logos/status:
+    get:
+      tags: [admin]
+      operationId: getApiAdminTitleLogosStatus
+      summary: Read title-logo discovery coverage and scheduled retries.
+      description: >-
+        Requires an admin and admin token scope. This read-only summary performs no discovery, queueing or
+        external requests. Ready, missing, error, unchecked, custom and text partition the active series;
+        a default missing row without a matching checked identity is unchecked. Eligibility and privacy-gate
+        counts are separate facts. Running includes queued work and eligible due work awaiting the next refill.
+      security: [{ bearer: [] }]
+      responses:
+        "200":
+          description: Current derived coverage, pending work and future retry timestamps.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [enabled, running, counts, checked, nextRetryAt, providerRetryAt, lastScanAt]
+                properties:
+                  enabled: { type: boolean }
+                  running: { type: boolean }
+                  checked: { type: integer }
+                  nextRetryAt: { type: [string, "null"], format: date-time }
+                  providerRetryAt: { type: [string, "null"], format: date-time }
+                  lastScanAt: { type: [string, "null"], format: date-time }
+                  counts:
+                    type: object
+                    properties:
+                      total: { type: integer }
+                      ready: { type: integer }
+                      missing: { type: integer }
+                      error: { type: integer }
+                      unchecked: { type: integer }
+                      custom: { type: integer }
+                      text: { type: integer }
+                      eligible: { type: integer }
+                      needsLink: { type: integer }
+                      libraryOptOut: { type: integer }
+                      firstPage: { type: integer }
+                      pending: { type: integer }
+                      due: { type: integer }
+        "401": { description: Not authenticated }
+        "403": { description: Not an admin or token lacks the admin scope }
+  /api/admin/title-logos/scan:
+    post:
+      tags: [admin]
+      operationId: postApiAdminTitleLogosScan
+      summary: Resume automatic title-logo discovery across the library.
+      description: >-
+        Requires an admin, admin token scope and the automatic-title-logo setting enabled. Refills the bounded
+        paced worker without waiting for remote art. Respects library opt-outs, first-page choices, custom/text
+        choices and checked AniList identity. retryMissing resets only completed, current-identity eligible misses;
+        provider failures and Retry-After deadlines remain protected. Normal scheduled discovery resumes at boot.
+      security: [{ bearer: [] }]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                retryMissing: { type: boolean, default: false }
+      responses:
+        "200": { description: Accepted; returns ok and the current status summary. }
+        "400": { description: Invalid request body }
+        "401": { description: Not authenticated }
+        "403": { description: Not an admin or token lacks the admin scope }
+        "409": { description: Automatic title logos are disabled }
+  /api/admin/series/{id}/logo/refresh:
+    post:
+      tags: [admin]
+      operationId: postApiAdminSeriesIdLogoRefresh
+      summary: Find a title logo for this series' checked AniList manga link, in the background.
+      description: >-
+        Requires an admin and admin token scope. One explicit lookup may bypass automatic online opt-outs.
+        Custom/text choices return 409; reset to automatic first. Current good art remains during a refresh
+        or provider outage. A changed link or manual choice prevents publishing a stale result.
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      security: [{ bearer: [] }]
+      responses:
+        "200":
+          description: Queued (or already pending); includes current TitleArt.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+                  status: { type: string }
+                  titleArt: { $ref: "#/components/schemas/TitleArt" }
+        "401": { description: Not authenticated }
+        "403": { description: Not an admin or token lacks the admin scope }
+        "404": { description: Series not visible }
+        "409": { description: Manual choice active, or no checked AniList manga link }
+        "429": { description: Provider Retry-After/backoff is active, or the bounded worker queue is full }
   /api/admin/art/overview:
     get:
       tags:
@@ -12595,7 +14239,7 @@ paths:
       description: >-
         Requires an admin account and a token carrying the admin scope. Scopes only ever restrict. Up to 50
         batches in every state, newest first, as `{content: [{id, origin, tracker, state, total, resolved,
-        added, already, failed, skippedNovels, truncated, created_at, updated_at, stale}]}` — `origin` is
+        added, already, failed, skippedNovels, truncated, leftOver, created_at, updated_at, stale}]}` — `origin` is
         `backup`, `mangadex`, `paste` or `tracker`, and `tracker` names the service (`anilist`, `myanimelist`,
         `kitsu`, `mangaupdates`) for a tracker batch, null otherwise; `skippedNovels` (integer: the novels a tracker read
         dropped, 0 for the other origins) and `truncated` (boolean: the intake kept the first 500 titles not
@@ -12637,13 +14281,18 @@ paths:
         since v0.51.0 the titles the library already holds are kept as skipped rows and do not count toward
         them, so `total` can be more than 500, and `truncated` says more titles not owned remained, which
         importing the same list again picks up once these are in. Answers `{batchId, total, truncated,
-        skippedNovels}`.
+        skippedNovels, leftOver}`: since v0.105.0 `leftOver` counts the titles not owned after the cut (null when not
+        counted, as when a tracker read stopped at its own cap). A title skipped in an earlier import of the list starts
+        skipped and does not count (remembered by its tracker id, else its title, until a pick un-skips it), and a
+        tracker row whose entry a series here is already linked to (by a person or the check) is owned at intake and
+        reads `status: already` at /run instead of being added again.
 
 
         The fourth intake, `origin: 'tracker'`, reads the requesting admin's OWN connected AniList /
         MyAnimeList / Kitsu account (the connection GET /api/trackers shows for them; never another member's)
-        for the lists named in `statuses` (Reading + Plan to read when omitted). Up to 501 entries are read;
-        the batch keeps 500 and reports `truncated` when the read hit the cap. Light novels are dropped and
+        for the lists named in `statuses` (Reading + Plan to read when omitted). Up to 2001 entries are read
+        (501 before v0.105.0); the batch keeps the first 500 not owned and reports `truncated` when the read hit the
+        cap or more came after them. Light novels are dropped and
         counted as `skippedNovels` (a novel resolves to its manga adaptation on every source, and would link
         the novel entry to the manga); both figures are stored on the batch row and come back as
         `skippedNovels` and `truncated` on every batch GET. Entries are deduped by their id on the service
@@ -12676,6 +14325,17 @@ paths:
             schema:
               type: object
               properties:
+                continueFrom:
+                  type: string
+                  format: uuid
+                  description: Completed batch owned by this account; idempotently continue its saved remainder and scope.
+                visibility:
+                  type: string
+                  enum: [shared, private]
+                  description: Default destination; validated private tracker entries always stay private.
+                libraryId:
+                  type: string
+                  description: Allowed shared destination; private owners are inferred.
                 dataUrl:
                   type: string
                   description: A .tachibk/.proto.gz backup as a data URL (no multipart plugin; mirrors the art upload).
@@ -12703,6 +14363,21 @@ paths:
                     type: string
                     enum: [reading, plan_to_read, completed, on_hold, dropped]
                   description: Which of the person's lists to bring over. Defaults to reading + plan_to_read.
+                markRead:
+                  type: boolean
+                  description: >-
+                    Mark chapters I've read (since v0.108.0, #433). When true, what each row says was read is marked read
+                    for the requesting admin: the chapters a backup has marked read, and every chapter at or below the
+                    highest progress its trackers give (a provider named twice with two different entries gives none). At
+                    intake for a title already in the library, at /run once a series is added or found. A number the series
+                    holds is marked on its chapter; one its sources list and this server does not hold becomes a
+                    listing mark (source `import`) that turns into a read chapter when it lands; any other number is
+                    skipped. Never marks a chapter unread, never touches one already read, writes no reading_events, pushes
+                    nothing to a tracker, and stamps each read just before its file's mtime, so the read-chapter cleanup
+                    never takes it for a read of this server's copy. A file holding a range of chapters is marked only when
+                    the tracker's number reaches its last chapter; a series numbered by posting order or by its chapter
+                    titles, or with a renumber pending, is left alone. Off when omitted; a continuation (`continueFrom`)
+                    keeps the choice of the batch it continues.
       security:
         - bearer: []
       responses:
@@ -12745,7 +14420,11 @@ paths:
         the match was found under, null when the search title found it), `progress` (chapters read on the
         tracker) and `linked` — true when a `series_trackers` row carries this entry's id on that service,
         i.e. the series was linked at intake (a title already owned) or at /run (an added one); read live,
-        not remembered, so a row whose link did not happen never claims it.
+        not remembered, so a row whose link did not happen never claims it. Since v0.108.0 (#433) the batch
+        carries `mark_read` (whether it was started with `markRead`), and each item `read_to` (the highest
+        chapter its backup has marked read, null when none; the backup's whole read set stays on the server) and
+        `marked_read` (how many chapters this import marked read for the row: at intake for an owned title, at
+        /run otherwise).
       parameters:
         - name: id
           in: path
@@ -12850,7 +14529,10 @@ paths:
         current number and clears the stamp, so re-reading the list is how a downward correction on the
         tracker reaches this app. A push goes out once the local count exceeds the floor (equal to an
         unstamped floor is skipped quietly; equal to a stamped one, a number this app sent, still pushes);
-        the row then reads `linked: true` on GET.
+        the row then reads `linked: true` on GET. On a batch started with `markRead`, a row that ends `added` or
+        `already` also has what it says was read marked on its series for the batch's owner, as POST
+        /api/admin/import/batches describes, and counted in its `marked_read`; on a series just added, that is
+        the listing the add wrote.
       parameters:
         - name: id
           in: path
@@ -12900,8 +14582,7 @@ paths:
       description: >-
         Requires an admin account and a token carrying the admin scope. Scopes only ever restrict. A
         `manual` pick clears the row's `matched_via` (a hand-picked match was found by nobody's alternate);
-        `auto` restores the resolve pass's suggestion and leaves `matched_via` as it is, so an auto → manual
-        → auto detour loses the note; `skip` on the last open row of a batch a run has been through closes
+        `auto` restores the resolve pass's suggestion, stored alternate-title provenance and ambiguity; `skip` on the last open row of a batch a run has been through closes
         the batch.
       parameters:
         - name: cid
@@ -13722,7 +15403,11 @@ paths:
       operationId: patchApiAdminUsersId
       description: >-
         Requires an admin account and a token carrying the admin scope. Scopes only ever restrict. A body with a
-        `password` is refused whole with 403 `sso_only` in SSO-only mode (since v0.63.0).
+        `password` is refused whole with 403 `sso_only` in SSO-only mode (since v0.63.0). `localOpen`,
+        `removePassword: true` and `managedBy` change how the account gets in: a profile that opens at home is never an
+        admin (400 `local_open_admin`) and an account keeps a way in (400 `no_way_in`); either change ends its sessions.
+        `removePassword` also deletes the account's API and OPDS tokens, unless the sign-on provider still signs it in.
+        `perms.canManageProfiles` lets a member make profiles of its own (POST /api/profiles).
       parameters:
         - name: id
           in: path
@@ -14494,3 +16179,492 @@ paths:
           description: "forbidden -- the token is read-only."
         "404":
           description: Not found, or not visible to this account
+
+  /api/personal/privacy:
+    get:
+      tags:
+        - personal
+      summary: Read the account’s private-library default.
+      description: Reports supported, defaultPrivate and privateLibraryId. Existing defaults remain shared;
+        delegated library backends report unsupported.
+      operationId: getApiPersonalPrivacy
+      security:
+        - bearer: []
+      responses:
+        "200":
+          description: Success; restricted to the authenticated account and its content scope.
+        "400":
+          description: Malformed or unsupported input.
+        "401":
+          description: Not authenticated or revoked credential.
+        "403":
+          description: Insufficient token scope, account permission or registration disabled.
+        "404":
+          description: Not found, not visible, or no unique available book matches the document.
+        "409":
+          description: A concurrent operation or content-scope safety rule prevents this change.
+    put:
+      tags:
+        - personal
+      summary: Change the account’s default destination for new additions.
+      description: Changes only future additions. Existing content is never reclassified. Explicit deny-all library
+        access is respected.
+      operationId: putApiPersonalPrivacy
+      security:
+        - bearer: []
+      responses:
+        "200":
+          description: Success; restricted to the authenticated account and its content scope.
+        "400":
+          description: Malformed or unsupported input.
+        "401":
+          description: Not authenticated or revoked credential.
+        "403":
+          description: Insufficient token scope, account permission or registration disabled.
+        "404":
+          description: Not found, not visible, or no unique available book matches the document.
+        "409":
+          description: A concurrent operation or content-scope safety rule prevents this change.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                defaultPrivate: &a1
+                  type: boolean
+              required:
+                - defaultPrivate
+  /api/personal/private-series:
+    get:
+      tags:
+        - personal
+      summary: List this account’s private copies, including removed copies.
+      description: Returns content rows with id,title,deleted,autoUpdate,canDelete. Other accounts’ copies and
+        inaccessible age-rated content are never included.
+      operationId: getApiPersonalPrivateSeries
+      security:
+        - bearer: []
+      responses:
+        "200":
+          description: Success; restricted to the authenticated account and its content scope.
+        "400":
+          description: Malformed or unsupported input.
+        "401":
+          description: Not authenticated or revoked credential.
+        "403":
+          description: Insufficient token scope, account permission or registration disabled.
+        "404":
+          description: Not found, not visible, or no unique available book matches the document.
+        "409":
+          description: A concurrent operation or content-scope safety rule prevents this change.
+  /api/series/{id}/privacy:
+    get:
+      tags:
+        - personal
+      summary: Read this copy’s visibility and owner-management capability.
+      description: Returns isPrivate,owner,canChange. A private copy is visible only to its owner; a normal
+        administrator cannot use an ID to bypass privacy.
+      operationId: getApiSeriesIdPrivacy
+      security:
+        - bearer: []
+      responses:
+        "200":
+          description: Success; restricted to the authenticated account and its content scope.
+        "400":
+          description: Malformed or unsupported input.
+        "401":
+          description: Not authenticated or revoked credential.
+        "403":
+          description: Insufficient token scope, account permission or registration disabled.
+        "404":
+          description: Not found, not visible, or no unique available book matches the document.
+        "409":
+          description: A concurrent operation or content-scope safety rule prevents this change.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+    put:
+      tags:
+        - personal
+      summary: Deliberately publish or re-private an owned copy.
+      description: Owner only. Preserves series/book IDs and files; refuses implicit work merges and unsafe shared
+        physical folders. Earlier private activity stays private. Never changes an AniList entry to public.
+      operationId: putApiSeriesIdPrivacy
+      security:
+        - bearer: []
+      responses:
+        "200":
+          description: Success; restricted to the authenticated account and its content scope.
+        "400":
+          description: Malformed or unsupported input.
+        "401":
+          description: Not authenticated or revoked credential.
+        "403":
+          description: Insufficient token scope, account permission or registration disabled.
+        "404":
+          description: Not found, not visible, or no unique available book matches the document.
+        "409":
+          description: A concurrent operation or content-scope safety rule prevents this change.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                isPrivate: *a1
+                libraryId:
+                  type: string
+                  minLength: 1
+                  maxLength: 64
+              required:
+                - isPrivate
+  /api/series/{id}/private-management:
+    post:
+      tags:
+        - personal
+      summary: Manage an owned private copy without global administrator rights.
+      description: pause/resume controls updates; remove is reversible; restore retains progress. delete
+        additionally requires confirmed:true, an already removed never-published copy and safe owned files.
+      operationId: postApiSeriesIdPrivateManagement
+      security:
+        - bearer: []
+      responses:
+        "200":
+          description: Success; restricted to the authenticated account and its content scope.
+        "400":
+          description: Malformed or unsupported input.
+        "401":
+          description: Not authenticated or revoked credential.
+        "403":
+          description: Insufficient token scope, account permission or registration disabled.
+        "404":
+          description: Not found, not visible, or no unique available book matches the document.
+        "409":
+          description: A concurrent operation or content-scope safety rule prevents this change.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                action:
+                  type: string
+                  enum:
+                    - pause
+                    - resume
+                    - remove
+                    - restore
+                    - delete
+                confirmed: *a1
+              required:
+                - action
+  /api/external-readers:
+    get:
+      tags:
+        - personal
+      summary: Read the account’s external-reader options.
+      description: Both externalReadingStats and opdsEstimatedBookmarks default off. External completions supply
+        counts only; byReader lists them by origin (komga, koreader, opds). Since v0.108.0 opdsEstimatedBookmarks also
+        completes a chapter paged through to the end over OPDS page streaming (see /opds/book/{id}/page/{n}).
+      operationId: getApiExternalReaders
+      security:
+        - bearer: []
+      responses:
+        "200":
+          description: Success; restricted to the authenticated account and its content scope.
+        "400":
+          description: Malformed or unsupported input.
+        "401":
+          description: Not authenticated or revoked credential.
+        "403":
+          description: Insufficient token scope, account permission or registration disabled.
+        "404":
+          description: Not found, not visible, or no unique available book matches the document.
+        "409":
+          description: A concurrent operation or content-scope safety rule prevents this change.
+    put:
+      tags:
+        - personal
+      summary: Save external-reader count and OPDS page-streaming tracking options.
+      description: Does not backfill historical events. External completions never invent duration or affect
+        streaks, badges or household rankings. opdsEstimatedBookmarks is the OPDS page-streaming switch (its v0.107.0
+        name), which since v0.108.0 keeps the reader's place and completes a chapter read to the end.
+      operationId: putApiExternalReaders
+      security:
+        - bearer: []
+      responses:
+        "200":
+          description: Success; restricted to the authenticated account and its content scope.
+        "400":
+          description: Malformed or unsupported input.
+        "401":
+          description: Not authenticated or revoked credential.
+        "403":
+          description: Insufficient token scope, account permission or registration disabled.
+        "404":
+          description: Not found, not visible, or no unique available book matches the document.
+        "409":
+          description: A concurrent operation or content-scope safety rule prevents this change.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                externalReadingStats: *a1
+                opdsEstimatedBookmarks: *a1
+              required:
+                - externalReadingStats
+                - opdsEstimatedBookmarks
+  /api/admin/import/batches/{id}/confirm:
+    post:
+      tags:
+        - admin
+      summary: Confirm the held suggestions among selected rows in an owned review batch.
+      description: Transactional and guarded against a concurrent import run. Only candidate IDs from this account’s
+        reviewable batch are accepted. Each selected row whose automatic suggestion is held for review is accepted as it
+        stands, as Confirm this match does for one row; other rows are left unchanged. Returns {ok, updated}.
+      operationId: postApiAdminImportBatchesIdConfirm
+      security:
+        - bearer: []
+      responses:
+        "200":
+          description: Success; restricted to the authenticated account and its content scope.
+        "400":
+          description: Malformed or unsupported input.
+        "401":
+          description: Not authenticated or revoked credential.
+        "403":
+          description: Insufficient token scope, account permission or registration disabled.
+        "404":
+          description: Not found, not visible, or no unique available book matches the document.
+        "409":
+          description: A concurrent operation or content-scope safety rule prevents this change.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                candidateIds:
+                  type: array
+                  minItems: 1
+                  maxItems: 500
+                  items:
+                    type: string
+                    format: uuid
+              required:
+                - candidateIds
+  /api/admin/import/batches/{id}/skip:
+    post:
+      tags:
+        - admin
+      summary: Skip selected rows in an owned review batch.
+      description: Transactional and guarded against a concurrent import run. Only candidate IDs from this account’s
+        reviewable batch are accepted; skip memory is keyed by account and effective content scope.
+      operationId: postApiAdminImportBatchesIdSkip
+      security:
+        - bearer: []
+      responses:
+        "200":
+          description: Success; restricted to the authenticated account and its content scope.
+        "400":
+          description: Malformed or unsupported input.
+        "401":
+          description: Not authenticated or revoked credential.
+        "403":
+          description: Insufficient token scope, account permission or registration disabled.
+        "404":
+          description: Not found, not visible, or no unique available book matches the document.
+        "409":
+          description: A concurrent operation or content-scope safety rule prevents this change.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                candidateIds:
+                  type: array
+                  minItems: 1
+                  maxItems: 500
+                  items:
+                    type: string
+                    format: uuid
+              required:
+                - candidateIds
+  /api/v1/kosync/users/auth:
+    get:
+      tags:
+        - opds
+      summary: Verify KOReader API-token credentials.
+      description: Use a read/write personal API token as KOReader username (x-auth-user) and any dummy password
+        (the client sends its MD5 as x-auth-key). Returns {authorized:"OK"}. Account passwords and
+        registration are not supported.
+      operationId: getApiV1KosyncUsersAuth
+      security:
+        - kosyncUser: []
+          kosyncKey: []
+      responses:
+        "200":
+          description: Success; restricted to the authenticated account and its content scope.
+        "400":
+          description: Malformed or unsupported input.
+        "401":
+          description: Not authenticated or revoked credential.
+        "403":
+          description: Insufficient token scope, account permission or registration disabled.
+        "404":
+          description: Not found, not visible, or no unique available book matches the document.
+        "409":
+          description: A concurrent operation or content-scope safety rule prevents this change.
+  /api/v1/kosync/users/create:
+    post:
+      tags:
+        - opds
+      summary: Reject KOReader registration; use an existing API token.
+      description: Authenticated requests receive 403; create a scoped token in Uchiyomi and choose Login in
+        KOReader. This endpoint never creates accounts.
+      operationId: postApiV1KosyncUsersCreate
+      security:
+        - kosyncUser: []
+          kosyncKey: []
+      responses:
+        "400":
+          description: Malformed or unsupported input.
+        "401":
+          description: Not authenticated or revoked credential.
+        "403":
+          description: Insufficient token scope, account permission or registration disabled.
+        "404":
+          description: Not found, not visible, or no unique available book matches the document.
+        "409":
+          description: A concurrent operation or content-scope safety rule prevents this change.
+  /api/v1/kosync/syncs/progress/{document}:
+    get:
+      tags:
+        - opds
+      summary: Read owner-scoped KOReader progress for an exact available document.
+      description: document is a 32-hex partial-MD5 of exact file bytes, with Binary matching. Returns canonical
+        reconciled fixed-page progress or stored opaque EPUB position, otherwise {}. Visibility and current
+        byte signature are checked; ambiguous hashes never pick an edition.
+      operationId: getApiV1KosyncSyncsProgressDocument}
+      security:
+        - kosyncUser: []
+          kosyncKey: []
+      responses:
+        "200":
+          description: Success; restricted to the authenticated account and its content scope.
+        "400":
+          description: Malformed or unsupported input.
+        "401":
+          description: Not authenticated or revoked credential.
+        "403":
+          description: Insufficient token scope, account permission or registration disabled.
+        "404":
+          description: Not found, not visible, or no unique available book matches the document.
+        "409":
+          description: A concurrent operation or content-scope safety rule prevents this change.
+      parameters:
+        - name: document
+          in: path
+          required: true
+          schema:
+            type: string
+  /api/v1/kosync/syncs/progress:
+    put:
+      tags:
+        - opds
+      summary: Push explicit KOReader progress without rewinding canonical reading.
+      description: Fixed-page progress is a one-based page string. EPUB positions remain opaque; percentage alone
+        does not invent chapter boundaries. Returns document and server timestamp. First binding/bulk catch-up
+        are silent; replayed progress cannot duplicate completion events.
+      operationId: putApiV1KosyncSyncsProgress
+      security:
+        - kosyncUser: []
+          kosyncKey: []
+      responses:
+        "200":
+          description: Success; restricted to the authenticated account and its content scope.
+        "400":
+          description: Malformed or unsupported input.
+        "401":
+          description: Not authenticated or revoked credential.
+        "403":
+          description: Insufficient token scope, account permission or registration disabled.
+        "404":
+          description: Not found, not visible, or no unique available book matches the document.
+        "409":
+          description: A concurrent operation or content-scope safety rule prevents this change.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                document:
+                  type: string
+                  pattern: ^[a-fA-F0-9]{32}$
+                progress:
+                  type: string
+                  minLength: 1
+                  maxLength: 4096
+                percentage:
+                  type: number
+                  minimum: 0
+                  maximum: 1
+                device:
+                  type: string
+                  minLength: 1
+                  maxLength: 128
+                device_id:
+                  type: string
+                  maxLength: 128
+                metadata: {}
+              required:
+                - document
+                - progress
+                - percentage
+                - device

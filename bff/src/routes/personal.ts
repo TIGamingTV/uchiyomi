@@ -1,29 +1,34 @@
-import type { FastifyInstance } from 'fastify';
+import { deleteAccountPreservingPrivate } from '../lib/contentScope';
+import type { FastifyInstance, FastifyRequest } from 'fastify';
+import { hash } from '@node-rs/argon2';
 import rateLimit from '@fastify/rate-limit';
 import { z } from 'zod';
-import { q, one } from '../lib/db';
+import { q, one, tx } from '../lib/db';
 // backend-agnostic content client: the owned library in owned mode, Komga otherwise. The old direct
 // `lib/komga` import silently nulled every series lookup here after the owned-library cutover.
 import { content as komga } from '../lib/backend';
-import { viewCtxFor, visible, browsable, browsableIds, Params, type ViewCtx, hideAdult, sourceAllowedFor } from '../lib/visibility';
+import { viewCtxFor, seriesVisible, visible, browsable, browsableIds, Params, type ViewCtx, hideAdult, sourceAllowedFor } from '../lib/visibility';
 import { getSource } from '../lib/sources';
 import { startBulkNewest, bulkNewestState } from '../lib/bulkNewest';
 // The download strip's "is a job running for this folder" lives with the strip, in routes/sources.ts, and
 // routes/admin.ts imports it from there too.
 import { jobBusy } from './sources';
 import { BlockedAddress } from '../lib/ssrfGuard';
-import { authenticate, userIdOf, roleOf, actsAsAdmin, issueOpdsToken, issueApiToken, listApiTokens, revokeApiToken, API_SCOPES, revokeOpdsToken, opdsTokenStatus, setOpdsShowAdult, OPDS_TOKEN_DAYS } from '../lib/auth';
+import { authenticate, requireCredentialSession, passwordError, revokeAllSessions, userIdOf, roleOf, actsAsAdmin, issueOpdsToken, issueApiToken, listApiTokens, revokeApiToken, API_SCOPES, revokeOpdsToken, opdsTokenStatus, setOpdsShowAdult, OPDS_TOKEN_DAYS } from '../lib/auth';
 import { enrichSeries, seenCounts } from '../lib/enrich';
 import { env } from '../env';
 import { pushEnabled, vapidPublicKey, saveSubscription, removeSubscription } from '../lib/push';
 import { statusFor, saveConnection, disconnect, whoAmI, pushSeriesProgress, pushSeriesProgressAsync, clearTrackerFloor, testConnection } from '../lib/trackers';
 import { ADAPTERS, isProvider, verdictOf, type Provider } from '../lib/trackerProviders';
 import { logAudit } from '../lib/audit';
+import { ssoOnly } from '../lib/authMode';
+import { MAX_MANAGED_PROFILES, freeUsername, inheritRestrictions, placeholderPasswordHash, profileKind, profileRefusal } from '../lib/profiles';
 import { noticeBook } from '../lib/noticeChapters';
 import { devicesOf, hourIn, lastDays, loadTimeline, summarize, validTz, yearRange } from '../lib/readingTime';
 import { listFor, ownListFor, listsFor, listItems, kindOf, ownerOf, type ListRow } from '../lib/lists';
 import { smartQuery, parseQuery } from '../lib/smartLists';
 import { insightsFor } from '../lib/readingInsights';
+import { externalReaderCounts } from '../lib/externalReading';
 import { FRAMES, badgeOfFrame, computeStreaks, earnedFrames, finishedDays } from '../lib/badges';
 import { favoriteOrder, orderFavorites } from '../lib/favorites';
 
@@ -86,7 +91,8 @@ export default async function personalRoutes(app: FastifyInstance) {
   const vc = (req: any): ViewCtx => req.viewCtx as ViewCtx;
 
   // issue/rotate the caller's OPDS token (shown once); used as the HTTP Basic password in an external reader
-  app.post('/api/opds/token', async (req) => {
+  // Not from a session entered without a password: the token would open the library from anywhere.
+  app.post('/api/opds/token', { preHandler: requireCredentialSession }, async (req) => {
     const token = await issueOpdsToken(userIdOf(req));
     return { token, url: `${env.PUBLIC_ORIGIN.replace(/\/$/, '')}/opds`, expiresInDays: OPDS_TOKEN_DAYS };
   });
@@ -114,7 +120,7 @@ export default async function personalRoutes(app: FastifyInstance) {
   // create call and never again, because only its hash is stored.
   app.get('/api/tokens', async (req) => ({ content: await listApiTokens(userIdOf(req)) }));
 
-  app.post('/api/tokens', async (req, reply) => {
+  app.post('/api/tokens', { preHandler: requireCredentialSession }, async (req, reply) => {
     const b = z
       .object({
         name: z.string().trim().min(1).max(60),
@@ -148,6 +154,118 @@ export default async function personalRoutes(app: FastifyInstance) {
     const { id } = req.params as { id: string };
     if (!(await revokeApiToken(userIdOf(req), id))) return reply.code(404).send({ error: 'not_found' });
     await logAudit('token.revoke', { userId: userIdOf(req), detail: { id }, req });
+    return { ok: true };
+  });
+
+  // ---- profiles this account manages ----
+  // A member the admin allows (perms.canManageProfiles), or an admin, makes profiles that open at home without a
+  // password -- the children's, say -- and switches to them from its own session. Its own only: Admin -> Members manages
+  // everyone's. Each starts with the member's own restrictions (lib/profiles.ts inheritRestrictions), and none of this
+  // is open to a session that was itself entered without a password.
+  const mayManageProfiles = async (req: FastifyRequest): Promise<boolean> => {
+    if (actsAsAdmin(req)) return true;
+    const u = await one<{ perms: { canManageProfiles?: boolean } | null }>('SELECT perms FROM users WHERE id = $1', [userIdOf(req)]);
+    return u?.perms?.canManageProfiles === true;
+  };
+  const NOT_ALLOWED = { error: 'forbidden', message: 'This account cannot manage profiles. Ask whoever runs the server.' };
+  const PROFILE_COLS = `id, username, display_name, avatar, disabled, created_at,
+                        password_login, local_open, oidc_sub IS NOT NULL AS sso, auth_kind`;
+  const asProfile = ({ password_login, local_open, sso, auth_kind, display_name, ...p }: any) =>
+    ({ ...p, displayName: display_name, kind: profileKind({ password_login, local_open, sso, auth_kind }) });
+  const profileId = (req: FastifyRequest) => z.string().uuid().safeParse((req.params as { id: string }).id);
+
+  app.get('/api/profiles', async (req) => ({
+    content: (await q(`SELECT ${PROFILE_COLS} FROM users WHERE managed_by = $1 ORDER BY created_at`, [userIdOf(req)])).map(asProfile),
+  }));
+
+  app.post('/api/profiles', { preHandler: requireCredentialSession }, async (req, reply) => {
+    const b = z.object({
+      displayName: z.string().trim().min(1).max(64),
+      // With a password it is a hybrid: no password at home, this one from anywhere else.
+      password: z.string().min(1).max(200).optional(),
+    }).safeParse(req.body);
+    if (!b.success) return reply.code(400).send({ error: 'bad_request' });
+    if (!(await mayManageProfiles(req))) return reply.code(403).send(NOT_ALLOWED);
+    const { displayName, password } = b.data;
+    if (password && ssoOnly()) return reply.code(403).send({ error: 'sso_only' });
+    if (password) {
+      const pwErr = passwordError(password);
+      if (pwErr) return reply.code(400).send({ error: 'weak_password', message: pwErr });
+    }
+    const me = userIdOf(req);
+    const ph = password ? await hash(password) : await placeholderPasswordHash();
+    let made: { id: string } | null;
+    try {
+      made = await tx(async (qq) => {
+        // Counted and made under one lock per manager, so two requests at once cannot both pass the count.
+        await qq('SELECT pg_advisory_xact_lock(hashtextextended($1::text, 6400))', [me]);
+        const [{ n }] = await qq<{ n: number }>('SELECT count(*)::int AS n FROM users WHERE managed_by = $1', [me]);
+        if (n >= MAX_MANAGED_PROFILES) return null;
+        const [row] = await qq<{ id: string }>(
+          `INSERT INTO users (display_name, username, role, password_hash, auth_kind, password_login, local_open, managed_by)
+           VALUES ($1, $2, 'user', $3, $4, $5, true, $6) RETURNING id`,
+          [displayName, await freeUsername(qq, displayName), ph, password ? 'password' : 'none', !!password, me]);
+        await qq(`INSERT INTO app_settings (user_id, data) VALUES ($1, '{}'::jsonb) ON CONFLICT (user_id) DO NOTHING`, [row.id]);
+        await inheritRestrictions(qq, me, row.id);
+        return row;
+      });
+    } catch (e) {
+      // Another writer took the generated name between the check and the insert (uq_users_username).
+      if ((e as { code?: string })?.code === '23505') return reply.code(409).send({ error: 'username_taken' });
+      throw e;
+    }
+    if (!made) return reply.code(409).send({ error: 'too_many_profiles', message: `At most ${MAX_MANAGED_PROFILES} profiles.` });
+    await logAudit('profile.create', { userId: me, detail: { profile: made.id, hybrid: !!password }, req });
+    return asProfile(await one(`SELECT ${PROFILE_COLS} FROM users WHERE id = $1`, [made.id]));
+  });
+
+  app.patch('/api/profiles/:id', { preHandler: requireCredentialSession }, async (req, reply) => {
+    const id = profileId(req);
+    const b = z.object({
+      displayName: z.string().trim().min(1).max(64).optional(),
+      password: z.string().min(1).max(200).optional(),
+      localOpen: z.boolean().optional(),
+    }).safeParse(req.body);
+    if (!id.success || !b.success) return reply.code(400).send({ error: 'bad_request' });
+    if (!(await mayManageProfiles(req))) return reply.code(403).send(NOT_ALLOWED);
+    const me = userIdOf(req);
+    const p = await one<{ password_login: boolean; local_open: boolean; sso: boolean }>(
+      'SELECT password_login, local_open, oidc_sub IS NOT NULL AS sso FROM users WHERE id = $1 AND managed_by = $2', [id.data, me]);
+    if (!p) return reply.code(404).send({ error: 'not_found' });
+    const { displayName, password, localOpen } = b.data;
+    if (password && ssoOnly()) return reply.code(403).send({ error: 'sso_only' });
+    const refused = profileRefusal({ role: 'user', localOpen: localOpen ?? p.local_open, credential: p.sso || p.password_login || !!password });
+    if (refused) return reply.code(400).send(refused);
+    if (password) {
+      const pwErr = passwordError(password);
+      if (pwErr) return reply.code(400).send({ error: 'weak_password', message: pwErr });
+      await q(`UPDATE users SET password_hash = $2, password_login = true, password_changed_at = now(), failed_logins = 0, locked_until = NULL
+                WHERE id = $1`, [id.data, await hash(password)]);
+    }
+    if (displayName) await q('UPDATE users SET display_name = $2 WHERE id = $1', [id.data, displayName]);
+    if (localOpen !== undefined) await q('UPDATE users SET local_open = $2 WHERE id = $1', [id.data, localOpen]);
+    // A new way in, or one taken away: the profile's sessions end, as an admin's password reset ends them.
+    if (password || localOpen !== undefined) await revokeAllSessions(id.data);
+    await logAudit('profile.update', { userId: me, detail: { profile: id.data, displayName, password: password ? '***' : undefined, localOpen }, req });
+    return asProfile(await one(`SELECT ${PROFILE_COLS} FROM users WHERE id = $1`, [id.data]));
+  });
+
+  app.delete('/api/profiles/:id', { preHandler: requireCredentialSession }, async (req, reply) => {
+    const id = profileId(req);
+    if (!id.success) return reply.code(400).send({ error: 'bad_request' });
+    if (!(await mayManageProfiles(req))) return reply.code(403).send(NOT_ALLOWED);
+    const me = userIdOf(req);
+    const p = await one<{ username: string | null }>('SELECT username FROM users WHERE id = $1 AND managed_by = $2', [id.data, me]);
+    if (!p) return reply.code(404).send({ error: 'not_found' });
+    // As DELETE /api/admin/users/:id does: what the profile's reading was, counted before there is nothing to count.
+    const lost = await one<{ progress: number; events: number; favorites: number }>(
+      `SELECT (SELECT count(*)::int FROM read_progress  WHERE user_id = $1) AS progress,
+              (SELECT count(*)::int FROM reading_events WHERE user_id = $1) AS events,
+              (SELECT count(*)::int FROM favorites      WHERE user_id = $1) AS favorites`, [id.data]).catch(() => null);
+    const deletion=await deleteAccountPreservingPrivate(id.data);
+    if (deletion === 'owned_content') return reply.code(409).send({error:'private_content_owned',message:'Remove this profile’s owned series before deleting the profile.'});
+    if (deletion === 'not_found') return reply.code(404).send({error:'not_found'});
+    await logAudit('profile.delete', { userId: me, detail: { target: id.data, username: p.username, destroyed: lost ?? 'uncounted' }, req });
     return { ok: true };
   });
 
@@ -245,9 +363,21 @@ export default async function personalRoutes(app: FastifyInstance) {
   // No `scope`: the caller's own hand-picked lists with the stored count, as before v0.61.0 -- the series page's "Add to
   // collection" sheet offers these, and an older client reads them. `scope=all`: theirs of both kinds and the
   // household's shared ones, counted for this viewer (lib/lists.ts listsFor).
-  app.get('/api/collections', async (req) => {
-    const { scope } = req.query as { scope?: string };
-    return { content: await listsFor(userIdOf(req), vc(req), scope === 'all' ? 'all' : 'manual') };
+  app.get('/api/collections', async (req, reply) => {
+    const query = z.object({ scope: z.string().optional(), seriesId: z.string().min(1).max(200).optional() }).safeParse(req.query);
+    if (!query.success) return reply.code(400).send({ error: 'bad_request' });
+    const { scope, seriesId } = query.data;
+    // Membership is exposed only for a series this viewer may open, and only for their own editable lists.
+    if (seriesId && !(await komga.series(vc(req), seriesId).catch(() => null))) {
+      return reply.code(404).send({ error: 'not_found' });
+    }
+    const content = await listsFor(userIdOf(req), vc(req), seriesId ? 'manual' : scope === 'all' ? 'all' : 'manual');
+    if (!seriesId) return { content };
+    const memberships = await q<{ collection_id: string }>(
+      `SELECT ci.collection_id FROM collection_items ci JOIN collections c ON c.id = ci.collection_id
+        WHERE ci.series_id = $1 AND c.user_id = $2 AND c.query IS NULL`, [seriesId, userIdOf(req)]);
+    const contains = new Set(memberships.map((item) => item.collection_id));
+    return { content: content.map((list) => ({ ...list, contains: contains.has(list.id) })) };
   });
 
   app.post('/api/collections', async (req, reply) => {
@@ -595,6 +725,7 @@ export default async function personalRoutes(app: FastifyInstance) {
       total_events: 0,
       last_read_at: null,
     };
+    const badgeCount=await one<{n:number}>("SELECT count(DISTINCT book_id)::int AS n FROM reading_events WHERE user_id=$1 AND origin='web' AND completed",[uid]);
     // DENSE, and one definition of "a day".
     //
     // This used to `GROUP BY date_trunc(...)` and return only the days that had events, which the chart then
@@ -642,7 +773,7 @@ export default async function personalRoutes(app: FastifyInstance) {
     );
     const weekChapters = counts?.week ?? 0;
     const settings = ((await one<{ data: any }>('SELECT data FROM app_settings WHERE user_id = $1', [uid]))?.data) ?? {};
-    return { ...summary, days: windowDays, byDay, windowChapters: counts?.in_window ?? 0, first_read_at: firstRead, currentStreak: streaks.current, longestStreak: streaks.longest, weekChapters, weeklyGoal: settings.weeklyGoal ?? 0 };
+    return { ...summary, badgeChapters:badgeCount?.n??0, days: windowDays, byDay, windowChapters: counts?.in_window ?? 0, first_read_at: firstRead, currentStreak: streaks.current, longestStreak: streaks.longest, weekChapters, weeklyGoal: settings.weeklyGoal ?? 0 };
   });
 
   /**
@@ -687,7 +818,7 @@ export default async function personalRoutes(app: FastifyInstance) {
    * incognito reads are not in reading_events, so they are in none of it. Reintroduce `WHERE true` for browsable():
    * "a hidden 18+ series never appears" in readingInsights.int.test.ts lists it.
    */
-  app.get('/api/stats/insights', async (req) => insightsFor(userIdOf(req), vc(req)));
+  app.get('/api/stats/insights', async (req) => ({...await insightsFor(userIdOf(req), vc(req)), externalReads:await externalReaderCounts(userIdOf(req))}));
 
   /**
    * v0.61.0: this reader's pace through a series, for its page's "Catch up in ~2 hr" -- the median time of the chapters
@@ -846,15 +977,16 @@ export default async function personalRoutes(app: FastifyInstance) {
       // GREATEST on page so marking a series read never rewinds a chapter someone is part-way through.
       // Deliberately no reading_events insert: that table records chapters actually read in the app, and
       // bulk-marking a backlog must not inflate streaks, the leaderboard or Wrapped. Same rule as the
-      // `silent` flag in lib/progress.ts.
+      // `silent` flag in lib/progress.ts. And their word, like Mark read's, ends a guess from OPDS page streaming
+      // (read_progress.inferred, lib/externalReading.ts).
       await q(
-        `INSERT INTO read_progress (user_id, book_id, series_id, page, completed)
-         SELECT $1, b.id, b.series_id, COALESCE(b.pages, 0), true
+        `INSERT INTO read_progress (user_id, book_id, series_id, page, completed, is_private)
+         SELECT $1, b.id, b.series_id, COALESCE(b.pages, 0), true, EXISTS(SELECT 1 FROM lib_series s WHERE s.id=b.series_id AND s.is_private)
            FROM lib_books b WHERE b.series_id = ANY($2)
             -- What the reader sees: a notice chapter the admin hides (lib/noticeChapters.ts) is left as it was.
             AND NOT ${noticeBook('b.id')}
          ON CONFLICT (user_id, book_id) DO UPDATE
-           SET completed = true, page = GREATEST(read_progress.page, EXCLUDED.page), updated_at = now()`,
+           SET completed = true, inferred = false, page = GREATEST(read_progress.page, EXCLUDED.page), updated_at = now(), is_private=read_progress.is_private OR EXCLUDED.is_private`,
         [uid, live],
       );
       // One tracker push per series, not per chapter, after the write and fire-and-forget. The existing
@@ -1049,8 +1181,10 @@ export default async function personalRoutes(app: FastifyInstance) {
         WHERE rp.user_id = $1 AND rp.completed = true`,
       [uid],
     );
-    void (async () => { for (const r of rows) await pushSeriesProgress(uid, r.series_id).catch(() => {}); })();
-    return { ok: true, series: rows.length };
+    const visibleRows = [];
+    for (const row of rows) if (await seriesVisible(row.series_id, await viewCtxFor(uid,roleOf(req)))) visibleRows.push(row);
+    void (async () => { for (const r of visibleRows) await pushSeriesProgress(uid, r.series_id).catch(() => {}); })();
+    return { ok: true, series: visibleRows.length };
   });
 
   // Allow the next push for one series to go DOWN.
@@ -1067,6 +1201,7 @@ export default async function personalRoutes(app: FastifyInstance) {
     const { provider, seriesId } = req.params as { provider: string; seriesId: string };
     if (!isProvider(provider)) return reply.code(404).send({ error: 'unknown_provider' });
     const uid = userIdOf(req);
+    if (!(await seriesVisible(seriesId,await viewCtxFor(uid,roleOf(req))))) return reply.code(404).send({error:'not_found'});
     await clearTrackerFloor(uid, seriesId, provider);
     // `lower`: since v0.61.2 a push sends nothing to a service already at or past this chapter (pushStatus), and this
     // route is the one place a lower number is the point. Only for the provider asked about.
@@ -1105,6 +1240,13 @@ export default async function personalRoutes(app: FastifyInstance) {
       if (!dir.success) return reply.code(400).send({ error: 'bad_settings', message: 'Choose High to low or Low to high.' });
       data.librarySortDir = dir.data;
     }
+    // v0.105.0 (#408): the series page's chapter order for every series (web/lib/chapterOrder.ts), Oldest or Newest first.
+    // Reintroduce by accepting anything: "a chapter order other than oldest or newest" in settingsV558.int.test.ts saves it.
+    if ('chapterOrder' in data) {
+      const order = z.enum(['oldest', 'newest']).safeParse(data.chapterOrder);
+      if (!order.success) return reply.code(400).send({ error: 'bad_settings', message: 'Choose Oldest or Newest first.' });
+      data.chapterOrder = order.data;
+    }
     // v0.69.1: the avatar is painted for other members (web/components/Avatar.tsx), its colour into an inline background,
     // where a stored `url(https://…)` made every viewer's browser fetch a URL the member chose. A hex colour and a short
     // emoji, or nothing. Reintroduce by accepting any object: "an avatar colour must be a hex colour" in
@@ -1134,6 +1276,9 @@ export default async function personalRoutes(app: FastifyInstance) {
     // v0.61.0, Incognito reading (lib/incognito.ts): the whole account's, read by the server on every progress write and
     // tracker push, so only a real boolean. Reintroduce by accepting anything: "Incognito must be on or off" in
     // incognito.int.test.ts saves "yes".
+    for(const key of ['externalReadingStats','opdsEstimatedBookmarks']) {
+      if(key in data&&typeof data[key]!=='boolean')return reply.code(400).send({error:'bad_settings',message:'External reader options must be on or off.'});
+    }
     if ('incognito' in data && typeof data.incognito !== 'boolean') {
       return reply.code(400).send({ error: 'bad_settings', message: 'Incognito reading must be on or off.' });
     }
@@ -1148,6 +1293,12 @@ export default async function personalRoutes(app: FastifyInstance) {
     // settingsV558.int.test.ts saves with 200.
     if ('comments' in data && typeof data.comments !== 'boolean') {
       return reply.code(400).send({ error: 'bad_settings', message: 'Comments and reactions must be on or off.' });
+    }
+    // "Only tell me about a new chapter when it is the one I'd read next" (lib/nextUp.ts notifyOnlyNextOn), read by the server
+    // at every push and every digest, so only a real boolean. Reintroduce by accepting anything: "Only my next chapter
+    // must be on or off" in nextUp.int.test.ts saves "yes".
+    if ('notifyOnlyNext' in data && typeof data.notifyOnlyNext !== 'boolean') {
+      return reply.code(400).send({ error: 'bad_settings', message: 'Only my next chapter must be on or off.' });
     }
     if ('homeCollections' in data) {
       const parsed = z.array(z.string().min(1).max(64)).max(30).safeParse(data.homeCollections);

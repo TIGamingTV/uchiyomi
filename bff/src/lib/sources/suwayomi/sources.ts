@@ -7,10 +7,13 @@
 // source-native identifier. So a series' sourceId here is Suwayomi's manga id. That is stable for as long as
 // Suwayomi's database lives; wiping it orphans the routing, same as uninstalling an extension would.
 import { UNNUMBERED, type SourceAdapter, type SourceSeries, type SourceChapter } from '../types';
-import { gql as defaultGql, suwayomiUrl, suwayomiImageHeaders, onEngineOrigin, type Gql } from './client';
+import { taggedContentRating } from '../../ageRating';
+import { gql as defaultGql, suwayomiUrl, suwayomiImageHeaders, onEngineOrigin, EngineRefusedError, type Gql, type GqlError } from './client';
+import { EngineAuthError } from './auth';
 import { OPS } from './operations';
 import { needsBrowserCheck, passSiteCheck, siteWasOpened } from './siteSessions';
 import { env } from '../../../env';
+import { creatorFilterPaths, creatorFilterChange, type FilterChange } from './creatorFilters';
 
 export const SW_PREFIX = 'sw:';
 
@@ -31,6 +34,8 @@ export interface RemoteSource {
   /** The engine's own word: SAFE, MIXED or NSFW. */
   contentWarning?: string | null;
   supportsLatest?: boolean | null;
+  /** Optional search metadata; ordinary registration does not wait for it. */
+  filters?: unknown;
   /**
    * The installed extension (APK) this source came out of. One package can expose many sources -- 3Hentai
    * is one extension and twenty-nine language variants -- and `pkgName` is the only thing they share that
@@ -59,6 +64,27 @@ export async function listRemoteSources(run: Gql = defaultGql): Promise<RemoteSo
   return Array.isArray(nodes)
     ? nodes.filter((s) => s && s.id != null).map((s) => ({ ...s, isNsfw: adultOf(s.contentWarning) }))
     : [];
+}
+
+// A bounded optional read enriches adapters already in the registry. Concurrent reloads share only the in-flight
+// read; a later reload re-reads metadata after extension updates. Old adapter objects can no longer affect new ones.
+const creatorReaders = new WeakMap<Gql, Promise<Map<string, unknown>>>();
+const creatorSetters = new WeakMap<SourceAdapter, (filters: unknown) => void>();
+
+export async function enrichCreatorSearch(adapters: readonly SourceAdapter[], run: Gql = defaultGql): Promise<void> {
+  if (!adapters.length) return;
+  let pending = creatorReaders.get(run);
+  if (!pending) {
+    pending = run<{ sources?: { nodes?: Array<{ id?: unknown; filters?: unknown }> } }>(OPS.sourceCreatorFilters.doc, {}, 2500)
+      .then((d) => new Map((Array.isArray(d?.sources?.nodes) ? d.sources!.nodes! : [])
+        .filter((s) => s && s.id != null).map((s) => [String(s.id), s.filters])));
+    creatorReaders.set(run, pending);
+  }
+  try {
+    const found = await pending;
+    for (const adapter of adapters) creatorSetters.get(adapter)?.(found.get(adapter.id.slice(SW_PREFIX.length)));
+  } catch { /* creator fields stay unsupported; ordinary sources are already registered */ }
+  finally { if (creatorReaders.get(run) === pending) creatorReaders.delete(run); }
 }
 
 // ---- the adapter --------------------------------------------------------------------------------------------------
@@ -129,13 +155,18 @@ function prettyStatus(s?: string | null): string | undefined {
 function toSeries(m: RemoteManga, adapterId: string): SourceSeries | null {
   // A row without an id can't be routed back to Suwayomi, and one without a title is not a real result.
   if (m?.id == null || !m.title?.trim()) return null;
+  const genres = Array.isArray(m.genre) ? m.genre.filter((g) => typeof g === 'string' && g.trim()) : undefined;
+  const contentRating = taggedContentRating(genres);
   return {
     sourceId: String(m.id),
     source: adapterId,
     title: m.title.trim(),
     summary: m.description?.trim() || undefined,
     author: m.author?.trim() || m.artist?.trim() || undefined,
-    genres: Array.isArray(m.genre) ? m.genre.filter((g) => typeof g === 'string' && g.trim()) : undefined,
+    genres,
+    // An extension that rates each title only by a genre tag (Safe, Suggestive, Erotica, Pornographic): the tag is the
+    // title's rating, as MangaDex's contentRating is, so the 18+ filter and the age cap see it.
+    ...(contentRating ? { contentRating } : {}),
     status: prettyStatus(m.status),
     // Suwayomi proxies covers through itself, so make the path absolute against its origin.
     coverUrl: m.thumbnailUrl ? suwayomiUrl(m.thumbnailUrl) : undefined,
@@ -214,23 +245,28 @@ export function makeSuwayomiAdapter(remote: RemoteSource, gqlRun: Gql = defaultG
     try {
       return await gqlRun<T>(doc, vars, timeoutMs);
     } catch (e) {
+      // Website cookies cannot fix the engine's own login, permissions or schema. In particular a
+      // partially executed GraphQL mutation must not be replayed by the quiet-WebView retry either.
+      if (e instanceof EngineAuthError || e instanceof EngineRefusedError || [401, 403].includes((e as GqlError)?.status ?? 0)) throw e;
       const home = remote.homeUrl?.trim();
       if (!home || !(needsBrowserCheck(e) || siteWasOpened(remote.id)) || !(await passSiteCheck(remote.id, home))) throw e;
       return gqlRun<T>(doc, vars, timeoutMs);
     }
   };
 
-  const fetchList = async (type: 'SEARCH' | 'LATEST' | 'POPULAR', query: string | null, page: number): Promise<SourceSeries[]> => {
+  const fetchList = async (type: 'SEARCH' | 'LATEST' | 'POPULAR', query: string | null, page: number, filters?: FilterChange[]): Promise<SourceSeries[]> => {
     const d = await run<{ fetchSourceManga: { mangas: RemoteManga[] } }>(OPS.fetchSourceManga.doc, {
       source: remote.id,
       type,
       query,
       page: Math.max(1, page),
+      ...(filters ? { filters } : {}),
     });
     const list = d?.fetchSourceManga?.mangas;
     if (!Array.isArray(list)) return [];
     const seen = new Set<string>();
     return list
+      .filter((m) => ownManga(m?.sourceId))
       .map((m) => toSeries(m, adapterId))
       .filter((s): s is SourceSeries => !!s && (seen.has(s.sourceId) ? false : (seen.add(s.sourceId), true)));
   };
@@ -254,7 +290,7 @@ export function makeSuwayomiAdapter(remote: RemoteSource, gqlRun: Gql = defaultG
     // the URL it is about to fetch, and some of those URLs are not the engine's: the cover proxy's `?u=` is the
     // caller's, so this used to hand the engine's Basic credentials to any host a member named. Reintroduce by
     // returning suwayomiImageHeaders() for every URL: outboundGuard.test.ts sees the login offered to another host.
-    imageHeaders: (url: string) => (onEngineOrigin(url) ? suwayomiImageHeaders() : {}),
+    imageHeaders: (url: string, signal?: AbortSignal) => (onEngineOrigin(url) ? suwayomiImageHeaders(signal) : {}),
     // Pages are fetched from the engine, not the site, so they may overlap and need no gap of their own;
     // see the doc comment above and SUWAYOMI_PAGE_CONCURRENCY in env.ts.
     pageConcurrency: env.SUWAYOMI_PAGE_CONCURRENCY,
@@ -273,6 +309,36 @@ export function makeSuwayomiAdapter(remote: RemoteSource, gqlRun: Gql = defaultG
     // Every extension pages its search the way its site does (#331): the engine asks the page it is given.
     async searchPage(query, page) {
       return fetchList('SEARCH', query, page);
+    },
+
+    async lookupByPath(path, timeoutMs) {
+      const normalized = path.trim().replace(/^\/+/, '').replace(/\/+$/, '');
+      if (!normalized) return [];
+      const deadline = Date.now() + Math.max(1, timeoutMs);
+      const paths = [normalized, `/${normalized}`, `${normalized}/`, `/${normalized}/`];
+      // This is a local engine catalogue read: the site's browser retry cannot repair it and would
+      // spend the identity budget opening an unrelated home page. Preserve 64-bit source ids as strings.
+      const d = await gqlRun<{ mangas?: { nodes?: RemoteManga[] } }>(OPS.mangaIdentity.doc, { source: remote.id, paths }, Math.max(1, deadline - Date.now()));
+      const seen = new Set<number>();
+      const rows = (Array.isArray(d?.mangas?.nodes) ? d.mangas!.nodes! : []).filter((m) =>
+        m && Number.isSafeInteger(m.id) && m.id > 0 && m.sourceId != null && String(m.sourceId) === String(remote.id) &&
+        typeof m.url === 'string' && m.url.trim().replace(/^\/+/, '').replace(/\/+$/, '') === normalized &&
+        (seen.has(m.id) ? false : (seen.add(m.id), true)));
+      if (rows.length !== 1) {
+        const matches = rows.map((m) => toSeries(m, adapterId)).filter((m): m is SourceSeries => !!m);
+        // Dropping a malformed duplicate must not turn an ambiguous catalogue into one proved hit.
+        return matches.length > 1 ? matches : [];
+      }
+      if (Date.now() >= deadline) return [];
+      // A stored hit might be stale. Refresh using the ENGINE'S numeric id and recheck both halves of
+      // identity; never hand a Mihon path to getSeries(Number(path)). Errors leave title search available.
+      const fresh = await gqlRun<{ fetchMangaAndChapters?: { manga?: RemoteManga | null } }>(OPS.fetchManga.doc,
+        { id: rows[0].id }, Math.max(1, deadline - Date.now()));
+      const m = fresh?.fetchMangaAndChapters?.manga;
+      if (!m || m.id !== rows[0].id || m.sourceId == null || String(m.sourceId) !== String(remote.id) ||
+        typeof m.url !== 'string' || m.url.trim().replace(/^\/+/, '').replace(/\/+$/, '') !== normalized) return [];
+      const result = toSeries(m, adapterId);
+      return result ? [result] : [];
     },
 
     async getSeries(id) {
@@ -335,5 +401,17 @@ export function makeSuwayomiAdapter(remote: RemoteSource, gqlRun: Gql = defaultG
   // the first caller.
   adapter.popular = (page = 1) => fetchList('POPULAR', null, page);
 
+  const setCreatorFilters = (filters: unknown) => {
+    const paths = creatorFilterPaths(filters);
+    if (!paths.size) { delete adapter.searchCreator; delete adapter.creatorFields; return; }
+    adapter.creatorFields = [...paths.keys()];
+    adapter.searchCreator = async (name, kind, page = 1) => {
+      const path = paths.get(kind);
+      if (!path || !name.trim()) return [];
+      return fetchList('SEARCH', '', Math.max(1, Math.floor(page)), [creatorFilterChange(path, name.trim())]);
+    };
+  };
+  creatorSetters.set(adapter, setCreatorFilters);
+  if (remote.filters) setCreatorFilters(remote.filters);
   return adapter;
 }

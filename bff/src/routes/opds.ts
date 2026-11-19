@@ -4,7 +4,9 @@
 //
 // Beyond the 1.2 baseline this speaks two things a reader can use or ignore:
 //   * OPDS-PSE 1.1 page streaming (Panels, Chunky, KOReader): a chapter can be read page by page over HTTP
-//     instead of downloaded whole. A reader that does not know the `rel` keeps downloading the CBZ.
+//     instead of downloaded whole. A reader that does not know the `rel` keeps downloading the CBZ. With the
+//     account's switch on, the pages streamed keep its place and a chapter paged through to the end counts as read
+//     (#377, the page route below).
 //   * Facets (OPDS 1.2 §7): sort, library, genre and status as links the reader renders as filters.
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import { createReadStream } from 'node:fs';
@@ -23,6 +25,8 @@ import { noticeShown, visibleBookCount } from '../lib/noticeChapters';
 import { onDeckPicks } from '../lib/onDeck';
 import { listFor, listsFor, listItems, ownerOf } from '../lib/lists';
 import { favoriteOrder } from '../lib/favorites';
+import { externalReaderSettings, rememberOpdsEstimate } from '../lib/externalReading';
+import { bookFileSignature, partialBufferMd5, partialMd5, rememberKoreaderHash } from '../lib/koreaderHash';
 const AdmZip = require('adm-zip');
 
 const IMG = /\.(jpe?g|png|webp|gif|avif)$/i;
@@ -81,6 +85,23 @@ const pageCt = (name: string): string => {
   const e = name.toLowerCase().split('.').pop() || '';
   return e === 'png' ? 'image/png' : e === 'webp' ? 'image/webp' : e === 'gif' ? 'image/gif' : e === 'avif' ? 'image/avif' : 'image/jpeg';
 };
+
+/**
+ * Whether a page fetch asks for the page at a size someone reads it at (#377): `maxWidth` absent, blank, left as the
+ * template's own `{maxWidth}`, or 600 px and up. A reader fills the template with its screen's width -- KOReader does,
+ * and e-reader screens start at 600 -- and asks for less for a strip of thumbnails or a scrubber, which is no page read.
+ * v0.107.0 counted only a fetch with no `maxWidth` at all, which our own template never makes, so its estimates almost
+ * never happened. Reintroduce `maxWidth === undefined`: "a page at reading size is recorded" in opdsPse.int.test.ts
+ * records nothing for 1264, blank or {maxWidth}.
+ */
+const readingSize = (maxWidth: unknown): boolean => {
+  if (maxWidth === undefined) return true;
+  if (typeof maxWidth !== 'string') return false;
+  const w = maxWidth.trim();
+  return w === '' || w === '{maxWidth}' || Number(w) >= 600;
+};
+/** A page fetch to record once it is known to have been served (the page route's onSend). */
+interface OpdsRead { book: { id: string; seriesId: string; pages: number }; page: number }
 
 /** The browsing parameters a series feed understands, and the query string that reproduces them. */
 interface Browse { sort: string; q: string; library: string; genre: string; status: string }
@@ -147,7 +168,7 @@ interface ChapterRow { id: string; title: string | null; number: number; pages: 
  * list and the Keep reading shelf). `series` heads the title on a shelf that mixes series.
  *
  * `{pageNumber}` and `{maxWidth}` are literal templates the reader fills in (OPDS-PSE 1.1), and the page number is
- * ZERO-based per that spec -- the same base as read_progress.page, so lastRead is passed through untouched. `esc()`
+ * ONE-based per that spec, like read_progress.page; the page request template itself is ZERO-based. `esc()`
  * leaves braces alone on purpose.
  */
 const chapterEntryXml = (b: ChapterRow, series = '') => {
@@ -179,6 +200,14 @@ async function countUnknownPages(books: ChapterRow[]): Promise<void> {
     b.pages = first.total;
     q('UPDATE lib_books SET pages=$1 WHERE id=$2 AND pages<>$1', [first.total, b.id]).catch(() => {});
   }));
+}
+
+/** Explicit positions win over inferred requests; estimates are used only when no real place exists. */
+async function estimatedPlaces(userId:string,books:ChapterRow[]):Promise<void>{
+  if(!books.length||!(await externalReaderSettings(userId)).opdsEstimatedBookmarks)return;
+  const rows=await q<{book_id:string;page:number;updated_at:string}>('SELECT book_id,page,updated_at FROM opds_estimated_bookmarks WHERE user_id=$1 AND book_id=ANY($2)',[userId,books.map(b=>b.id)]);
+  const byId=new Map(rows.map(r=>[r.book_id,r]));
+  for(const book of books){const r=byId.get(book.id);if(r&&book.last_page===null){book.last_page=r.page;book.last_at=r.updated_at;}}
 }
 
 export default async function opdsRoutes(app: FastifyInstance) {
@@ -360,6 +389,7 @@ export default async function opdsRoutes(app: FastifyInstance) {
           AND ${noticeShown('s', 'b', 'ov')}
         ORDER BY b.number ASC, b.file ASC`, bp.values as any[]);
     await countUnknownPages(books);
+    await estimatedPlaces(uidOf(req),books);
     const entries = books.map((b) => chapterEntryXml(b));
     const label = (await editionLabels([id], vc(req))).get(id) ?? '';
     return sendXml(reply, 'acq', feed({
@@ -390,6 +420,7 @@ export default async function opdsRoutes(app: FastifyInstance) {
     const byId = new Map(rows.map((b) => [b.id, b]));
     const books = picks.map((r) => byId.get(r.bookId)).filter((b): b is ChapterRow & { series_title: string } => !!b);
     await countUnknownPages(books);
+    await estimatedPlaces(uidOf(req),books);
     return sendXml(reply, 'acq', feed({
       id: 'yomi:opds:continue', title: 'Keep reading', self: '/opds/continue', kind: 'acq', up: '/opds',
       entries: books.map((b) => chapterEntryXml(b, b.series_title)),
@@ -455,14 +486,27 @@ export default async function opdsRoutes(app: FastifyInstance) {
   // bytes under the SAME cache key the web reader uses, so the two never fetch or store a page twice; with
   // it, a distinct key and a JPEG, because a resized variant must not be mistaken for the original and a
   // reader asking for a width is not necessarily one that decodes webp.
-  app.get('/opds/book/:id/page/:n', async (req, reply) => {
+  //
+  // With the account's switch on, a page served at reading size is a page read (#377; lib/externalReading.ts
+  // rememberOpdsEstimate decides when that finishes the chapter). Recorded in onSend, once the answer is known to be a
+  // GET's 200 -- a 404, a 304 revalidation, a range or a HEAD is no page read -- and before its bytes go, so a reader
+  // that asks for the next page only once it has this one is recorded in the order it read.
+  app.get('/opds/book/:id/page/:n', {
+    onSend: async (req, reply, payload) => {
+      const read = (req as { opdsRead?: OpdsRead }).opdsRead;
+      if (read && req.method === 'GET' && reply.statusCode === 200) await rememberOpdsEstimate(uidOf(req), read.book, read.page).catch(() => {});
+      return payload;
+    },
+  }, async (req, reply) => {
     const { id, n } = req.params as { id: string; n: string };
     const pageNo = Number(n);
     if (!Number.isInteger(pageNo) || pageNo < 0) return reply.code(400).send('bad page');
     const row = await visibleBookFile(id, vc(req));
     if (!row) return reply.code(404).send('not found');
     const abs = join(row.root || LIBRARY_ROOT, row.file);
-    const w = Number((req.query as Record<string, string>).maxWidth);
+    const maxWidth = (req.query as Record<string, unknown>).maxWidth;
+    if (readingSize(maxWidth)) (req as { opdsRead?: OpdsRead }).opdsRead = { book: { id, seriesId: row.series_id, pages: row.pages }, page: pageNo + 1 };
+    const w = Number(maxWidth);
     if (w && Number.isInteger(w) && w >= 64 && w <= 2000) {
       return serveImage(req, reply, `pse-page:${id}:${pageNo + 1}:w${w}`, async () => {
         const page = await cbzPageAt(abs, pageNo);
@@ -492,14 +536,24 @@ export default async function opdsRoutes(app: FastifyInstance) {
     const base = (row.file.split('/').pop() || 'chapter').replace(/\.(cbr|zip|rar)$/i, '.cbz');
     reply.header('Content-Type', CBZ);
     if (st.isDirectory()) {
+      const signature=await bookFileSignature(abs);
       const zip = new AdmZip();
       // Regular files only, read without following a symlink and within the page cap (lib/archiveCaps.ts): addLocalFile
       // followed an entry named like an image out of the library -- the audit downloaded a jwt.secret this way.
-      for (const name of await regularFiles(abs, (n) => IMG.test(n))) zip.addFile(name, await readRegularFile(abs, name));
+      for (const name of (await regularFiles(abs, (n) => IMG.test(n))).sort()) {
+        const entry=zip.addFile(name,await readRegularFile(abs,name));
+        // ZIP stores local calendar fields, so constructing its fixed date locally produces the same
+        // DOS timestamp in every server timezone (a UTC instant can fall into 1979 west of Greenwich).
+        entry.header.time=new Date(1980,0,1);
+      }
       reply.header('Content-Disposition', `attachment; filename="${esc(base)}.cbz"`);
-      return reply.send(zip.toBuffer());
+      const bytes=zip.toBuffer();
+      if(signature===await bookFileSignature(abs))await rememberKoreaderHash(id,signature,partialBufferMd5(bytes));
+      return reply.send(bytes);
     }
     reply.header('Content-Disposition', `attachment; filename="${esc(base)}"`);
+    const hash=await partialMd5(abs);
+    await rememberKoreaderHash(id,hash.signature,hash.digest);
     return reply.send(createReadStream(abs));
   });
 }

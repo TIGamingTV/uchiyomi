@@ -113,6 +113,12 @@ const schema = z.object({
   // How much the server log says: logLevel below.
   LOG_LEVEL: z.string().optional(),
   PORT: z.coerce.number().default(3000),
+  TITLE_EXTRACTOR_URL: z.string().default(''),
+  TITLE_EXTRACTOR_TOKEN: z.string().default(''),
+  TITLE_EXTRACTOR_OCR_DIR: z.string().default(''),
+  TITLE_EXTRACTOR_CALIBRATION_FILE: z.string().default(''),
+  // The Uchiyomi logo library (v0.103.0, lib/titleLogoLibrary.ts): unset = the project's library, empty = off.
+  TITLE_LOGO_LIBRARY_URL: z.string().optional(),
   DATABASE_URL: z.string().min(1),
   KOMGA_BASE_URL: z.string().url().default('http://komga:25600'),
   KOMGA_API_KEY: z.string().default(''), // only needed when LIBRARY_BACKEND=komga; owned mode ignores it
@@ -125,8 +131,14 @@ const schema = z.object({
   // talking to the app port directly chose its own address for the sign-in rate limits and the activity log. The
   // default trusts the proxies a home server actually has -- loopback, link-local and private networks (Docker, an
   // Umbrel app proxy, nginx or Nginx Proxy Manager on the LAN). `true` trusts every peer as before; `false` none; or a
-  // comma list of addresses and CIDR ranges (for a proxy on a public address).
+  // comma list of addresses and CIDR ranges (for a proxy on a public address). Set here, it outranks Admin -> Settings
+  // -> Server -> Home network, which then shows it and cannot change it (lib/clientAddr.ts networkConfig).
   TRUST_PROXY: z.string().default('loopback, linklocal, uniquelocal'),
+  // The networks that are home (lib/clientAddr.ts): a profile without a password opens from these only, and a visitor
+  // from anywhere else needs a credential. A comma list of addresses and CIDR ranges, e.g. 192.168.1.0/24, or `none`.
+  // Unset, Admin -> Settings -> Server -> Home network decides, and its default is the private networks; set, it
+  // outranks that page.
+  LOCAL_NETWORKS: z.string().default(''),
   CACHE_DIR: z.string().default('/cache'),
   CONFIG_DIR: z.string().default('/config'),
   // Optional OIDC / SSO. Everything stays off unless an issuer and client id are set, so an install that
@@ -160,6 +172,7 @@ const schema = z.object({
   EXTENSION_ENGINE: z.string().optional().transform(engineSwitchOn),
   SUWAYOMI_USERNAME: z.string().default(''),
   SUWAYOMI_PASSWORD: z.string().default(''),
+  SUWAYOMI_AUTH_MODE: z.enum(['auto', 'none', 'basic', 'simple', 'ui_login']).default('auto'),
   // Suwayomi can expose hundreds of sources; cross-source search fans out to every REGISTERED source, so
   // registration is opt-in per source and additionally capped here.
   SUWAYOMI_MAX_SOURCES: z.coerce.number().int().min(1).max(500).default(25),

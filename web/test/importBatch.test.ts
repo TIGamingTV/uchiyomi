@@ -12,7 +12,8 @@ import { readFileSync, readdirSync } from 'fs';
 import { join } from 'path';
 import {
   needsAttention, containsDiverges, matchTitleDiffers, matchedViaAlt, openBatches, batchOriginLabel, runStatusLabel, runStatusColor,
-  linkedCount, linkedLine, truncatedWords, sameSourcePair, alreadyImported,
+  linkedCount, linkedLine, truncatedWords, sameSourcePair, alreadyImported, filterImportRows, importRowState, selectableImport, readyImport, importProvenance, trackerProgressLine,
+  readToLine, markedLine,
   type ImportCandidate, type ImportBatchSummary,
 } from '../lib/importBatch';
 import { readPage } from '../lib/settingsIndex';
@@ -117,7 +118,7 @@ test('a batch can be discarded from every live state, and it is a DELETE', () =>
   // review nobody wanted to finish, could only be left to the sweep. Reintroduce by removing the `canDiscard`
   // button from the header, or by turning the request into a POST to /cancel.
   const src = code(read('app/admin/import/page.tsx'));
-  assert.match(src, /api\(`\/api\/admin\/import\/batches\/\$\{batchId\}`, \{ method: 'DELETE' \}\)/, 'Discard does not DELETE the batch');
+  assert.match(src, /api\(`\/api\/admin\/import\/batches\/\$\{batchId\}`, \{ method: 'DELETE', expectedOwnerId: ownerId \}\)/, 'Discard must DELETE only under the account that owns this review');
   assert.match(src, /const canDiscard = !!batch && batch\.state !== 'done' && batch\.state !== 'cancelled'/, 'Discard is not offered in resolving, review AND importing');
   assert.match(src, /\{canDiscard && \([\s\S]{0,200}setDiscarding\(true\)/, 'the header has no Discard button');
   // Destructive, so through the shared ConfirmDialog -- never window.confirm, and never opened over the
@@ -155,7 +156,7 @@ test('the intake copy names the button that commits, and the review copy tells t
   const src = read('app/admin/import/page.tsx');
   assert.ok(src.includes('nothing lands in your library until you press Import selected.'), 'the intake card promises a button that does not exist');
   assert.doesNotMatch(code(src), /press Continue/, '"Continue" is back');
-  assert.ok(src.includes("tr('Import selected — {n}', { n: selectedIds.size })"), 'the commit button is no longer "Import selected — {n}"');
+  assert.ok(src.includes("tr('Import selected — {n}', { n: importCount })"), 'the commit button is no longer "Import selected — {n}"');
   // Adding with nothing downloaded still asks each source for the series, one title at a time.
   assert.doesNotMatch(src, /seconds of database work/, 'the copy calls a minutes-long add "seconds"');
   assert.match(src, /a long list takes a few minutes/, 'the review card does not say how long an import takes');
@@ -255,17 +256,19 @@ test('a run status reads as a sentence, and a duplicate reads as "already in you
   assert.doesNotMatch(src, /runStatusLabel[\s\S]{0,900}tr\([a-z]/, 'runStatusLabel passes a variable to tr(), which no locale file can see');
 });
 
-test('a list cut at the 500 says how to get the rest, and a tracker read keeps its words', () => {
-  // Discussion #121 (v0.51.0): a backup, a MangaDex list or a paste keeps its first 500 titles NOT in the library,
-  // so importing it again once they are in picks up the rest. Reintroduce by returning the tracker's words for every
-  // origin: the backup's note reads "(first 500 kept)" again.
-  assert.match(truncatedWords('backup').note, /import again for the rest/, 'the note does not say how to get the rest');
-  assert.match(truncatedWords('paste').toast, /import the same list again for the rest/, 'the toast does not say how to get the rest');
-  assert.equal(truncatedWords('tracker').note, '(first 500 kept)', 'a tracker read stops at its own cap, which reading it again does not get past');
+test('a list cut at the 500 says how to get the rest, and how many are left (#410)', () => {
+  // Discussion #121 (v0.51.0): every intake keeps its first 500 titles NOT in the library, so importing it again once they
+  // are in picks up the rest -- a tracker read too since v0.105.0, which reads far past 500. Reintroduce the count's
+  // absence: the note with a count reads no number.
+  assert.match(truncatedWords().note, /source list was limited/, 'the note does not say how to get the rest');
+  assert.match(truncatedWords(null).toast, /may not be the whole list/, 'the toast does not say how to get the rest');
+  assert.match(truncatedWords(312).note, /312 titles after this batch/, 'the note does not say how many are left');
+  assert.match(truncatedWords(312).toast, /Continue with next batch for 312 titles/);
+  assert.match(truncatedWords(0).note, /source list was limited/, 'no count without one to give');
   const src = code(read('app/admin/import/page.tsx'));
-  assert.match(src, /parts\.push\(truncatedWords\(n\.origin\)\.note\)/, 'the review headline does not use the words');
-  assert.match(src, /toast\(truncatedWords\(origin\)\.toast, 'info'\)/, 'the intake toast does not use the words');
-  assert.match(src, /truncated: batch\.truncated \?\? intakeNote\?\.truncated \?\? false, origin: batch\.origin \}/, 'the note is not told where the batch came from');
+  assert.match(src, /parts\.push\(truncatedWords\(n\.leftOver\)\.note\)/, 'the review headline does not use the words');
+  assert.match(src, /toast\(truncatedWords\(r\.leftOver\)\.toast, 'info'\)/, 'the intake toast does not use the words');
+  assert.match(src, /leftOver: batch\.leftOver \?\? intakeNote\?\.leftOver \?\? null \}/, 'the note is not told how many are left');
 });
 
 test('Select all “same source as before” takes the exact pairs only', () => {
@@ -277,11 +280,11 @@ test('Select all “same source as before” takes the exact pairs only', () => 
   assert.equal(sameSourcePair(row({ confidence: 'same_source', decision: 'skip' })), false, 'a skipped row');
   assert.equal(sameSourcePair(row({ confidence: null, decision: 'manual' })), false, 'a pick by hand');
   const src = code(read('app/admin/import/page.tsx'));
-  assert.match(src, /const selectSameSource = \(\) => setSelected\(new Set\(items\.filter\(sameSourcePair\)\.map\(\(c\) => c\.id\)\)\);/, 'the key does not select the pairs');
+  assert.match(src, /const selectSameSource = \(\) => setSelected\(new Set\(filtered\.filter\(sameSourcePair\)\.map\(\(c\) => c\.id\)\)\);/, 'the key does not select the pairs');
   assert.match(src, /onClick=\{onSelectSameSource\}[^>]*>\{tr\('Select all “same source as before”'\)\} · \{sameSourceCount\}/, 'the key is not on the review card');
 });
 
-test('Hide already imported hides the titles the library holds', () => {
+test('the owned state distinguishes already held rows from deliberate skips', () => {
   // Discussion #121 (v0.51.0): a long backup imported again is mostly titles already here. Reintroduce by dropping
   // the filter line in page.tsx: the toggle is wired to nothing.
   assert.equal(alreadyImported(row({ in_library: true, decision: 'skip' })), true, 'held at intake');
@@ -289,9 +292,11 @@ test('Hide already imported hides the titles the library holds', () => {
   assert.equal(alreadyImported(row({ status: 'duplicate' })), true, 'found already there by a run');
   assert.equal(alreadyImported(row({})), false, 'a title still to decide');
   assert.equal(alreadyImported(row({ status: 'no_chapters' })), false, 'an add that failed is not in the library');
-  const src = code(read('app/admin/import/page.tsx'));
-  assert.match(src, /if \(hideHere && alreadyImported\(c\)\) return false;/, 'the toggle hides nothing');
-  assert.match(src, /onClick=\{\(\) => setHideHere\(!hideHere\)\} aria-pressed=\{hideHere\}/, 'the toggle is not on the review card');
+  const held=row({id:'held',in_library:true,decision:'skip'}),skipped=row({id:'skipped',decision:'skip'});
+  assert.deepEqual(filterImportRows([held,skipped],'owned','','').map(c=>c.id),['held']);
+  assert.deepEqual(filterImportRows([held,skipped],'skipped','','').map(c=>c.id),['skipped']);
+  assert.equal(selectableImport(held),false);
+
 });
 
 test('the manual-search results are rails: one flex row per source, scrolling sideways', () => {
@@ -328,6 +333,17 @@ test('a link to a batch that no longer exists goes back to the intake card and s
   assert.match(src, /const startOver = \(\) => \{[\s\S]{0,400}qc\.invalidateQueries\(\{ queryKey: \['import-batches'\] \}\);[\s\S]{0,80}router\.replace\('\/admin\/import\/'\);/, 'startOver does not refresh the list and the URL');
 });
 
+test('a batch is a page of its own: Back, the browser\'s or the header\'s, returns to the intake (#409)', () => {
+  // Reintroduce router.replace in start or openBatch: the batch overwrites the intake's entry, and the browser's Back
+  // leaves the import (or does nothing in a new tab). Reintroduce the header's router.push('/admin/'): it jumps past
+  // the intake to the admin console.
+  const src = code(read('app/admin/import/page.tsx'));
+  assert.match(src, /fromIntake\.current = true;\s*router\.push\(`\/admin\/import\/\?batch=\$\{r\.batchId\}`\);/, 'a started batch replaces the intake');
+  assert.match(src, /const openBatch = \(id: string\) => \{[^}]*fromIntake\.current = true; router\.push\(`\/admin\/import\/\?batch=\$\{id\}`\);/, 'an opened batch replaces the intake');
+  assert.match(src, /const back = \(\) => \{\s*if \(!batchId\) router\.push\('\/admin\/'\);\s*else if \(fromIntake\.current\) router\.back\(\);\s*else router\.push\('\/admin\/import\/'\);/);
+  assert.match(src, /<button onClick=\{back\}[^>]*aria-label=\{tr\('Back'\)\}>/, "the header's Back is not the import's own");
+});
+
 test('an interrupted batch in Open imports reads as interrupted, not as matching', () => {
   // The list route computes `stale` like the GET route; without reading it the card said "Matching…
   // 12/40" after a restart while nothing was matching. Reintroduce by rendering batchStateLabel(b.state)
@@ -348,31 +364,30 @@ test('the importing card counts the rows this run was sent, and the selection fo
   assert.match(src, /const ids = items\.filter\(\(c\) => selectedReady\.has\(c\.id\)\)\.map\(\(c\) => c\.id\);/, '/run is sent ids the server will not take');
   // A row skipped from the sheet, or added by a run, leaves the selection on the next refetch: "6 selected"
   // used to keep a row Change → Skip had just removed. Reintroduce by deleting the `useEffect` on `items`.
-  assert.match(src, /useEffect\(\(\) => \{\s*setSelected\(\(s\) => \{[\s\S]{0,400}items\.filter\(isReady\)[\s\S]{0,300}\}, \[items\]\);/, 'the selection is not pruned to ready rows on refetch');
+  assert.match(src, /useEffect\(\(\) => \{\s*setSelected\(\(s\) => \{[\s\S]{0,400}items\.filter\(selectableImport\)[\s\S]{0,300}\}, \[items\]\);/, 'the selection is not pruned to ready rows on refetch');
 });
 
 test('the review filter finds a row by its matched title too', () => {
   // "Naruto → Boruto: Naruto Next Generations" is the row a person types "Boruto" to find, and the filter
   // found nothing. Reintroduce by matching `backup_title` alone.
-  const src = code(read('app/admin/import/page.tsx'));
-  assert.match(src, /c\.backup_title\.toLowerCase\(\)\.includes\(needle\) && !\(c\.match_title \|\| ''\)\.toLowerCase\(\)\.includes\(needle\)/, 'the filter ignores match_title');
+  const candidate=row({backup_title:'Naruto',match_title:'Boruto: Naruto Next Generations',alt_titles:['BORUTO Alternate']});
+  assert.equal(filterImportRows([candidate],'all','','boruto').length,1);
+  assert.equal(filterImportRows([candidate],'all','','alternate').length,1);
+  assert.equal(filterImportRows([candidate],'all','','unrelated').length,0);
+
 });
 
 test('the intake card tells the truth about what a backup gives up: title, source AND address', () => {
   // The matcher reads each entry's url (its address on the source) and uses it as the same-source proof;
   // the card and the docs said only the titles and their source were read. Reintroduce by restoring the
   // old sentence, in the page or in any locale file.
-  const key = "A .tachibk backup stays on your server — only each entry's title, its source and its address on that source are read.";
-  const src = read('app/admin/import/page.tsx');
-  assert.ok(src.includes("only each entry\\'s title, its source and its address on that source are read."), 'the card no longer names the address');
-  assert.doesNotMatch(src, /only the titles \(and, where available/, 'the old sentence is back on the card');
-  const dir = join(ROOT, 'public/locales');
-  for (const f of readdirSync(dir).filter((x) => x.endsWith('.json'))) {
-    const d = JSON.parse(readFileSync(join(dir, f), 'utf8'));
-    assert.ok(typeof d[key] === 'string' && d[key].trim(), `${f} has no translation of the new sentence`);
-    const old = Object.keys(d).find((k) => k.startsWith('A .tachibk backup stays on your server') && k !== key);
-    assert.equal(old, undefined, `${f} still carries the old sentence: ${old}`);
+  const key='A .tachibk backup stays on your server. Titles, source addresses, tracker links, progress and privacy are read. Passwords and tokens are not imported.';
+  const src=read('app/admin/import/page.tsx');assert.ok(src.includes(key));
+  const dir=join(ROOT,'public/locales');
+  for(const f of readdirSync(dir).filter(f=>f.endsWith('.json'))) {
+    const d=JSON.parse(readFileSync(join(dir,f),'utf8'));assert.ok(typeof d[key]==='string' && d[key].trim(),`${f} has no translated backup disclosure`);
   }
+
 });
 
 test('the selection-prune effect keys on the query result, never on an array minted per render', () => {
@@ -472,7 +487,7 @@ test('the tracker intake is a nested box, and the intake card still ends on its 
   assert.match(intake, /className="btn-ghost ms-auto px-3 py-1 text-xs disabled:opacity-50">\s*\{starting \? tr\('Starting…'\) : tr\('Load list'\)\}/, 'Load list is not a ghost control');
   // The same box style as Open imports, rendered between that list and the eyebrow.
   assert.match(intake, /<div className="mb-4 rounded-xl border border-ink-700 bg-ink-900\/50 p-2\.5" data-tracker-intake>/, 'the tracker intake is not the nested box');
-  assert.match(intake, /<OpenImports batches=\{open\} onOpen=\{onOpen\} \/>\s*<TrackerIntake starting=\{starting\} onStart=\{onTracker\} \/>\s*<p className="mb-2 text-xs font-semibold uppercase tracking-wider text-fog-500">\{tr\('Bring your library over'\)\}<\/p>/, 'the box is not between Open imports and the eyebrow');
+  assert.match(intake, /<OpenImports batches=\{open\} onOpen=\{onOpen\} \/>\s*<TrackerIntake canStart=\{canStart\} starting=\{starting\} onStart=\{onTracker\} \/>\s*<p className="mb-2 text-xs font-semibold uppercase tracking-wider text-fog-500">\{tr\('Bring your library over'\)\}<\/p>/, 'the box is not between Open imports and the eyebrow');
   // Not connected: one dim line that lands ON the Progress tracking card (tab + card, see the profile test).
   assert.match(intake, /<Link href="\/profile\/\?tab=Connections&card=tracking"[^>]*>\s*\{broken\.length \? tr\('Your tracker token no longer works\. Reconnect it under Profile\.'\) : NOT_CONNECTED\(\)\}/, 'the not-connected line does not point at the tracking card');
   // Reading + Plan to read on by default; "Finished" is the read-state word, never the series status "Completed".
@@ -598,7 +613,7 @@ test('the intake note comes from the batch row, so a reload or an Open-imports t
   // uses the intake's answer only until the first GET (and on an older server). Reintroduce by reading
   // `noteText(intakeNote)` alone: "the note is read from page state, not the batch" fails.
   const src = code(read('app/admin/import/page.tsx'));
-  assert.match(src, /const note = noteText\(batch\s*\? \{ skippedNovels: batch\.skippedNovels \?\? intakeNote\?\.skippedNovels \?\? 0, truncated: batch\.truncated \?\? intakeNote\?\.truncated \?\? false, origin: batch\.origin \}\s*: null\);/, 'the note is read from page state, not the batch');
+  assert.match(src, /const note = noteText\(batch\s*\? \{ skippedNovels: batch\.skippedNovels \?\? intakeNote\?\.skippedNovels \?\? 0, truncated: batch\.truncated \?\? intakeNote\?\.truncated \?\? false, origin: batch\.origin,\s*leftOver: batch\.leftOver \?\? intakeNote\?\.leftOver \?\? null \}\s*: null\);/, 'the note is read from page state, not the batch');
   assert.match(read('lib/importBatch.ts'), /skippedNovels\?: number;\s*truncated\?: boolean;/, 'ImportBatch does not type the fields');
 });
 
@@ -632,7 +647,7 @@ test('the add dialog offers the other sources only when it already holds a list,
   // (#116's `numbering` and #117's "Archive the rest slowly" ride after it, pinned in numbering.test.ts and
   // addSeriesDialog.test.ts.)
   // (v0.52.0's language edition rides after those, pinned in addSeriesDialog.test.ts.)
-  assert.match(src, /json: \{\s*source: picked\.source, sourceId: picked\.sourceId, chapterCount, chapterFrom, autoUpdate, force, alsoFollow: alsoFollowBody, numbering,?(?:\s*\.\.\.\(archiving \? \{ archive: true \} : \{\}\),?)?(?:\s*\.\.\.\(editionBody \? \{ edition: editionBody \} : \{\}\),?)?\s*\}/, 'the add body does not carry alsoFollow');
+  assert.match(src, /json: \{\s*source: picked\.source, sourceId: picked\.sourceId, chapterCount, chapterFrom, autoUpdate, force, alsoFollow: alsoFollowBody, numbering,\s*\.\.\.\(!edSeed \? \{ visibility: contentScope\.visibility \} : \{\}\),(?:\s*\.\.\.\(archiving \? \{ archive: true \} : \{\}\),?)?(?:\s*\.\.\.\(editionBody \? \{ edition: editionBody \} : \{\}\),?)?\s*\}/, 'the add body does not carry alsoFollow');
   // The switch is on the options step only with candidates, remembered per device under one key.
   assert.match(src, /\{mayFollow && others\.length > 0 && !view\?\.posting && \(\s*<div className="mt-3" data-also-follow>/, 'the switch shows without candidates');
   assert.match(src, /const ALSO_FOLLOW_KEY = 'uchiyomi\.alsoFollow';/, 'the per-device key changed');
@@ -707,4 +722,65 @@ test('the i18n rig visits the consoles\' pages by their ?tab= address and looks 
       assert.ok(d[w] && d[w] !== w, `${f}: "${w}" is missing or the same as the English, so the rig would count it as a leak`);
     }
   }
+});
+
+
+test('state/source/title filters and selections keep skipped, unmatched, private and confirmed rows distinct',()=> {
+ const rows=[row({id:'exact'}),row({id:'unmatched',decision:'unresolved',match_source:null,match_source_id:null}),row({id:'skip',decision:'skip'}),row({id:'private',decision:'manual',match_source:'other',content_scope:{visibility:'private',libraryId:'private_fixture'}}),row({id:'ambiguous',ambiguous:true})];
+ assert.equal(filterImportRows(rows,'unmatched','__none','').length,1);
+ assert.deepEqual(filterImportRows(rows,'all','other','').map(c=>c.id),['private']);
+ assert.equal(filterImportRows(rows,'all','other','').filter(readyImport).length,1);
+ assert.equal(filterImportRows(rows,'all','','').filter(selectableImport).length,5,'unmatched and skipped titles can be bulk skipped');
+ assert.equal(readyImport(rows[4]),false,'an ambiguous automatic choice needs explicit confirmation');
+ assert.equal(needsAttention(row({confidence:'fuzzy',status:'added'})),false,'owned results no longer need match review');
+ assert.equal(needsAttention(row({confidence:'fuzzy',in_library:true})),false,'held rows never inflate the attention filter');
+ assert.equal(importRowState(row({in_library:true,decision:'skip'})),'owned');
+ assert.equal(importProvenance(row({decision:'manual'})),'Picked by you');
+ assert.match(importProvenance(row({confidence:'same_source'})),/source and address/);
+ assert.match(trackerProgressLine('anilist',1),/AniList: 1 chapter$/);
+ assert.match(trackerProgressLine('anilist',30,true),/backup on AniList: 30 chapters$/);
+ const next={id:'next',origin:'paste',state:'done',canContinue:true,total:500,resolved:500,added:0,failed:0,created_at:''} as ImportBatchSummary;
+ assert.deepEqual(openBatches([next]).map(b=>b.id),['next'],'a finished tranche with remaining titles remains reachable');
+});
+
+test('Mark chapters I’ve read is one checkbox, on by default, above every way in, and sent with each new intake (#433)', () => {
+  // Reintroduce by starting the state at false: "the checkbox is not on by default". By leaving markRead out of the
+  // body: the server marks only when asked, so nothing is marked. By putting the box under the entrances: a backup
+  // starts the moment its file is picked, before the box below it was ever seen.
+  const src = code(read('app/admin/import/page.tsx'));
+  assert.match(src, /const \[markRead, setMarkRead\] = useState\(true\);/, 'the checkbox is not on by default');
+  assert.match(src, /json: body\.continueFrom \? body : \{\.\.\.body,visibility:scope\.visibility,markRead\}/, 'a new intake does not send markRead');
+  assert.match(src, /<ContentScopePicker scope=\{scope\} disabled=\{starting\} \/><MarkReadChoice on=\{markRead\} onChange=\{setMarkRead\} disabled=\{starting\} \/><\/div><IntakeCard /,
+    'the checkbox is not beside the library choice, above the intake');
+  const choice = src.slice(src.indexOf('function MarkReadChoice('), src.indexOf('function IntakeCard('));
+  assert.ok(choice.length > 0, 'MarkReadChoice is not where this test looks');
+  assert.equal((choice.match(/type="checkbox"/g) || []).length, 1, 'more than one control');
+  assert.match(choice, /tr\('Mark chapters I’ve read'\)/);
+  assert.match(choice, /tr\('Chapters you’ve read are marked read here\. Nothing is marked unread or sent to your trackers\.'\)/);
+  assert.deepEqual(missingIn('es.json', ['Mark chapters I’ve read', 'Chapters you’ve read are marked read here. Nothing is marked unread or sent to your trackers.']), []);
+});
+
+test('an import says what it marked read: a done line over the whole batch, and how far each backup row was read (#433)', () => {
+  // Reintroduce by counting the rows instead of their chapters in markedLine: "Marked 2 chapters…" for 57. By the plural
+  // for one: "Marked 1 chapters read in 1 series." By counting ReviewCard's `items` -- the filtered view -- instead of the
+  // batch: the line changes with the filter. By dropping the review card's line: a backup of the library you already
+  // have, whose rows are all owned and never leave review, never says what it marked.
+  const marked = (id: string, n: number) => row({ id, marked_read: n });
+  assert.equal(markedLine([marked('a', 50), marked('b', 7), row({ id: 'c' })]), 'Marked 57 chapters read in 2 series.');
+  assert.equal(markedLine([marked('a', 12)]), 'Marked 12 chapters read in 1 series.');
+  assert.equal(markedLine([marked('a', 1)]), 'Marked 1 chapter read.');
+  assert.equal(markedLine([row({}), row({ marked_read: 0 })]), null, 'nothing marked prints a line');
+  assert.equal(readToLine(row({ read_to: 57 })), 'Read to ch. 57');
+  assert.equal(readToLine(row({ read_to: 12.5 })), 'Read to ch. 12.5');
+  assert.equal(readToLine(row({ read_to: null })), null);
+  assert.equal(readToLine(row({})), null, 'an older server, which sends no read_to, gets a caption');
+  const src = code(read('app/admin/import/page.tsx'));
+  assert.match(src, /const marked = markedLine\(items\);/, 'the line is not counted over every row of the batch');
+  const between = (a: string, b: string) => src.slice(src.indexOf(a), src.indexOf(b));
+  assert.match(between('function ReviewRow(', 'function ReviewCard('), /\{c\.read_to != null && <p className="text-\[11px\] text-fog-500" data-read-to>\{readToLine\(c\)\}<\/p>\}/, 'the row has no caption');
+  assert.match(between('function ReviewCard(', 'function RunCard('), /\{marked && <p className="mb-1 text-\[11px\] text-fog-300" data-import-marked>\{marked\}<\/p>\}/, 'the review card does not say what was marked');
+  assert.match(between('function RunCard(', 'function ImportWizardInner('), /\{batch\.state === 'done' && marked && <p className="mb-3 text-\[11px\] text-fog-300" data-import-marked>\{marked\}<\/p>\}/, 'the done card does not say what was marked');
+  assert.match(src, /note=\{note\} marked=\{marked\} filter=\{filter\}/, 'the review card is not handed the line');
+  assert.match(src, /<RunCard batch=\{batch\} items=\{items\} runIds=\{runIds\} runTotal=\{runTotal\} note=\{note\} marked=\{marked\}/, 'the done card is not handed the line');
+  assert.deepEqual(missingIn('es.json', ['Read to ch. {n}', 'Marked 1 chapter read.', 'Marked {n} chapters read in 1 series.', 'Marked {n} chapters read in {m} series.']), []);
 });

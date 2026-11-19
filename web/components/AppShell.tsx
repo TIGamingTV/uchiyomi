@@ -2,6 +2,7 @@
 import { useEffect, useState } from 'react';
 import { usePathname, useRouter } from 'next/navigation';
 import { useAuth } from '@/lib/auth';
+import { PALETTE_EVENT } from '@/lib/palette';
 import { runSmartOffline } from '@/lib/offlineSync';
 import { BottomNav } from './BottomNav';
 import { TopNav } from './TopNav';
@@ -23,6 +24,8 @@ import { IncognitoBanner, useIncognito } from './IncognitoBanner';
 import { AdultBanner } from './AdultToggle';
 import { usePrefetchSeriesOnClick } from '@/lib/seriesPrefetch';
 import { scrollMemory } from '@/lib/scrollMemory';
+import { acknowledgeNativeAppControls } from '@/lib/native';
+import { useNativeNavigationLayout, usesSideNavigation } from '@/lib/nativeLayout';
 
 function Splash() {
   return (
@@ -71,8 +74,18 @@ export function AppShell({ children }: { children: React.ReactNode }) {
   const router = useRouter();
   const [palette, setPalette] = useState(false);
   const [paletteSeed, setPaletteSeed] = useState('');
-  // The desktop's sidebar is mounted from lg up only: on a phone none of it is in the document (components/Sidebar.tsx).
+  // Wide browsers keep their rail. A supported iOS host may ask for that same themed rail when its layout turns vertical.
   const wide = useWideViewport();
+  const nativeLayout = useNativeNavigationLayout((status === 'authed' || status === 'offline') && !path.startsWith('/reader'));
+  const nativeSide = nativeLayout === 'side';
+  const sideNavigation = usesSideNavigation(wide, nativeLayout);
+  // The iOS wrapper's own Servers button, for when these controls are out of reach (offline, the downloads alone). Loading
+  // says nothing yet: the wrapper waits 2 s before offering it, so a quick start shows no button and a start that hangs
+  // still gets one, where "unavailable" here flashed it over every splash. A chapter is never covered by it, online or
+  // off: the reader counts as handled, and leaving it for the offline downloads brings the button back.
+  useEffect(() => {
+    if (status !== 'loading') acknowledgeNativeAppControls(status === 'authed' || status === 'anon' || path.startsWith('/reader'));
+  }, [status, path]);
 
   /**
    * An offline launch arrives at `/` -- the manifest's `start_url` -- which is a home screen assembled
@@ -102,6 +115,13 @@ export function AppShell({ children }: { children: React.ReactNode }) {
   // Where each page was left, for Back and Forward to put back (lib/scrollMemory.ts) -- from the first page on, the reader
   // included, which is not inside the page fade that otherwise installs it.
   useEffect(() => { scrollMemory(); }, []);
+  // The phone's way in: a button (the search page's) asks through lib/palette.ts, since a phone has no hotkey.
+  useEffect(() => {
+    if (status !== 'authed') return;
+    const on = (e: Event) => { setPaletteSeed(String((e as CustomEvent<string>).detail ?? '')); setPalette(true); };
+    window.addEventListener(PALETTE_EVENT, on);
+    return () => window.removeEventListener(PALETTE_EVENT, on);
+  }, [status]);
 
   // smart offline: keep favorites' latest unread chapters downloaded. Never on desktop, where "Save offline"
   // is hidden: it would copy chapters already on this disk into the window's storage (lib/desktop.ts).
@@ -147,11 +167,11 @@ export function AppShell({ children }: { children: React.ReactNode }) {
         {status === 'authed' && <TrackerAlert />}
       </div>
       <TopNav onSearchFocus={() => { setPaletteSeed(''); setPalette(true); }} />
-      {wide && <Sidebar />}
+      {sideNavigation && <Sidebar nativeCompact={nativeSide && !wide} />}
       <main className="shell relative z-[1] pb-28 lg:pb-12">
         <PageTransition>{children}</PageTransition>
       </main>
-      <BottomNav />
+      <BottomNav nativeSide={nativeSide} />
       {status === 'authed' && <CommandPalette open={palette} seed={paletteSeed} onClose={() => setPalette(false)} />}
     </>
   );

@@ -34,6 +34,7 @@ import { diagnose, currentError, type DiagnosisCode } from './sourceDiagnosis';
 import { currentFailures, isRateLimit, openFailures, stageLines, type Stage, type StageLine, type Stages } from './sourceEvidence';
 import { haveNumbers, impossibleLimit, listedWholeNumbers, median, plausibleNumbers } from './libraryNumbers';
 import { atHiddenNumber } from './noticeChapters';
+import { specialName } from './specialChapters';
 import { slowStreakNow } from './sourceHealth';
 import { listBudgetFor } from './sources/budget';
 import { cbzPageDims, DL_ROOT, LIBRARY_ROOT, lastScanReport, QUIET_WALK, type WalkIssue, type WalkReason } from './library';
@@ -688,8 +689,8 @@ const NUMBERED_SHOWN_MS = 14 * DAY_MS;
 async function numberingCheck(): Promise<HealthCheck | null> {
   const rows = await q<{
     id: string; title: string; source_name: string | null; source_id: string | null;
-    numbering: 'source' | 'posting_order' | null; numbering_by: 'auto' | 'manual' | null; numbering_source: string | null;
-    numbering_pending: 'posting_order' | 'source' | 'remap' | null; numbering_note: NumberingNote | null;
+    numbering: 'source' | 'posting_order' | 'titles' | null; numbering_by: 'auto' | 'manual' | null; numbering_source: string | null;
+    numbering_pending: 'posting_order' | 'titles' | 'source' | 'remap' | null; numbering_note: NumberingNote | null;
     journal: boolean; changed_at: string | null;
   }>(
     `SELECT ls.id, ls.title, ls.source AS source_name, ls.source_id, ls.numbering, ls.numbering_by, ls.numbering_source,
@@ -733,6 +734,11 @@ async function numberingCheck(): Promise<HealthCheck | null> {
       item = auto
         ? { ...base, ...detailOf([shared, say('numbering.reviewWaits'), held]), actions: ['renumber', 'keep_numbers'] }
         : { ...base, ...detailOf([say('numbering.askedWaits'), held]), actions: ['renumber'] };
+    } else if (r.numbering_pending === 'titles') {
+      // #379: the source counts its specials as chapters. "Keep the source's numbers" is the admin's to say, as for posting order.
+      const ex = note?.titles?.example;
+      item = { ...base, ...detailOf([say('numbering.titles', { name, ...(ex ? { title: ex.title, number: ex.from } : {}) }), say('numbering.titlesWaits'), held]),
+        actions: ['renumber', 'keep_numbers'] };
     } else if (r.numbering_pending === 'source') {
       item = { ...base, ...detailOf([say('numbering.sourceWaits', { name }), held]), actions: ['renumber'] };
     } else if (r.numbering === 'posting_order' && auto) {
@@ -804,19 +810,29 @@ async function shortChapters(): Promise<HealthCheck> {
     id: string; series_id: string; title: string; folder: string; number: number; pages: number;
     root: string | null; file: string; short_confirmed_at: string | null; missing_pages: number[] | null;
     short_result: { at?: string; why?: string; asked?: number; answered?: number; best?: number; hunt?: string; by?: string | null } | null;
-    page_dims: PageDim[] | null;
+    page_dims: PageDim[] | null; chapter_name: string | null; book_title: string | null; listed_title: string | null;
   }>(
     `SELECT b.id, b.series_id, ls.title, ls.folder, b.number::float8 AS number, b.pages, b.root, b.file,
-            b.short_confirmed_at, b.missing_pages, b.short_result, b.page_dims
+            b.short_confirmed_at, b.missing_pages, b.short_result, b.page_dims,
+            b.chapter_name, b.title AS book_title, sl.title AS listed_title
        FROM lib_books b JOIN lib_series ls ON ls.id = b.series_id AND ${visibleToAll('ls')}
+       LEFT JOIN series_listing sl ON sl.series_id = b.series_id AND sl.number = b.number
       WHERE b.pages BETWEEN 1 AND 2 AND b.number = floor(b.number) AND b.pruned_at IS NULL
         -- Not a chapter at a number an admin hid (#240): no chapter here, and its Fix would be refused.
         AND NOT ${atHiddenNumber('b')}
       ORDER BY ls.title, b.number`,
   );
+  // A chapter whose title names a special -- a Q&A, a giveaway, an author's note -- is short on purpose, as a half-chapter
+  // notice is (lib/specialChapters.ts), and is counted in the summary rather than listed. Before the measuring, so a
+  // special spends none of this report's reads. Reintroduce by dropping the test: "a chapter titled as a special is not
+  // short" in health.int.test.ts finds it listed.
+  let specials = 0;
   const budget = { left: MEASURE_PER_REPORT };
   const rows: typeof found = [];
-  for (const r of found) if (!longStrip(await measured(r, budget))) rows.push(r);
+  for (const r of found) {
+    if (!r.short_confirmed_at && specialName(Number(r.number), r.chapter_name, r.book_title, r.listed_title)) { specials++; continue; }
+    if (!longStrip(await measured(r, budget))) rows.push(r);
+  }
   const item = (r: typeof rows[number]): HealthItem => {
     // "Fix" replaces the file, so it is offered ONLY for a file this server downloaded and named itself:
     // the download root, under exactly the name chapterFileRel writes. Somebody's own copy in the read
@@ -871,8 +887,9 @@ async function shortChapters(): Promise<HealthCheck> {
     ...summaryOf([
       live ? say('short.live', { n: live }) : say('short.none'),
       quiet > 0 && say('short.quiet', { n: quiet }),
+      specials > 0 && say('short.specials', { n: specials }),
     ]),
-    ...noteOf([say('short.note'), hiddenPart(hidden)]),
+    ...noteOf([say('short.note'), joined('sentence', say('short.specialNote')), hiddenPart(hidden)]),
     items: shown,
   }, items);
 }

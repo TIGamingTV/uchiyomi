@@ -116,15 +116,15 @@ test('with Tap a page of a pair off, a tap is the tap layout\'s, the middle show
 test('only a joined spread loses the gap down the middle; every other pair keeps its gutter', () => {
   // #232 took the 4 px gap from every pair. Reintroduce by dropping `gap-1` outright: an ordinary Double spread changes look.
   const src = code(read('app/reader/page.tsx'));
-  assert.match(src, /items-center justify-center\$\{isJoined \? '' : ' gap-1'\}/);
-  assert.match(src, /area\.w \/ 2 - \(isJoined \? 0 : 2\)/);
-  assert.match(src, /dir=\{isJoined \? 'ltr' : undefined\}/, 'a joined spread is laid out as drawn, not by the track');
+  assert.match(src, /justify-center\$\{isJoined \? '' : ' gap-1'\}/);
+  assert.match(src, /pageArea\.w \/ 2 - \(isJoined \? 0 : 2\)/);
+  assert.match(src, /dir=\{isJoined \|\| !pagedRtl \? 'ltr' : 'rtl'\}/, 'a joined spread is laid out as drawn, not by the track');
 });
 
 test('the page list asks for spreads only with joining on, and a join found late keeps the page being read', () => {
   const src = code(read('app/reader/page.tsx'));
-  assert.match(src, /const first = await loadChapter\(bookId, loadPrefs\(\)\.joinSplit\);/);
-  assert.match(src, /const ch = await loadChapter\(next\.id, prefs\.joinSplit\);/);
+  assert.match(src, /const first = await loadChapter\(bookId, loadPrefs\(\)\.joinSplit,\s*user\?\.id\?\?null\);/, 'initial chapter keeps joining and the initiating account');
+  assert.match(src, /const ch = await loadChapter\(next\.id, prefs\.joinSplit,\s*user\?\.id\?\?null\);/, 'next chapter keeps joining and the initiating account');
   assert.match(src, /\/pages\$\{spreads \? '\?spreads=1' : ''\}/);
   assert.match(src, /joinSplit: prefs\.joinSplit \}\)/, 'pairSlides is not told whether joining is on');
   // The joins effect: two slides made one before the page being read would otherwise move the reader a page on.

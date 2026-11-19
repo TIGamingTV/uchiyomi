@@ -6,6 +6,10 @@ import { typeFromGenres, SERIES_TYPE_FROM } from './seriesTypeSignals';
 import { cleanGenres } from './genres';
 import { REFILE_FAILURES_SQL } from './chapterFailures';
 import { ssoOnly } from './authMode';
+import { PRIVATE_LIBRARY_DDL } from './privateLibrarySchema';
+import { EXTERNAL_READER_DDL } from './externalReaderSchema';
+import { IMPORT_ENHANCEMENT_DDL } from './importEnhancementSchema';
+import { DISCOVERY_HUB_DDL } from './discoveryHubSchema';
 
 // NOTE: gen_random_uuid() is in Postgres core (v13+); no pgcrypto extension needed.
 // (The supabase/postgres image's event triggers reject CREATE EXTENSION under a custom role.)
@@ -133,6 +137,15 @@ CREATE TABLE IF NOT EXISTS read_progress (
   updated_at timestamptz NOT NULL DEFAULT now(),
   PRIMARY KEY (user_id, book_id)
 );
+
+-- "Remove from Keep reading": the series stays in the library, it only leaves that Home row. A row hides the series
+-- until it is read again (read_progress.updated_at moves past hidden_at), so reading it brings it back by itself.
+CREATE TABLE IF NOT EXISTS keep_reading_hidden (
+  user_id    uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  series_id  text NOT NULL,
+  hidden_at  timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (user_id, series_id)
+);
 CREATE INDEX IF NOT EXISTS idx_rp_series ON read_progress(user_id, series_id);
 CREATE INDEX IF NOT EXISTS idx_rp_recent ON read_progress(user_id, updated_at DESC) WHERE completed = false;
 
@@ -167,6 +180,14 @@ CREATE TABLE IF NOT EXISTS lib_series (
   cover_book_id text,
   scanned_at    timestamptz NOT NULL DEFAULT now()
 );
+CREATE TABLE IF NOT EXISTS series_local_art (
+  series_id text NOT NULL REFERENCES lib_series(id) ON DELETE CASCADE,
+  root text NOT NULL, folder text NOT NULL, priority integer NOT NULL,
+  cover_file text, cover_stamp text, banner_file text, banner_stamp text,
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (series_id, root, folder)
+);
+
 CREATE TABLE IF NOT EXISTS lib_books (
   id         text PRIMARY KEY,
   series_id  text NOT NULL REFERENCES lib_series(id) ON DELETE CASCADE,
@@ -187,6 +208,7 @@ ALTER TABLE lib_series ADD COLUMN IF NOT EXISTS latest_mtime bigint      NOT NUL
 ALTER TABLE lib_books  ADD COLUMN IF NOT EXISTS root text NOT NULL DEFAULT '/library';
 -- cached per-page pixel dimensions [{name,width,height}] (the reader needs these to lay pages out)
 ALTER TABLE lib_books  ADD COLUMN IF NOT EXISTS page_dims jsonb;
+ALTER TABLE lib_books  ADD COLUMN IF NOT EXISTS page_dims_version text;
 -- chapter release date on the source (stamped at download/update time; NULL for library-only books)
 ALTER TABLE lib_books  ADD COLUMN IF NOT EXISTS published_at timestamptz;
 -- whether the scheduled updater pulls new chapters for this series (user choice at add time)
@@ -964,6 +986,15 @@ CREATE TABLE IF NOT EXISTS page_hashes (
 );
 CREATE INDEX IF NOT EXISTS page_hashes_hash_idx ON page_hashes (hash);
 
+-- #354: absent means disabled. A series rule overrides its source rule, including an explicit false.
+CREATE TABLE IF NOT EXISTS source_page_rules (
+  source_id text NOT NULL,
+  series_scope text NOT NULL DEFAULT '',
+  skip_gif boolean NOT NULL,
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (source_id, series_scope)
+);
+
 -- Bulk import (backup / MangaDex list / pasted titles) → match review → add. Unlike importJob/artJob/
 -- relinkJob (in-memory singletons in admin.ts), this survives a restart on purpose: matching is a
 -- cross-source search pass that can run for minutes, and a human then has to look at every uncertain row,
@@ -1072,9 +1103,10 @@ ALTER TABLE import_batches    ADD COLUMN IF NOT EXISTS truncated      boolean NO
 -- chapter lands -- clamped to just before the file's mtime. Stamping now() there would make the read-chapter
 -- cleanup delete a file minutes after fetching it (the which-copy-did-they-read rule in dueSql,
 -- lib/chapterCleanup.ts), and the tombstone would make that permanent. source is 'web' or 'komga': whether a
--- person ticked it here or a paired phone's sync wrote it. ⚠️ Not a support field -- it is the difference
+-- person ticked it here or a paired phone's sync wrote it ('import' since v0.108.0: an import brought it over, below).
+-- ⚠️ Not a support field -- it is the difference
 -- between an act and an echo. Mihon PUTs on every bind, and that PUT marks the ghosts under the run this
--- server just reported, so only a 'web' row says the READER did anything (lib/komgaProgress readProgressDetail).
+-- server just reported, so only a row that is not 'komga' says the READER did anything (lib/komgaProgress readProgressDetail).
 --
 -- The keys are declared here rather than in the NOT VALID list below: this table is new, so there are no
 -- orphans to quarantine first. Deleting a series (Forget) or a user takes the marks with it; merging carries
@@ -1760,6 +1792,19 @@ CREATE TABLE IF NOT EXISTS anilist_related (
   fetched_at  timestamptz NOT NULL DEFAULT now()
 );
 
+-- The English, romanised and Japanese titles of a series' linked AniList entry, shown on the series page
+-- (lib/otherTitles.ts). One row per series; a row with all three NULL records an answer with no names, asked again
+-- after a day (one with names after a month). Additive: the previous version boots on this schema and ignores it.
+CREATE TABLE IF NOT EXISTS series_other_titles (
+  series_id  text PRIMARY KEY REFERENCES lib_series(id) ON DELETE CASCADE,
+  anilist_id text,
+  english    text,
+  romaji     text,
+  native     text,
+  fetched_at timestamptz NOT NULL DEFAULT now()
+);
+ALTER TABLE series_other_titles ADD COLUMN IF NOT EXISTS anilist_id text;
+
 -- v0.61.0: the release radar (lib/releaseRadar.ts) -- when a series' next chapter is likely, from when its chapters
 -- came: the dates its sources list, else when they arrived on this server (most chapters carry no source date).
 -- One row per series, rewritten whole after every listing refresh and after a check lands chapters; no row while
@@ -2003,6 +2048,210 @@ CREATE INDEX IF NOT EXISTS idx_spread_marks_book ON spread_marks (book_id);
 -- of its home page whenever it fails, at most once in half an hour: BatCave's guard pass lasts a day, and it fails with a
 -- plain 404 when it runs out. NULL for every other source. Additive: v0.90.x ignores the column.
 ALTER TABLE suwayomi_sources ADD COLUMN IF NOT EXISTS site_opened_at timestamptz;
+
+-- v0.98.0: Discover's trending titles (lib/trending.ts), one row per country of origin (KR, JP, CN): what AniList last
+-- answered, kept so a restart or a deploy answers the hero and the trending rows from this copy at once instead of
+-- waiting on AniList -- or, with AniList busy, showing no hero at all. Rewritten whole by a pull at most every six hours;
+-- shared by every viewer, and filtered per viewer when it is read, never here. Additive: v0.97.x ignores the table.
+CREATE TABLE IF NOT EXISTS anilist_trending (
+  country     text PRIMARY KEY,
+  items       jsonb NOT NULL DEFAULT '[]'::jsonb,
+  fetched_at  timestamptz NOT NULL DEFAULT now()
+);
+
+-- Profiles that open without a password, from the local network only. These
+-- columns come first and nothing writes them yet. password_login: /auth/login accepts the row (false for a profile
+-- with no password). local_open: it opens without a password from the local network. managed_by: the account that
+-- manages it; deleting that account leaves the profile to the admin rather than deleting its reading too. Every row
+-- an older release wrote reads as it did (true, false, NULL), and a rollback has none of them to write.
+ALTER TABLE users ADD COLUMN IF NOT EXISTS password_login boolean NOT NULL DEFAULT true;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS local_open     boolean NOT NULL DEFAULT false;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS managed_by     uuid REFERENCES users(id) ON DELETE SET NULL;
+-- A profile anyone at home can open never runs the server. The desktop app's own account is the exception it already
+-- is (lib/desktopUser.ts): its window is the only way in.
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'users_local_open_not_admin') THEN
+    ALTER TABLE users ADD CONSTRAINT users_local_open_not_admin
+      CHECK (NOT local_open OR role <> 'admin' OR auth_kind = 'desktop');
+  END IF;
+END $$;
+-- A session's name through its rotations (session_id; NULL on a row from before it, which is then its own id), the
+-- session it was opened from (parent_session: ending that one ends this one, lib/auth.ts revokeDerived), and how it
+-- was entered (via). lib/auth.ts supersede carries all three to the next token.
+ALTER TABLE refresh_tokens ADD COLUMN IF NOT EXISTS session_id     uuid;
+ALTER TABLE refresh_tokens ADD COLUMN IF NOT EXISTS parent_session uuid;
+ALTER TABLE refresh_tokens ADD COLUMN IF NOT EXISTS via            text;
+CREATE INDEX IF NOT EXISTS idx_rt_parent  ON refresh_tokens (parent_session) WHERE parent_session IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_rt_session ON refresh_tokens (session_id) WHERE session_id IS NOT NULL;
+
+-- The accounts a device remembers (lib/deviceRing.ts): a sign-in that ticked Remember on this device, by device -- the
+-- hash of its yomi_dev cookie, never the cookie -- and the session it can take up again. No key to refresh_tokens:
+-- sessions are revoked, not deleted, and an entry opens only while its session is live; the daily prune drops the rest.
+-- Additive: an older release never reads it.
+CREATE TABLE IF NOT EXISTS device_ring (
+  device_hash text        NOT NULL,
+  user_id     uuid        NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  session_id  uuid        NOT NULL,
+  added_at    timestamptz NOT NULL DEFAULT now(),
+  last_used   timestamptz,
+  PRIMARY KEY (device_hash, user_id)
+);
+CREATE INDEX IF NOT EXISTS idx_device_ring_user ON device_ring (user_id);
+-- The sign-in screen's "who is reading?" at home (routes/auth.ts /auth/pick): off unless an admin turns it on.
+ALTER TABLE server_settings ADD COLUMN IF NOT EXISTS local_pick boolean NOT NULL DEFAULT false;
+-- The home network and the trusted proxies as Admin -> Settings -> Server -> Home network sets them (lib/clientAddr.ts):
+-- NULL is the default (the private networks; loopback, link-local and private proxies). LOCAL_NETWORKS and TRUST_PROXY
+-- in the environment outrank both. Additive: an older release never reads them.
+ALTER TABLE server_settings ADD COLUMN IF NOT EXISTS local_networks  text;
+ALTER TABLE server_settings ADD COLUMN IF NOT EXISTS trusted_proxies text;
+-- Title wordmarks are optional persistent art. Existing installations make no new online requests by default.
+ALTER TABLE server_settings ADD COLUMN IF NOT EXISTS automatic_title_logos boolean NOT NULL DEFAULT false;
+-- Provider-wide Retry-After survives a process restart; no title or user identity is stored here.
+ALTER TABLE server_settings ADD COLUMN IF NOT EXISTS title_logo_retry_at timestamptz;
+-- Local cover lettering creates private review drafts; this never authorizes automatic publication.
+ALTER TABLE server_settings ADD COLUMN IF NOT EXISTS automatic_cover_titles boolean NOT NULL DEFAULT false;
+CREATE TABLE IF NOT EXISTS series_title_extractions (
+  id uuid PRIMARY KEY,
+  series_id text NOT NULL REFERENCES lib_series(id) ON DELETE CASCADE,
+  owner_id uuid REFERENCES users(id) ON DELETE CASCADE,
+  automatic boolean NOT NULL DEFAULT false,
+  status text NOT NULL CHECK(status IN ('queued','running','ready','rejected','error','applied')),
+  snapshot text NOT NULL,
+  cover_fingerprint text NOT NULL,
+  source_sha256 text NOT NULL,
+  candidate_sha256 text,
+  title_version bigint NOT NULL,
+  region jsonb,
+  exclusions jsonb NOT NULL DEFAULT '[]',
+  quality jsonb,
+  reasons jsonb NOT NULL DEFAULT '[]',
+  error text,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  expires_at timestamptz NOT NULL DEFAULT now()+interval '30 minutes',
+  CHECK((automatic AND owner_id IS NULL) OR (NOT automatic AND owner_id IS NOT NULL))
+);
+CREATE INDEX IF NOT EXISTS series_title_extractions_series_idx ON series_title_extractions(series_id,created_at DESC);
+-- Older drafts overwrote the request region with inference output; their original selection intent is unknown.
+ALTER TABLE series_title_extractions ADD COLUMN IF NOT EXISTS selection_mode text NOT NULL DEFAULT 'legacy'
+  CHECK(selection_mode IN ('manual','automatic','legacy'));
+ALTER TABLE series_title_extractions ADD COLUMN IF NOT EXISTS result_region jsonb;
+ALTER TABLE series_title_extractions ADD COLUMN IF NOT EXISTS candidate_region jsonb;
+ALTER TABLE series_title_extractions ADD COLUMN IF NOT EXISTS model_fingerprint text;
+-- The immutable baseline and private numbered previews belong only to their expiring extraction draft.
+ALTER TABLE series_title_extractions ADD COLUMN IF NOT EXISTS mask_revision integer NOT NULL DEFAULT 0 CHECK(mask_revision>=0);
+ALTER TABLE series_title_extractions ADD COLUMN IF NOT EXISTS mask_strokes jsonb NOT NULL DEFAULT '[]';
+ALTER TABLE series_title_extractions ADD COLUMN IF NOT EXISTS mask_width integer;
+ALTER TABLE series_title_extractions ADD COLUMN IF NOT EXISTS mask_height integer;
+ALTER TABLE series_title_extractions ADD COLUMN IF NOT EXISTS mask_baseline_sha256 text;
+ALTER TABLE series_title_extractions ADD COLUMN IF NOT EXISTS mask_original_sha256 text;
+ALTER TABLE series_title_extractions ADD COLUMN IF NOT EXISTS mask_preview_file text;
+ALTER TABLE series_title_extractions ADD COLUMN IF NOT EXISTS mask_bounds jsonb;
+ALTER TABLE server_settings ADD COLUMN IF NOT EXISTS automatic_cover_title_generation boolean NOT NULL DEFAULT false;
+ALTER TABLE server_settings ADD COLUMN IF NOT EXISTS automatic_cover_title_apply boolean NOT NULL DEFAULT false;
+ALTER TABLE server_settings ADD COLUMN IF NOT EXISTS cover_title_next_run_at timestamptz;
+CREATE TABLE IF NOT EXISTS title_extraction_runs (
+  id uuid PRIMARY KEY, origin text NOT NULL CHECK(origin IN ('manual','nightly')),
+  status text NOT NULL DEFAULT 'running' CHECK(status IN ('running','completed','cancelled','error')),
+  created_by uuid REFERENCES users(id) ON DELETE SET NULL, started_at timestamptz NOT NULL DEFAULT now(), finished_at timestamptz,
+  retry_errors boolean NOT NULL DEFAULT false
+);
+CREATE UNIQUE INDEX IF NOT EXISTS title_extraction_one_run_idx ON title_extraction_runs((true)) WHERE status='running';
+CREATE TABLE IF NOT EXISTS title_extraction_items (
+  id uuid PRIMARY KEY, run_id uuid NOT NULL REFERENCES title_extraction_runs(id) ON DELETE CASCADE,
+  series_id text REFERENCES lib_series(id) ON DELETE SET NULL, series_key text NOT NULL,
+  status text NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','processing','ready','applied','skipped','failed','cancelled')),
+  job_id uuid REFERENCES series_title_extractions(id) ON DELETE SET NULL,
+  attempts integer NOT NULL DEFAULT 0, retry_at timestamptz NOT NULL DEFAULT now(), reason text,
+  UNIQUE(run_id,series_key)
+);
+CREATE INDEX IF NOT EXISTS title_extraction_items_due_idx ON title_extraction_items(run_id,status,retry_at);
+CREATE UNIQUE INDEX IF NOT EXISTS title_extraction_one_active_item_idx ON title_extraction_items(run_id) WHERE status='processing';
+CREATE TABLE IF NOT EXISTS series_title_extraction_history (
+  series_id text PRIMARY KEY REFERENCES lib_series(id) ON DELETE CASCADE,
+  source_fingerprint text NOT NULL, model_fingerprint text NOT NULL, outcome text NOT NULL,
+  processed_at timestamptz NOT NULL DEFAULT now(), retry_at timestamptz
+);
+ALTER TABLE series_title_extractions ADD COLUMN IF NOT EXISTS batch_item_id uuid REFERENCES title_extraction_items(id) ON DELETE SET NULL;
+ALTER TABLE series_title_extractions ADD COLUMN IF NOT EXISTS asset_bytes bigint NOT NULL DEFAULT 0;
+ALTER TABLE series_title_extractions ADD COLUMN IF NOT EXISTS verification_key text;
+ALTER TABLE series_title_extractions ADD COLUMN IF NOT EXISTS publication_requested boolean NOT NULL DEFAULT false;
+ALTER TABLE series_title_extraction_history ADD COLUMN IF NOT EXISTS verification_key text NOT NULL DEFAULT '';
+ALTER TABLE series_title_extraction_history ADD COLUMN IF NOT EXISTS publication_requested boolean NOT NULL DEFAULT false;
+CREATE TABLE IF NOT EXISTS series_title_extraction_state (
+  series_id text PRIMARY KEY REFERENCES lib_series(id) ON DELETE CASCADE,
+  automatic_key text NOT NULL,
+  retry_at timestamptz NOT NULL
+);
+CREATE TABLE IF NOT EXISTS series_title_art (
+  series_id text PRIMARY KEY REFERENCES lib_series(id) ON DELETE CASCADE,
+  mode text NOT NULL DEFAULT 'automatic' CHECK (mode IN ('automatic','custom','text')),
+  style text NOT NULL DEFAULT 'auto' CHECK (style IN ('auto','action','fantasy','scifi','soft','noir','plain')),
+  version bigint NOT NULL DEFAULT 0,
+  custom_file text,
+  auto_file text,
+  auto_anilist_id text,
+  auto_language text CHECK (auto_language IN ('en','original')),
+  auto_caption boolean NOT NULL DEFAULT true,
+  auto_manual boolean NOT NULL DEFAULT false,
+  auto_attribution jsonb,
+  lookup_status text NOT NULL DEFAULT 'missing' CHECK (lookup_status IN ('ready','missing','error')),
+  lookup_anilist_id text,
+  retry_at timestamptz,
+  updated_at timestamptz NOT NULL DEFAULT now()
+);
+ALTER TABLE series_title_art ADD COLUMN IF NOT EXISTS auto_cover_key text;
+ALTER TABLE series_title_art ADD COLUMN IF NOT EXISTS custom_attribution jsonb;
+-- v0.103.0: the logo library entry (anilistId:sha256) last tried, so each new or reworked logo is tried once.
+ALTER TABLE series_title_art ADD COLUMN IF NOT EXISTS library_attempt text;
+
+-- v0.103.1: an automatic AniList link named as its series by nothing but a synonym gives way to the entry named so by its
+-- own title (lib/anilist.ts fetchAniListArt, lib/matchCheck.ts). Both additive, with defaults: v0.103.0 boots on this
+-- schema and never names them.
+--
+-- rev: how many times a moved link replaced the cover and banner its old entry gave the series. The pictures made from
+-- a series' art are cached by the series, not by the address (routes/images.ts), so a new address under the old key would
+-- serve the old picture for good; the key carries rev once it is past 0, so every picture cached before stays warm.
+ALTER TABLE series_art ADD COLUMN IF NOT EXISTS rev integer NOT NULL DEFAULT 0;
+-- match_check_rule: the rule the background recheck last held every automatic link to (lib/matchCheck.ts MATCH_RULE).
+-- 1 is v0.55.7's, under which every link stored before was checked; below the current rule, the next background pass
+-- holds every automatic link to it once, checked or not.
+ALTER TABLE server_settings ADD COLUMN IF NOT EXISTS match_check_rule smallint NOT NULL DEFAULT 1;
+
+-- v0.105.0 (#406): whether this server hides 18+ until someone shows it (lib/visibility.ts adultHidingOn). On by default, so
+-- an existing install behaves exactly as before; an admin whose server only adults use turns it off. Additive: v0.104.0
+-- boots on this schema and never reads it.
+ALTER TABLE server_settings ADD COLUMN IF NOT EXISTS adult_hiding boolean NOT NULL DEFAULT true;
+
+-- v0.105.0 (#410): how many titles not in the library came after an import's first 500, so the page can say how many are
+-- left (NULL: not counted, before v0.105.0 or when a tracker read stopped at its own cap). And the titles someone skipped
+-- in an import, so the next import of the same list leaves them skipped: a tracker entry by its id, anything else by its
+-- title key (routes/admin.ts importSkipKey). Both additive: v0.104.0 boots on this schema and never reads them.
+ALTER TABLE import_batches ADD COLUMN IF NOT EXISTS left_over integer;
+CREATE TABLE IF NOT EXISTS import_skips (
+  key        text PRIMARY KEY,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+${PRIVATE_LIBRARY_DDL}
+-- Preserve the original privacy of ghost progress until its actual chapter arrives.
+ALTER TABLE listing_progress ADD COLUMN IF NOT EXISTS is_private boolean NOT NULL DEFAULT false;
+ALTER TABLE listing_progress ADD COLUMN IF NOT EXISTS incognito boolean NOT NULL DEFAULT false;
+${EXTERNAL_READER_DDL}
+${IMPORT_ENHANCEMENT_DDL}
+${DISCOVERY_HUB_DDL}
+
+-- v0.108.0 (#433): reading progress an import brings over (lib/importProgress.ts). All additive, with defaults:
+-- v0.107.0 boots on this schema and never names them.
+--   import_batches.mark_read        the intake's Mark chapters I've read. Off on every batch from before, each of
+--                                    which was started on the promise that titles alone are brought over.
+--   import_candidates.read_numbers  the chapters the backup has marked read (lib/tachibk.ts), kept for /run to mark
+--                                    once the series exists. A tracker's progress rides in tracker_links, as before.
+--   import_candidates.marked_read   how many chapters this import marked read for the row: the done line's count.
+-- The marks the import makes on chapters this server does not hold are listing_progress rows with source 'import':
+-- a person's act, as 'web' is (lib/listingProgress.ts marksByOrigin), never an echo of this server's own answer.
+ALTER TABLE import_batches    ADD COLUMN IF NOT EXISTS mark_read    boolean NOT NULL DEFAULT false;
+ALTER TABLE import_candidates ADD COLUMN IF NOT EXISTS read_numbers real[]  NOT NULL DEFAULT '{}';
+ALTER TABLE import_candidates ADD COLUMN IF NOT EXISTS marked_read  int     NOT NULL DEFAULT 0;
 `;
 
 // Serialises migrate() across processes. CREATE TABLE IF NOT EXISTS is not safe to run concurrently:

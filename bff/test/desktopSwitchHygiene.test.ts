@@ -71,6 +71,11 @@ const IS_DESKTOP_ALLOWED = new Set([
   'lib/backupExtensions.ts',
   // v0.85.0: translated pages are Docker only for now: the engine's processes do not run inside the desktop app.
   'lib/translate/engine.ts',
+  // Profiles that open at home: the desktop server is this computer's alone, so every
+  // request to it is at home.
+  'lib/clientAddr.ts',
+  // And the desktop app's own account is the desktop owner there, an ordinary account anywhere else.
+  'lib/profiles.ts',
 ]);
 
 test('UCHIYOMI_DESKTOP is read in lib/desktop.ts and nowhere else', () => {
@@ -109,8 +114,9 @@ test('server.ts keeps the server arm of every networking difference', () => {
   // Reintroduce by writing `host: '127.0.0.1'` without the ternary: the Docker image stops answering on its port.
   assert.match(s, /host: isDesktop\(\) \? '127\.0\.0\.1' : '0\.0\.0\.0'/, 'the listen host lost its server arm');
   // Reintroduce by writing `trustProxy: false`: every server behind a reverse proxy logs the proxy's address. The
-  // server arm trusts the proxies TRUST_PROXY names (v0.69.1, trustProxy.test.ts), the desktop arm nothing.
-  assert.match(s, /trustProxy: isDesktop\(\) \? false : trustProxySetting\(env\.TRUST_PROXY\),/, 'trustProxy lost its server arm');
+  // server arm trusts the proxies in force -- TRUST_PROXY, or Admin -> Settings (v0.69.1, trustProxy.test.ts;
+  // lib/clientAddr.ts trustsPeer) -- the desktop arm nothing.
+  assert.match(s, /trustProxy: isDesktop\(\) \? false : trustsPeer,/, 'trustProxy lost its server arm');
   // The guard hook only on desktop, and only once.
   // Reintroduce by calling installDesktopGuards(app) unconditionally: every server request with a Host other
   // than 127.0.0.1 would answer 421.
@@ -251,7 +257,15 @@ test('the desktop-only filesystem rules sit behind isDesktop(), with the server 
   // Reintroduce by running the lower(folder) lookup on the server: two series whose titles differ only in case
   // (on a case-sensitive disk, two real folders) would be merged into one on add.
   const add = code(read('routes/sources.ts'));
-  assert.match(add, /let folder = edition \? editionFolder\(srcDir, title, edition\.lang\) : `\$\{srcDir\}\/\$\{sanitize\(title\)\}`;\s*if \(isDesktop\(\)\) \{\s*const stored = await one<\{ folder: string \}>\(\s*'SELECT folder FROM lib_series WHERE lower\(folder\) = lower\(\$1\)/);
+  assert.match(add, /let folder = edition \? editionFolder\(srcDir, title, edition\.lang\) : `\$\{srcDir\}\/\$\{sanitize\(title\)\}`;/);
+  // Ownership/destination resolution applies on both platforms before the
+  // desktop-only spelling pass. The lookup may only reuse its selected scope.
+  const scopedFolderAt=add.indexOf('await folderForScope(scope,folder)');
+  const desktopSpellingAt=add.indexOf('if (isDesktop()) {',scopedFolderAt);
+  assert.ok(scopedFolderAt>=0 && desktopSpellingAt>scopedFolderAt,'scope resolution must precede desktop spelling');
+  assert.match(add.slice(desktopSpellingAt), /^if \(isDesktop\(\)\) \{\s*const stored = await scopedOne<\{ folder: string \}>\(\s*'SELECT s\.folder FROM lib_series s WHERE lower\(s\.folder\) = lower\(\$1\) AND __SCOPE__[^\n]+\n\s*folder = stored\?\.folder \?\? await diskSpelling\(\[DL_ROOT, LIBRARY_ROOT\], folder\);\s*\}/,
+    'desktop spelling must retain both the scoped stored lookup and disk fallback inside isDesktop');
+  assert.equal(add.match(/lower\(s\.folder\) = lower\(\$1\)/g)?.length,1,'case-folded folder reuse must not run outside the desktop branch');
   // The source's folder is made Windows-safe on Windows only; a server keeps the name as it always stored it.
   // Reintroduce by using `src.name` raw: a custom site called `Site: EN` cannot be created as a folder on
   // Windows at all. Or by sanitizing everywhere: a Linux server's `A.B.` source moves to a new folder.

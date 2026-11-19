@@ -67,6 +67,8 @@ test('a new list is named by what it narrows, else by its order', () => {
   assert.equal(suggestListName({ v: 1, sort: 'popular' }), 'Most popular');
   assert.equal(suggestListName({ v: 1, status: 'ONGOING', lib: 'lib_a', src: '-', sort: 'az' }, { lib: () => 'Manga' }), 'Ongoing · Manga · No source');
   assert.equal(suggestListName({ v: 1, anysrc: 'mdx', sort: 'az' }, { source: (id) => (id === 'mdx' ? 'MangaDex' : id) }), 'MangaDex');
+  // v0.100.0 (#338): a shelf opened from an author's name is named by them.
+  assert.equal(suggestListName({ v: 1, author: 'Elf Toon', genres: ['Action'], sort: 'az' }), 'Action · by Elf Toon');
   assert.ok(suggestListName({ v: 1, q: 'x'.repeat(300), sort: 'az' }).length <= 120, 'within the server\'s limit for a name');
 });
 
@@ -165,7 +167,7 @@ test('one query key per shape: every list, the plain answer, a list, and a rail 
     if (c.key === "['collections']") assert.equal(c.call, '/api/collections', c.where);
     if (c.call.includes('limit=')) assert.match(c.key, /'rail'\]$/, c.where);
   }
-  assert.ok(calls.some((c) => c.where.startsWith('app/series/page.tsx') && c.key === "['collections']"), 'the Add to collection sheet reads the plain answer');
+  assert.ok(calls.some((c) => c.where.startsWith('app/series/page.tsx') && c.key === "['collections', 'membership', seriesId]" && c.call.startsWith('/api/collections?seriesId=')), 'the Add to list sheet isolates per-series membership from plain list caches');
   for (const f of ['app/page.tsx', 'app/collections/page.tsx', 'components/ProfileYou.tsx']) {
     assert.ok(calls.some((c) => c.where.startsWith(f) && c.key === "['lists-all']")
       || code(read(f)).includes('useListsAll('), `${f} does not read every list`);

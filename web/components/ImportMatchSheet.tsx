@@ -17,8 +17,13 @@ import { msgOf } from '@/components/ConfirmDialog';
 import { IcCheck, IcSearch, IcX } from '@/components/icons';
 import { t as tr } from '@/lib/i18n';
 import { bookCountText } from '@/lib/format';
-import type { ImportCandidate } from '@/lib/importBatch';
+import { importProvenance, trackerProgressLine, type ImportCandidate, type ImportOrigin } from '@/lib/importBatch';
 import type { Src } from '@/lib/sourceGroups';
+import { searchPoll, searchProgressLine, searchWait, type SearchProgress } from '@/lib/searchPoll';
+import { matchPreview } from '@/lib/matchPreview';
+import { SourceSearchPages } from '@/components/SourceSearchPages';
+import { revealed } from '@/lib/adult';
+import { useAuth } from '@/lib/auth';
 
 interface SourceResult {
   source: string; sourceId: string; title: string; coverUrl?: string; inLibrary?: boolean;
@@ -27,7 +32,7 @@ interface SourceGroup { source: string; name: string; lang: string | null; resul
 /** A pick under consideration — set by tapping a result card, not yet written to the candidate row. */
 interface Pending { source: string; sourceId: string; title: string; coverUrl?: string }
 /** The fields this screen reads off GET /api/sources/detail; see routes/sources.ts for the rest. */
-interface Detail { title: string; coverUrl: string | null; count: number }
+interface Detail { title: string; coverUrl: string | null; count: number; summary?: string; genres?: string[]; status?: string; author?: string }
 
 function useDebounced<T>(value: T, ms: number) {
   const [v, setV] = useState(value);
@@ -38,35 +43,66 @@ function useDebounced<T>(value: T, ms: number) {
   return v;
 }
 
-/** Cover + title + chapter count for one pick, so "currently selected" and "new pick" render identically. */
-function MiniCard({ label, title, coverUrl, sourceId, sourceLabel, count, loading }: {
+/**
+ * Cover + title + chapter count for one pick, so "currently selected" and "new pick" render identically, and
+ * (#353) its status, genres and description, so two similarly named titles can be told apart before one is picked.
+ */
+function MiniCard({ label, title, coverUrl, sourceId, sourceLabel, count, loading, preview, author }: {
   label: string; title: string; coverUrl?: string | null;
   /** Adapter id, e.g. `sw:123` — for the cover proxy, never shown. */
   sourceId: string;
   /** Human-readable source name, for display only. */
   sourceLabel: string;
   count?: number; loading?: boolean;
+  preview?: { facts: string; summary: string };
+  author?: string;
 }) {
+  // The description starts at two lines: this card sits in the Sheet's pinned footer, twice, and the footer once
+  // took most of a 390 px screen (see `footer` below). More opens it in place.
+  const [open, setOpen] = useState(false);
+  // More only when two lines cut the description off: on one that fits it would be a button that does nothing.
+  const textRef = useRef<HTMLParagraphElement>(null);
+  const [cut, setCut] = useState(false);
+  useEffect(() => {
+    const el = textRef.current;
+    if (el && !open) setCut(el.scrollHeight > el.clientHeight + 1);
+  }, [preview?.summary, open]);
   return (
-    <div className="flex items-center gap-2.5 rounded-xl border border-ink-700 bg-ink-900/50 p-2">
-      <Img src={coverUrl ? sourceCover(sourceId, coverUrl) : ''} alt="" fallbackSrc={coverUrl || undefined}
-        className="h-16 w-11 shrink-0 rounded" />
-      <div className="min-w-0 flex-1">
-        <p className="text-[10px] font-semibold uppercase tracking-wider text-fog-500">{label}</p>
-        <p className="truncate text-sm text-fog-100">{title}</p>
-        <p className="truncate text-[11px] text-fog-400">
-          {sourceLabel}{loading ? ` · ${tr('checking…')}` : count != null ? ` · ${bookCountText(count)}` : ''}
-        </p>
+    <div className="rounded-xl border border-ink-700 bg-ink-900/50 p-2">
+      <div className="flex items-center gap-2.5">
+        <Img src={coverUrl ? sourceCover(sourceId, coverUrl) : ''} alt="" fallbackSrc={coverUrl || undefined}
+          className="h-16 w-11 shrink-0 rounded" />
+        <div className="min-w-0 flex-1">
+          <p className="text-[10px] font-semibold uppercase tracking-wider text-fog-500">{label}</p>
+          <p className="line-clamp-2 text-sm text-fog-100" dir="auto">{title}</p>
+          {author && <p className="line-clamp-2 text-[11px] text-fog-400" dir="auto">{tr('by {author}', { author })}</p>}
+          <p className="truncate text-[11px] text-fog-400">
+            {sourceLabel}{loading ? ` · ${tr('checking…')}` : count != null ? ` · ${bookCountText(count)}` : ''}
+          </p>
+          {preview?.facts && <p className="truncate text-[11px] text-fog-500">{preview.facts}</p>}
+        </div>
       </div>
+      {preview?.summary && (
+        <div className="mt-1.5 text-[11px] leading-relaxed text-fog-400">
+          <p ref={textRef} className={open ? 'max-h-40 overflow-y-auto' : 'line-clamp-2'} data-lenis-prevent>{preview.summary}</p>
+          {(cut || open) && (
+            <button type="button" onClick={() => setOpen((v) => !v)} aria-expanded={open} className="text-accent">
+              {open ? tr('Less') : tr('More')}
+            </button>
+          )}
+        </div>
+      )}
     </div>
   );
 }
 
-export function ImportMatchSheet({ batchId, candidate, onClose }: {
+export function ImportMatchSheet({ batchId, candidate, onClose, origin }: {
   batchId: string;
   candidate: ImportCandidate;
   onClose: () => void;
+  origin?: ImportOrigin;
 }) {
+  const ownerId = useAuth().user?.id ?? null;
   const toast = useToast();
   const qc = useQueryClient();
   const [term, setTerm] = useState(candidate.backup_title);
@@ -80,17 +116,26 @@ export function ImportMatchSheet({ batchId, candidate, onClose }: {
 
   useEffect(() => { inputRef.current?.focus(); }, []);
 
+  // Polled while sources are still being asked (#353), as Discover's search is: the first answer holds only the
+  // sources that beat the server's grace, and a slower one used to never show here at all.
   const { data, isFetching, error } = useQuery({
     queryKey: ['import-search-source', debounced],
-    queryFn: () => api<{ content: SourceGroup[] }>(`/api/sources/search-all?groupBy=source&q=${encodeURIComponent(debounced)}`),
+    queryFn: ({ signal, queryKey, client }) => api<{ content: SourceGroup[] } & SearchProgress>(
+      revealed(`/api/sources/search-all?groupBy=source&q=${encodeURIComponent(debounced)}&wait=${searchWait(client.getQueryState(queryKey)?.dataUpdateCount ?? 0)}`),
+      { signal },
+    ),
     enabled: debounced.length >= 2,
     staleTime: 30_000,
+    refetchInterval: (qy) => searchPoll(qy.state.data),
   });
+  const progress = searchProgressLine(data);
 
   // Source display names for the preview cards -- the candidate row only carries the source id.
+  // Every source, so an adult one is named rather than shown as its id (#405); its own key, so a revealed list is never
+  // the one Discover reads.
   const { data: sourcesData } = useQuery({
-    queryKey: ['sources'],
-    queryFn: () => api<{ content: Src[] }>('/api/sources'),
+    queryKey: ['sources', 'all'],
+    queryFn: () => api<{ content: Src[] }>(revealed('/api/sources')),
     staleTime: 30_000,
   });
   const sourceName = (id: string | null | undefined): string => (id && sourcesData?.content.find((s) => s.id === id)?.name) || id || '';
@@ -113,7 +158,7 @@ export function ImportMatchSheet({ batchId, candidate, onClose }: {
   const delta = currentDetail.data && pendingDetail.data ? pendingDetail.data.count - currentDetail.data.count : null;
 
   const patch = async (body: Record<string, unknown>) => {
-    await api(`/api/admin/import/candidates/${candidate.id}`, { method: 'PATCH', json: body });
+    await api(`/api/admin/import/candidates/${candidate.id}`, { method: 'PATCH', json: body, expectedOwnerId: ownerId });
     await qc.invalidateQueries({ queryKey: ['import-batch', batchId] });
   };
 
@@ -142,6 +187,15 @@ export function ImportMatchSheet({ batchId, candidate, onClose }: {
   };
 
   const groups = data?.content ?? [];
+  const provenance=importProvenance(candidate);
+  const trackerRows=candidate.tracker_links?.length ? candidate.tracker_links : candidate.tracker && candidate.progress != null ? [{provider:candidate.tracker,progress:candidate.progress}] : [];
+  const confirmCurrent=async()=> {
+    if(!candidate.match_source || !candidate.match_source_id) return;
+    setBusy('__confirm');
+    try { await patch({decision:'manual',source:candidate.match_source,sourceId:candidate.match_source_id,title:candidate.match_title || candidate.backup_title,coverUrl:candidate.match_cover || undefined}); onClose(); }
+    catch(error) { toast(msgOf(error,tr('Could not save that pick')),'error'); }
+    setBusy(null);
+  };
 
   // The pick comparison and its buttons live in the Sheet's pinned FOOTER, not in the scroller. They used to
   // sit in one sticky block with the search field, and at 390 px that block was 250-330 px of a 75 vh sheet:
@@ -150,21 +204,25 @@ export function ImportMatchSheet({ batchId, candidate, onClose }: {
   // what is being compared, and Use this pick / Skip, stay at the bottom, clear of the phone nav.
   const footer = (
     <div className="space-y-2">
+      {/* Long descriptions must not consume the result list or push the confirmation buttons off screen. */}
+      <div className="max-h-[32svh] space-y-2 overflow-y-auto overscroll-contain" data-lenis-prevent data-match-comparison>
+      {provenance && <p className="text-[11px] text-fog-400" data-import-provenance>{provenance}</p>}
+      {trackerRows.map((link,i)=><p key={i} className="text-[11px] text-fog-400">{trackerProgressLine(link.provider,link.progress,origin==='backup')}</p>)}
       {candidate.match_source && candidate.match_source_id ? (
         <MiniCard label={tr('Currently selected')} title={candidate.match_title || candidate.backup_title}
           coverUrl={candidate.match_cover} sourceId={candidate.match_source!} sourceLabel={sourceName(candidate.match_source)}
-          count={currentDetail.data?.count} loading={currentDetail.isFetching} />
+          count={currentDetail.data?.count} loading={currentDetail.isFetching} preview={matchPreview(currentDetail.data)} author={currentDetail.data?.author} />
       ) : (
         <div className="rounded-xl border border-dashed border-ink-700 px-3 py-2.5 text-center text-[11px] text-fog-500">
           {candidate.decision === 'skip' ? tr('Skipped — nothing will be imported for this title.') : tr('No match yet — pick one from the search results.')}
         </div>
       )}
 
-      {pending ? (
+      {pending && (
         <>
-          <MiniCard label={tr('New pick')} title={pending.title} coverUrl={pending.coverUrl}
+          <MiniCard key={`${pending.source}:${pending.sourceId}`} label={tr('New pick')} title={pending.title} coverUrl={pending.coverUrl}
             sourceId={pending.source} sourceLabel={sourceName(pending.source)}
-            count={pendingDetail.data?.count} loading={pendingDetail.isFetching} />
+            count={pendingDetail.data?.count} loading={pendingDetail.isFetching} preview={matchPreview(pendingDetail.data)} author={pendingDetail.data?.author} />
           {delta != null && (
             <p className={`text-center text-[11px] ${delta === 0 ? 'text-fog-500' : delta > 0 ? 'text-emerald-400' : 'text-amber-400'}`}>
               {delta === 0 ? tr('Same chapter count as the current pick')
@@ -174,6 +232,10 @@ export function ImportMatchSheet({ batchId, candidate, onClose }: {
                 : tr('{n} fewer chapters than the current pick', { n: Math.abs(delta) })}
             </p>
           )}
+        </>
+      )}
+      </div>
+      {pending ? (
           <div className="flex gap-2">
             <button onClick={() => setPending(null)} disabled={busy === '__confirm'} className="chip flex-1 py-1.5 text-xs disabled:opacity-50">
               {tr('Cancel')}
@@ -182,9 +244,9 @@ export function ImportMatchSheet({ batchId, candidate, onClose }: {
               {busy === '__confirm' ? tr('Working…') : tr('Use this pick')}
             </button>
           </div>
-        </>
       ) : (
         <div className="flex gap-2">
+          {candidate.ambiguous && candidate.decision==='auto' && <button type="button" onClick={confirmCurrent} disabled={!!busy} className="btn-accent flex-1 text-xs">{tr('Confirm this match')}</button>}
           <button onClick={skip} disabled={!!busy} className="chip flex-1 py-1.5 text-xs disabled:opacity-50">
             {busy === '__skip' ? tr('Working…') : tr('Skip this one')}
           </button>
@@ -219,8 +281,14 @@ export function ImportMatchSheet({ batchId, candidate, onClose }: {
             </button>
           )}
         </div>
+        {!!candidate.alt_titles?.length && <div className="mt-2 flex flex-wrap gap-1" data-import-alternates>{[candidate.backup_title,...candidate.alt_titles].map(title=><button key={title} type="button" onClick={()=>setTerm(title)} className="chip max-w-full truncate text-[11px]" dir="auto">{title}</button>)}</div>}
       </div>
 
+      {/* Who the search is still waiting on (#353): the rails below fill in as they answer. Polite, so a screen reader
+          hears it change without the focus moving. */}
+      {debounced.length >= 2 && progress && (
+        <p className="mb-2 px-0.5 text-xs tabular-nums text-fog-500" aria-live="polite" data-search-progress>{progress}</p>
+      )}
       {debounced.length < 2 ? (
         <p className="py-10 text-center text-sm text-fog-500">{tr('Type at least 2 characters to search.')}</p>
       ) : error ? (
@@ -251,8 +319,10 @@ export function ImportMatchSheet({ batchId, candidate, onClose }: {
                   so a two-line title lifted its cover 14 px, wrapping into a 730 px block at 390 px with
                   nothing to scroll. `pb-3`, not `hide-scrollbar`: ScrollRail stops hiding the bar on purpose
                   (see its header) and wants room for it under the cards. */}
-              <ScrollRail className="flex gap-2.5 pb-3">
-                {g.results.map((r) => {
+              <SourceSearchPages source={g.source} query={debounced} initial={g.results}
+                pageable={!!sourcesData?.content.find((s) => s.id === g.source)?.searchPages}>
+                {(results) => <ScrollRail className="flex gap-2.5 pb-3">
+                {results.map((r) => {
                   const selected = pending?.source === g.source && pending?.sourceId === r.sourceId;
                   return (
                     <button
@@ -280,7 +350,8 @@ export function ImportMatchSheet({ batchId, candidate, onClose }: {
                     </button>
                   );
                 })}
-              </ScrollRail>
+              </ScrollRail>}
+              </SourceSearchPages>
             </div>
           ))}
         </div>

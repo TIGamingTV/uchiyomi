@@ -176,39 +176,35 @@ test('Discover reads ?q= once, inside a Suspense boundary, opens on that search,
   assert.match(inner, /setMode\('search'\);\s*writeQ\(next\);/, 'a search does not write its term');
   assert.match(inner, /const backToNewest = \(\) => \{ setQ\(''\); setMode\('newest'\); writeQ\(''\); \};/, 'back to Newest leaves ?q= behind');
   // An account the server refuses is not asked, even when the address says to search.
-  assert.match(inner, /enabled: mode === 'search' && !!term && mayAdd,/);
+  assert.match(inner, /enabled: tabReady && tab === 'sources' && mode === 'search' && !!term && mayAdd,/);
 });
 
-test('Discover\'s AniList rails: Because you read above the wall, manhwa, manga and manhua under it, through one rail', () => {
+test('Discover keeps personal catalog queries separate from the source browser and isolates their cache by account/reveal', () => {
   const src = code(read('app/discover/page.tsx'));
-  // The countries are the server's (bff lib/anilist.ts TREND_COUNTRIES), each with its own words declared for the
-  // translators, in the same order.
+  const hub = code(read('components/DiscoveryHub.tsx'));
   assert.match(src, /const TREND_RAILS = \['KR', 'JP', 'CN'\] as const;/);
   assert.match(read('../bff/src/lib/anilist.ts'), /export const TREND_COUNTRIES = \['KR', 'JP', 'CN'\] as const;/);
-  assert.match(src, /const TREND_LABELS = keys\('Trending manhwa', 'Trending manga', 'Trending manhua'\);/);
-  // One key per country: Korea's, the hero's, as a literal (queryKeys.test.ts holds it to its endpoint); the others by
-  // the country they ask for, while browsing. Reintroduce a shared key: Japan's answer paints Korea's rail.
-  assert.match(src, /queryKey: \['discover-trending', 'KR'\],\s*queryFn: \(\) => api<\{ content: Trending\[\] \}>\('\/api\/discover\/trending\?country=KR'\),/);
-  assert.match(src, /queries: TREND_RAILS\.slice\(1\)\.map\(\(country\) => \(\{\s*queryKey: \['discover-trending', country\],\s*queryFn: \(\) => api<\{ content: Trending\[\] \}>\(`\/api\/discover\/trending\?country=\$\{country\}`\),\s*enabled: mayAdd && mode === 'newest',/);
-  assert.match(src, /queryKey: \['discover-because'\],\s*queryFn: \(\) => api<[^>]*>\('\/api\/discover\/because'\),\s*enabled: mayAdd && mode === 'newest',/);
-  // Because you read: above the wall, while browsing, only with something on it, titled with the existing key.
-  const because = src.indexOf('<AniListRail kind="because"');
-  const wall = src.indexOf("{mode === 'search' ? tr('Results across your sources')");
-  const trending = src.indexOf('{mode === \'newest\' && TREND_RAILS.map((country, i) =>');
-  assert.ok(because > 0 && because < wall, 'Because you read is not above the wall');
-  assert.ok(trending > wall, 'the trending rails are not under the wall');
-  assert.match(src, /\{mode === 'newest' && because\?\.seed && becauseRail\.length > 0 && \(\s*<AniListRail kind="because"/);
-  assert.match(src, /title=\{tr\('Because you read \{title\}', \{ title: `\\u2068\$\{because\.seed\.title\}\\u2069` \}\)\}/, 'the title is not isolated');
-  assert.match(src, /trendRails\[i\]\.length > 0 && \(\s*<AniListRail key=\{country\} kind=\{country\} title=\{tr\(TREND_LABELS\[i\]\)\} items=\{trendRails\[i\]\} onPick=\{pickRail\} \/>/);
-  // Every rail is the one AniListRail, and its one ScrollRail (rails.test.ts holds the count).
-  assert.equal((src.match(/<AniListRail\b/g) ?? []).length, 2);
-  assert.match(src, /function AniListRail\([\s\S]*?<ScrollRail label=\{title\}/);
-  // A card opens the add dialog, and an added card leaves its rail -- the rail it came from, by its AniList entry, and
-  // only that one: the ref is forgotten when the dialog closes. Reintroduce the bare setSeed: the card stays.
-  assert.match(src, /const pickRail = \(t: Trending\) => \{ fromKey\.current = null; fromRail\.current = railKey\(t\); setSeed\(\{ kind: 'trending', title: t\.title \}\); \};/);
+  assert.match(src, /queryKey: \['discover-trending', 'KR', user\?\.id, adultOn\]/);
+  assert.match(src, /queryKey: \['discover-trending', country, user\?\.id, adultOn\]/);
+  assert.match(src, /queryKey: \['discover-because', user\?\.id, adultOn\]/);
+  assert.match(src, /queryKey: \['discover-recommendations', user\?\.id, adultOn\]/);
+  assert.match(src, /enabled: mayAdd && tabReady && tab === 'for-you'/);
+  assert.match(src, /tabReady && tab === 'for-you' && user\?\.id && <section role="tabpanel"/);
+  assert.match(src, /tabReady && tab === 'sources' && <section role="tabpanel"/);
+  const sourcePanel = src.slice(src.indexOf("{tabReady && tab === 'sources' && <section"));
+  assert.match(sourcePanel, /<SourceLatest/);
+  assert.doesNotMatch(sourcePanel, /<ForYouBand|<DiscoverHero|<DiscoveryHub/, 'personal rails must not push down the source feed');
+  assert.match(hub, /<ForYouBand picks=\{filteredPicks\}/);
+  assert.match(hub, /mixCatalog\(groups\.map/);
+  // A title preview precedes explicit source finding; opening a catalog card alone must not scrape sources.
+  assert.match(hub, /<DiscoverHero[^>]*onPick=\{\(t\) => setPreview\(t as DiscoveryItem\)\}/);
+  assert.match(hub, /onFind\(item\)/);
+  assert.match(src, /onFind=\{pickRail\}/);
+  assert.match(src, /tr\('Because you read \{title\}', \{ title: `\\u2068\$\{pk\.from\.because\}\\u2069` \}\)/);
+  assert.match(src, /fromRail\.current = railKey\(t\)/);
   assert.match(src, /useEffect\(\(\) => \{ if \(!seed\) fromRail\.current = null; \}, \[seed\]\);/);
-  assert.match(src, /const railCard = fromRail\.current;\s*if \(railCard\) setRailAdded\(\(prev\) => new Set\(prev\)\.add\(railCard\)\);/);
-  assert.match(src, /const becauseRail = useMemo\(\(\) => \(because\?\.content \?\? \[\]\)\.filter\(\(t\) => !railAdded\.has\(railKey\(t\)\)\), \[because, railAdded\]\);/);
+  assert.match(src, /if \(railCard\) setRailAdded\(\(prev\) => new Set\(prev\)\.add\(railCard\)\)/);
+  assert.match(src, /\.filter\(\(t\) => !railAdded\.has\(railKey\(t\)\)\)/, 'an added catalog title remains in the hub');
 });
 
 test('the new words are in all eight languages, and none is an English copy', () => {

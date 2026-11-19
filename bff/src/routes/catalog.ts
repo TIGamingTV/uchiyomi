@@ -1,3 +1,4 @@
+import { sharedActivitySql } from '../lib/contentScope';
 import type { FastifyInstance, FastifyRequest } from 'fastify';
 import { z } from 'zod';
 import { q, one } from '../lib/db';
@@ -6,10 +7,11 @@ import { junkPagesFor, setPageOverride } from '../lib/junkPages';
 import { spreadsFor } from '../lib/spreadMeasure';
 import { marksFor, marksJson, setMark } from '../lib/spreadMarks';
 import { komgaImage } from '../lib/komga';
+import { otherTitlesFor } from '../lib/otherTitles';
 import { content as komga, NATIVE_PROGRESS, OWNED } from '../lib/backend';
 import { UnsupportedFilter, owned } from '../lib/ownedCatalog';
 import { cleanDescription } from '../lib/htmlText';
-import { viewCtxFor, SYSTEM_CTX, type ViewCtx, hideAdult, browsableIds, browsable, Params, adultFilterConfigured, seriesVisible } from '../lib/visibility';
+import { viewCtxFor, SYSTEM_CTX, type ViewCtx, hideAdult, browsableIds, browsable, Params, adultFilterConfigured, adultHidingOn, seriesVisible } from '../lib/visibility';
 
 /** The viewer attached by the preHandler above. */
 const vc = (req: FastifyRequest): ViewCtx => (req as any).viewCtx as ViewCtx;
@@ -20,8 +22,9 @@ import { sourceLabel } from '../lib/health';
 import { actsAsAdmin, authenticate, roleOf, userIdOf } from '../lib/auth';
 import { warmHeroBackdrops } from './images';
 import { writeProgress, reachedEnd } from '../lib/progress';
-import { onDeckPicks, type DeckPick } from '../lib/onDeck';
+import { onDeckPicks, keepReadingHidden, type DeckPick } from '../lib/onDeck';
 import { enrichSeries, newSinceSeen, seenCounts, seriesSeen } from '../lib/enrich';
+import { queueTitleLogos } from '../lib/titleArt';
 import { seriesSourcesFor } from '../lib/seriesSources';
 import { readSeriesPrefs, effectivePrefsFor } from '../lib/scanlatorPrefs';
 import { listingFor, type ListingCopy } from '../lib/seriesListing';
@@ -177,9 +180,11 @@ export default async function catalogRoutes(app: FastifyInstance) {
   // toggle renders only where there is something to reveal, and `/api/libraries` can only say that about
   // libraries -- so without this, an install whose only adult content is a genre on the 18+ filter hid it
   // with no off switch on the Library or Home page. A boolean, never the lists themselves.
+  // `hiding` (#406): whether this server hides 18+ at all. Off, there is nothing to reveal, `configured` is false, and
+  // the web app drops every Show 18+ button and the banner.
   app.get('/api/adult-filter', async (req) => {
     const ctx = await viewCtxFor(userIdOf(req), roleOf(req), { hideAdult: true });
-    return { configured: adultFilterConfigured(ctx) };
+    return { configured: adultFilterConfigured(ctx), hiding: adultHidingOn() };
   });
 
   // No re-sort. SQL already ordered these by the database collation; sorting again in JS is byte order, so
@@ -222,7 +227,7 @@ export default async function catalogRoutes(app: FastifyInstance) {
     // so the rail quietly came back short for anyone who could not see one of the twelve -- and now also for
     // anyone hiding 18+.
     const rows = await q<{ series_id: string }>(
-      `SELECT series_id FROM reading_events WHERE created_at > now() - interval '14 days'
+      `SELECT e.series_id FROM reading_events e LEFT JOIN lib_series s ON s.id=e.series_id WHERE e.origin='web' AND ${sharedActivitySql('s','e')} AND e.created_at > now() - interval '14 days'
        GROUP BY series_id ORDER BY count(*) DESC LIMIT 60`,
     );
     const ok = await browsableIds(rows.map((r) => r.series_id), vc(req));
@@ -235,9 +240,9 @@ export default async function catalogRoutes(app: FastifyInstance) {
   app.get('/api/leaderboard', async () => {
     const rows = await q(
       `SELECT u.id, u.display_name, u.username, u.avatar,
-              count(DISTINCT e.book_id) FILTER (WHERE e.completed AND e.created_at > now() - interval '7 days')::int AS week,
-              count(DISTINCT e.book_id) FILTER (WHERE e.completed)::int AS total
-       FROM users u LEFT JOIN reading_events e ON e.user_id = u.id
+              count(DISTINCT e.book_id) FILTER (WHERE e.origin='web' AND ${sharedActivitySql('s','e')} AND e.completed AND e.created_at > now() - interval '7 days')::int AS week,
+              count(DISTINCT e.book_id) FILTER (WHERE e.origin='web' AND ${sharedActivitySql('s','e')} AND e.completed)::int AS total
+       FROM users u LEFT JOIN reading_events e ON e.user_id = u.id LEFT JOIN lib_series s ON s.id=e.series_id
        GROUP BY u.id ORDER BY week DESC, total DESC`,
     );
     return { content: rows };
@@ -275,6 +280,7 @@ export default async function catalogRoutes(app: FastifyInstance) {
     const picks = merged.slice(0, 7);
     // pre-generate both hero frames for today's picks so the carousel never waits on sharp/remote fetches
     void warmHeroBackdrops(picks.map((s) => s.id));
+    await queueTitleLogos(picks.map((s) => s.id));
     return { content: await enrichSeries(req, picks) };
   });
 
@@ -338,6 +344,39 @@ export default async function catalogRoutes(app: FastifyInstance) {
     };
   });
 
+  // "Remove from Keep reading": the series stays in the library and only leaves that row, until it is read again.
+  app.put('/api/keep-reading/:seriesId', async (req, reply) => {
+    const uid = userIdOf(req);
+    const { seriesId } = req.params as { seriesId: string };
+    const { hidden } = z.object({ hidden: z.boolean() }).parse(req.body);
+    if (hidden) {
+      // Only a series this person may see: an id from a library they were not granted is a 404, not a stored row.
+      if (!(await browsableIds([seriesId], vc(req))).has(seriesId)) return reply.code(404).send({ error: 'not_found' });
+      await q(`INSERT INTO keep_reading_hidden (user_id, series_id) VALUES ($1, $2)
+               ON CONFLICT (user_id, series_id) DO UPDATE SET hidden_at = now()`, [uid, seriesId]);
+    } else {
+      await q('DELETE FROM keep_reading_hidden WHERE user_id = $1 AND series_id = $2', [uid, seriesId]);
+    }
+    return { ok: true, hidden };
+  });
+
+  const keepReadingHiddenCount = async (req: FastifyRequest, uid: string): Promise<number> => {
+    const rows = await keepReadingHidden(uid).catch(() => []);
+    if (!rows.length) return 0;
+    return (await browsableIds(rows.map((r) => r.seriesId), vc(req))).size;
+  };
+
+  // What is out of Keep reading right now, for the list that puts it back.
+  app.get('/api/keep-reading/hidden', async (req) => {
+    const rows = await keepReadingHidden(userIdOf(req));
+    const shown = await browsableIds(rows.map((r) => r.seriesId), vc(req));
+    const content = (await Promise.all(rows.filter((r) => shown.has(r.seriesId)).map(async (r) => {
+      const s: any = await komga.series(vc(req), r.seriesId).catch(() => null);
+      return s ? { seriesId: r.seriesId, title: s.metadata?.title || s.name, hiddenAt: r.hiddenAt } : null;
+    }))).filter(Boolean);
+    return { content };
+  });
+
   app.get('/api/home', async (req) => {
     const uid = userIdOf(req);
     const admin = NATIVE_PROGRESS && actsAsAdmin(req);
@@ -351,7 +390,12 @@ export default async function catalogRoutes(app: FastifyInstance) {
 
     let onDeckP: Promise<any[]>;
     if (admin) {
-      onDeckP = komga.booksOnDeck(vc(req), 0, 20).then((r: any) => r.content).catch(() => []);
+      onDeckP = komga.booksOnDeck(vc(req), 0, 20).then((r: any) => r.content).catch(() => [])
+        .then(async (books: any[]) => {
+          if (!books.length) return books;
+          const hide = new Set((await keepReadingHidden(uid).catch(() => [])).map((r) => r.seriesId));
+          return hide.size ? books.filter((b) => !hide.has(b.seriesId)) : books;
+        });
     } else {
       // The pick itself is lib/onDeck.ts (v0.61.0: shared with Pick back up and the OPDS Keep reading shelf).
       onDeckP = onDeckPicks(uid, vc(req), { window: 'recent', limit: ON_DECK_LIMIT }).then(resolvePicks);
@@ -431,6 +475,8 @@ export default async function catalogRoutes(app: FastifyInstance) {
       // v0.61.0: Home draws each only when it has something in it.
       pickUp,
       gems: await enrichSeries(req, (gems as any).content ?? []),
+      // How many series are out of Keep reading by the reader's own choice: the rail's "Hidden" list shows when it is above 0.
+      keepReadingHidden: await keepReadingHiddenCount(req, uid),
       updatesCount,
     };
   });
@@ -457,6 +503,7 @@ export default async function catalogRoutes(app: FastifyInstance) {
   app.get('/api/series/:id', async (req) => {
     const { id } = req.params as { id: string };
     const series = await komga.series(vc(req), id);
+    await queueTitleLogos([id]);
     // opening a series marks its new chapters as seen -- in every chapter row, hidden notices included (lib/enrich.ts
     // seenCounts)
     await q(
@@ -721,6 +768,19 @@ export default async function catalogRoutes(app: FastifyInstance) {
       else if (byId.has(e.seriesId)) content.push({ relation: e.relation, series: byId.get(e.seriesId) });
     }
     return { lookups: r.lookups, content };
+  });
+
+  /**
+   * The English, romanised and Japanese titles of the series' AniList entry, for the series page: `{titles}`, null when
+   * the series has no checked AniList link, its library's lookups are off, or AniList has no names for it. Kept
+   * (lib/otherTitles.ts), so most reads ask nothing. Resolved through the series' own visibility first: a 404 for a
+   * series this viewer may not open.
+   */
+  app.get('/api/series/:id/other-titles', async (req) => {
+    const { id } = req.params as { id: string };
+    await komga.series(vc(req), id);
+    if (!OWNED) return { titles: null };
+    return { titles: await otherTitlesFor(id) };
   });
 
   app.get('/api/series/:id/books', async (req) => {

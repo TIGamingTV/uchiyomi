@@ -8,6 +8,8 @@ import { AuthProvider } from '@/lib/auth';
 import { ToastProvider } from '@/components/Toast';
 import { I18nProvider } from '@/lib/I18nProvider';
 import { flushOutbox } from '@/lib/downloads';
+import { nativeHost, usesNativeCache } from '@/lib/native';
+import { setSmoothScroll } from '@/lib/smoothScroll';
 
 export function Providers({ children }: { children: ReactNode }) {
   const [qc] = useState(
@@ -22,6 +24,9 @@ export function Providers({ children }: { children: ReactNode }) {
         },
       }),
   );
+
+  // A verified native UI generation is confirmed only after React has mounted.
+  useEffect(() => { nativeHost()?.ready?.(); }, []);
 
   // Real viewport height for the immersive reader (mobile URL-bar proof).
   useEffect(() => {
@@ -38,7 +43,7 @@ export function Providers({ children }: { children: ReactNode }) {
   // Register the service worker (PWA + offline) and keep it self-updating — installed iOS PWAs are sticky,
   // so we proactively check for a new worker on launch/foreground and reload once it takes control.
   useEffect(() => {
-    if (!('serviceWorker' in navigator)) return;
+    if (usesNativeCache() || !('serviceWorker' in navigator)) return;
     let reloaded = false;
     const onController = () => { if (!reloaded) { reloaded = true; window.location.reload(); } };
     navigator.serviceWorker.addEventListener('controllerchange', onController);
@@ -74,6 +79,7 @@ export function Providers({ children }: { children: ReactNode }) {
     if (reduceEffects || effectsReduced()) return;
     if (window.matchMedia('(prefers-reduced-motion: reduce)').matches) return;
     const lenis = new Lenis({ duration: 1.05, smoothWheel: true });
+    setSmoothScroll(lenis);
     // Lenis animates nothing but a wheel turn (touch scrolls natively), so a device with no mouse or trackpad starts the
     // frame loop at its first wheel, never before. A phone ran this requestAnimationFrame every frame of every page -- the
     // reader's included -- for nothing: a main-thread wake-up 60 or 120 times a second that only ever returned. A mouse
@@ -92,6 +98,7 @@ export function Providers({ children }: { children: ReactNode }) {
       window.removeEventListener('wheel', start);
       fine.removeEventListener('change', start);
       cancelAnimationFrame(raf);
+      setSmoothScroll(null);
       lenis.destroy();
     };
   }, [reduceEffects]);
@@ -104,22 +111,25 @@ export function Providers({ children }: { children: ReactNode }) {
     };
     window.addEventListener('beforeinstallprompt', onPrompt);
     const flush = () => flushOutbox().catch(() => {});
+    const foreground = () => { if (document.visibilityState === 'visible') flush(); };
     window.addEventListener('online', flush);
+    document.addEventListener('visibilitychange', foreground);
     const t = setTimeout(flush, 4000);
     return () => {
       window.removeEventListener('beforeinstallprompt', onPrompt);
       window.removeEventListener('online', flush);
+      document.removeEventListener('visibilitychange', foreground);
       clearTimeout(t);
     };
   }, []);
 
   return (
     <QueryClientProvider client={qc}>
-      <I18nProvider>
-        <ToastProvider>
-          <AuthProvider>{children}</AuthProvider>
-        </ToastProvider>
-      </I18nProvider>
+      <AuthProvider>
+        <I18nProvider>
+          <ToastProvider>{children}</ToastProvider>
+        </I18nProvider>
+      </AuthProvider>
     </QueryClientProvider>
   );
 }

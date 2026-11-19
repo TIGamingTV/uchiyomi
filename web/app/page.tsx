@@ -1,7 +1,7 @@
 'use client';
 import { ScrollRail, CARD_RAIL } from '@/components/ScrollRail';
 import Link from 'next/link';
-import { Fragment, ReactNode, useEffect, useState } from 'react';
+import { Fragment, ReactNode, useCallback, useEffect, useState } from 'react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { api, img } from '@/lib/api';
 import { HomePayload, Series } from '@/lib/types';
@@ -10,9 +10,11 @@ import { useAuth } from '@/lib/auth';
 import { triggerRefresh } from '@/lib/refresh';
 import { applyCover, clearCover } from '@/lib/theme';
 import { ART } from '@/lib/art';
-import { Img, ProgressBar, RailSkeleton, SectionTitle, Reveal } from '@/components/ui';
+import { Img, ProgressBar, RailSkeleton, SectionTitle, Reveal, useWideViewport } from '@/components/ui';
 import { SeriesCard, ContinueCard } from '@/components/cards';
+import { KeepReadingHidden } from '@/components/KeepReadingHidden';
 import { HeroCarousel } from '@/components/HeroCarousel';
+import { useTitleArtPolling } from '@/lib/useTitleArtPolling';
 import { useArtUnderChrome } from '@/lib/overArt';
 import { AdultToggle, useAdultFilterConfigured } from '@/components/AdultToggle';
 import { IcPlay, IcSparkle, IcRefresh, IcBell } from '@/components/icons';
@@ -38,7 +40,7 @@ type CollectionRow = ListRow;
  * (lib/lists.ts), a smart one or one someone shares included, from ['lists-all'].
  */
 function CollectionRails() {
-  const { user } = useAuth();
+  const { user, status: authStatus } = useAuth();
   const { data } = useListsAll(true, 300_000);
   const all = data?.content ?? [];
   const saved = user?.settings?.homeCollections;
@@ -92,7 +94,7 @@ function greeting(name?: string) {
 }
 
 export default function HomePage() {
-  const { user } = useAuth();
+  const { user, status: authStatus } = useAuth();
   const [quickOpen, setQuickOpen] = useState(false);
   const qc = useQueryClient();
   // A second reason for the 18+ reveal to render: a genre or source on the admin's 18+ filter.
@@ -105,6 +107,10 @@ export default function HomePage() {
   const { data: foryou } = useQuery({ queryKey: ['foryou'], queryFn: () => api<{ genres: string[]; content: Series[] }>('/api/foryou'), staleTime: 600000, enabled: on('forYou') });
   const { data: trending } = useQuery({ queryKey: ['trending'], queryFn: () => api<{ content: Series[] }>('/api/trending'), staleTime: 300000, enabled: on('top10') });
   const { data: featured, isPending: featuredPending } = useQuery({ queryKey: ['featured'], queryFn: () => api<{ content: Series[] }>('/api/featured'), staleTime: 600000 });
+  const refetchTitleArt = useCallback(() => qc.refetchQueries({ queryKey: ['featured'], exact: true }), [qc]);
+  // The hero's title logo is a computer's (v0.102.2, components/HeroTitle.tsx `logo`): a phone has none to wait for.
+  const wideHero = useWideViewport();
+  useTitleArtPolling('featured', featured?.content ?? [], refetchTitleArt, authStatus !== 'offline' && wideHero);
 
   // "Because you read X" — seed a named recommendation rail from what you're currently reading (else a top favorite)
   const seed = data?.onDeck?.[0]
@@ -141,12 +147,15 @@ export default function HomePage() {
     switch (key) {
       case 'continue':
         // Keep reading. Every rail says pt-8; the list below gives the first one shown pt-4, whichever it is.
-        return (data?.onDeck?.length ?? 0) > 0 && (
+        // Everything removed from it still draws the title and its Hidden key, which is the way to put one back.
+        return ((data?.onDeck?.length ?? 0) > 0 || (data?.keepReadingHidden ?? 0) > 0) && (
           <section className="pt-8">
-            <SectionTitle>{tr('Keep reading')}</SectionTitle>
-            <ScrollRail label={tr('Keep reading')} className={CARD_RAIL}>
-              {data!.onDeck.map((b, i) => <ContinueCard key={b.id} book={b} eager={i < 4} />)}
-            </ScrollRail>
+            <SectionTitle action={<KeepReadingHidden count={data?.keepReadingHidden ?? 0} />}>{tr('Keep reading')}</SectionTitle>
+            {(data?.onDeck?.length ?? 0) > 0 && (
+              <ScrollRail label={tr('Keep reading')} className={CARD_RAIL}>
+                {data!.onDeck.map((b, i) => <ContinueCard key={b.id} book={b} eager={i < 4} keepReading />)}
+              </ScrollRail>
+            )}
           </section>
         );
       case 'forYou':
@@ -290,13 +299,13 @@ export default function HomePage() {
       {(featured?.content?.length ?? 0) > 0 ? (
         <HeroCarousel slides={featured!.content} />
       ) : isLoading || featuredPending ? (
-        <div className="skeleton bleed-lg under-topbar under-phone-header h-[min(150vw,82svh)] lg:h-[62vh] lg:min-h-[440px]" />
+        <div data-home-hero-skeleton className="skeleton bleed-lg under-topbar under-phone-header h-[min(150vw,82svh)] lg:h-[72vh]" />
       ) : (
         <div className="bleed-lg under-topbar under-phone-header relative h-[58vh] min-h-[420px] overflow-hidden lg:h-[70vh]">
           {/* eslint-disable-next-line @next/next/no-img-element */}
           <img src={ART.hero} alt="" className="absolute inset-0 h-full w-full object-cover" />
           <div className="absolute inset-0 bg-linear-to-t from-ink-950 via-ink-950/55 to-ink-950/15" />
-          <div className="absolute inset-x-0 bottom-0 px-5 pb-12 lg:pe-14 lg:ps-[calc(var(--rail-w)+3.5rem)]">
+          <div data-welcome-hero-content className="absolute inset-x-0 bottom-0 px-5 pb-12 lg:pe-14 lg:ps-[calc(var(--rail-w)+3.5rem)]">
             <span className="mb-2 inline-flex items-center gap-1.5 rounded-full bg-black/45 px-3 py-1.5 text-xs font-medium text-accent backdrop-blur"><IcSparkle width={13} height={13} />{tr('Welcome')}</span>
             <h1 className="font-brand text-4xl font-bold leading-tight text-white drop-shadow lg:text-6xl">{tr('Welcome to Uchiyomi')}</h1>
             <p className="mb-4 mt-1 text-sm text-fog-300">{tr('Your cinematic library awaits.')}</p>

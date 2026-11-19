@@ -28,7 +28,48 @@ The ones worth knowing:
   app's port directly, around your proxy (another device on the LAN, another container on its Docker network), set
   `TRUST_PROXY` to your proxy's own address, so only it can say who a visitor is (`TRUST_PROXY=172.18.0.5`), or to
   `false` when there is no proxy at all. Since v0.78.1 sign-in counts wrong passwords per address and name, so the
-  address the app sees is worth getting right.
+  address the app sees is worth getting right. An entry the app cannot read (a typo like `loopbak`, a range like
+  `10.0.0.0/33`) stops it at start, with a `[net]` line in `docker logs uchiyomi` naming the entry; a stray comma is
+  ignored. Two values that work but rarely mean what was meant are said in the same log at every start: `true`, and a
+  bare number. Some guides spell "trust one proxy" as `TRUST_PROXY=1`, but here `1` is read as the address 0.0.0.1
+  and trusts no proxy at all. Unset, it can be changed in Admin -> Settings -> Server -> Home network instead (see below).
+- `LOCAL_NETWORKS`: your home network, as addresses or CIDR ranges (`LOCAL_NETWORKS=192.168.1.0/24`, an IPv6 range
+  beside it if your devices use one), or `none`. Profiles without a password open from these networks only: from
+  anywhere else, only an account with a password (or single sign-on) gets in, and a profile without one stops working
+  on the next request once a phone leaves home. Unset, the home network is set in Admin -> Settings -> Server -> Home
+  network, and its default is the private networks (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, loopback,
+  link-local and their IPv6 kin), as Sonarr and Radarr read "local addresses". One thing that default cannot see: a
+  proxy or a NAT that hands the app every visitor as its own private address -- a reverse proxy that does not send
+  `X-Forwarded-For`, Docker Desktop's port forwarding -- puts the whole internet at home. The same page lists the
+  address the server sees for you and for every signed-in device, each marked at home or outside: if a phone on mobile
+  data reads "at home", write your real network there, or `none`. Write the network, not a name (`uniquelocal` is
+  refused), never `0.0.0.0/0`; the app stops at start on a value it cannot read, and refuses `LOCAL_NETWORKS` together
+  with `TRUST_PROXY=true`, which would let anyone claim a home address (with `TRUST_PROXY=true` and no `LOCAL_NETWORKS`,
+  nobody is at home).
+- **Behind a reverse proxy, name it by address** (`TRUST_PROXY=loopback, 172.18.0.5`, or on the settings page's
+  *Trusted proxies*): a request that comes through a proxy counts as at home only when every proxy on its way is written
+  out by address or range. The default names (`loopback`, `linklocal`, `uniquelocal`) trust every private peer, which is
+  right for the activity log and the sign-in limits, but a chain of private hops -- Docker Desktop's port forwarding, a
+  proxy behind a router -- would then let a visitor write their own `X-Forwarded-For` and pick a home address. Reaching
+  the app's port directly from home needs nothing. The settings page names the proxy you came through when it is not
+  written out, with a key that trusts it alone.
+- **Through Cloudflare, nobody is at home.** A request that crossed Cloudflare's edge -- a Cloudflare Tunnel, or its
+  proxy -- carries `CF-Ray` and `CF-Connecting-IP`, and counts as outside whatever address the hops after it report:
+  `cloudflared` runs at home, so to the proxy behind it every visitor looks like a home address. At home, reach the app
+  by its local address, or by a local DNS name that points at your proxy. Another tunnel (Tailscale Funnel, ngrok, a
+  WireGuard proxy) has no such mark: with one, write your real home network instead of the private-networks default, so
+  the tunnel's own address is not home.
+- **Set in the environment, either one wins**: the settings page shows its value and cannot change it, so what your
+  compose file says is what runs. Saved on the page, a change is in force at the next request, with no restart.
+- **Rolling back after using profiles:** sessions opened without a password use a separate signing key derived from
+  `JWT_SECRET` and a keyed refresh-token hash. Older releases cannot verify their access/image cookies or exchange
+  their refresh cookies, including rotations and remembered sessions. An image rollback therefore signs those
+  profiles out; it cannot turn them into sessions that work from outside home. Ordinary password/SSO sessions retain
+  their existing format. Keep `JWT_SECRET` unchanged for an ordinary rollback. If you previously ran a development
+  profiles build that signed local tokens with the ordinary key, revoke every local session and its descendants,
+  clear `device_ring`, and rotate `JWT_SECRET` before starting an older release (or restore a database backup from
+  before that build). Rotating the key invalidates outstanding access/image cookies; revoke ordinary refresh
+  sessions too if every device must sign in again. Do not reuse the old key later with the old session data.
 - `LOG_LEVEL` (since v0.92.0): how much the server log says (`docker logs uchiyomi`). `info` by default, a line for
   every request; `warn` keeps only warnings and errors. `debug` adds, for each series a *Find other sources* run
   looks at, the names it searched each source under, what each source answered, which result it took, and why a
@@ -98,6 +139,14 @@ to anything.
 
 Set `UCHIYOMI_PING_URL` to point the count somewhere else — at your own collector if you run a fork — or to
 an empty string to make sure it can never send anything regardless of the setting.
+
+**Automatic title logos** — *off by default* (Admin → Art, since v0.105.0). Once a day the server reads the
+[Uchiyomi logo library](https://github.com/AngeloSha/uchiyomi-title-logos)'s `index.json` from GitHub, and for a manga
+whose confirmed AniList id the index lists, downloads that one logo and checks it against the SHA-256 the index names.
+GitHub sees your IP address and which logo files are fetched. For manga the library does not have, the server asks
+Wikidata and Wikimedia Commons by the same AniList id. A library whose automatic online lookup is off is never looked up.
+Set `TITLE_LOGO_LIBRARY_URL` to read the library from a mirror (an https address holding the same `index.json` and
+`logos/` files), or to an empty string to turn the library off; Wikimedia is still asked while the switch is on.
 
 **Translate pages** — *off, and nothing downloaded, until an admin presses Download* (Admin → Settings → Server).
 Download fetches the translation engine once: the pack from this project's GitHub releases (`translate-v1`) and the
@@ -465,13 +514,17 @@ rarely needed:
   `AUTOFIX_MAX_MINUTES` is spent, and the next run continues down the list. `0` switches its extensions phase off. A
   package that carries none of the series it was searched for is removed again at once, and is not tried for those
   series again for a month.
-- `MAX_FOLLOWED_SOURCES` (default `3`, 1 to 10): how many sources besides the main one a series may follow, by hand or
+- `MAX_FOLLOWED_SOURCES` (default `3`, 1 to 25): how many sources besides the main one a series may follow, by hand or
   automatically, until an admin picks a number. Since v0.89.0 that is a menu in the app, **Admin → Settings → Downloads
-  → More options → Other sources per series** (1 to 10), and this is only its starting value. Each one is another
-  chapter list read on every update. A source that is broken, switched off or no longer installed does not count
+  → More options → Other sources per series** (1 to 25 since v0.105.0, 1 to 10 before), and this is only its starting
+  value. The first three are asked on every update; since v0.105.0 the rest are backups, asked once a day while the
+  series has nothing missing and on every update while it does (#413). A source that is broken, switched off or no longer installed does not count
   toward it for the sources Uchiyomi adds on its own.
 - `MIN_FREE_GB` (default `10`): refuse to start a download when the download disk has less than this free.
   `0` disables the floor. Fails open if free space cannot be measured.
+- `UPLOAD_MAX_MB` (default `2048`): the largest chapter or volume file that can be uploaded by hand, from
+  **Library → Upload a series**. Uploads go into the download folder (a new series under `Uploads/<title>`) and stop
+  at `MIN_FREE_GB`, checking received bytes even for chunked bodies. PDF/RAR/CBR uploads have a separate 128 MiB ceiling. No uploaded file replaces an existing file.
 
 An ordinary chapter failure may continue from as many of the sources already followed for that series as a series may
 follow (**Other sources per series**, three by default), at most four. A copy explicitly picked by a person never switches. A 403/429 never becomes a

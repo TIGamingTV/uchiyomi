@@ -33,6 +33,11 @@ export interface StageLine {
    */
   kind: 'error' | 'empty' | 'unnumbered' | 'site_offline' | 'rate_limited' | null;
   error: string | null;
+  /**
+   * The failure counts now (bff currentFailures): confirmed, recent, not a cooldown. An open line that does not -- one
+   * failure in ordinary use, a week old, an HTTP 429 -- is history (#426). Absent from an older server: then it counts.
+   */
+  current?: boolean;
 }
 
 /** The last deliberate live check (`live` on GET /api/admin/sources, `tested` on a Health item). */
@@ -51,6 +56,8 @@ export interface TestCheck {
   stage?: Stage;
   kind?: 'error' | 'empty' | 'timeout' | 'unnumbered' | 'site_offline';
   error?: string;
+  /** false: shown, not part of the verdict (the Test's one image, when the site asked to slow down or time ran out). */
+  vote?: false;
 }
 
 /** POST /api/admin/sources/:id/test, as far as these screens read it. */
@@ -127,12 +134,15 @@ const checkName = (n: string): string =>
 /**
  * A live Test answer as lines, one per stage the Test covers, plus Covers when it was looked at.
  *
- * ⚠️ "Working normally." is said ONLY when the Test passed and no line on screen is a ✗. It used to be the
- * fallback for any diagnosis without a reason, which is how it sat under a failed Search (#115).
+ * A passing Test speaks only for the steps it checked. Recorded failures from an unchecked step
+ * remain visible with their original date; a list probe cannot clear a failed image download (#426).
  */
-export function answerView(t: TestAnswer): EvidenceView {
+export function answerView(t: TestAnswer, recorded?: StageLine[] | null): EvidenceView {
   const rows: EvidenceRow[] = [];
-  for (const stage of ['search', 'chapters', 'pages'] as const) {
+  // A Test fetches the first page's image since #426; an older server's answer has no images check, and then that row
+  // says a Test does not download images, as it always has.
+  const imageChecked = (t.checks || []).some((c) => c.stage === 'images');
+  for (const stage of (imageChecked ? ['search', 'chapters', 'pages', 'images'] : ['search', 'chapters', 'pages']) as Stage[]) {
     const cs = (t.checks || []).filter((c) => c.stage === stage);
     if (!cs.length) {
       // Nothing ran at this stage: the Test stopped earlier (or ran out of time before it).
@@ -159,16 +169,30 @@ export function answerView(t: TestAnswer): EvidenceView {
     if (c.stage) continue;
     rows.push({ key: `check:${c.name}`, glyph: c.ok ? 'ok' : 'fail', label: checkName(c.name), detail: c.ok ? c.detail || null : null, error: c.ok ? null : c.detail || null, when: null });
   }
-  // The smoke test never fetches an image byte, so it cannot speak for downloads: say so, rather than leave an
+  // An older server's Test never fetches an image byte, so it cannot speak for downloads: say so, rather than leave an
   // admin wondering why a passing Test did not clear a download failure.
-  rows.push({ key: 'images', glyph: 'none', label: stageLabel('images'), detail: tr('a Test does not download images'), error: null, when: null });
+  if (!imageChecked) rows.push({ key: 'images', glyph: 'none', label: stageLabel('images'), detail: tr('a Test does not download images'), error: null, when: null });
 
-  const failedLine = rows.some((r) => r.glyph === 'fail');
+  const liveFailure = rows.some((r) => r.glyph === 'fail');
+  let recordedFailure = false;
+  for (let i = 0; i < rows.length; i++) {
+    const row = rows[i];
+    if (row.glyph !== 'none') continue;
+    // Only a failure that counts now. Reintroduce `line.state === 'fail'` alone: "history is not a failure" in
+    // sourceEvidence.test.ts reads "earlier failures are shown below" over a source that is not failing.
+    const prior = recorded?.find((line) => line.stage === row.key && line.state === 'fail' && line.current !== false);
+    if (!prior) continue;
+    recordedFailure = true;
+    rows[i] = { ...row, glyph: 'fail', detail: tr('not checked by this test'), error: prior.error,
+      when: whenBy(prior.at, prior.by) };
+  }
+  const failedLine = liveFailure || recordedFailure;
   const d = t.diagnosis;
   // The verdict in the reader's language: the reason by its code, the fix by its own (lib/said.ts).
   const reason = diagnosisReason(d);
   let head: EvidenceView['head'];
-  if (t.ok && !failedLine) head = { tone: 'ok', text: tr('Working normally.') };
+  if (t.ok && !liveFailure && recordedFailure) head = { tone: 'warn', text: tr('The checked steps passed; earlier failures are shown below.') };
+  else if (t.ok && !failedLine) head = { tone: 'ok', text: tr('The checked steps passed.') };
   else if (t.ok) head = { tone: 'warn', text: tr('Works, but not everything checked out') };
   else if (t.state === 'inconclusive' || (t.timedOut && !failedLine)) {
     head = { tone: 'warn', text: reason || tr('The test ran out of time. That alone is not proof it is broken.') };
@@ -200,6 +224,13 @@ export function testedLine(v: LiveVerdict | null | undefined, failing = true): {
   return { tone, text };
 }
 
+/** The action and its notice share Details' scope; a list Test cannot announce recovered downloads. */
+export function sourceTestOutcome(answer: TestAnswer, recorded?: StageLine[] | null): { text: string; ok: boolean; partial: boolean } {
+  const head = answerView(answer, recorded).head;
+  return { text: head?.text ?? tr('That source is still failing'), ok: answer.ok,
+    partial: answer.ok && head?.tone !== 'ok' };
+}
+
 /**
  * Persisted evidence as lines: every stage, what was last seen there, when, and by what.
  *
@@ -207,6 +238,7 @@ export function testedLine(v: LiveVerdict | null | undefined, failing = true): {
  * cooldowns too (thirty of them, once a language is hidden), and every one of them got four "nothing recorded
  * yet" lines. `failing` defaults to what the lines show; Providers passes its confirmed failures (testedLine).
  */
+
 export function evidenceView(
   lines: StageLine[] | null | undefined, tested?: LiveVerdict | null, fix?: string | null, failing?: boolean,
 ): EvidenceView {

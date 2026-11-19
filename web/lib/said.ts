@@ -293,6 +293,13 @@ const WORDS: Record<string, (p: P) => string | null> = {
   'numbering.askedWaits': () => tr('Numbering by posting order, as asked, waits to be applied.'),
   'numbering.sourceWaits': (p) => opensOnOwnWords(p, tr('Going back to {name}\'s own numbers waits to be applied.', { name: sourceNameMid(p) })),
   'numbering.since': (p) => tr('numbered by posting order since {date}.', { date: dayText(p.at) }),
+  // #379: a source that counts its specials as chapters, with the newest chapter it numbers ahead of its title when sent.
+  'numbering.titles': (p) => (str(p, 'title') && p.number != null
+    ? tr('{name} counts its specials as chapters, so its chapter numbers run ahead of their titles (it numbers “{title}” {number})', {
+      name: sourceName(p), title: str(p, 'title'), number: num(p, 'number'),
+    })
+    : tr('{name} counts its specials as chapters, so its chapter numbers run ahead of their titles', { name: sourceName(p) })),
+  'numbering.titlesWaits': () => tr('numbering them by their titles waits for your review.'),
   // v0.81.0: what the scout (bff lib/sourceScout.ts) last did for the series on a Health row.
   'scout.following': (p) => (num(p, 'n') === 1
     ? tr('Searched 1 other source on {date}: now also using {source}', { date: dayText(p.at), source: str(p, 'source') })
@@ -309,6 +316,8 @@ const WORDS: Record<string, (p: P) => string | null> = {
   'short.none': () => tr('No truncated chapters found'),
   'short.quiet': (p) => (num(p, 'n') === 1 ? tr('1 confirmed short at the source') : tr('{n} confirmed short at the source', { n: num(p, 'n') })),
   'short.note': () => tr('Counted nightly by the repair task, which opens the chapter files nobody has read yet, so this is no longer limited to chapters someone has opened. Half-chapters are excluded since author notices really are one page. "Fix" replaces the chapter only if another source has a longer copy; "It\'s fine" records that it really is this short, and the nightly stops looking at it.'),
+  'short.specials': (p) => (num(p, 'n') === 1 ? tr('1 special left out') : tr('{n} specials left out', { n: num(p, 'n') })),
+  'short.specialNote': () => tr('A chapter whose title names a special (a Q&A, a giveaway, an announcement, an author\'s note, bonus art) is left out too: those are meant to be short.'),
   'short.detail': (p) => (num(p, 'pages') === 1
     ? tr('Chapter {number} has 1 page', { number: num(p, 'number') })
     : tr('Chapter {number} has {n} pages', { number: num(p, 'number'), n: num(p, 'pages') })),
@@ -784,6 +793,11 @@ const WORDS: Record<string, (p: P) => string | null> = {
   'run.diskFull': () => tr('The library disk is full.'),
   'run.chapterLimit': () => tr('Stopped at this run\'s chapter limit; the rest wait for the next one.'),
 
+  // ---- A deleted chapter that could not be put back (#437, bff routes/sources.ts POST /api/books/:id/refetch)
+  'restore.notListed': (p) => tr('No source this series follows lists chapter {number} right now. Check for new chapters, or add a source that has it.', { number: num(p, 'number') }),
+  'restore.notInPlace': () => tr('That chapter cannot be put back where it was: its file is not one Uchiyomi downloaded under its usual name. Pick a copy under Versions to fetch it instead.'),
+  'restore.notDeleted': () => tr('That chapter was not deleted on purpose: its file went missing. Check for new chapters to fetch it again.'),
+
   // ---- A renumbering refused or put off
   'renumber.downloading': () => tr('Chapters are being fetched for this series. Try again when that ends.'),
   'renumber.checking': () => tr('This series is being checked right now. Try again when that ends.'),
@@ -828,8 +842,8 @@ const WORDS: Record<string, (p: P) => string | null> = {
   'attach.unreachable': (p) => tr('{name} did not say what that title is. Try again in a minute.', { name: str(p, 'name') }),
   'attach.cooling': (p) => tr('{name} is cooling down after errors, so it is not asked anything right now. Try again later.', { name: str(p, 'name') }),
   'attach.cap': (p) => (num(p, 'n') === 1
-    ? tr('This series already follows 1 other source, as many as it may. Remove one first, or move the series to this source.')
-    : tr('This series already follows {n} other sources, as many as it may. Remove one first, or move the series to this source.', { n: num(p, 'n') })),
+    ? tr('This series already follows 1 other source, as many as this server allows. Remove one first, move the series to this source, or allow more in Admin → Settings → Downloads → More options → Other sources per series.')
+    : tr('This series already follows {n} other sources, as many as this server allows. Remove one first, move the series to this source, or allow more in Admin → Settings → Downloads → More options → Other sources per series.', { n: num(p, 'n') })),
   'detach.noMain': () => tr('This series has no main source to detach.'),
   // A source retired, or a site removed, while some series still has it as its main source (bff lib/retireSource.ts).
   'retire.inUse': (p) => (num(p, 'n') === 1
@@ -1081,7 +1095,7 @@ const WORDS: Record<string, (p: P) => string | null> = {
     : tr('The extension engine\'s own Cloudflare bypass is switched off. On the Suwayomi engine\'s container (uchiyomi-suwayomi in the shipped compose files) set FLARESOLVERR_ENABLED=true and FLARESOLVERR_URL to the same solver address Uchiyomi uses (http://uchiyomi-flaresolverr:8191 in the shipped files), then recreate it. The v0.37.0 compose files already set both, so an upgrade that recreates the engine is the fix there.')),
   'fix.engineLogin': () => (isDesktop()
     ? tr('Uchiyomi\'s extension engine refused Uchiyomi\'s own login. Quit and reopen Uchiyomi to restart both.')
-    : tr('The extension engine refused Uchiyomi\'s login. Set SUWAYOMI_USERNAME and SUWAYOMI_PASSWORD to the engine\'s own basic-auth user and password (or turn its auth off), then restart Uchiyomi.')),
+    : tr('The extension engine refused Uchiyomi\'s login. Set SUWAYOMI_AUTH_MODE to match the engine, and SUWAYOMI_USERNAME and SUWAYOMI_PASSWORD to its login, then restart Uchiyomi.')),
   'fix.engineDown': () => (isDesktop()
     ? tr('This is Uchiyomi\'s extension engine, not the site. Quit and reopen Uchiyomi to restart it.')
     : tr('This is the Suwayomi extension server, not the site. Check that container.')),

@@ -31,7 +31,7 @@ export const ADMIN_SETTINGS: SettingsIndex = {
     { id: 'library', label: 'Libraries', group: 'Library',
       keywords: ['library', 'folders', 'hidden series', 'removed series', 'restore', 'age rating'] },
     { id: 'sources', label: 'Sources', group: 'Library', keywords: ['providers', 'extensions', 'mangadex', 'sites', 'add a site', 'repositories'] },
-    { id: 'art', label: 'Art', group: 'Library', keywords: ['covers', 'artwork', 'banners', 'images'] },
+    { id: 'art', label: 'Art', group: 'Library', keywords: ['covers', 'artwork', 'banners', 'images', 'title logos', 'cover titles', 'title artwork'] },
     // Uchiyomi Desktop is one person: no other accounts, no other sessions (lib/desktop.ts).
     { id: 'members', label: 'Members', group: 'People', when: ['web'], keywords: ['users', 'accounts', 'people', 'roles', 'age limit', 'reset password'] },
     { id: 'sessions', label: 'Sessions', group: 'People', when: ['web'], keywords: ['devices', 'signed in', 'logins'] },
@@ -50,6 +50,12 @@ export const ADMIN_SETTINGS: SettingsIndex = {
     // ---- Server ----
     { id: 'server-name', cat: 'server', label: 'Server name', keywords: ['name', 'title'] },
     { id: 'registration', cat: 'server', label: 'Open registration', when: ['web', 'local-accounts'], keywords: ['sign up', 'signup', 'register', 'new accounts'] },
+    { id: 'local-pick', cat: 'server', label: 'Choose a profile at home', when: ['web'],
+      keywords: ['profiles', 'who is reading', 'no password', 'children', 'family', 'home network'] },
+    { id: 'local-networks', cat: 'server', label: 'Home network', when: ['web'],
+      keywords: ['local network', 'lan', 'private networks', 'local addresses', 'LOCAL_NETWORKS', 'at home'] },
+    { id: 'trusted-proxies', cat: 'server', more: 'network-more', label: 'Trusted proxies', when: ['web'],
+      keywords: ['reverse proxy', 'nginx', 'traefik', 'caddy', 'X-Forwarded-For', 'TRUST_PROXY', 'ip address'] },
     { id: 'member-defaults-link', cat: 'server', label: 'When someone signs up', when: ['web'],
       keywords: ['new member defaults', 'permissions', 'age limit', 'libraries', 'can download'] },
     { id: 'update-check', cat: 'server', label: 'Check for updates', keywords: ['updates', 'new version', 'release', 'github'] },
@@ -62,6 +68,7 @@ export const ADMIN_SETTINGS: SettingsIndex = {
     { id: 'notice-chapters', cat: 'series', label: 'Notice chapters',
       keywords: ['notices', 'announcements', 'hiatus', 'short chapters'] },
     { id: 'notice-short-only', cat: 'series', label: 'Only hide short ones (3 pages or fewer)', editor: 'notice-chapters' },
+    { id: 'adult-hiding', cat: 'series', label: 'Hide 18+ until someone shows it', keywords: ['adult', 'nsfw', '18+', 'show 18+', 'adults only'] },
     { id: 'adult-filter', cat: 'series', label: '18+ filter', keywords: ['adult', 'nsfw', 'mature', 'show 18+', 'genres'] },
     { id: 'deleted-ghosts', cat: 'series', label: 'Show deleted chapters as ghosts', keywords: ['deleted chapters', 'ghost', 'fetch again'] },
     { id: 'fill-details', cat: 'series', label: 'Fill in missing details', keywords: ['anilist', 'metadata', 'description', 'author', 'cover'] },
@@ -69,6 +76,10 @@ export const ADMIN_SETTINGS: SettingsIndex = {
     { id: 'discover-lookups', cat: 'series', label: 'Match Discover titles online', keywords: ['discover', 'anilist', 'mangadex', 'mangaupdates', 'duplicates'] },
     { id: 'mihon-missing', cat: 'series', more: 'series-more', label: 'Show missing chapters in Mihon', when: ['web'],
       keywords: ['komga', 'ghost chapters', 'tachiyomi', 'trackers'] },
+
+    // ---- Art (v0.105.0, #411: the title artwork jobs beside the covers and banners) ----
+    { id: 'automatic-title-logos', cat: 'art', label: 'Automatic title logos', keywords: ['manga', 'logo', 'title artwork', 'wikimedia', 'anilist', 'hero'] },
+    { id: 'automatic-cover-titles', cat: 'art', label: 'Automatically extract cover titles', keywords: ['cover', 'extract', 'title', 'preview', 'logo', 'local'] },
 
     // ---- Downloads ----
     { id: 'update-interval', cat: 'downloads', label: 'Library update interval', keywords: ['update interval', 'schedule', 'how often', 'check for new chapters'],
@@ -82,6 +93,7 @@ export const ADMIN_SETTINGS: SettingsIndex = {
     { id: 'group-priority', cat: 'downloads', label: 'Default priority', editor: 'scanlators', keywords: ['group order', 'ranking'] },
     { id: 'patience', cat: 'downloads', label: 'Patience (days)', editor: 'scanlators', keywords: ['wait for group'] },
     { id: 'group-upgrade', cat: 'downloads', label: 'Upgrade chapters to a preferred group', editor: 'scanlators', keywords: ['replace chapters', 'better group'] },
+    { id: 'politeness', cat: 'downloads', more: 'downloads-more', label: 'Downloads & politeness', keywords: ['limits', 'environment variables', 'concurrency', 'timeout', 'blocked sources', 'unblock', 'cache size', 'backup keep'] },
     { id: 'slow-archive', cat: 'downloads', label: 'Slow archive', keywords: ['archive', 'older chapters', 'whole series', 'pace'] },
     { id: 'archive-per-hour', cat: 'downloads', label: 'Chapters an hour, per source', editor: 'slow-archive', keywords: ['pace', 'speed'] },
     { id: 'archive-window', cat: 'downloads', label: 'Only during set hours', editor: 'slow-archive', keywords: ['night', 'schedule', 'hours'] },
@@ -91,7 +103,7 @@ export const ADMIN_SETTINGS: SettingsIndex = {
     { id: 'mangadex-languages', cat: 'downloads', label: 'MangaDex languages', keywords: ['mangadex', 'languages', 'translations'] },
     { id: 'sources-per-series', cat: 'downloads', more: 'downloads-more', label: 'Other sources per series',
       keywords: ['more sources', 'followed sources', 'sources per series', 'multiple sources', 'follow limit', 'MAX_FOLLOWED_SOURCES'],
-      help: 'How many sources besides its main one a series may follow, whether you add them or Uchiyomi finds them. 3 by default. Each one is one more chapter list to ask for at every library update.' },
+      help: 'How many sources besides its main one a series may follow, whether you add them or Uchiyomi finds them. 3 by default. The first 3 are asked at every library update; the others are backups, asked once a day while the series has nothing missing.' },
     { id: 'smart-checks', cat: 'downloads', more: 'downloads-more', label: 'Smart update checks', keywords: ['quiet series', 'check less often', 'release radar', 'sweep'] },
 
     // ---- Maintenance ----

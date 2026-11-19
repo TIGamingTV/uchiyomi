@@ -1,6 +1,8 @@
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import sharp from 'sharp';
 import { IMG_COOKIE, API_TOKEN_PREFIX, resolveApiToken, resolveOpdsBasic, accountActive } from '../lib/auth';
+import { clientZone } from '../lib/clientAddr';
+import { verifyLocalSessionJwt } from '../lib/profileTokens';
 import { komga, komgaImage } from '../lib/komga';
 import { serveImage, getOrFetch } from '../lib/imageCache';
 import { doneTranslation, drawPage, readerLang } from '../lib/translate/pages';
@@ -21,14 +23,17 @@ import { fetchPages } from '../lib/downloader';
 import { previewPageList, copyPageList, isRefusal } from './sources';
 import { assertPublicHost, isBlockedHost, BlockedAddress } from '../lib/ssrfGuard';
 import { fetchPublicHop } from '../lib/publicConnection';
-import { suwayomiUrl, suwayomiBase, suwayomiImageHeaders, onEngineOrigin } from '../lib/sources/suwayomi/client';
+import { suwayomiUrl, suwayomiBase, suwayomiFetch, onEngineOrigin } from '../lib/sources/suwayomi/client';
 import { fetchPublic, readCapped, withoutCredentials, MAX_COVER_BYTES, MAX_ICON_BYTES, MAX_HTML_BYTES } from '../lib/safeFetch';
 import { env } from '../env';
-import { join } from 'path';
-import { readFile } from 'fs/promises';
+import { readLocalSeriesArt } from '../lib/localSeriesArt';
+import { basename, join, resolve, sep } from 'path';
+import { readFile, stat } from 'fs/promises';
 import { q, one } from '../lib/db';
+import { pageFileVersion, pageFileVersionOf } from '../lib/pageCleanupFiles';
 import { viewCtxFor, visibleBookFile, seriesVisible, sourceAllowedFor, SYSTEM_CTX, type ViewCtx } from '../lib/visibility';
-import { artFile, firstPageBookOf, FIRST_PAGE } from '../lib/seriesArt';
+import { ART_DIR, artFile, firstPageBookOf, FIRST_PAGE } from '../lib/seriesArt';
+import { readTitleLogo } from '../lib/titleArt';
 import { namesOf } from '../lib/altTitles';
 import { HERO_FRAMES, backdropLook, heroFit, type HeroAr } from '../lib/heroFrame';
 import { heroServable, heroFrame, heroVariant, queueHero, type AutoHeroAr } from '../lib/autoHero';
@@ -184,7 +189,7 @@ export async function fetchCoverImage(u: string, source?: string, opts: { caller
   // by dropping `redirect: 'error'`: engineRedirect.test.ts's redirect case is followed instead of refused.
   const engineTarget = engineCoverUrl(u);
   if (engineTarget) {
-    const r = await fetch(engineTarget, { headers: suwayomiImageHeaders(), redirect: 'error', signal: AbortSignal.timeout(20000) })
+    const r = await suwayomiFetch(engineTarget, { redirect: 'error', signal: AbortSignal.timeout(20000) })
       .catch(() => { throw Object.assign(new Error('cover'), { statusCode: 502 }); });
     if (!r.ok) throw Object.assign(new Error('cover'), { statusCode: 502 });
     return readCapped(r, MAX_COVER_BYTES).catch(() => { throw Object.assign(new Error('cover'), { statusCode: 502 }); });
@@ -206,7 +211,7 @@ export async function fetchCoverImage(u: string, source?: string, opts: { caller
   }
   const src = source ? getSource(source) : null;
   const staticReferer = typeof src?.imageReferer === 'string' ? src.imageReferer : undefined;
-  const extras = typeof src?.imageHeaders === 'function' ? src.imageHeaders(u) : src?.imageHeaders ?? {};
+  const extras = typeof src?.imageHeaders === 'function' ? await src.imageHeaders(u) : src?.imageHeaders ?? {};
   const sourceHeaders: Record<string, string> = {
     'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36',
     accept: 'image/avif,image/webp,image/apng,image/*,*/*;q=0.8',
@@ -388,13 +393,22 @@ async function backdropRecipe(id: string, style: 'hero' | 'banner' | null, ar: H
       },
     };
   }
+  const localBanner = ovr?.cover === FIRST_PAGE ? null : await readLocalSeriesArt(id, 'banner');
+  if (localBanner) {
+    const look = backdropLook(style, { hasUrl: true, fromBanner: true });
+    return {
+      variant: `local-banner:${id}:${localBanner.version}:${style ?? 'ambient'}:${ar}`,
+      producer: async () => ({ buffer: look === 'hero' ? await heroSharp(localBanner.bytes, ar)
+        : look === 'banner' ? await bannerSharp(localBanner.bytes) : await ambientComposite(localBanner.bytes), contentType: 'image/webp' }),
+    };
+  }
   // Use the first page (v0.55.7, lib/seriesArt.ts FIRST_PAGE): the series' art is its own pages -- the first page's wash
   // here, and the banner made from its pages -- and nothing online is looked up or shown for it. Reintroduce by reading
   // series_art for it: "the first page, chosen, keeps online art away" in onlineMatch.int.test.ts finds the stored
   // banner's variant.
-  let art: { banner: string | null; cover: string | null; checked_at: Date | null } | null = ovr?.cover === FIRST_PAGE
+  let art: { banner: string | null; cover: string | null; checked_at: Date | null; rev?: number } | null = ovr?.cover === FIRST_PAGE
     ? { banner: null, cover: null, checked_at: new Date() }
-    : await one<{ banner: string | null; cover: string | null; checked_at: Date | null }>('SELECT banner, cover, checked_at FROM series_art WHERE series_id = $1', [id]);
+    : await one<{ banner: string | null; cover: string | null; checked_at: Date | null; rev: number }>('SELECT banner, cover, checked_at, rev FROM series_art WHERE series_id = $1', [id]);
   // An opted-out add may still have its source cover.  That row is deliberately unchecked: once its current library
   // allows automatic enrichment, look up the missing online banner without replacing the source's own cover.
   if (!art || (!art.banner && !art.checked_at)) {
@@ -427,13 +441,13 @@ async function backdropRecipe(id: string, style: 'hero' | 'banner' | null, ar: H
         // one decision. A refused transaction stores no negative result, so enabling later can take the lookup up.
         const applied = await withAniListMutation({ id }, 'automatic', async (qq, seriesId) => {
           // checked_at: held to the title check as it was stored (lib/matchCheck.ts rechecks a row only while it is NULL).
-          const stored = await qq<{ banner: string | null; cover: string | null; checked_at: Date | null }>(
+          const stored = await qq<{ banner: string | null; cover: string | null; checked_at: Date | null; rev: number }>(
             `INSERT INTO series_art (series_id, banner, cover, checked_at) VALUES ($1, $2, $3, now())
              ON CONFLICT (series_id) DO UPDATE SET
                banner = COALESCE(series_art.banner, EXCLUDED.banner),
                cover = COALESCE(series_art.cover, EXCLUDED.cover),
                fetched_at = now(), checked_at = now()
-             RETURNING banner, cover, checked_at`,
+             RETURNING banner, cover, checked_at, rev`,
             [seriesId, fetched.banner, fetched.cover],
           );
           // The same match also anchors tracker sync and carries the weakest direction/type evidence.
@@ -447,8 +461,8 @@ async function backdropRecipe(id: string, style: 'hero' | 'banner' | null, ar: H
         if (applied.applied) {
           art = applied.value ?? { banner: art?.banner ?? fetched.banner, cover: art?.cover ?? fetched.cover, checked_at: new Date() };
         } else {
-          art = await one<{ banner: string | null; cover: string | null; checked_at: Date | null }>(
-            'SELECT banner, cover, checked_at FROM series_art WHERE series_id = $1', [id],
+          art = await one<{ banner: string | null; cover: string | null; checked_at: Date | null; rev: number }>(
+            'SELECT banner, cover, checked_at, rev FROM series_art WHERE series_id = $1', [id],
           ) ?? art ?? { banner: null, cover: null, checked_at: null };
         }
       } catch {
@@ -460,13 +474,24 @@ async function backdropRecipe(id: string, style: 'hero' | 'banner' | null, ar: H
   // reached -- gets the one made from its pages soon, in the background (lib/autoHero.ts queueHero: one at a time,
   // paced, standing aside for a sweep, a repair or the source check; a no-op for one made, tried lately or not
   // eligible). Nothing here waits on it: the payload offers it once it is made.
+  const localCover = !ovr?.cover && !art.banner ? await readLocalSeriesArt(id, 'cover') : null;
+  if (localCover) {
+    const look = backdropLook(style, { hasUrl: true, fromBanner: false });
+    return {
+      variant: `local-cover:${id}:${localCover.version}:${style ?? 'ambient'}:${ar}`,
+      producer: async () => ({ buffer: look === 'hero' ? await heroSharp(localCover.bytes, ar)
+        : await ambientComposite(localCover.bytes), contentType: 'image/webp' }),
+    };
+  }
   if (!art.banner) queueHero(id);
   const url = art.banner || art.cover;
   // The look the art in hand would get: the hero shows a banner OR a cover sharp (only the no-art first page stays
   // ambient), the series page only a real banner -- a cover blown up to a banner's frame stays the blurred wash.
   const planned = backdropLook(style, { hasUrl: !!url, fromBanner: !!art.banner });
+  // `rev` (v0.103.1): the art was replaced under the same series -- a link moved to the series' own AniList entry
+  // (lib/matchCheck.ts moveLink) -- and the picture made from the old one must not answer for it. 0 keeps the key it was.
   const variant = url
-    ? `artw${planned === 'hero' ? `7h${ar}` : planned === 'banner' ? '8b' : '6'}:${id}:${art.banner ? 'b' : 'c'}`
+    ? `artw${planned === 'hero' ? `7h${ar}` : planned === 'banner' ? '8b' : '6'}:${id}:${art.banner ? 'b' : 'c'}${art.rev ? `:r${art.rev}` : ''}`
     : `artw6:${id}:p`;
   const srcRow = await one<{ source_id: string | null }>('SELECT source_id FROM lib_series WHERE id = $1', [id]);
   return {
@@ -556,7 +581,9 @@ export async function authorizeImageRequest(
   const token = req.cookies?.[IMG_COOKIE];
   if (token) {
     try {
-      const claims = app.jwt.verify(token) as { sub?: string; typ?: string };
+      let claims: { sub?: string; typ?: string; loc?: unknown };
+      try { claims = app.jwt.verify(token); }
+      catch { claims = verifyLocalSessionJwt(app, token); }
       // ⚠️ Only the image cookie itself. Every JWT this server signs verifies under the same secret, so
       // without this an ACCESS token -- or any other signed payload that names a `sub` -- pasted into the
       // yomi_img cookie was an image session for that account. The cookie is minted with `typ: 'img'`
@@ -567,6 +594,9 @@ export async function authorizeImageRequest(
         // disabled or deleted owner gets the 401 every other credential gets. Reintroduce by dropping this line:
         // "the image cookie stops working..." in imageBearer.int.test.ts sees a disabled member's page (200).
         if (!(await accountActive(claims.sub))) return reply.code(401).send({ error: 'unauthorized' });
+        // The cookie of a session entered without a password (`loc`, routes/auth.ts) opens pages at home only, like every
+        // request of that session (lib/auth.ts authenticate); it lasts a week, so it is judged on every use too.
+        if (claims.loc === true && clientZone(req) !== 'local') return reply.code(401).send({ error: 'local_only' });
         (req as any).viewCtx = await viewCtxFor(claims.sub ?? null);
         (req as any).imgCredential = { kind: 'session' } satisfies ImgCredential;
         return;
@@ -666,36 +696,58 @@ export const serveLibSeriesThumb = async (req: FastifyRequest, reply: FastifyRep
   const ovr = await one<{ cover: string | null; v: string }>('SELECT cover, EXTRACT(EPOCH FROM updated_at) * 1000 AS v FROM series_overrides WHERE series_id = $1', [id]);
   if (ovr?.cover) {
     return serveImage(req, reply, `lib-sthumb:${id}:ov:${Math.floor(Number(ovr.v))}${wk}`, async () => {
-      let input: Buffer;
-      if (ovr.cover === 'upload') input = await readFile(artFile(id, 'cover'));
-      // Use the first page (v0.55.7): nothing to fetch, and series_art is not read -- whatever it holds.
-      else if (ovr.cover === FIRST_PAGE) input = await firstPageInput(id, vc(req));
-      else { try { input = await fetchCoverImage(ovr.cover!); } catch { input = await firstPageInput(id, vc(req)); } }
+      const input = await seriesCoverInput(id, vc(req));
       storeColor(id, input);
       const buffer = await thumbWebp(input, w, 80);
       return { buffer, contentType: 'image/webp' };
     });
   }
-  const art = await one<{ cover: string | null; source_id: string | null }>(
-    'SELECT a.cover, s.source_id FROM series_art a LEFT JOIN lib_series s ON s.id = a.series_id WHERE a.series_id = $1', [id]);
+  const localCover = await readLocalSeriesArt(id, 'cover');
+  if (localCover) return serveImage(req, reply, `lib-sthumb:${id}:local:${localCover.version}${wk}`, async () => {
+    storeColor(id, localCover.bytes);
+    return { buffer: await thumbWebp(localCover.bytes, w, 80), contentType: 'image/webp' };
+  });
+  const art = await one<{ cover: string | null; source_id: string | null; rev: number }>(
+    'SELECT a.cover, s.source_id, a.rev FROM series_art a LEFT JOIN lib_series s ON s.id = a.series_id WHERE a.series_id = $1', [id]);
   if (art?.cover) {
-    return serveImage(req, reply, `lib-sthumb:${id}:c${wk}`, async () => {
+    // `rev`: a cover replaced under the same series (backdropRecipe says why) is a new key; 0 keeps the one it was.
+    return serveImage(req, reply, `lib-sthumb:${id}:c${art.rev ? `:r${art.rev}` : ''}${wk}`, async () => {
       // remote cover first; on ANY failure (hotlink CDN, dead link, timeout) fall back to the first page
-      let input: Buffer;
-      try { input = await fetchCoverImage(art.cover!, art.source_id || undefined); }
-      catch { input = await firstPageInput(id, vc(req)); }
+      const input = await seriesCoverInput(id, vc(req));
       storeColor(id, input);
       const buffer = await thumbWebp(input, w, 80);
       return { buffer, contentType: 'image/webp' };
     });
   }
   return serveImage(req, reply, `lib-sthumb:${id}:p${wk}`, async () => {
-    const input = await firstPageInput(id, vc(req));
+    const input = await seriesCoverInput(id, vc(req));
     storeColor(id, input);
     const buffer = await thumbWebp(input, w, 72);
     return { buffer, contentType: 'image/webp' };
   });
 };
+/** The current cover's actual input, shared by thumbnails and local title extraction. No new metadata lookup. */
+export async function seriesCoverInput(id: string, ctx: ViewCtx): Promise<Buffer> {
+  if (!(await seriesVisible(id, ctx))) throw Object.assign(new Error('no cover'), { statusCode: 404 });
+  const ovr = await one<{ cover: string | null }>('SELECT cover FROM series_overrides WHERE series_id=$1', [id]);
+  if (ovr?.cover === 'upload') {
+    const path=resolve(ART_DIR,basename(artFile(id,'cover')));
+    if(!path.startsWith(resolve(ART_DIR)+sep))throw Object.assign(new Error('no cover'),{statusCode:404});
+    return readFile(path);
+  }
+  if (ovr?.cover === FIRST_PAGE) return firstPageInput(id, ctx);
+  if (ovr?.cover) {
+    try { return await fetchCoverImage(ovr.cover); } catch { return firstPageInput(id, ctx); }
+  }
+  const local = await readLocalSeriesArt(id, 'cover');
+  if (local) return local.bytes;
+  const art = await one<{ cover: string | null; source_id: string | null }>(
+    'SELECT a.cover,s.source_id FROM series_art a JOIN lib_series s ON s.id=a.series_id WHERE a.series_id=$1', [id]);
+  if (art?.cover) {
+    try { return await fetchCoverImage(art.cover, art.source_id || undefined); } catch { return firstPageInput(id, ctx); }
+  }
+  return firstPageInput(id, ctx);
+}
 /** WebP holds no image taller (or wider) than this; JPEG holds 65,535. */
 const WEBP_MAX_SIDE = 16383;
 const JPEG_MAX_SIDE = 65535;
@@ -806,38 +858,52 @@ export const serveLibBookThumb = async (req: FastifyRequest, reply: FastifyReply
 export const serveLibBookPage = async (req: FastifyRequest, reply: FastifyReply, id: string, pageNo: number, w: number, fit = 0, tl: string | null = null) => {
   const abs = await bookFileAbs(id, vc(req));
   if (!abs) return reply.code(404).send({ error: 'no_book' });
+  // The reader changes ?cv= after reversible page edits. The disk cache must identify the new bytes too,
+  // otherwise a fresh browser URL would still be answered with the old cached page.
+  const fileStat = await stat(abs).catch(() => null);
+  if (!fileStat) return reply.code(404).send({ error: 'no_book' });
+  const fileVersion = pageFileVersionOf(fileStat);
+  const requestedVersion = (req.query as Record<string, unknown>).cv;
+  if (requestedVersion !== undefined && requestedVersion !== fileVersion)
+    return reply.code(409).send({ error: 'page_version_changed', message: 'The chapter changed. Reload its page list or restart this download.' });
+  const currentPage = async () => {
+    const page = await pageOrGone(abs, pageNo - 1);
+    if (await pageFileVersion(abs) !== fileVersion)
+      throw Object.assign(new Error('The chapter changed while reading this page. Restart its download.'), { statusCode: 409 });
+    return page;
+  };
   if (tl && !w) {
     const engine = (await translateOn()) ? await engineKey() : null;
     const done = engine ? await doneTranslation(id, pageNo, tl, engine) : null;
     if (done && engine) {
-      return serveImage(req, reply, `lib-page:${id}:${pageNo}:tl${tl}:${engine}:r${RENDER_VERSION}:${done.at}${fit ? `:fit${fit}` : ''}`, async () => {
-        const page = await pageOrGone(abs, pageNo - 1);
+      return serveImage(req, reply, `lib-page:${id}:${pageNo}:tl${tl}:${engine}:r${RENDER_VERSION}:${done.at}${fit ? `:fit${fit}` : ''}:${fileVersion}`, async () => {
+        const page = await currentPage();
         if (!page) throw Object.assign(new Error('no page'), { statusCode: 404 });
         const drawn = await drawPage(page.bytes, done.regions, tl);
         return fit ? pageForScreen(drawn.buffer, drawn.contentType, fit) : drawn;
       });
     }
-    const page = await pageOrGone(abs, pageNo - 1);
+    const page = await currentPage();
     if (!page) return reply.code(404).send({ error: 'no_page' });
     const out = fit ? await pageForScreen(page.bytes, libCt(page.name), fit) : { buffer: page.bytes, contentType: libCt(page.name) };
     return reply.header('content-type', out.contentType).header('cache-control', 'private, no-store').send(out.buffer);
   }
   if (fit && !w) {
-    return serveImage(req, reply, `lib-page:${id}:${pageNo}:fit${fit}`, async () => {
-      const page = await pageOrGone(abs, pageNo - 1);
+    return serveImage(req, reply, `lib-page:${id}:${pageNo}:fit${fit}:${fileVersion}`, async () => {
+      const page = await currentPage();
       if (!page) throw Object.assign(new Error('no page'), { statusCode: 404 });
       return pageForScreen(page.bytes, libCt(page.name), fit);
     });
   }
   if (w && Number.isInteger(w) && w >= 64 && w <= 2000) {
-    return serveImage(req, reply, `lib-page:${id}:${pageNo}:w${w}`, async () => {
-      const page = await pageOrGone(abs, pageNo - 1);
+    return serveImage(req, reply, `lib-page:${id}:${pageNo}:w${w}:${fileVersion}`, async () => {
+      const page = await currentPage();
       if (!page) throw Object.assign(new Error('no page'), { statusCode: 404 });
       return pageAtWidth(page.bytes, w, 74);
     });
   }
-  return serveImage(req, reply, `lib-page:${id}:${pageNo}`, async () => {
-    const page = await pageOrGone(abs, pageNo - 1);
+  return serveImage(req, reply, `lib-page:${id}:${pageNo}:${fileVersion}`, async () => {
+    const page = await currentPage();
     if (!page) throw Object.assign(new Error('no page'), { statusCode: 404 });
     q('UPDATE lib_books SET pages=$1 WHERE id=$2 AND pages<>$1', [page.total, id]).catch(() => {});
     return { buffer: page.bytes, contentType: libCt(page.name) };
@@ -996,6 +1062,15 @@ export default async function imageRoutes(app: FastifyInstance) {
     return serveImage(req, reply, r.variant, r.producer);
   });
 
+  // A title logo is already a local normalized raster. Do not crop it or fall back to a cover.
+  app.get('/img/series/:id/logo', async (req, reply) => {
+    const { id } = req.params as { id: string };
+    if (!(await seriesVisible(id, vc(req)))) return reply.code(404).header('cache-control', 'private, no-store').send({ error: 'not_found' });
+    const logo = await readTitleLogo(id);
+    if (!logo) return reply.code(404).header('cache-control', 'private, no-store').send({ error: 'not_found' });
+    return reply.type('image/webp').header('cache-control', 'private, max-age=86400').header('x-content-type-options', 'nosniff').send(logo.bytes);
+  });
+
   // The automatic banner (v0.51.0, lib/autoHero.ts): four crops of the series' own pages, for a series with no banner
   // of its own. Gated exactly as its cover is -- deleted, merged, outside the viewer's libraries or above their age
   // cap is a 404 -- and then a 404 again for a series that may not have one: a real banner, 18+ by any rule, or a last
@@ -1032,8 +1107,7 @@ export default async function imageRoutes(app: FastifyInstance) {
     // the package name lands in a URL path, so allow only what a package name can actually contain
     if (!/^[A-Za-z0-9._-]{1,200}$/.test(pkgName)) return reply.code(400).send({ error: 'bad' });
     return serveImage(req, reply, `swicon:${pkgName}`, async () => {
-      const r = await fetch(suwayomiUrl(`/api/v1/extension/icon/${pkgName}`), {
-        headers: suwayomiImageHeaders(),
+      const r = await suwayomiFetch(suwayomiUrl(`/api/v1/extension/icon/${pkgName}`), {
         signal: AbortSignal.timeout(15000),
       });
       if (!r.ok) throw new Error(`extension icon ${r.status}`);
@@ -1201,7 +1275,7 @@ async function sourceIconBytes(src: { id: string; iconUrl?: string; base?: strin
     const abs = /^https?:/i.test(src.iconUrl) ? src.iconUrl : suwayomiUrl(src.iconUrl);
     if (onEngineOrigin(abs)) {
       try {
-        const r = await fetch(abs, { headers: { 'user-agent': ICON_UA, ...suwayomiImageHeaders() }, redirect: 'error', signal: AbortSignal.timeout(8000) });
+        const r = await suwayomiFetch(abs, { headers: { 'user-agent': ICON_UA }, redirect: 'error', signal: AbortSignal.timeout(8000) });
         const buf = r.ok ? await readCapped(r, MAX_ICON_BYTES) : null;
         if (isIcon(buf)) return buf;
       } catch { /* fall through to the site's own icon */ }

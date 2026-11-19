@@ -16,8 +16,9 @@
 // genre or link is still there on the way back.
 import { useEffect, useId, useMemo, useRef, useState, type DragEvent, type KeyboardEvent as ReactKeyboardEvent, type ReactNode, type RefObject } from 'react';
 import { motion, useReducedMotion } from 'framer-motion';
+import { createPortal } from 'react-dom';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
-import { api, ApiError, img } from '@/lib/api';
+import { api, ApiError, img, getCurrentUser } from '@/lib/api';
 import type { Series } from '@/lib/types';
 import { languageName } from '@/lib/format';
 import { languageChoices } from '@/lib/editions';
@@ -31,8 +32,14 @@ import { metaSaver, seedMeta, type SeriesMeta } from '@/lib/seriesMeta';
 import { SERIES_TYPES, seriesTypeKey } from '@/lib/seriesTypes';
 import { useToast } from './Toast';
 import { msgOf } from './ConfirmDialog';
+import { MoveToLibrary } from './MoveToLibrary';
+import { moveSeriesToLibrary, type LibraryDestination } from '@/lib/moveLibrary';
 import { Backdrop, useRtl } from './ui';
 import { ProgressRing } from './ProgressRing';
+import { HeroTitle } from './HeroTitle';
+import { TitleExtractionButton } from './TitleExtraction';
+import { TITLE_ART_STYLES, TITLE_ART_STYLE_LABELS } from '@/lib/titleArt';
+import type { TitleArtStyle } from '@/lib/types';
 import { useContextMenu } from './ContextMenu';
 import { useCheckNow } from './SourcesSheet';
 import { IcX } from './icons';
@@ -109,7 +116,7 @@ const ages = (current: string): number[] => {
   return current !== '' && Number.isInteger(n) && !AGES.includes(n) ? [...AGES, n].sort((a, b) => a - b) : AGES;
 };
 
-type ArtKind = 'cover' | 'banner';
+type ArtKind = 'cover' | 'banner' | 'logo';
 
 /** Tab through the dialog and round again, never out of it: the page under a modal is not there to the keyboard. */
 const FOCUSABLE = 'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]';
@@ -214,7 +221,7 @@ export function SeriesEditor({ id, series, tab: opening = 'details', onClose, on
 
   return (
     <div
-      className="fixed inset-0 z-50 flex items-end justify-center bg-ink-950/70 backdrop-blur-xs md:items-center md:p-6 md:pb-[calc(5.5rem+env(safe-area-inset-bottom))] lg:pb-28 lg:pt-[5.5rem]"
+      className="fixed inset-0 z-50 flex items-end justify-center bg-ink-950/70 backdrop-blur-xs md:items-center md:p-6 md:pb-[calc(5.5rem+env(safe-area-inset-bottom))] lg:pb-28 lg:pt-[5.5rem]" data-shell-editor
       onPointerDown={(e) => { downOnBackdrop.current = e.target === e.currentTarget; }}
       onClick={(e) => { if (e.target === e.currentTarget && (downOnBackdrop.current || e.detail === 0)) onClose(); }}
     >
@@ -631,30 +638,35 @@ function FilesPane({ id, series, onSaved }: { id: string; series: Series; onSave
  * re-pathing an existing one, which is the whole point and also the reason not to do it by accident.
  */
 function LibraryRow({ id, series, onSaved }: { id: string; series: Series; onSaved: () => void }) {
-  const { run } = useAutosave();
   const sid = useId();
-  const [lib, setLib] = useState<string>(series.libraryPinned ? series.libraryId : '');
+  const qc = useQueryClient();
+  const [open, setOpen] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const owner = getCurrentUser();
   const { data: libs } = useQuery({
-    queryKey: ['admin-libraries'],
-    queryFn: () => api<{ content: { id: string; name: string; age_rating: number | null }[] }>('/api/admin/libraries'),
+    queryKey: ['admin-libraries', owner],
+    queryFn: () => api<{ content: LibraryDestination[] }>('/api/admin/libraries', { expectedOwnerId: owner }),
   });
-  const pick = async (next: string) => {
-    const prev = lib;
-    setLib(next);
-    if (await run(() => api(`/api/admin/series/${id}/library`, { method: 'POST', json: { libraryId: next || null } }))) onSaved();
-    else setLib(prev);
-  };
-  return (
+  const currentName = libs?.content.find((l) => l.id === series.libraryId)?.name;
+  return <>
     <Row label={tr('Library')} htmlFor={sid} stacked
-      help={lib ? tr('Filed here by hand. Rescans and new libraries will leave it alone.') : tr('Whichever library covers this folder, most specific first.')}>
-      <select id={sid} value={lib} onChange={(e) => void pick(e.target.value)} className="field">
-        <option value="">{tr('Automatic — follow the folder')}</option>
-        {(libs?.content ?? []).map((l) => (
-          <option key={l.id} value={l.id}>{l.name}{l.age_rating != null ? ` (${l.age_rating}+)` : ''}</option>
-        ))}
-      </select>
+      help={series.libraryPinned ? tr('Filed here by hand. Rescans and new libraries will leave it alone.') : tr('Whichever library covers this folder, most specific first.')}>
+      <button id={sid} type="button" className="btn-ghost min-h-11 w-full justify-between px-3 text-sm" aria-haspopup="dialog" aria-expanded={open}
+        onClick={() => setOpen(true)}>
+        <span dir="auto" className="truncate">{currentName ?? tr('Automatic — follow the folder')}</span><span className="ms-3 text-xs text-accent">{tr('Change')}</span>
+      </button>
     </Row>
-  );
+    {open && typeof document !== 'undefined' && createPortal(<MoveToLibrary n={1} busy={busy} current={{ libraryId: series.libraryId }}
+      onClose={() => setOpen(false)} onPick={async (libraryId, options) => {
+        setBusy(true);
+        try {
+          const result = await moveSeriesToLibrary([id], libraryId, options);
+          for (const key of [['library'], ['home'], ['collection'], ['series', id], ['series-privacy'], ['content-privacy']]) qc.invalidateQueries({ queryKey: key });
+          onSaved();
+          return result;
+        } finally { setBusy(false); }
+      }} />, document.body)}
+  </>;
 }
 
 /* =============================== Art =============================== */
@@ -664,6 +676,9 @@ const carriesFiles = (e: DragEvent) => [...(e.dataTransfer?.types ?? [])].includ
 const webLink = (s: string): boolean => {
   try { const u = new URL(s); return u.protocol === 'http:' || u.protocol === 'https:'; } catch { return false; }
 };
+/** Where a title logo came from, in the reader's words; Wikimedia Commons keeps its own name. */
+const titleArtSource = (source: string): string => source === 'Cover lettering' ? tr('From the cover')
+  : source === 'Uchiyomi logo library' ? tr('Uchiyomi logo library') : source;
 
 /**
  * A refusal in the reader's words. The art route answers in English with a code (bff routes/admin.ts): a file that
@@ -672,10 +687,11 @@ const webLink = (s: string): boolean => {
 function artRefusal(e: unknown, kind: ArtKind): string {
   let code: string | null = null;
   try { code = e instanceof ApiError ? (JSON.parse(e.body)?.error ?? null) : null; } catch { /* not JSON: the plain failure */ }
+  if (code === 'manual_choice') return tr('Reset to automatic before looking for another logo.');
   if (code === 'bad_image') return tr('That file is not an image this server can read.');
   if (code === 'no_url' || code === 'bad_request') return tr('Paste a full link to an image, starting with https://');
   if (e instanceof ApiError && e.status === 413) return tr('That image is over {n} MB. Pick a smaller one.', { n: ART_MAX_MB });
-  return kind === 'cover' ? tr('Could not change the cover') : tr('Could not change the banner');
+  return kind === 'cover' ? tr('Could not change the cover') : kind === 'banner' ? tr('Could not change the banner') : tr('Could not change the title logo');
 }
 
 const IcUpload = () => (
@@ -727,7 +743,7 @@ function ArtPanel({ id, series, onSaved, onNewBanner }: { id: string; series: Se
   const file = useRef<HTMLInputElement>(null);
   const fileFor = useRef<ArtKind>('cover');
   const ov = series.overrides;
-  const word = (kind: ArtKind, cover: string, banner: string) => (kind === 'cover' ? cover : banner);
+  const word = (kind: ArtKind, cover: string, banner: string, logo: string) => (kind === 'cover' ? cover : kind === 'banner' ? banner : logo);
 
   const change = async (kind: ArtKind, body: Record<string, unknown>, done: string): Promise<boolean> => {
     setBusy(kind);
@@ -738,6 +754,7 @@ function ArtPanel({ id, series, onSaved, onNewBanner }: { id: string; series: Se
       // has, rather than showing the old art as if the change had not taken.
       onSaved();
       await qc.refetchQueries({ queryKey: ['series', id] }, { cancelRefetch: false }).catch(() => {});
+      if (kind === 'logo') void qc.invalidateQueries({ queryKey: ['featured'] });
       toast(done, 'success');
       return true;
     } catch (e) {
@@ -754,14 +771,26 @@ function ArtPanel({ id, series, onSaved, onNewBanner }: { id: string; series: Se
     setBusy(kind);
     let dataUrl: string;
     try { dataUrl = await dataUrlOf(f); } catch { setBusy(null); toast(tr('That file is not an image this server can read.'), 'error'); return; }
-    await change(kind, { mode: 'upload', dataUrl }, word(kind, tr('Cover updated'), tr('Banner updated')));
+    await change(kind, { mode: 'upload', dataUrl }, word(kind, tr('Cover updated'), tr('Banner updated'), tr('Title logo updated')));
   };
   const fromLink = async (kind: ArtKind, raw: string) => {
     const url = raw.trim();
     if (!webLink(url)) { toast(tr('Paste a full link to an image, starting with https://'), 'error'); return; }
-    if (await change(kind, { mode: 'url', url }, word(kind, tr('Cover updated'), tr('Banner updated')))) setLinkFor(null);
+    if (await change(kind, { mode: 'url', url }, word(kind, tr('Cover updated'), tr('Banner updated'), tr('Title logo updated')))) setLinkFor(null);
   };
-  const reset = (kind: ArtKind) => change(kind, { mode: 'reset' }, word(kind, tr('Cover reset to automatic'), tr('Banner reset to automatic')));
+  const reset = (kind: ArtKind) => change(kind, { mode: 'reset' }, word(kind, tr('Cover reset to automatic'), tr('Banner reset to automatic'), tr('Title logo reset to automatic')));
+  const refreshLogo = async () => {
+    if (busy || series.titleArt?.status === 'pending' || (series.titleArt && series.titleArt.mode !== 'automatic')) return;
+    setBusy('logo');
+    try {
+      const result = await api<{ status: string }>(`/api/admin/series/${id}/logo/refresh`, { method: 'POST', json: {} });
+      onSaved();
+      await qc.refetchQueries({ queryKey: ['series', id] }, { cancelRefetch: false });
+      void qc.invalidateQueries({ queryKey: ['featured'] });
+      if (result.status === 'disabled') toast(tr('An online logo lookup is not available for this manga.'), 'info');
+    } catch (e) { toast(artRefusal(e, 'logo'), 'error'); }
+    finally { setBusy(null); }
+  };
   const firstPage = () => change('cover', { mode: 'first_page' }, tr('Cover updated'));
   const shuffle = async () => {
     if (!onNewBanner || busy) return;
@@ -825,6 +854,52 @@ function ArtPanel({ id, series, onSaved, onNewBanner }: { id: string; series: Se
             disabled={!!busy} onClick={(e) => bannerMenu.openFrom(e.currentTarget)} className="btn-key w-8 px-0"><IcMore /></button>
         </div>
         {linkFor === 'banner' && <LinkField kind="banner" busy={busy === 'banner'} onSet={(u) => void fromLink('banner', u)} onCancel={() => setLinkFor(null)} />}
+      </div>
+
+      <div data-title-art-editor>
+        <h3 className="mb-2 text-sm text-fog-100">{tr('Title logo')}</h3>
+        <ArtPreview kind="logo" busy={busy === 'logo'} onFile={(f) => void upload('logo', f)} className="min-h-36 w-full rounded-xl">
+          <Backdrop seriesId={id} genres={series.metadata?.genres} version={series.artVersion} autoHero={series.autoHero} banner className="absolute inset-0 opacity-35" />
+          <div className="relative flex min-h-36 items-center p-4"><HeroTitle as="div" series={series} /></div>
+        </ArtPreview>
+        <div className="mt-2 flex flex-wrap gap-1.5">
+          <button type="button" data-art-upload="logo" disabled={!!busy} onClick={() => choose('logo')} className="btn-key"><IcUpload />{tr('Upload')}</button>
+          <button type="button" data-art-link="logo" aria-expanded={linkFor === 'logo'} disabled={!!busy}
+            onClick={() => setLinkFor(linkFor === 'logo' ? null : 'logo')} className="btn-key">{tr('From a link')}</button>
+          <button type="button" data-art-find-logo disabled={!!busy || series.titleArt?.status === 'pending' || (!!series.titleArt && series.titleArt.mode !== 'automatic')} onClick={() => void refreshLogo()} className="btn-key">{tr('Find logo')}</button>
+          <button type="button" data-art-logo-reset disabled={!!busy} onClick={() => void reset('logo')} className="btn-key">{tr('Reset to automatic')}</button>
+          <button type="button" data-art-logo-text disabled={!!busy || series.titleArt?.mode === 'text'}
+            onClick={() => void change('logo', { mode: 'text' }, tr('Styled title selected'))} className="btn-key">{tr('Use styled title')}</button>
+          <TitleExtractionButton series={series} disabled={!!busy} onSaved={onSaved} />
+        </div>
+        {series.titleArt && series.titleArt.mode !== 'automatic' && <p className="mt-2 text-[11px] text-fog-500">{tr('Reset to automatic before looking for another logo.')}</p>}
+        {linkFor === 'logo' && <LinkField kind="logo" busy={busy === 'logo'} onSet={(u) => void fromLink('logo', u)} onCancel={() => setLinkFor(null)} />}
+        <label className="mt-3 block text-xs text-fog-300">
+          {tr('Style for titles without a logo')}
+          <select data-title-art-style value={series.titleArt?.style ?? 'auto'} disabled={!!busy} className="field mt-1 w-full text-xs"
+            onChange={(e) => void change('logo', { mode: 'style', style: e.target.value as TitleArtStyle }, tr('Title style updated'))}>
+            {TITLE_ART_STYLES.map((style) => <option key={style} value={style}>{tr(TITLE_ART_STYLE_LABELS[style])}</option>)}
+          </select>
+        </label>
+        <p className="mt-2 text-[11px] leading-relaxed text-fog-500">{tr('Transparent PNG or WebP works best. Original-language logos keep a readable title beneath them.')}</p>
+        <p data-title-art-status aria-live="polite" className="mt-1 text-[11px] leading-relaxed text-fog-500">
+          {series.titleArt?.mode === 'text' ? tr('Styled text, by your choice. No automatic logo lookup.')
+            : series.titleArt?.status === 'pending' ? tr('Looking for original title artwork…')
+            : series.titleArt?.mode === 'custom' ? tr('Your title logo. Automatic lookups will not replace it.')
+            : series.titleArt?.status === 'missing' ? tr('No matching logo found. The styled title is shown.')
+            : series.titleArt?.status === 'error' ? tr('The artwork source is unavailable. Cached artwork or the styled title stays visible.')
+            : series.titleArt?.status === 'disabled' ? tr('Automatic logo lookup is off or this manga has no confirmed AniList link.')
+            : tr('Automatic: verified title artwork, otherwise a style matched to this manga.')}
+        </p>
+        {series.titleArt?.attribution && <div className="mt-2 space-y-1 text-[11px] text-fog-400">
+          {series.titleArt.attribution.sourceUrl && webLink(series.titleArt.attribution.sourceUrl)
+            ? <a href={series.titleArt.attribution.sourceUrl} target="_blank" rel="noopener noreferrer" className="text-accent underline">{titleArtSource(series.titleArt.attribution.source)}</a>
+            : <p>{titleArtSource(series.titleArt.attribution.source)}</p>}
+          {series.titleArt.attribution.artist && <p>{series.titleArt.attribution.artist}</p>}
+          {series.titleArt.attribution.license && (series.titleArt.attribution.licenseUrl && webLink(series.titleArt.attribution.licenseUrl)
+            ? <a href={series.titleArt.attribution.licenseUrl} target="_blank" rel="noopener noreferrer" className="block underline">{series.titleArt.attribution.license}</a>
+            : <p>{series.titleArt.attribution.license}</p>)}
+        </div>}
       </div>
 
       <div className="space-y-1 text-[11px] leading-relaxed text-fog-500">

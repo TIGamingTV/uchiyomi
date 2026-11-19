@@ -5,11 +5,13 @@ import type { Stats } from 'fs';
 import { join } from 'path';
 import sharp from 'sharp';
 import { q, one, tx } from './db';
+import { privateScopeForFolder } from './contentScope';
 import { newSeriesId, newBookId } from './ids';
 import { env } from '../env';
+import { localArtFilename, refreshLocalSeriesArt } from './localSeriesArt';
 import { fingerprintChapter } from './fingerprint';
 import { findRematch, applyRematch, logRematch, MIN_BOOKS } from './rematch';
-import { naturalCmp, chapterName, numberByRule, NAME_RULE } from './naming';
+import { naturalCmp, pageCmp, chapterName, numberByRule, NAME_RULE } from './naming';
 import { parseComicInfoAgeRating } from './ageRating';
 import { directionFromComicInfo } from './directionSignals';
 import { typeFromGenres, SERIES_TYPE_FROM } from './seriesTypeSignals';
@@ -32,6 +34,11 @@ import { epubPages } from './readers/epub';
 
 export const LIBRARY_ROOT = process.env.LIBRARY_ROOT || '/library';
 const IMG = /\.(jpe?g|png|webp|gif|avif)$/i;
+
+/** An archive's image entries in page order (lib/naming.ts pageCmp), the order page cleanup numbers them by. */
+export function zipPageNames(entries: Record<string, { isDirectory: boolean }>): string[] {
+  return Object.keys(entries).filter((name) => !entries[name].isDirectory && IMG.test(name)).sort(pageCmp);
+}
 
 export interface ScanBook {
   id: string;
@@ -93,6 +100,12 @@ function chapterKind(path: string): ChapterKind {
   // An EPUB is a zip, but its pages come in spine order rather than filename order, so it is its own kind.
   if (/\.epub$/i.test(path)) return 'epub';
   return 'dir';
+}
+
+/** Whether a chapter's pages are in name order (lib/naming.ts pageCmp): archives and folders; a PDF or EPUB has its own. */
+export function pagesInNameOrder(path: string): boolean {
+  const k = chapterKind(path);
+  return k === 'zip' || k === 'rar' || k === 'dir';
 }
 
 const ARCHIVE = /\.(cbz|cbr|zip|rar|pdf|epub)$/i;
@@ -218,7 +231,13 @@ export async function listChapters(folderAbs: string, opts: {
     else if (e.kind === 'file' && /\.epub$/i.test(e.name)) {
       if ((await epubPages(join(folderAbs, e.name))).length) out.push(e.name);
     }
-    else if (e.kind === 'dir' && !SKIP_DIR.test(e.name) && (await isImageChapterDir(join(folderAbs, e.name), fsx))) out.push(e.name);
+    else if (e.kind === 'dir' && !SKIP_DIR.test(e.name)) {
+      if (e.name.toLowerCase() === 'artwork') {
+        const names = await fsx.readdirNames(join(folderAbs, e.name)).catch(() => [] as string[]);
+        if (names.length && names.every(n => n.startsWith('.') || localArtFilename(n))) continue;
+      }
+      if (await isImageChapterDir(join(folderAbs, e.name), fsx)) out.push(e.name);
+    }
   }
   return out.sort(naturalCmp);
 }
@@ -300,24 +319,24 @@ async function readArchive(path: string): Promise<{ xml: string; pages: number }
 }
 
 /** Sorted image page names inside a chapter (CBZ/CBR/folder) — used by the page server. */
-export async function cbzPages(path: string): Promise<string[]> {
-  const k = chapterKind(path);
+export async function cbzPages(path: string, formatName: string = path): Promise<string[]> {
+  const k = chapterKind(formatName);
   if (k === 'pdf') return pdfPages(path);
   if (k === 'epub') return epubPages(path);   // already in spine order; do NOT re-sort
-  if (k === 'dir') return regularFiles(path, (n) => IMG.test(n), naturalCmp);
-  if (k === 'rar') return (await rarHeaders(await rarExtractor(path))).map((h) => h.name).filter((n) => IMG.test(n)).sort(naturalCmp);
+  if (k === 'dir') return regularFiles(path, (n) => IMG.test(n), pageCmp);
+  if (k === 'rar') return (await rarHeaders(await rarExtractor(path))).map((h) => h.name).filter((n) => IMG.test(n)).sort(pageCmp);
   const zip = new StreamZip.async({ file: path });
   try {
     const entries = await zip.entries();
-    return Object.keys(entries).filter((n) => !entries[n].isDirectory && IMG.test(n)).sort(naturalCmp);
+    return zipPageNames(entries);
   } finally {
     await zip.close();
   }
 }
 
 /** Raw bytes of a single page (CBZ/CBR/folder) — used by the page server. */
-export async function cbzEntry(path: string, name: string): Promise<Buffer> {
-  const k = chapterKind(path);
+export async function cbzEntry(path: string, name: string, formatName: string = path): Promise<Buffer> {
+  const k = chapterKind(formatName);
   if (k === 'pdf') return pdfPageBytes(path, pdfPageIndex(name));
   if (k === 'dir') return readRegularFile(path, name);
   if (k === 'rar') return rarExtract(await rarExtractor(path), name);
@@ -358,20 +377,20 @@ export async function cbzPageAt(
     finally { await zip.close(); }
   }
   if (k === 'dir') {
-    const names = await regularFiles(path, (n) => IMG.test(n), naturalCmp);
+    const names = await regularFiles(path, (n) => IMG.test(n), pageCmp);
     const name = names[index];
     return name ? { name, bytes: await readRegularFile(path, name), total: names.length } : null;
   }
   if (k === 'rar') {
     const ex = await rarExtractor(path); // one extractor for both the listing and the read
-    const names = (await rarHeaders(ex)).map((h) => h.name).filter((n) => IMG.test(n)).sort(naturalCmp);
+    const names = (await rarHeaders(ex)).map((h) => h.name).filter((n) => IMG.test(n)).sort(pageCmp);
     const name = names[index];
     return name ? { name, bytes: await rarExtract(ex, name), total: names.length } : null;
   }
   const zip = new StreamZip.async({ file: path });
   try {
     const entries = await zip.entries();
-    const names = Object.keys(entries).filter((n) => !entries[n].isDirectory && IMG.test(n)).sort(naturalCmp);
+    const names = zipPageNames(entries);
     const name = names[index];
     return name ? { name, bytes: await zipEntryCapped(zip, name), total: names.length } : null;
   } finally {
@@ -396,7 +415,7 @@ export async function cbzPageDims(path: string): Promise<Array<{ name: string; w
     const zip = new StreamZip.async({ file: path });
     try {
       const entries = await zip.entries();
-      for (const name of Object.keys(entries).filter((n) => !entries[n].isDirectory && IMG.test(n)).sort(naturalCmp)) {
+      for (const name of zipPageNames(entries)) {
         // A page over the cap is measured as unknown rather than failing the whole chapter's dimensions.
         const bytes = await zipEntryCapped(zip, name).catch(() => null);
         if (bytes) await dim(name, bytes); else out.push({ name, width: null, height: null });
@@ -424,7 +443,7 @@ export async function eachPageBytes(path: string, fn: (bytes: Buffer | null) => 
     const zip = new StreamZip.async({ file: path });
     try {
       const entries = await zip.entries();
-      const names = Object.keys(entries).filter((n) => !entries[n].isDirectory && IMG.test(n)).sort(naturalCmp);
+      const names = zipPageNames(entries);
       for (const name of names) await fn(await zipEntryCapped(zip, name).catch(() => null));
       return names.length;
     } finally { await zip.close(); }
@@ -994,8 +1013,9 @@ async function scanOnce(): Promise<ScanResult> {
         // belong to: unordered, the deleted twin could come back first and the `continue` below skipped the
         // folder for good. Reintroduce by dropping the ORDER BY: "a deleted twin does not hide the live row"
         // in scanResilience.int.test.ts finds its books missing.
-        const known = await one<{ id: string; deleted_at: string | null; merged_into: string | null; library_id: string; renumbering: boolean; info_read: string | null }>(
-          `SELECT id, deleted_at, merged_into, library_id, renumber_plan IS NOT NULL AS renumbering, info_read FROM lib_series WHERE folder = $1
+        const privateScope = await privateScopeForFolder(folderRel);
+        const known = await one<{ id: string; deleted_at: string | null; merged_into: string | null; library_id: string; owner_user_id: string | null; is_private: boolean; renumbering: boolean; info_read: string | null }>(
+          `SELECT id, deleted_at, merged_into, library_id, owner_user_id, is_private, renumber_plan IS NOT NULL AS renumbering, info_read FROM lib_series WHERE folder = $1
             ORDER BY (deleted_at IS NOT NULL), (merged_into IS NOT NULL), created_at LIMIT 1`,
           [folderRel],
         );
@@ -1007,9 +1027,14 @@ async function scanOnce(): Promise<ScanResult> {
         // new id, with none of the reading history -- for every file that moved. Its next check finishes the
         // journal; until then the folder is left exactly as it is.
         if (known?.renumbering) continue;
+        if (privateScope && known && known.owner_user_id !== privateScope.ownerUserId) continue;
         // Merged away: its files belong to the survivor now. Without this the books get pulled back out by
         // `ON CONFLICT (root, file) DO UPDATE SET series_id = EXCLUDED.series_id` and the merge silently undoes.
         const mergeTarget = known?.merged_into || null;
+        if(mergeTarget && known){
+          const target=await one<{is_private:boolean;owner_user_id:string|null}>('SELECT is_private,owner_user_id FROM lib_series WHERE id=$1',[mergeTarget]);
+          if(!target || target.is_private!==known.is_private || known.is_private && target.owner_user_id!==known.owner_user_id) continue;
+        }
 
         // Only a folder with no row of its own can be a move. Anything already known is the normal path.
         // ⚠️ `!known`, the half of that rule the line below once lacked (v0.55.7, #150). A known folder that took in
@@ -1020,7 +1045,7 @@ async function scanOnce(): Promise<ScanResult> {
         // rematched onto another" in rematch.int.test.ts finds the folder skipped.
         let rematched: { id: string; oldFolder: string } | null = null;
         if (env.LIBRARY_REMATCH !== 'off' && !known && !seenFolders.has(folderRel)) {
-          rematched = await tryRematch(folderRel, folderAbs, files, root, onDisk, libraryIdFor(folderRel, libs));
+          rematched = await tryRematch(folderRel, folderAbs, files, root, onDisk, privateScope?.libraryId ?? libraryIdFor(folderRel, libs));
         }
 
         // The first file's stat, when the series' info was looked at below: the chapter loop reuses it.
@@ -1061,8 +1086,8 @@ async function scanOnce(): Promise<ScanResult> {
               // reassigned, made the conflict target miss and mint a second row with a new id -- which is
               // the one thing that strands everyone's reading progress. Reassignment is a deliberate UPDATE.
               `INSERT INTO lib_series (id, source, title, summary, author, status, genres, web, folder, books_count, library_id, age_rating,
-                                       reading_direction, reading_direction_from, scanned_at, info_read)
-               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14, now(), $15)
+                                       reading_direction, reading_direction_from, scanned_at, info_read, owner_user_id, is_private)
+               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14, now(), $15,$16,$17)
                ON CONFLICT (library_id, folder) DO UPDATE SET source=EXCLUDED.source, title=EXCLUDED.title, summary=EXCLUDED.summary,
                  author=EXCLUDED.author, status=EXCLUDED.status, genres=EXCLUDED.genres, web=EXCLUDED.web,
                  -- Never overwrite a rating we have with one we do not: a chapter whose ComicInfo omits
@@ -1077,16 +1102,17 @@ async function scanOnce(): Promise<ScanResult> {
                  scanned_at=now(), info_read=EXCLUDED.info_read
                RETURNING id`,
               [
-                newSeriesId(), srcName, field(firstXml, 'Series') || folderRel.split('/').pop()!, cleanSummary(field(firstXml, 'Summary')),
+                newSeriesId(), privateScope ? (folderRel.split('/')[2] ?? srcName) : srcName, field(firstXml, 'Series') || folderRel.split('/').pop()!, cleanSummary(field(firstXml, 'Summary')),
                 field(firstXml, 'Writer'), cleanStatus(field(firstXml, 'PublishingStatusTachiyomi') || field(firstXml, 'PublishingStatus')),
                 // Without a site's genre menu (lib/genres.ts): files a page-wide read wrote before v0.55.5 still carry one.
                 cleanGenres((field(firstXml, 'Genre') || '').split(',')),
                 field(firstXml, 'Web'), folderRel, files.length,
-                known?.library_id ?? libraryIdFor(folderRel, libs),
+                known?.library_id ?? privateScope?.libraryId ?? libraryIdFor(folderRel, libs),
                 parseComicInfoAgeRating(field(firstXml, 'AgeRating')),
                 directionFromComicInfo(field(firstXml, 'Manga')),
                 directionFromComicInfo(field(firstXml, 'Manga')) ? 'comicinfo' : null,
                 read.ok ? infoRead : null,
+                known?.owner_user_id ?? privateScope?.ownerUserId ?? null, known?.is_private ?? !!privateScope,
               ],
             );
             id = rows[0].id;
@@ -1198,7 +1224,9 @@ async function scanOnce(): Promise<ScanResult> {
           );
           return id;
         });
-        void seriesId;
+        // A local-art failure never loses an indexed chapter or changes provider artwork.
+        await refreshLocalSeriesArt(seriesId, root, folderRel, root === DL_ROOT ? 1 : 0)
+          .catch(e => console.warn('[scan] local artwork:', String((e as Error)?.message || e).slice(0, 120)));
       } catch (e) {
         skippedTotal++;
         const error = String((e as Error)?.message || e).slice(0, 300);
@@ -1245,8 +1273,8 @@ async function scanOnce(): Promise<ScanResult> {
 
 /**
  * The number setBookDates and setBookMeta match a landing to, as SQL over `lib_books b` and `lib_series s`: the raw
- * lib_books.number (see setBookDates for why), except on a series numbered by posting order (#116), where it is
- * the override-aware one. There a book in a root the renumber could not rename keeps the SOURCE's number as its
+ * lib_books.number (see setBookDates for why), except on a series numbered by posting order (#116) or by its chapter
+ * titles (#379), where it is the override-aware one. There a book in a root the renumber could not rename keeps the SOURCE's number as its
  * raw number (another post's, now) and its own post's in book_overrides (lib/numbering.ts); matched raw, the
  * landing of post 2 re-stamped the read-only post 21 with post 2's chapter id, name, group and date -- and the
  * chapter id is the evidence every later remap trusts first (#116 review). Reintroduce the raw match: "a chapter in
@@ -1256,7 +1284,7 @@ async function scanOnce(): Promise<ScanResult> {
  * the range test: "a landing stamps the chapter it is, never a range file" in chapterRanges.int.test.ts finds the
  * file stamped with chapter 1's group.
  */
-const BOOK_NUMBER = `(CASE WHEN s.numbering = 'posting_order'
+const BOOK_NUMBER = `(CASE WHEN s.numbering IN ('posting_order', 'titles')
   THEN COALESCE((SELECT o.number FROM book_overrides o WHERE o.book_id = b.id), b.number) ELSE b.number END)`;
 
 /**

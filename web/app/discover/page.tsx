@@ -3,31 +3,33 @@ import { Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'rea
 import Link from 'next/link';
 import { useSearchParams } from 'next/navigation';
 import { useQueries, useQuery, useQueryClient } from '@tanstack/react-query';
-import { api } from '@/lib/api';
+import { api, getCurrentUser, img } from '@/lib/api';
 import { ART } from '@/lib/art';
 import { relativeTime } from '@/lib/format';
 import { useAuth, canDownload } from '@/lib/auth';
-import { keys, t as tr } from '@/lib/i18n';
+import { t as tr } from '@/lib/i18n';
 import { reasonText } from '@/lib/said';
-import { isDesktop } from '@/lib/desktop';
 import { EmptyState } from '@/components/EmptyState';
-import { ProgressBar, Reveal } from '@/components/ui';
+import { ProgressBar } from '@/components/ui';
 import { SourceCard, SourceItem, StillLoadingCard } from '@/components/cards';
-import { ScrollRail } from '@/components/ScrollRail';
-import { DiscoverHero, TrendingCard, Trending } from '@/components/DiscoverHero';
-import { RecommendationRail } from '@/components/RecommendationRail';
+import { heroPoll, type Trending } from '@/components/DiscoverHero';
+import { DiscoveryHub, DiscoveryTabLoading } from '@/components/DiscoveryHub';
+import { discoveryView, openingDiscoveryTab, type DiscoveryState, type DiscoveryTab } from '@/lib/discoveryHub';
+import { isDesktop } from '@/lib/desktop';
+import { pollAfter, type Recommendations } from '@/lib/recommendations';
+import { mergePicks, type Pick, type ReadPick } from '@/lib/forYou';
 import { SourcePicker, SourceLatest, Src, SrcState } from '@/components/SourcePicker';
-import { aloneEmpty, answeredPage, budgetForMode, discoverSources, WALL_IN_FLIGHT, type ListMode, type SrcExtension, type StackSource } from '@/lib/sourceGroups';
+import { aloneEmpty, answeredPage, budgetForMode, creatorSearchBudget, supportsCreatorSearch, discoverSources, WALL_IN_FLIGHT, type ListMode, type SrcExtension, type StackSource } from '@/lib/sourceGroups';
 import { normTitle } from '@/lib/normTitle';
 import { applyWorks, foldByWork, followWorks, mergeGroups, unknownWorks, workKey, type WallProvider } from '@/lib/wall';
 import { useLiveWorks } from '@/lib/useLiveWorks';
 import { AddSeriesDialog, AddSeed } from '@/components/AddSeriesDialog';
 import { AdultToggle, useAdultShown } from '@/components/AdultToggle';
-import { IcChevronLeft, IcSearch, IcSparkle, IcX } from '@/components/icons';
+import { IcChevronLeft, IcSearch, IcX } from '@/components/icons';
 import { forStrip } from '@/lib/jobs';
 import { downloadsHref, stripHref } from '@/lib/libraryView';
 import { useServerDownloads } from '@/lib/useServerDownloads';
-import { canSearchMore, freshCards, noMore, soloSource, type SearchMore } from '@/lib/searchMore';
+import { canSearchMore, freshCards, noMore, soloSource, sourcePageCards, sourceSearchPage, type SearchMore, type SourcePageItem } from '@/lib/searchMore';
 /**
  * One search card. Since v0.52.0 (#72) `inLibrary` means held in every provider's language, `libraryLangs` the
  * languages the library holds the title in, and each provider carries its own `lang` and `inLibrary`. Since v0.55.4
@@ -72,68 +74,14 @@ const SEARCH_NAMES_SHOWN = 3;
  */
 const HERO_FIND_SOURCES = 10;
 
-/**
- * How many titles the hero rotates through.
- *
- * At 5s a slide this is a 50-second loop. Going much higher means the last few slides are seen by nobody,
- * and every slide is one more proxied cover fetch.
- */
-const HERO_SLIDES = 10;
-
-/**
- * The trending rails under the wall (v0.61.0), by AniList's country of origin: Korea's (manhwa -- the hero shows its
- * first ten, as it always has, and the rail the rest), then Japan's (manga) and China's (manhua). What each is called,
- * in the same order, declared for the translators: the rails render it through a variable.
- */
+/** Catalog origins used by the personal hub. */
 const TREND_RAILS = ['KR', 'JP', 'CN'] as const;
-const TREND_LABELS = keys('Trending manhwa', 'Trending manga', 'Trending manhua');
-/** An AniList rail's card, as the page remembers what this visit added from it: by its entry, else its title. */
-const railKey = (t: Trending): string => (t.id != null ? `al:${t.id}` : `t:${normTitle(t.title)}`);
+/** The Sources tab keeps its established responsive cover grid. */
+const WALL_GRID = 'grid grid-cols-3 gap-x-3 gap-y-5 sm:grid-cols-4 md:grid-cols-5 lg:grid-cols-7 lg:gap-x-4 xl:grid-cols-8 2xl:grid-cols-9 3xl:grid-cols-10';
+/** An AniList row's card, as the page remembers what this visit added from it: by its entry, else its title. */
+const railKey = (t: { id?: number | null; title: string }): string => (t.id != null ? `al:${t.id}` : `t:${normTitle(t.title)}`);
 
-/**
- * One of Discover's AniList rails (v0.61.0): Because you read above the wall, and the trending rails under it. Every
- * one goes through this one ScrollRail -- a strip a mouse can move (rails.test.ts) -- and a card opens the add dialog,
- * which looks the title up on the best-ranked sources.
- */
-function AniListRail({ kind, title, items, onPick, className = 'pb-6' }: {
-  kind: string; title: string; items: Trending[]; onPick: (t: Trending) => void; className?: string;
-}) {
-  return (
-    <section className={className} data-anilist-rail={kind}>
-      <h2 className="mb-3 font-display text-lg font-semibold tracking-tight text-fog-50 lg:text-xl">{title}</h2>
-      {/* pb-3 rather than pb-1: the global scrollbar is 8px and used to be hidden, so the rail had no
-          room for it and it would have sat on the card captions. */}
-      <ScrollRail label={title}
-        className="bleed bleed-pad flex gap-3 pb-3 [scroll-snap-type:x_mandatory]">
-        {items.map((t, i) => (
-          <Reveal key={railKey(t)} delay={Math.min(i, 12) * 28}>
-            <TrendingCard t={t} onPick={onPick} />
-          </Reveal>
-        ))}
-      </ScrollRail>
-    </section>
-  );
-}
-
-/**
- * Discover, rebuilt around what people actually do here.
- *
- * This is the only page that adds new series from the internet, and it was a bare search box on black with a
- * ragged grid hanging off it. Production said something the design did not: in 48 hours there were 32 calls
- * to "newest from a source" and ZERO searches. The thing buried behind a label, a 45-option dropdown and a
- * separate button was the entire point of the page, and the search box that dominated it was unused.
- *
- * So: a wall of what your sources published, led by a full-bleed hero built from AniList key art that
- * `/api/discover/trending` has been returning all along and this page rendered as a 144px thumbnail. The
- * sources are ranked and every one of them is asked, the best first, four at a time (v0.58.0: it was the best
- * six to ten, and the owner's 29 sources were mostly never on the wall). Search survives as a field, with a
- * way back out that it never had.
- *
- * `/api/sources/latest` takes up to fifteen seconds, so the sources are fetched independently and the
- * wall fills in as each lands, in arrival order, with a card at its end naming who is still loading. Nothing
- * already on screen ever moves: only mangadex populates `updatedAt`, so "newest across every source" is not a
- * sortable quantity and pretending otherwise would reflow tiles under a reading thumb.
- */
+/** Discover's source browser remains independent of the personal hub's filters and feedback. */
 function DiscoverInner() {
   const qc = useQueryClient();
   const { user, isAdmin } = useAuth();
@@ -147,61 +95,101 @@ function DiscoverInner() {
   // `?view=`; afterwards the page writes the address itself (writeQ below), so a reload stays on what is on screen.
   const params = useSearchParams();
   const [arrivedQ] = useState(() => (params.get('q') ?? '').trim().slice(0, 200));
+  const [searchKind, setSearchKind] = useState<'title' | 'author' | 'artist'>(() => { const kind = params.get('creator'); return kind === 'author' || kind === 'artist' ? kind : 'title'; });
+  const [openingTab] = useState(() => openingDiscoveryTab(params.get('tab'), arrivedQ));
+  const [tabChoice, setTab] = useState<DiscoveryTab | null>(openingTab);
+  // The hero keeps its personal-hub state, while the shared controls stay mounted across tab changes.
+  const [heroTarget, setHeroTarget] = useState<HTMLDivElement | null>(null);
+  const tabWrites = useRef<Promise<void>>(Promise.resolve());
 
+
+  const adultOn = useAdultShown();
+  const stateKey = ['discover-state', user?.id, adultOn] as const;
+  const stateQ = useQuery({
+    queryKey: stateKey,
+    queryFn: ({ signal }) => api<DiscoveryState>('/api/discover/state', { signal, expectedOwnerId: user?.id }),
+    enabled: mayAdd && !!user?.id, staleTime: 30_000, retry: false,
+  });
+  // Restoring the preference is part of choosing the first view. Never paint or fetch the wrong tab first.
+  const { tab, ready: tabReady } = discoveryView(tabChoice, stateQ.data?.tab, stateQ.isPending);
   const { data: sourcesData } = useQuery({
     queryKey: ['sources'],
-    // `hiddenAdult` is how many adult providers the "Show 18+" reveal is keeping out of `content` right now
-    // (v0.42.0). Optional, so an older server's answer still renders; 0 for an age-capped account, which
-    // never had those sources to hide. It is the only reason the reveal chip appears on this page.
     queryFn: () => api<{ content: Src[]; hiddenAdult?: number }>('/api/sources'),
-    enabled: mayAdd,
+    enabled: mayAdd && tabReady,
     staleTime: 30_000,
     refetchInterval: 60_000,
   });
-  // Never a backup extension's (v0.82.0, lib/sourceGroups.ts discoverSources): only the sources a person added.
   const sources = useMemo(() => discoverSources(sourcesData?.content ?? []), [sourcesData]);
-  /**
-   * Whether to offer the reveal chip here at all.
-   *
-   * ⚠️ The `adultOn ||` is load-bearing, not defensive. With the reveal ON the server hides nothing, so
-   * `hiddenAdult` is 0 — and a chip that vanishes the moment it is pressed strands the session with no way
-   * back. `AdultToggle` still renders on its own wherever an 18+ library exists.
-   */
-  const adultOn = useAdultShown();
+  // Keep the reveal mounted while it is on, even when nothing is hidden any more.
   const showAdultChip = adultOn || (sourcesData?.hiddenAdult ?? 0) > 0;
+  const chooseTab = (next: DiscoveryTab) => {
+    setTab(next);
+    try {
+      const u = new URL(window.location.href); u.searchParams.set('tab', next);
+      if (next === 'for-you') { u.searchParams.delete('q'); u.searchParams.delete('creator'); }
+      else if (mode === 'search' && term) { u.searchParams.set('q', term); if (searchKind !== 'title') u.searchParams.set('creator', searchKind); }
+      window.history.replaceState(window.history.state, '', `${u.pathname}${u.search}${u.hash}`);
+    } catch { /* browsing still works without address persistence */ }
+    const owner = user?.id;
+    if (owner) tabWrites.current = tabWrites.current.catch(() => {}).then(async () => {
+      if (getCurrentUser() !== owner) return;
+      await api('/api/discover/state', { method: 'PATCH', json: { tab: next }, expectedOwnerId: owner });
+      if (getCurrentUser() === owner) qc.setQueryData<DiscoveryState>(stateKey, (old) => old ? { ...old, tab: next } : old);
+    }).catch(() => {});
+  };
 
-  const { data: trending } = useQuery({
+  const trendQ = useQuery({
     // NOT ['trending'] -- that key belongs to /api/trending, which is what the household is reading and is a
     // Series[]. This is /api/discover/trending, which is AniList and carries genres, banner and score. They
     // shared a key, so arriving here from the home page handed this the wrong shape out of the cache and the
     // hero threw on `genres.slice`. A direct page load was fine, which is why it looked intermittent.
     // v0.61.0: one key per country of origin; this one is Korea's, the hero's and the first rail's.
-    queryKey: ['discover-trending', 'KR'],
-    queryFn: () => api<{ content: Trending[] }>('/api/discover/trending?country=KR'),
-    enabled: mayAdd,
+    queryKey: ['discover-trending', 'KR', user?.id, adultOn],
+    queryFn: () => api<{ content: Trending[]; pending?: boolean }>('/api/discover/trending?country=KR'),
+    enabled: mayAdd && tabReady && tab === 'for-you',
     staleTime: 0,
     refetchOnMount: 'always',
+    // v0.98.0: asked again while a server that has never stored a copy is still pulling one (bff lib/trending.ts).
+    refetchInterval: (qy) => heroPoll(qy.state.data, qy.state.dataUpdateCount),
   });
+  const trending = trendQ.data;
+  /**
+   * The first cached country answers before the other catalog/recommendation queries start, retaining the existing
+   * request pacing. Sources browsing does not start catalog pulls.
+   */
+  const heroSettled = !trendQ.isPending;
 
   // ---------------------------------------------------------------- the wall
   const [mode, setMode] = useState<'newest' | 'search'>(arrivedQ ? 'search' : 'newest');
-  // v0.61.0: the manga and manhua rails under the wall -- while browsing, each country its own answer and its own key.
+  // v0.61.0: the manga and manhua rows -- while browsing, each country its own answer and its own key; once Korea's is in.
   const moreTrending = useQueries({
     queries: TREND_RAILS.slice(1).map((country) => ({
-      queryKey: ['discover-trending', country],
-      queryFn: () => api<{ content: Trending[] }>(`/api/discover/trending?country=${country}`),
-      enabled: mayAdd && mode === 'newest',
+      queryKey: ['discover-trending', country, user?.id, adultOn],
+      queryFn: () => api<{ content: Trending[]; pending?: boolean }>(`/api/discover/trending?country=${country}`),
+      enabled: mayAdd && tabReady && tab === 'for-you' && heroSettled,
       staleTime: 0,
       refetchOnMount: 'always' as const,
+      refetchInterval: (qy: { state: { data?: { pending?: boolean }; dataUpdateCount: number } }) => heroPoll(qy.state.data, qy.state.dataUpdateCount),
     })),
   });
-  // v0.61.0: "Because you read {title}" above the wall -- what AniList's readers recommend after something this account
-  // read lately, less what the server holds. The server answers from its stored copy; nothing asks AniList here.
-  const { data: because } = useQuery({
-    queryKey: ['discover-because'],
-    queryFn: () => api<{ seed: { id: string; title: string } | null; content: Trending[] }>('/api/discover/because'),
-    enabled: mayAdd && mode === 'newest',
+  // v0.61.0: "Because you read {title}" -- what AniList's readers recommend after the series this account read lately, less
+  // what the server holds; since v0.98.0 from every recent read, each pick naming its own. The server answers from its
+  // stored copy; nothing asks AniList here.
+  const becauseQ = useQuery({
+    queryKey: ['discover-because', user?.id, adultOn],
+    queryFn: () => api<{ seed: { id: string; title: string } | null; content: ReadPick[] }>('/api/discover/because'),
+    enabled: mayAdd && tabReady && tab === 'for-you' && heroSettled,
     staleTime: 5 * 60_000,
+  });
+  const because = becauseQ.data;
+  // #248's "Recommended for you": what the trackers this person connected suggest. The server does the caching (a day's old
+  // answer is normal), so this asks once per visit and only polls while a first-time refresh is still running there.
+  const recsQ = useQuery({
+    queryKey: ['discover-recommendations', user?.id, adultOn],
+    queryFn: () => api<Recommendations>('/api/discover/recommendations'),
+    enabled: mayAdd && tabReady && tab === 'for-you' && heroSettled,
+    staleTime: 10 * 60_000,
+    refetchInterval: (qy) => pollAfter(qy.state.data, qy.state.dataUpdateCount),
   });
   /**
    * Which listing the wall shows, and which single source (if any) is shown alone.
@@ -238,7 +226,7 @@ function DiscoverInner() {
   const [railAdded, setRailAdded] = useState<Set<string>>(new Set());
   const fromRail = useRef<string | null>(null);
   useEffect(() => { if (!seed) fromRail.current = null; }, [seed]);
-  const pickRail = (t: Trending) => { fromKey.current = null; fromRail.current = railKey(t); setSeed({ kind: 'trending', title: t.title }); };
+  const pickRail = (t: { id?: number | null; title: string }) => { fromKey.current = null; fromRail.current = railKey(t); setSeed({ kind: 'trending', title: t.title }); };
 
   // Every source that can answer this listing, best first. A source that cannot answer the chosen listing is
   // not in the pool at all, the same way one without `latest` has never been. Popular is universal among
@@ -267,7 +255,7 @@ function DiscoverInner() {
   // the wall is on screen (lib/useLiveWorks.ts), and every source's rows are read through the answers: a card joins
   // the one its work already has, and one the library turns out to hold leaves the wall. An add follows its work.
   const wallKeys = useMemo(() => unknownWorks(mine(byId).flatMap(([, list]) => list)), [byId, mine]);
-  const wallWorks = useLiveWorks(wallKeys, mayAdd && mode === 'newest');
+  const wallWorks = useLiveWorks(wallKeys, mayAdd && tab === 'sources' && mode === 'newest');
   const rows = useMemo(() => Object.fromEntries(mine(byId).map(([k, list]) => [k, applyWorks(list, wallWorks)])), [byId, mine, wallWorks]);
   const wallAdded = useMemo(() => followWorks(added, wallWorks), [added, wallWorks]);
 
@@ -281,7 +269,7 @@ function DiscoverInner() {
    * each answer releases the next, so more sources only means the wall keeps filling for longer -- and its last card
    * says who it is still waiting on.
    */
-  const budget = pool;
+  const budget = useMemo(() => creatorSearchBudget(pool, mode, searchKind), [pool, mode, searchKind]);
 
   // Where the hero's add looks a title up: the best-ranked HERO_FIND_SOURCES (v0.58.0 kept it there when the wall
   // began asking every source -- /api/sources/find asks all it is given at once, with no gate like the wall's).
@@ -291,7 +279,12 @@ function DiscoverInner() {
   const budgetIds = useMemo(() => budget.slice(0, HERO_FIND_SOURCES).map((s) => s.id), [budget]);
 
   const onSettled = useCallback((id: string, items: SourceItem[], ok: boolean, at = 1) => {
-    setById((prev) => (prev[id]?.length && !items.length ? prev : { ...prev, [id]: [...(prev[id] ?? []), ...items] }));
+    setById((prev) => {
+      const have = prev[id] ?? [];
+      const seen = new Set(have.map((it) => `${it.source}:${it.sourceId}`));
+      const fresh = items.filter((it) => { const key = `${it.source}:${it.sourceId}`; if (seen.has(key)) return false; seen.add(key); return true; });
+      return fresh.length ? { ...prev, [id]: [...have, ...fresh] } : prev;
+    });
     setOrder((prev) => (prev.includes(id) ? prev : [...prev, id]));
     setStates((prev) => ({ ...prev, [id]: !ok ? 'blocked' : items.length ? 'ok' : 'empty' }));
     setUpTo((prev) => ((prev[id] ?? 0) >= at ? prev : { ...prev, [id]: at }));
@@ -339,17 +332,18 @@ function DiscoverInner() {
     // `selected` is part of the key: narrowing to a source is a different question, and must not be
     // answered from the unfiltered search's cache. So is the 18+ filter, and whether Show 18+ is on: an answer from
     // before the switch was flipped says nothing about the account's age limit after it.
-    queryKey: ['search-all', term, selected, ratingAsked, adultOn],
+    queryKey: ['search-all', term, selected, ratingAsked, adultOn, searchKind],
     queryFn: ({ signal, queryKey, client }) => {
       // ⚠️ Only the first request may wait the long wait. A poll that also waited six seconds would hold
       // its answer until the server's grace expired, so the wall would fill in six seconds late every time.
       const first = (client.getQueryState(queryKey)?.dataUpdateCount ?? 0) === 0;
       const only = selected ? `&source=${encodeURIComponent(selected)}` : '';
       const rated = ratingAsked === 'all' ? '' : `&rating=${ratingAsked}`;
-      return api<SearchAnswer>(`/api/sources/search-all?q=${encodeURIComponent(term)}&wait=${first ? SEARCH_FIRST_WAIT_MS : SEARCH_POLL_WAIT_MS}${only}${rated}`, { signal });
+      const creator = searchKind === 'title' ? '' : `&creator=${searchKind}`;
+      return api<SearchAnswer>(`/api/sources/search-all?q=${encodeURIComponent(term)}&wait=${first ? SEARCH_FIRST_WAIT_MS : SEARCH_POLL_WAIT_MS}${only}${rated}${creator}`, { signal });
     },
     // `mayAdd` (v0.61.0): an arrival's `?q=` starts in search mode, and an account the server refuses is not asked.
-    enabled: mode === 'search' && !!term && mayAdd,
+    enabled: tabReady && tab === 'sources' && mode === 'search' && !!term && mayAdd,
     // A failed search is shown as one; retrying it would be another fan-out to every source.
     retry: false,
     staleTime: 5 * 60_000,
@@ -363,7 +357,7 @@ function DiscoverInner() {
   }, [adultOn, ratingAsked, searchQ.data]);
   // The search's own unplaced names, asked about while its results are on screen, as the wall's are (v0.56.0).
   const searchKeys = useMemo(() => unknownWorks(searchQ.data?.content ?? []), [searchQ.data]);
-  const searchWorks = useLiveWorks(searchKeys, mayAdd && mode === 'search');
+  const searchWorks = useLiveWorks(searchKeys, mayAdd && tab === 'sources' && mode === 'search');
   const searchAdded = useMemo(() => followWorks(added, searchWorks), [added, searchWorks]);
   // The answer's groups read through what the server has placed since, one per work: two it could not tell apart when
   // it answered are one card once it can (lib/wall.ts mergeGroups). Owned ones stay -- search shows what you have, with
@@ -400,7 +394,7 @@ function DiscoverInner() {
   // at a time -- so a search on the chosen source, or on the only one there is, loads its next page as the wall is
   // scrolled (below, under "more"). Keyed on the search, so another term, source or filter starts over.
   const solo = mode === 'search' ? soloSource(selected, searchQ.data?.sources) : null;
-  const moreKey = solo ? [term, solo, ratingAsked, adultOn ? 'adult' : 'safe'].join('\u0000') : '';
+  const moreKey = solo ? [term, solo, searchKind, ratingAsked, adultOn ? 'adult' : 'safe'].join('\u0000') : '';
   const [moreState, setMore] = useState<SearchMore>(noMore());
   const more = moreState.key === moreKey ? moreState : noMore(moreKey);
   const [moreBusy, setMoreBusy] = useState(false);
@@ -490,10 +484,12 @@ function DiscoverInner() {
    * The address says what is on screen (v0.61.0): `?q=` while a search is, nothing while browsing -- replaced, never
    * pushed, so Back leaves Discover instead of stepping through its searches.
    */
-  const writeQ = (value: string) => {
+  const writeQ = (value: string, kind = searchKind) => {
     try {
       const u = new URL(window.location.href);
       if (value) u.searchParams.set('q', value); else u.searchParams.delete('q');
+      u.searchParams.set('tab', 'sources');
+      if (value && kind !== 'title') u.searchParams.set('creator', kind); else u.searchParams.delete('creator');
       window.history.replaceState(window.history.state, '', `${u.pathname}${u.search}${u.hash}`);
     } catch { /* the page works the same without it */ }
   };
@@ -501,7 +497,8 @@ function DiscoverInner() {
   const search = (e?: React.FormEvent) => {
     e?.preventDefault();
     const next = q.trim();
-    if (!next) return;
+    if (!next) { backToNewest(); return; }
+    chooseTab('sources');
     setMode('search');
     writeQ(next);
     // The same term submitted again while its answer is on screen is a refetch -- a failed search has no
@@ -548,7 +545,7 @@ function DiscoverInner() {
   // The next page once every source has answered this one (v0.58.0: once each had answered at all, so a page could
   // start while the last one was still being asked -- and with the gate counting by page, the sources it had not
   // reached yet would have been skipped).
-  const canPage = mode === 'newest' && answered >= budget.length && budget.length > 0 && page < 5;
+  const canPage = tab === 'sources' && mode === 'newest' && answered >= budget.length && budget.length > 0 && page < 5;
   useEffect(() => {
     const el = sentinel.current;
     if (!el || !canPage) return;
@@ -558,8 +555,8 @@ function DiscoverInner() {
   }, [canPage]);
   // A search on one source, its next page (#331): asked when the end of the wall comes near, one page at a time, until a
   // page brings nothing new. A failure ends it too: a search typed again starts over.
-  const canMore = canSearchMore({
-    solo, pages: !!sources.find((s) => s.id === solo)?.searchPages, rating: ratingAsked,
+  const canMore = tab === 'sources' && canSearchMore({
+    solo, pages: searchKind === 'title' ? !!sources.find((s) => s.id === solo)?.searchPages : supportsCreatorSearch(sources.find((s) => s.id === solo), searchKind), rating: ratingAsked,
     pending: stillAsking, firstPage: searchHits.length, more, busy: moreBusy,
   });
   const loadMore = useCallback(async () => {
@@ -568,15 +565,15 @@ function DiscoverInner() {
     setMoreBusy(true);
     let fresh: SourceItem[] = [];
     try {
-      const r = await api<{ content: SourceItem[] }>(`/api/sources/search?source=${encodeURIComponent(solo)}&q=${encodeURIComponent(term)}&page=${next}`);
-      fresh = freshCards(shown, r.content ?? []);
+      const r = await api<{ content: SourcePageItem[] }>(sourceSearchPage(solo, term, next, searchKind));
+      fresh = freshCards(shown, sourcePageCards(solo, r.content ?? []));
     } catch { /* the end, as an empty page is */ }
     setMore((m) => {
       const base = m.key === key ? m : noMore(key);
       return { key, items: [...base.items, ...fresh], page: next, done: fresh.length === 0 };
     });
     setMoreBusy(false);
-  }, [solo, moreKey, more, searchHits, term]);
+  }, [solo, moreKey, more, searchHits, term, searchKind]);
   useEffect(() => {
     const el = sentinel.current;
     if (!el || !canMore) return;
@@ -593,36 +590,12 @@ function DiscoverInner() {
   // showing the last few minutes of them, as it always did (lib/jobs.ts `forStrip`).
   const jobs = forStrip(jobsData?.content ?? []);
 
-  /**
-   * The hero's slides: everything with wide key art first, then topped up from the rest.
-   *
-   * This was `withArt.length ? withArt : all` -- all-or-nothing, falling back only when NOTHING had a
-   * banner -- and it quietly capped the hero far below its own limit. Measured on a real library: AniList
-   * returns 40 trending manhwa, 16 carry banner art, and after removing the 215 series that library already
-   * owned, 7 banner-bearing titles were left. Raising the slice alone would have changed nothing, and the
-   * pool shrinks further with every series added.
-   *
-   * Topping up costs nothing, because the hero already handles a missing banner: it falls back to the 2:3
-   * cover and letterboxes it on wide viewports.
-   */
-  const heroSlides = useMemo(() => {
-    const all = trending?.content ?? [];
-    const withArt = all.filter((t) => t.banner);
-    const rest = all.filter((t) => !t.banner);
-    return [...withArt, ...rest].slice(0, HERO_SLIDES);
-  }, [trending]);
-  const rail = useMemo(() => {
-    const lead = new Set(heroSlides.map((s) => s.title));
-    return (trending?.content ?? []).filter((t) => !lead.has(t.title));
-  }, [trending, heroSlides]);
-  // Each AniList rail's cards, less what this visit added from them (v0.61.0): Korea's (what the hero did not take),
-  // Japan's, China's, in TREND_RAILS' order; and Because you read's.
-  const jpTrending = moreTrending[0]?.data;
-  const cnTrending = moreTrending[1]?.data;
-  const trendRails = useMemo(() => [rail, jpTrending?.content ?? [], cnTrending?.content ?? []]
-    .map((list) => list.filter((t) => !railAdded.has(railKey(t)))), [rail, jpTrending, cnTrending, railAdded]);
-  const becauseRail = useMemo(() => (because?.content ?? []).filter((t) => !railAdded.has(railKey(t))), [because, railAdded]);
-
+  const heroWaiting = [trendQ, ...moreTrending].some((query, i) => query.isPending
+    || heroPoll(query.data, qc.getQueryState(['discover-trending', TREND_RAILS[i], user?.id, adultOn])?.dataUpdateCount ?? 0) !== false);
+  // The one picks row (v0.98.0, lib/forYou.ts): the trackers' suggestions and the reads' picks in turn, one card a title,
+  // less what this visit added from it.
+  const picks = useMemo(() => mergePicks(recsQ.data?.content ?? [], because?.content ?? [], because?.seed ?? null)
+    .filter((pk) => !railAdded.has(railKey(pk))), [recsQ.data, because, railAdded]);
   // ---------------------------------------------------------------- may they be here at all
   // The tab is hidden for this account and every route this page calls now refuses it, so a typed URL would
   // otherwise render a wall of empty skeletons and a "try again" button that never works. Say it plainly.
@@ -635,91 +608,93 @@ function DiscoverInner() {
     );
   }
 
-  // ---------------------------------------------------------------- zero sources
-  if (sourcesData && sources.length === 0) {
-    return (
-      <div className="min-h-screen-d px-4 lg:px-0">
-        {/* An age-limited account is served a filtered list, so "none" here can mean "none you may use"
-            rather than "none installed" — and telling a reader to mount SOURCES_DIR would be nonsense. */}
-        {(sourcesData.hiddenAdult ?? 0) > 0 ? (
-          // Every provider on this server is marked 18+ and the reveal is off, so the page is empty for a
-          // reason the reader can undo. Without this branch the one screen that could offer the chip is the
-          // one screen the chip never reaches, and the sources would look uninstalled. `hiddenAdult`, not
-          // `showAdultChip`: with the reveal already on nothing is hidden and this sentence would be false.
-          <>
-            <EmptyState art={ART.emptyLibrary} title={tr('Nothing to browse with 18+ hidden')}
-              sub={tr('Every provider set up for your account is marked 18+. Turn on Show 18+ to browse them.')} />
-            <div className="-mt-10 flex justify-center pb-10"><AdultToggle alsoWhen /></div>
-          </>
-        ) : isAdmin ? (
-          <EmptyState art={ART.emptyLibrary} title={tr('No sources installed')}
-            sub={isDesktop()
-              ? tr('Add a site, or turn on an extension source, in Admin → Sources.')
-              : tr('Add a site or an extension in Admin → Sources, or mount a source pack at SOURCES_DIR.')} />
-        ) : (
-          <EmptyState art={ART.emptyLibrary} title={tr('No sources available')}
-            sub={tr('There is nothing set up for your account to browse yet. Ask whoever runs this server.')} />
-        )}
-      </div>
-    );
-  }
-
+  // Every card names its sources, one of them or five, in Newest, Popular and search alike (v0.56.0).
+  const cardsOf = (from: number, to: number) => wall.items.slice(from, to).map((it, k) => (
+    <SourceCard key={`${it.source}:${it.sourceId}`} item={{ ...it, inLibrary: it.inLibrary || shownAdded.has(workKey(it)) }}
+      providers={stackOf(it)}
+      onAdd={() => open(it)} eager={from + k < 12} />
+  ));
+  // Keep mixed-direction seed names intact inside translated recommendation reasons.
+  const whyOf = (pk: Pick) => {
+    const reason = pk.from.because ? tr('Because you read {title}', { title: `\u2068${pk.from.because}\u2069` }) : undefined;
+    return pk.from.kind === 'tracker'
+      ? { badge: pk.from.badge, reason, tip: pk.from.tip }
+      : { reason, art: img.seriesThumb(pk.from.seriesId), tip: reason };
+  };
   return (
     <div className="min-h-screen-d px-4 lg:px-0">
-      {heroSlides.length > 0 && mode === 'newest' && (
-        <DiscoverHero slides={heroSlides} onPick={(t) => setSeed({ kind: 'trending', title: t.title })} />
-      )}
-
-      <header className="pt-5 lg:pt-7">
-        <div className="flex flex-wrap items-end justify-between gap-x-4 gap-y-3">
-          <div className="min-w-0">
-            <h1 className="font-display text-2xl font-bold tracking-tight lg:text-3xl">{tr('Discover')}</h1>
-            {/* Follows the listing, or the toggle below says Popular while the page says Newest. */}
-            <div className="mt-0.5 flex flex-wrap items-center gap-x-2.5 gap-y-1.5">
-              <p className="text-sm text-fog-400">{listMode === 'popular' ? tr('Popular on your sources') : tr('Newest from your sources')}</p>
-              {/* In the HEADER and not on the chip row below, deliberately: SourcePicker is mounted only
-                  while `mode === 'newest'`, so a chip anchored there would disappear the moment someone
-                  searched — and search is one of the surfaces the reveal now changes. */}
-              <AdultToggle alsoWhen={showAdultChip} className="shrink-0 text-xs" />
-            </div>
-            <p className="mt-1 max-w-prose text-[11px] text-fog-500">
-              {tr('Manual AniList actions can contact AniList even when automatic lookups are off.')}
-            </p>
+      <h1 className="sr-only">{tr('Discover')}</h1>
+      {tabReady && tab === 'for-you' && user?.id && <div ref={setHeroTarget} data-discovery-hero-slot />}
+      <header className="mb-5 mt-4 rounded-2xl border border-ink-700/70 bg-ink-900/30 p-4 lg:p-5" data-discovery-controls>
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div role="tablist" aria-label={tr('Discover')} className="flex gap-2" data-discovery-tabs>
+            {(['for-you', 'sources'] as const).map((key) => <button key={key} type="button" role="tab" id={`discover-tab-${key}`}
+              aria-selected={tab === key} aria-controls={`discover-panel-${key}`} tabIndex={tab === key ? 0 : -1}
+              className={`chip min-h-11 px-5 text-sm ${tab === key ? 'chip-active' : ''}`} onClick={() => chooseTab(key)}
+              onKeyDown={(e) => { if (e.key === 'ArrowLeft' || e.key === 'ArrowRight' || e.key === 'Home' || e.key === 'End') {
+                e.preventDefault(); const next = e.key === 'Home' ? 'for-you' : e.key === 'End' ? 'sources' : key === 'for-you' ? 'sources' : 'for-you';
+                chooseTab(next); document.getElementById(`discover-tab-${next}`)?.focus();
+              } }}>{key === 'for-you' ? tr('For you') : tr('Sources')}</button>)}
           </div>
-          <form onSubmit={search} className="flex w-full items-center gap-2 sm:w-auto">
-            <div className="field flex min-w-0 flex-1 items-center gap-2 py-0 sm:w-72 lg:w-80">
-              <IcSearch width={17} height={17} className="shrink-0 text-fog-500" />
-              <input value={q} onChange={(e) => setQ(e.target.value)}
-                onKeyDown={(e) => { if (e.key === 'Escape') backToNewest(); }}
-                placeholder={tr('Search all sources…')} aria-label={tr('Search all sources…')}
-                className="w-full bg-transparent py-2.5 text-sm text-fog-50 outline-hidden placeholder:text-fog-500" />
-              {q && (
-                <button type="button" onClick={backToNewest} aria-label={tr('Close')} className="shrink-0 text-fog-500 hover:text-fog-200">
-                  <IcX width={15} height={15} />
-                </button>
-              )}
-            </div>
-            <button className="btn-accent shrink-0 px-5 py-2.5 text-sm">{tr('Search')}</button>
-          </form>
+          <AdultToggle alsoWhen={showAdultChip} className="shrink-0 text-xs" />
         </div>
+        <form onSubmit={search} className="mt-4 grid grid-cols-[auto_minmax(0,1fr)] gap-2 sm:grid-cols-[auto_minmax(0,28rem)_auto] sm:justify-start">
+          <select value={searchKind} aria-label={tr('Search by')}
+            onChange={(e) => { const kind = e.target.value as 'title' | 'author' | 'artist'; setSearchKind(kind); if (mode === 'search') writeQ(term, kind); }}
+            className="field min-h-11 max-w-28 py-2.5 text-sm">
+            <option value="title">{tr('Title')}</option>
+            <option value="author">{tr('Author')}</option>
+            <option value="artist">{tr('Artist')}</option>
+          </select>
+          <div className="field flex min-w-0 items-center gap-2 py-0">
+            <IcSearch width={17} height={17} className="shrink-0 text-fog-500" />
+            <input value={q} onChange={(e) => setQ(e.target.value)}
+              onKeyDown={(e) => { if (e.key === 'Escape') backToNewest(); }}
+              placeholder={tr('Search all sources…')} aria-label={tr('Search all sources…')}
+              className="w-full min-w-0 bg-transparent py-2.5 text-sm text-fog-50 outline-hidden placeholder:text-fog-500" />
+            {q && (
+              <button type="button" onClick={backToNewest} aria-label={tr('Close')} className="shrink-0 text-fog-500 hover:text-fog-200">
+                <IcX width={15} height={15} />
+              </button>
+            )}
+          </div>
+          <button className="btn-accent col-span-2 min-h-11 px-5 py-2.5 text-sm sm:col-span-1">{tr('Search')}</button>
+        </form>
+        {searchKind !== 'title' && (
+          <p className="mt-2 text-xs text-fog-500" role="status">
+            {tr('Creator searches only ask sources that support author and artist filters.')}
+          </p>
+        )}
+        <p className="mt-3 max-w-prose text-[11px] text-fog-500">
+          {tr('Manual AniList actions can contact AniList even when automatic lookups are off.')}
+        </p>
       </header>
-
-      {mode === 'newest' && <RecommendationRail enabled={mayAdd} onPick={(title) => setSeed({ kind: 'trending', title })} />}
-
-      {/* v0.61.0: "Because you read {title}", above the wall while browsing, only with something on it -- under the
-          header, so the source picker stays beside the wall it narrows. The title is isolated: a Latin title inside an
-          Arabic sentence takes its order, as Home's rail of that name does. */}
-      {mode === 'newest' && because?.seed && becauseRail.length > 0 && (
-        <AniListRail kind="because" className="pt-6"
-          title={tr('Because you read {title}', { title: `\u2068${because.seed.title}\u2069` })}
-          items={becauseRail} onPick={pickRail} />
-      )}
-
+      {!tabReady && <DiscoveryTabLoading />}
+      {tabReady && tab === 'for-you' && user?.id && <section role="tabpanel" id="discover-panel-for-you" aria-labelledby="discover-tab-for-you">
+        <DiscoveryHub key={`${user.id}:${adultOn}`} heroTarget={heroTarget} owner={user.id} state={stateQ.data} stateLoading={stateQ.isPending} stateError={stateQ.isError} stateKey={stateKey}
+          onRetryState={() => void stateQ.refetch()} waiting={heroWaiting} failed={trendQ.isError && moreTrending.every((m) => m.isError)}
+          groups={TREND_RAILS.map((country, i) => ({ country, items: (i === 0 ? trending?.content ?? [] : moreTrending[i - 1]?.data?.content ?? []).filter((t) => !railAdded.has(railKey(t))) }))}
+          picks={picks} whyOf={whyOf} onFind={pickRail}
+          onRetry={() => { void trendQ.refetch(); moreTrending.forEach((m) => void m.refetch()); }} />
+      </section>}
+      {tabReady && tab === 'sources' && <section role="tabpanel" id="discover-panel-sources" aria-labelledby="discover-tab-sources">
+      {sourcesData && sources.length === 0 ? <div className="pb-8">
+        {(sourcesData.hiddenAdult ?? 0) > 0 ? <>
+          <EmptyState art={ART.emptyLibrary} title={tr('Nothing to browse with 18+ hidden')}
+            sub={tr('Every provider set up for your account is marked 18+. Turn on Show 18+ to browse them.')} />
+          <div className="-mt-10 flex justify-center"><AdultToggle alsoWhen /></div>
+        </> : isAdmin ? <EmptyState art={ART.emptyLibrary} title={tr('No sources installed')}
+          sub={isDesktop()
+            ? tr('Add a site, or turn on an extension source, in Admin → Sources.')
+            : tr('Add a site or an extension in Admin → Sources, or mount a source pack at SOURCES_DIR.')} />
+          : <EmptyState art={ART.emptyLibrary} title={tr('No sources available')}
+            sub={tr('There is nothing set up for your account to browse yet. Ask whoever runs this server.')} />}
+      </div> : <>
       {/*
         In both modes, not just while browsing. The picker is the only place the chosen source is visible or
         clearable, so hiding it during a search -- while the search itself is narrowed to that source --
-        would leave the results silently filtered with nothing on screen to say why. Choosing a list tab is
-        a browse action, so from a search it returns to browsing that list.
+        would leave the results silently filtered with nothing on screen to say why. The Newest/Popular tabs
+        are browse-only: search results come in each source's relevance order, so they are not offered then.
       */}
       <SourcePicker
         sources={budget} states={states} settled={settled} total={budget.length}
@@ -731,9 +706,9 @@ function DiscoverInner() {
         mode={listMode}
         // The source shown alone stays chosen when the other listing has it: flipping dropped it, so one source's Newest
         // flipped to every source's Popular.
-        onMode={(m) => {
+        onMode={mode === 'search' ? undefined : (m) => {
           setListMode(m); setSelected(selected && budgetForMode(sources, m, Infinity).some((s) => s.id === selected) ? selected : null);
-          setPage(1); if (mode === 'search') backToNewest();
+          setPage(1);
         }}
       />
 
@@ -826,13 +801,8 @@ function DiscoverInner() {
         )}
       </div>
 
-      <div className="grid grid-cols-3 gap-x-3 gap-y-5 sm:grid-cols-4 md:grid-cols-5 lg:grid-cols-7 lg:gap-x-4 xl:grid-cols-8 2xl:grid-cols-9 3xl:grid-cols-10">
-        {/* Every card names its sources, one of them or five, in Newest, Popular and search alike (v0.56.0). */}
-        {wall.items.map((it, i) => (
-          <SourceCard key={`${it.source}:${it.sourceId}`} item={{ ...it, inLibrary: it.inLibrary || shownAdded.has(workKey(it)) }}
-            providers={stackOf(it)}
-            onAdd={() => open(it)} eager={i < 12} />
-        ))}
+      <div className={WALL_GRID} data-wall-part>
+        {cardsOf(0, wall.items.length)}
         {/* The next page of a search on one source on its way (#331), after the cards: it is asked only once every source
             has answered, so the still-loading card below is never beside it. */}
         {mode === 'search' && moreBusy && Array.from({ length: 3 }).map((_, i) => (
@@ -873,10 +843,8 @@ function DiscoverInner() {
 
       <div ref={sentinel} className="h-16" />
 
-      {/* The trending rails (v0.61.0: manga and manhua beside the manhwa), each only with something on it. */}
-      {mode === 'newest' && TREND_RAILS.map((country, i) => trendRails[i].length > 0 && (
-        <AniListRail key={country} kind={country} title={tr(TREND_LABELS[i])} items={trendRails[i]} onPick={pickRail} />
-      ))}
+      </>}
+      </section>}
 
       {seed && (
         <AddSeriesDialog

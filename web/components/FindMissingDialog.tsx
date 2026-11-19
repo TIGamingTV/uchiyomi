@@ -13,7 +13,7 @@
 import { useMemo, useRef, useState } from 'react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { api, ApiError } from '@/lib/api';
-import { Modal, msgOf } from '@/components/ConfirmDialog';
+import { Modal, actionFailure, msgOf } from '@/components/ConfirmDialog';
 import { Img, ProgressBar } from '@/components/ui';
 import { sourceCover } from '@/components/cards';
 import { useToast } from '@/components/Toast';
@@ -27,7 +27,7 @@ import type { SeriesSource } from '@/lib/types';
 import { jobNoteLines, type JobCardNotes } from '@/lib/jobNotes';
 import { fetchingToast, joinSentences } from '@/lib/jobs';
 import { editionOffer, editionOfferKey, type EditionOffer } from '@/lib/editions';
-import { languageName } from '@/lib/format';
+import { chapterNo, languageName } from '@/lib/format';
 
 interface Candidate {
   source: string; name: string; sourceSeriesId: string; title: string; coverUrl?: string;
@@ -128,7 +128,7 @@ function ChapterPicker({ numbers, selected, onChange }: {
                 className={`chip text-xs ${state === 'all' ? 'border-accent/60 text-accent' : state === 'some' ? 'border-accent/30 text-fog-200' : 'text-fog-500 line-through decoration-fog-600'}`}
               >
                 {/* <bdi>: a number range stays one unit inside an Arabic sentence. */}
-                <bdi>{r.lo === r.hi ? tr('Ch. {n}', { n: r.lo }) : tr('Ch. {a}–{b}', { a: r.lo, b: r.hi })}</bdi>
+                <bdi>{r.lo === r.hi ? tr('Ch. {n}', { n: chapterNo(r.lo) }) : tr('Ch. {a}–{b}', { a: chapterNo(r.lo), b: chapterNo(r.hi) })}</bdi>
               </button>
               {r.nums.length > 1 && (
                 <button type="button" aria-label={tr('Pick chapters one by one')} aria-expanded={open === r.lo}
@@ -142,7 +142,7 @@ function ChapterPicker({ numbers, selected, onChange }: {
         <div className="mt-2 flex max-h-40 flex-wrap gap-1 overflow-y-auto" data-lenis-prevent>
           {opened.nums.map((n) => (
             <button key={n} type="button" aria-pressed={selected.has(n)} onClick={() => onChange(toggleOne(selected, n))}
-              className={`chip px-2 text-[11px] ${selected.has(n) ? 'border-accent/60 text-accent' : 'text-fog-500'}`}>{n}</button>
+              className={`chip px-2 text-[11px] ${selected.has(n) ? 'border-accent/60 text-accent' : 'text-fog-500'}`}>{chapterNo(n)}</button>
           ))}
         </div>
       )}
@@ -224,7 +224,7 @@ export function FindMissingDialog({ seriesId, onClose, onAddEdition }: {
       qc.invalidateQueries({ queryKey: ['source-jobs'] });
       toast(fetchingToast(numbers.length), 'info', { busy: true });
     } catch (e) {
-      toast(msgOf(e, tr('Could not start.')), 'error');
+      toast(actionFailure(e, tr('Could not start downloading the missing chapters.')), 'error');
     } finally {
       setBusy(false);
     }
@@ -329,7 +329,7 @@ export function FindMissingDialog({ seriesId, onClose, onAddEdition }: {
       // the follow stands, and the card now offers a plain Download for when it has.
       else if (followedNow && code === 'nothing_to_fetch') toast(tr('Now following {s}. It is still listing its chapters: press Download again in a minute.', { s: c.name }), 'info');
       else if (code === 'nothing_to_fetch' && allLater(e)) toast(tr('Its site is busy right now. These chapters will download on their own when it is ready.'), 'info');
-      else toast(msgOf(e, tr('Could not start.')), 'error');
+      else toast(actionFailure(e, tr('Could not start downloading the missing chapters.')), 'error');
     } finally {
       setBusy(false);
     }
@@ -442,9 +442,10 @@ export function FindMissingDialog({ seriesId, onClose, onAddEdition }: {
         <>
           <p className="text-sm text-fog-300">
             {d.have.count === 1 ? tr('You have 1 chapter') : tr('You have {n} chapters').replace('{n}', String(d.have.count))}
-            {d.have.first != null && `, ${d.have.first}–${d.have.last}`}
+            {/* chapterNo: the held numbers arrive as float8 copies of float4s, 80.2 as 80.19999694824219 (#439). */}
+            {d.have.first != null && `, ${chapterNo(d.have.first)}–${chapterNo(d.have.last ?? d.have.first)}`}
             {d.gaps.length
-              ? `. ${tr('Missing')}: ${d.gaps.map((g) => (g.lo === g.hi ? g.lo : `${g.lo}–${g.hi}`)).join(', ')}`
+              ? `. ${tr('Missing')}: ${d.gaps.map((g) => (g.lo === g.hi ? chapterNo(g.lo) : `${chapterNo(g.lo)}–${chapterNo(g.hi)}`)).join(', ')}`
               : `. ${tr('No gaps between them.')}`}
           </p>
 

@@ -252,6 +252,7 @@ const NOT_CENTRED: Record<string, string> = {
  */
 const CLEAR_OF_THE_CORNER: Record<string, string> = {
   'components/SeriesEditor.tsx': 'Edit details (v0.53.0), about 880 px wide with the art in a column',
+  'components/TitleExtraction.tsx': 'Cover title preview, with the source cover and candidate side by side',
 };
 /** A max-w-* class in rem: Tailwind's named steps, and an arbitrary px or rem width. */
 const maxWidthRem = (w: string): number | null => {
@@ -421,12 +422,14 @@ test('the viewport is over the bottom nav: rendered beside the app, not inside <
   const palette = code(read('components/CommandPalette.tsx'));
   const notices = zOf(toast, /<section data-notices/);
   assert.ok(notices > zOf(nav, /<nav /), `the notices are under the bottom nav (z ${notices})`);
+  const sheet = code(read('components/ui.tsx'));
+  assert.ok(notices > zOf(sheet, /<div className="fixed inset-0 z-\[\d+\] flex items-end/), 'a portalled sheet intercepts the notice actions');
   // The palette is anchored at the top and is the one layer over the notices.
   assert.ok(notices < zOf(palette, /\{open && \(\s*<motion\.div /), 'the notices are over the command palette');
   const provider = toast.slice(toast.indexOf('export function ToastProvider('));
   assert.match(provider, /\{children\}\s*<NoticeViewport /, 'the viewport is not rendered beside the app');
   const providers = code(read('app/providers.tsx'));
-  assert.match(providers, /<ToastProvider>\s*<AuthProvider>\{children\}<\/AuthProvider>\s*<\/ToastProvider>/, 'ToastProvider no longer wraps the app shell');
+  assert.match(providers, /<AuthProvider>\s*<I18nProvider>\s*<ToastProvider>\{children\}<\/ToastProvider>\s*<\/I18nProvider>\s*<\/AuthProvider>/, 'the authenticated, translated app shell must remain inside ToastProvider');
   assert.doesNotMatch(code(read('components/AppShell.tsx')), /NoticeViewport|data-notices/, 'the notices moved inside the app shell');
 });
 

@@ -2,7 +2,9 @@
 // the source loader capture when they load; today they happen to import env (which imports this first) before
 // reading anything, but that order is an accident this line stops relying on. A no-op on a server.
 import './lib/desktop';
+import { uploadSeriesRoutes } from './routes/upload';
 import Fastify from 'fastify';
+import { APP_ROUTER_OPTIONS } from './lib/httpLimits';
 import cookie from '@fastify/cookie';
 import cors from '@fastify/cors';
 import helmet from '@fastify/helmet';
@@ -25,6 +27,9 @@ import { scheduleMatchCheck } from './lib/matchCheck';
 import { startTitleWorks } from './lib/discoverIdentity';
 import { scheduleMergeLeftovers } from './lib/mergeLeftovers';
 import { scheduleAniListScores } from './lib/anilistScores';
+import { initializeTitleLogoScan, startTitleLogoScan } from './lib/titleLogoScan';
+import { initializeTitleExtractions, startTitleExtractions } from './lib/titleExtraction';
+import { initializeTitleExtractionBatch, startTitleExtractionBatch } from './lib/titleExtractionBatch';
 import { notifyAdmins } from './lib/push';
 import { runSourceCheck } from './lib/sourceWatchdog';
 import { runSweep } from './lib/updater';
@@ -44,6 +49,7 @@ import { runExtensionMonitor } from './lib/extensionMonitor';
 import { startEngineCacheKeeper } from './lib/sources/suwayomi/cache';
 import { startSweeper } from './lib/imageCache';
 import { pruneAudit } from './lib/audit';
+import { pruneRing } from './lib/deviceRing';
 import { startActivityLog, flushActivityLog } from './lib/activityLog';
 import { runBackup, backupDelay, backupSettings, stampDelay } from './lib/backup';
 import { firstRunFloor, DESKTOP_FLOORS } from './lib/desktop';
@@ -57,16 +63,22 @@ import { registerApiDocs } from './lib/apiDocs';
 import { appVersion } from './lib/appVersion';
 import { buildPayload, installFacts, sendPing } from './lib/installPing';
 import authRoutes from './routes/auth';
-import { trustProxySetting } from './lib/auth';
+import { trustProxyProblems, trustProxyWarnings, authenticate, requireAdmin } from './lib/auth';
+import { loadNetworkSettings, localNetworksProblems, localNetworksWarnings, networkConfig, trustsPeer } from './lib/clientAddr';
 import adminRoutes, { sweepImportBatches } from './routes/admin';
 import catalogRoutes from './routes/catalog';
 import imageRoutes, { authorizeImageRequest } from './routes/images';
 import personalRoutes from './routes/personal';
 import recommendationRoutes from './routes/recommendations';
+import discoveryHubRoutes from './routes/discoveryHub';
 import downloadRoutes from './routes/downloads';
 import sourceRoutes, { jobBusy } from './routes/sources';
 import opdsRoutes from './routes/opds';
 import komgaCompatRoutes from './routes/komgaCompat';
+import kosyncRoutes from './routes/kosync';
+import externalReaderRoutes from './routes/externalReaders';
+import { privateLibraryRoutes, privateResponseHeaders } from './routes/privateLibrary';
+import { privateAdminContentGuard, privateAdminResponse } from './lib/privateAdmin';
 import notifyRoutes from './routes/notify';
 import translateRoutes from './routes/translate';
 import { stopEngine } from './lib/translate/engine';
@@ -78,7 +90,32 @@ import { initialiseBulkChapterDeleteRuns } from './lib/bulkChapterDelete';
 import { authFacts, authModeProblems, authModeWarnings } from './lib/authMode';
 
 async function main() {
+  // A TRUST_PROXY entry Fastify cannot read stops the server here, naming the entry, before the migrations run; one that
+  // works but not as its author likely thinks is said at every start (lib/auth.ts trustProxyProblems, trustProxyWarnings).
+  // Not on desktop, which trusts no proxy whatever is set (`trustProxy` below).
+  // LOCAL_NETWORKS likewise (lib/clientAddr.ts): it decides who is at home, where a profile without a password opens.
+  if (!isDesktop()) {
+    const netProblems = [...trustProxyProblems(env.TRUST_PROXY), ...localNetworksProblems(env.LOCAL_NETWORKS, env.TRUST_PROXY)];
+    if (netProblems.length) {
+      for (const p of netProblems) console.error(`[net] ${p}`);
+      process.exit(1);
+    }
+  } else if (env.LOCAL_NETWORKS.trim()) {
+    console.warn('[net] Uchiyomi Desktop is reached from this computer alone: LOCAL_NETWORKS is ignored.');
+  }
   await migrate();
+  await initializeTitleLogoScan();
+  await initializeTitleExtractions();
+  await initializeTitleExtractionBatch();
+  // What Admin -> Settings -> Server -> Home network saved, where the environment does not say (lib/clientAddr.ts),
+  // before any request is judged by it; then what is in force, said once.
+  if (!isDesktop()) {
+    await loadNetworkSettings();
+    const net = networkConfig();
+    for (const w of [...trustProxyWarnings(net.trustedProxies.value), ...localNetworksWarnings(net.localNetworks.value, net.trustedProxies.value)]) {
+      console.warn(`[net] ${w}`);
+    }
+  }
   // v0.63.0 (#208, lib/authMode.ts): a sign-in mode that cannot work stops the server here and says why, before any
   // route exists -- a typo in AUTH_MODE must never leave the password routes open behind an operator who thinks them
   // closed -- and SSO-only mode says what it changes at every start.
@@ -130,13 +167,18 @@ async function main() {
 
   const app = Fastify({
     // LOG_LEVEL (env.ts logLevelOf): `info` in production unless the operator says otherwise.
-    logger: { level: logLevel },
+    logger: { level: logLevel, redact: [
+      'req.headers.authorization', 'req.headers.cookie',
+      'req.headers["x-auth-user"]', 'req.headers["x-auth-key"]',
+    ] },
     // Desktop: nothing sits in front of the app, so a forwarded-for header is only ever something a local
-    // process made up. Elsewhere only the peers TRUST_PROXY names may set it (env.ts): trusting every peer let a client
-    // on the app port choose its own address for the rate limits. Reintroduce `true`: trustProxy.test.ts sees 14
-    // sign-ins with rotating X-Forwarded-For all answered 401, none 429.
-    trustProxy: isDesktop() ? false : trustProxySetting(env.TRUST_PROXY),
+    // process made up. Elsewhere only the trusted proxies may set it (TRUST_PROXY, or Admin -> Settings): trusting every
+    // peer let a client on the app port choose its own address for the rate limits. Reintroduce `true`:
+    // trustProxy.test.ts sees 14 sign-ins with rotating X-Forwarded-For all answered 401, none 429. A function rather
+    // than the list, so a save on the settings page is in force at the next request (lib/clientAddr.ts trustsPeer).
+    trustProxy: isDesktop() ? false : trustsPeer,
     bodyLimit: 2 * 1024 * 1024,
+    routerOptions: APP_ROUTER_OPTIONS,
   });
 
   await app.register(helmet, { contentSecurityPolicy: false, crossOriginResourcePolicy: false });
@@ -147,6 +189,24 @@ async function main() {
   await app.register(cookie);
   await app.register(jwt, { secret: env.JWT_SECRET });
   await app.register(rateLimit, { global: false });
+  app.addHook('onSend', async (req, reply, payload) => {
+    await privateResponseHeaders(req, reply);
+    return payload;
+  });
+  // Content plugins cannot gain access to another account's private records merely by using an admin URL.
+  app.addHook('preHandler', async (req, reply) => {
+    if (!/^\/api\/admin(?:\/|$)/.test(req.url.split('?')[0])) return;
+    return authenticate(req, reply);
+  });
+  app.addHook('preHandler', async (req, reply) => {
+    if (!/^\/api\/admin(?:\/|$)/.test(req.url.split('?')[0])) return;
+    return requireAdmin(req, reply);
+  });
+  app.addHook('preHandler', async (req, reply) => {
+    if (!/^\/api\/admin(?:\/|$)/.test(req.url.split('?')[0])) return;
+    return privateAdminContentGuard(req, reply);
+  });
+  app.addHook('preSerialization', privateAdminResponse);
   /**
    * The single-container layout has no nginx in front of it, and nginx was the only thing compressing
    * anything: `gzip_types text/css application/javascript application/json image/svg+xml
@@ -223,7 +283,7 @@ async function main() {
   // owns it, and a plugin that forgets auth inherits it instead of escaping it.
   app.addHook('preHandler', async (req, reply) => {
     if (!req.url.startsWith('/img/')) return;
-    await authorizeImageRequest(app, req, reply);
+    return authorizeImageRequest(app, req, reply);
   });
 
   await app.register(authRoutes);
@@ -233,8 +293,11 @@ async function main() {
   await app.register(catalogRoutes);
   await app.register(imageRoutes);
   await app.register(personalRoutes);
+  await app.register(privateLibraryRoutes);
   await app.register(recommendationRoutes);
+  await app.register(discoveryHubRoutes);
   await app.register(downloadRoutes);
+  await app.register(uploadSeriesRoutes);
   await app.register(sourceRoutes);
   // Translated pages (v0.85.0): answers "off" until an admin downloads the engine and turns it on. Hidden on desktop
   // (DESKTOP_HIDDEN_ROUTES), whose server runs inside the app, where the engine's processes cannot (docs/DESKTOP.md).
@@ -247,6 +310,8 @@ async function main() {
   // The Komga-compatible API for Mihon's Komga extension + tracker. Its own auth hook (API tokens and the
   // UCHIYOMI-SESSION cookie), encapsulated like OPDS: the cookie is honoured by these routes and nowhere else.
   if (!isDesktop()) await app.register(komgaCompatRoutes);
+  if (!isDesktop()) await app.register(kosyncRoutes);
+  if (!isDesktop()) await app.register(externalReaderRoutes);
   // The interactive API reference, BEFORE the web root: registerWebRoot installs the not-found handler that
   // serves the app shell for any unknown path, and a route added after it would still work, but its
   // static assets under /api/docs/ would not be found by the UI in the same way. Unauthenticated on
@@ -260,7 +325,11 @@ async function main() {
   startSweeper();
   // v0.69.1: the refusal rows an outside caller can write stay bounded (lib/audit.ts pruneAudit, refusals only -- the
   // rest of audit_log is evidence other code reads back). Shortly after boot, then once a day.
-  const pruneRefusals = () => { pruneAudit().catch((e) => app.log.warn({ err: e }, 'audit prune failed')); };
+  const pruneRefusals = () => {
+    pruneAudit().catch((e) => app.log.warn({ err: e }, 'audit prune failed'));
+    // And the device keyring's entries whose session has ended (lib/deviceRing.ts): they open nothing meanwhile.
+    pruneRing().catch((e) => app.log.warn({ err: e }, 'device ring prune failed'));
+  };
   setTimeout(pruneRefusals, 10 * 60_000).unref();
   setInterval(pruneRefusals, 24 * 60 * 60_000).unref();
 
@@ -485,6 +554,14 @@ async function main() {
    * entry, a few minutes after boot and then every six hours -- each round only what is missing or three days old.
    */
   scheduleAniListScores(app.log);
+
+  // Opt-in discovery continues across the whole library and after restart, without needing page views.
+  const stopTitleLogoScan = startTitleLogoScan(app.log);
+  app.addHook('onClose', async () => { stopTitleLogoScan(); });
+  const stopTitleExtractions=startTitleExtractions(app.log);
+  app.addHook('onClose',async()=>{stopTitleExtractions();});
+  const stopTitleExtractionBatch=startTitleExtractionBatch(app.log);
+  app.addHook('onClose',async()=>{stopTitleExtractionBatch();});
 
   /**
    * The opt-in install count.

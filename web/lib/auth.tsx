@@ -1,12 +1,15 @@
 'use client';
-import { createContext, useContext, useEffect, useRef, useState, ReactNode } from 'react';
+import { createContext, useContext, useEffect, useRef, useState, Fragment, ReactNode } from 'react';
 import { QueryClientContext } from '@tanstack/react-query';
-import { api, ApiError, refreshSession, setAccessToken, setCurrentUser } from './api';
+import { api, ApiError, beginAccountTransition, getCurrentUser, refreshSession, setAccessToken, setCurrentUser } from './api';
 import { readOfflineIdentity, writeOfflineIdentity, clearOfflineIdentity, OfflineIdentity } from './offlineIdentity';
 import { deviceId, deviceName } from './device';
 import { clearShownOnce } from './shownOnce';
 import { applyReduceEffects, restoreReduceEffects } from './effects';
 import { applyTone, restoreTone } from './tone';
+import { flushOutbox } from './downloads';
+import { usesNativeCache } from './native';
+import { setAdultShown } from './adult';
 import { isDesktop, serverReachableHint, untilReachable } from './desktop';
 import { t as tr } from './i18n';
 import type { AvatarFrame } from './badges';
@@ -21,6 +24,8 @@ interface User {
   totpEnabled?: boolean;
   /** Linked to an identity at the OIDC provider (v0.63.0): Profile → Account offers Link to … until it is. */
   sso?: boolean;
+  /** What kind of profile this is (bff lib/profiles.ts): `desktop-owner` is Uchiyomi Desktop's own account. */
+  kind?: string;
   perms?: Record<string, boolean>;
   avatar?: Avatar;
   settings: Record<string, any>;
@@ -46,7 +51,8 @@ interface AuthCtx {
   status: Status;
   user: User | null;
   isAdmin: boolean;
-  login: (username: string, password: string, code?: string) => Promise<{ ok: boolean; totp?: boolean; error?: string }>;
+  /** `remember`: Remember on this device (bff lib/deviceRing.ts). */
+  login: (username: string, password: string, code?: string, remember?: boolean) => Promise<{ ok: boolean; totp?: boolean; error?: string }>;
   firstRunSetup: (username: string, password: string) => Promise<{ ok: boolean; error?: string }>;
   /** Sign up while Open registration is on (v0.61.0). `closed`: it was switched off meanwhile. */
   register: (username: string, password: string) => Promise<{ ok: boolean; closed?: boolean; error?: string }>;
@@ -59,6 +65,18 @@ interface AuthCtx {
   desktop: boolean;
   /** Try the session again -- DesktopReconnect's button. True when it came back. */
   reconnect: () => Promise<boolean>;
+  /** Switch this device to a profile that opens at home, without its password (bff POST /auth/switch). */
+  switchProfile: (profileId: string) => Promise<{ ok: boolean; error?: string }>;
+  /** Take up an account this device remembers, without its password (bff POST /auth/resume). */
+  resumeProfile: (profileId: string) => Promise<{ ok: boolean; error?: string }>;
+  /** Sign in from the sign-in screen as a profile that opens at home, when an admin offers it (POST /auth/profile-login). */
+  pickProfile: (profileId: string) => Promise<{ ok: boolean; error?: string }>;
+  /** Sign in as someone else, keeping this account remembered on this device when it is (bff POST /auth/leave). */
+  leave: () => Promise<void>;
+  /** Uchiyomi Desktop: from a profile switched to on this PC back to its owner (the shell's POST /auth/desktop). */
+  backToOwner: () => Promise<boolean>;
+  /** Why the server last signed this device out, by its code: `local_only` is a profile that opens at home, from outside. */
+  signedOutWhy: string | null;
 }
 
 const Ctx = createContext<AuthCtx>(null as any);
@@ -77,6 +95,12 @@ export const useAuth = () => useContext(Ctx);
 export function canDownload(user: { role?: string; perms?: Record<string, boolean> } | null | undefined): boolean {
   if (!user) return true;
   return user.role === 'admin' || user.perms?.canDownload !== false;
+}
+
+/** Starting a series from uploaded files: admins, and members an admin allowed (opt-in, off by default). */
+export function canUploadManually(user: { role?: string; perms?: Record<string, boolean> } | null | undefined): boolean {
+  if (!user) return false;
+  return user.role === 'admin' || user.perms?.canUploadManually === true;
 }
 
 function applyAccent(settings?: Record<string, any>) {
@@ -100,6 +124,7 @@ function applyAccent(settings?: Record<string, any>) {
  */
 /** Tell the worker who is signed in, so background sync files queued reading against the right account. */
 async function tellWorkerUser(userId: string | null): Promise<void> {
+  if (usesNativeCache()) return;
   try {
     const reg = await Promise.race([
       navigator.serviceWorker?.ready,
@@ -110,6 +135,7 @@ async function tellWorkerUser(userId: string | null): Promise<void> {
 }
 
 async function purgeAccountCaches(): Promise<void> {
+  if (usesNativeCache()) return;
   try {
     // `serviceWorker.ready` resolves only once a worker is ACTIVE, and never at all if registration failed or
     // has not happened yet -- so awaiting it bare would hang sign-in on exactly the browsers where there is
@@ -126,6 +152,12 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const [status, setStatus] = useState<Status>('loading');
   const [user, setUser] = useState<User | null>(null);
   const timer = useRef<any>(null);
+  const [signedOutWhy, setSignedOutWhy] = useState<string | null>(null);
+  // Who this tab shows, compared at every refresh: the refresh cookie is the browser's, and another tab may have switched
+  // it to another profile (switchProfile). Not `user`, which the effect below holds as it was at mount, and not
+  // getCurrentUser(), which refreshSession has already set to whoever answered.
+  const shownUser = useRef<string | null>(null);
+  const channel = useRef<BroadcastChannel | null>(null);
   // Read from the context rather than with useQueryClient, which throws without a provider: tests mount AuthProvider
   // alone, and a provider-less AuthProvider simply has no query cache to clear.
   const qc = useContext(QueryClientContext);
@@ -150,6 +182,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
    */
   const adoptAuthed = (u: User, exp?: number) => {
     setCurrentUser(u.id);
+    shownUser.current = u.id;
     void tellWorkerUser(u.id);
     writeOfflineIdentity(u, exp);
     setUser(u);
@@ -166,6 +199,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   /** No server, but this device remembers an unexpired session. Open the downloads rather than the sign-in. */
   const adoptOffline = (saved: OfflineIdentity) => {
     setCurrentUser(saved.id);
+    shownUser.current = saved.id;
     // ⚠️ Not optional. The worker starts each launch with no idea who is signed in, and its background flush
     // skips every event stamped with an owner while that is true -- so without this line, reading queued
     // offline would be dropped silently by the one flush that runs after the app is closed.
@@ -190,9 +224,10 @@ export function AuthProvider({ children }: { children: ReactNode }) {
    * forgetting it in one of the two would leave the next person on a shared tablet holding the previous
    * person's identity -- and with it, the key to their downloads.
    */
-  const clearLocalSession = async () => {
+  const clearLocalSession = async (nextStatus:'anon'|'loading'='anon') => {
     setAccessToken(null);
     setCurrentUser(null);
+    shownUser.current = null;
     clearOfflineIdentity();
     // The sign-in screen belongs to nobody, so it gets the app's default look -- and the mirror goes with the
     // saved identity it exists to serve, or the next person's offline launch would inherit this one's choice.
@@ -206,12 +241,57 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     // The tone likewise: the sign-in screen is OLED, and the next person's offline launch does not inherit this one's.
     applyTone(null);
     setUser(null);
-    setStatus('anon');
+    setStatus(nextStatus);
     // Secrets the server only ever sends once are held outside React so a remount cannot destroy them.
     // That store has to end with the session, or a shared machine hands the next person a live token.
     clearShownOnce();
     void tellWorkerUser(null);
     await forgetAccountData();
+  };
+
+  /**
+   * The server accepted an intentional account change. Fence retained callbacks
+   * synchronously before the cache purge can yield, and remove the previous
+   * account from both imperative stores and React. A failed switch never reaches
+   * this point, so it leaves the previous screen/session intact.
+   */
+  const beginOwnedAccountChange = () => {
+    const release = beginAccountTransition();
+    setAccessToken(null);
+    setCurrentUser(null);
+    shownUser.current = null;
+    clearOfflineIdentity();
+    clearShownOnce();
+    setUser(null);
+    setStatus('loading');
+    void tellWorkerUser(null);
+    return release;
+  };
+
+  const replaceAuthedSession = async (res: {accessToken:string;user:User;refreshExpiresAt?:number}, resetAdult=false) => {
+    const previousOwner=getCurrentUser();
+    const replacingDocument=previousOwner!==null && previousOwner!==res.user.id;
+    const release=beginOwnedAccountChange();
+    // Once the cookie belongs to a different owner, even a failed cache purge
+    // must not release the old document to discover that owner's session.
+    const holdUntilReload=replacingDocument;
+    try {
+      await forgetAccountData();
+      if(resetAdult)setAdultShown(false);
+      if(replacingDocument){
+        // A's document must never acquire B's credential or global identity:
+        // even an unreviewed delayed callback remains powerless until reload.
+        writeOfflineIdentity(res.user,res.refreshExpiresAt);
+        channel.current?.postMessage({type:'switched',userId:res.user.id});
+        window.location.reload();
+        return true;
+      }
+      // No await between the token and identity adoption: no retained callback
+      // may observe the new credential paired with the previous account.
+      setAccessToken(res.accessToken);
+      adoptAuthed(res.user,res.refreshExpiresAt);
+      return false;
+    } finally { if(!holdUntilReload)release(); }
   };
 
   useEffect(() => {
@@ -224,10 +304,19 @@ export function AuthProvider({ children }: { children: ReactNode }) {
      * foreground -- which happens far more often than it is launched. It only ever promotes or ejects.
      */
     const revalidate = async () => {
+      const before = shownUser.current;
       const r = await refreshSession();
       if (!alive) return;
+      // Another tab switched this browser to another profile: nothing this tab holds is the new one's, so it starts over
+      // as it. Reintroduce by adopting in place: "a profile switched in another tab starts this one over" in
+      // web/test/profileSwitch.test.ts fails.
+      if (r.kind === 'authed' && before && r.user.id !== before) {
+        await forgetAccountData();
+        window.location.reload();
+        return;
+      }
       if (r.kind === 'authed') adoptAuthed(r.user, r.refreshExpiresAt);
-      else if (r.kind === 'rejected') await clearLocalSession();
+      else if (r.kind === 'rejected') { setSignedOutWhy(r.reason ?? null); await clearLocalSession(); }
       // 'unreachable': stay exactly as we are. A flaky network is not a sign-out.
     };
 
@@ -251,7 +340,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       const r = await untilReachable(refreshSession, () => alive);
       if (!alive) return;
       if (r.kind === 'authed') adoptAuthed(r.user, r.refreshExpiresAt);
-      else if (r.kind === 'rejected') await clearLocalSession();
+      else if (r.kind === 'rejected') { setSignedOutWhy(r.reason ?? null); await clearLocalSession(); }
       else if (saved) adoptOffline(saved);
       else { setCurrentUser(null); setStatus('anon'); }
     })();
@@ -260,24 +349,33 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     timer.current = setInterval(revalidate, 12 * 60 * 1000);
     const onVisible = () => { if (document.visibilityState === 'visible') void revalidate(); };
     window.addEventListener('online', revalidate);
+    const onAccountChanged = () => { void clearLocalSession().then(() => window.location.reload()); };
+    window.addEventListener('yomi-account-changed', onAccountChanged);
     document.addEventListener('visibilitychange', onVisible);
+    // A switch in another tab of this browser says so at once, rather than at this tab's next refresh.
+    if (typeof BroadcastChannel !== 'undefined') {
+      channel.current = new BroadcastChannel('yomi-auth');
+      channel.current.onmessage = (e) => {
+        if (e.data?.type === 'switched' && e.data.userId !== shownUser.current) window.location.reload();
+      };
+    }
     return () => {
       alive = false;
+      channel.current?.close();
+      channel.current = null;
       clearInterval(timer.current);
       window.removeEventListener('online', revalidate);
+      window.removeEventListener('yomi-account-changed', onAccountChanged);
       document.removeEventListener('visibilitychange', onVisible);
     };
   }, []);
 
-  const login = async (username: string, password: string, code?: string): Promise<{ ok: boolean; totp?: boolean; error?: string }> => {
+  const login = async (username: string, password: string, code?: string, remember?: boolean): Promise<{ ok: boolean; totp?: boolean; error?: string }> => {
     try {
       const res = await api<{ accessToken: string; user: User; refreshExpiresAt?: number }>('/auth/login', {
-        json: { username, password, code, deviceId: deviceId(), deviceName: deviceName() },
+        json: { username, password, code, deviceId: deviceId(), deviceName: deviceName(), ...(remember ? { remember: true } : {}) },
       });
-      await forgetAccountData(); // whoever used this device last does not get to answer this account's requests
-      setAccessToken(res.accessToken);
-      // After the purge, never before: the identity write must not be the thing the purge sweeps away.
-      adoptAuthed(res.user, res.refreshExpiresAt);
+      await replaceAuthedSession(res);
       return { ok: true };
     } catch (e: any) {
       let body: any = {};
@@ -301,8 +399,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const firstRunSetup = async (username: string, password: string): Promise<{ ok: boolean; error?: string }> => {
     try {
       const res = await api<{ accessToken: string; user: User; refreshExpiresAt?: number }>('/api/setup', { json: { username, password } });
-      setAccessToken(res.accessToken);
-      adoptAuthed(res.user, res.refreshExpiresAt);
+      await replaceAuthedSession(res);
       return { ok: true };
     } catch (e: any) {
       let body: any = {};
@@ -332,9 +429,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       const res = await api<{ accessToken: string; user: User; refreshExpiresAt?: number }>('/auth/register', {
         json: { username, password, deviceId: deviceId(), deviceName: deviceName() },
       });
-      await forgetAccountData();
-      setAccessToken(res.accessToken);
-      adoptAuthed(res.user, res.refreshExpiresAt);
+      await replaceAuthedSession(res);
       return { ok: true };
     } catch (e: any) {
       let body: any = {};
@@ -352,17 +447,86 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     }
   };
 
-  const logout = async () => {
+  /**
+   * Change the person on this device without a password: to a profile that opens at
+   * home (bff POST /auth/switch), or to an account the device remembers (POST /auth/resume). A sign-in like `login`,
+   * step for step, with what a change of person needs on top:
+   * reading queued offline is sent first, while the session it was read in still answers (lib/downloads.ts flushOutbox
+   * files it against whoever is signed in); the caches go only once the server has said yes, so a refused switch leaves
+   * the screen as it was; the 18+ reveal, the browser's and not the account's (lib/adult.ts), is put away, so a child
+   * does not inherit it; and the other tabs are told. Reintroduce a step out of order: web/test/profileSwitch.test.ts.
+   */
+  const changeProfile = async (path: '/auth/switch' | '/auth/resume' | '/auth/profile-login', profileId: string): Promise<{ ok: boolean; error?: string }> => {
+    const expectedOwnerId=getCurrentUser();
+    await flushOutbox().catch(() => 0);
+    let res: { accessToken: string; user: User; refreshExpiresAt?: number };
     try {
-      await api('/auth/logout', { method: 'POST' });
+      res = await api(path, { json: { profileId }, expectedOwnerId });
+    } catch (e: any) {
+      let body: any = {};
+      try { body = JSON.parse(e?.body || '{}'); } catch {}
+      return {
+        ok: false,
+        error: body.error === 'local_only' ? tr('Profiles without a password open from home only.')
+          : body.error === 'reauth' ? tr('Sign in again: an admin stays remembered for 12 hours.')
+          : tr('Could not switch profile'),
+      };
+    }
+    const replacingDocument=await replaceAuthedSession(res,true);
+    if(!replacingDocument)channel.current?.postMessage({ type: 'switched', userId: res.user.id });
+    return { ok: true };
+  };
+  const switchProfile = (profileId: string) => changeProfile('/auth/switch', profileId);
+  const resumeProfile = (profileId: string) => changeProfile('/auth/resume', profileId);
+  const pickProfile = (profileId: string) => changeProfile('/auth/profile-login', profileId);
+
+  /**
+   * Uchiyomi Desktop: back to the owner from a profile switched to on this PC. The shell's own handshake signs the owner
+   * in again (POST /auth/desktop, the header added below the page; lib/api.ts desktopExchange), taking up the session the
+   * profile was opened from; then the app starts over as the owner, as after a switch in another tab. Queued reading
+   * goes first, while the profile's session still answers.
+   */
+  const backToOwner = async (): Promise<boolean> => {
+    const expectedOwnerId=getCurrentUser();
+    await flushOutbox().catch(() => 0);
+    try { await api('/auth/desktop', { method: 'POST', expectedOwnerId }); }
+    catch { return false; }
+    // The cookie now belongs to the owner. Keep this document fenced through
+    // navigation; it must never issue a retained profile callback as the owner.
+    beginOwnedAccountChange();
+    await forgetAccountData();
+    setAdultShown(false);
+    window.location.reload();
+    return true;
+  };
+
+  /** Sign in as someone else: an account this device remembers is put aside rather than ended (bff POST /auth/leave). */
+  const leave = async () => {
+    const expectedOwnerId=getCurrentUser();
+    if(expectedOwnerId===null)return;
+    try { await api('/auth/leave', { method: 'POST', expectedOwnerId }); } catch {}
+    if(getCurrentUser()!==expectedOwnerId)return;
+    beginAccountTransition(); // Held until the old account's document is gone.
+    await clearLocalSession('loading');
+    window.location.reload();
+  };
+
+  const logout = async () => {
+    const expectedOwnerId=getCurrentUser();
+    if(expectedOwnerId===null)return;
+    try {
+      await api('/auth/logout', { method: 'POST', expectedOwnerId });
     } catch {}
+    if(getCurrentUser()!==expectedOwnerId)return;
+    beginAccountTransition(); // A future sign-in starts in a fresh document.
     // ⚠️ Signing out ENDS THE OFFLINE GRACE. `clearLocalSession` drops the saved identity, so the next cold
     // boot on this device -- online or not -- gets the sign-in screen, and the downloads in IndexedDB become
     // unaddressable again because nothing knows their owner. The chapters are deliberately left where they
     // are: they are scoped by owner, not secret, and signing back in makes them readable again without a
     // re-download. Reintroduce by clearing the session without the identity, and the next person to pick up
     // the tablet inherits the previous person's offline library.
-    await clearLocalSession();
+    await clearLocalSession('loading');
+    window.location.reload();
   };
 
   const setSettings = (partial: Record<string, any>) => {
@@ -390,8 +554,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   };
 
   return (
-    <Ctx.Provider value={{ status, user, isAdmin: user?.role === 'admin', login, firstRunSetup, register, logout, setSettings, setAvatar, setTotpEnabled, desktop: isDesktop(), reconnect }}>
-      {children}
+    <Ctx.Provider value={{ status, user, isAdmin: user?.role === 'admin', login, firstRunSetup, register, logout, setSettings, setAvatar, setTotpEnabled, switchProfile, resumeProfile, pickProfile, leave, backToOwner, signedOutWhy, desktop: isDesktop(), reconnect }}>
+      <Fragment key={user?.id ?? 'anonymous'}>{children}</Fragment>
     </Ctx.Provider>
   );
 }

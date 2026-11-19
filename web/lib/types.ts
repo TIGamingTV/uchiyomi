@@ -190,7 +190,21 @@ export interface SeriesEdition {
   editions?: EditionRow[];
 }
 
+export type TitleArtStyle = 'auto' | 'action' | 'fantasy' | 'scifi' | 'soft' | 'noir' | 'plain';
+export interface SeriesTitleArt {
+  mode: 'automatic' | 'custom' | 'text';
+  style: TitleArtStyle;
+  status: 'ready' | 'pending' | 'missing' | 'error' | 'disabled';
+  version: number;
+  logoUrl: string | null;
+  language: 'en' | 'original' | null;
+  showReadableTitle: boolean;
+  attribution: null | { source: 'Uchiyomi logo library' | 'Wikimedia Commons' | 'Cover lettering'; sourceUrl: string | null; artist: string | null; license: string | null; licenseUrl: string | null };
+}
+
 export interface Series {
+  /** Account-owned copy; authorization is always enforced by the server. */
+  isPrivate?: boolean;
   /** Admins only: the library it is in. */
   library?: { id: string; name: string };
   /** The reading defaults of the library the series is in (#235): the content's look, never a theme; null when it has none. */
@@ -231,6 +245,8 @@ export interface Series {
   source?: { missing: number | null; chapters: number | null; checkedAt: string } | null;
   yomi?: UchiyomiFlags;
   artVersion?: number; // bumps when an admin edits the cover/banner → cache-busts the image URLs
+  /** Cached title artwork; absent on older servers, which retain the styled readable title. */
+  titleArt?: SeriesTitleArt;
   /**
    * v0.51.0: the banner the server makes from the series' own pages, for a series with no banner of its own --
    * `{seed}` once one is made (lib/art.ts autoHeroUrl), null when it has a banner, is 18+, or none is made (yet).
@@ -414,6 +430,8 @@ export interface Ghost {
 }
 
 export interface Listing {
+  /** Deleted single-chapter rows whose every known source copy is blocked. The progress/history row is retained. */
+  blockedDeletedBookIds?: string[];
   /** When the updater last wrote this list, or null when it never has. Stale beats empty, so the age is shown. */
   checkedAt: string | null;
   content: Ghost[];
@@ -537,6 +555,11 @@ export interface LanguageSettings {
 
 export interface PageInfo {
   number: number;
+  /** A stable page slot removed by an admin; never shown as a reading page. */
+  removed?: true;
+  restorable?: boolean;
+  /** Archive revision used to invalidate immutable image URLs after an edit. */
+  contentVersion?: string;
   /** Set by the server when this page recurs across chapters of the series -- a credit page, an advert. */
   junk?: boolean;
   /**
@@ -787,6 +810,8 @@ export interface HomePayload {
    */
   pickUp?: Book[];
   gems?: Series[];
+  /** How many series the reader removed from Keep reading and has not read since (see /api/keep-reading/hidden). */
+  keepReadingHidden?: number;
 }
 
 export interface DownloadManifest {
@@ -801,7 +826,7 @@ export interface DownloadManifest {
   coverUrl: string;
   totalBytes: number;
   /** `missing` rides along like `junk`: the placeholder bytes download like any page, and the caption is drawn offline too. */
-  pages: { number: number; url: string; width: number | null; height: number | null; bytes: number | null; junk?: boolean; missing?: true; join?: 'rtl' | 'ltr'; mark?: 'join' | 'split' }[];
+  pages: { number: number; url: string; width: number | null; height: number | null; bytes: number | null; junk?: boolean; missing?: true; removed?: true; restorable?: boolean; contentVersion?: string; join?: 'rtl' | 'ltr'; mark?: 'join' | 'split' }[];
 }
 
 export function isWebtoon(dir?: string): boolean {

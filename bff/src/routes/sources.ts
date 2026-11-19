@@ -1,12 +1,14 @@
+import { resolveAddScope, scopeForSeries, scopeSql, folderForScope, defaultPrivateFor, privateFolderOwner, reservedPrivateFolder, type AddScope } from '../lib/contentScope';
 // Search across sources and add a new series to the library (queues its download). Backed by the source
 // adapters + the downloader. The cover proxy lives under /img (cookie auth) so <img> tags can load it.
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
-import { randomBytes } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import { z } from 'zod';
+import { withoutHiddenDiscover } from '../lib/discoveryHub';
 import { actsAsAdmin, authenticate, userIdOf, roleOf } from '../lib/auth';
 import { getSource, listSources, isSwAdapterId, SW_PREFIX, swAdapterId, withTimeout } from '../lib/sources';
 import { MANGADEX_GROUP } from '../lib/sources/mangadex';
-import type { SourceAdapter, SourceSeries, SourceChapter } from '../lib/sources/types';
+import { supportsCreatorSearch, type SourceAdapter, type SourceSeries, type SourceChapter } from '../lib/sources/types';
 import { chapterFileRel, sanitize, type DownloadInput } from '../lib/downloader';
 import { downloadWithFallback } from '../lib/chapterFallback';
 import { selectChapters, type ChapterFrom } from '../lib/selectChapters';
@@ -16,6 +18,7 @@ import { followGuard, seriesLanguage } from '../lib/seriesLang';
 import { searchAll, groupByTitle, bySource, ratingOf, narrowTo, SEARCH_FIRST_ANSWER_MS, type Rated, type RatingFilter } from '../lib/searchAll';
 import type { SourceSeries as DiscoverItem } from '../lib/sources/types';
 import { budgetFor, listBudgetFor } from '../lib/sources/budget';
+import { importMatchNeedsReview } from '../lib/importMatchReview';
 import { SOLVER_CONCURRENCY, withSolverDeadline } from '../lib/sources/flaresolverr';
 
 /**
@@ -79,7 +82,7 @@ function fillScanView(st: FillScan) {
 export function _clearFillScans(): void { fillScans.clear(); }
 import { persistScan, setBookDates, setBookMeta, libraryIdFor, libraryRows, LIBRARY_ROOT, DL_ROOT } from '../lib/library';
 import { notInLibrary, notInLibraryParts } from '../lib/downloadCensus';
-import { english, joined, say, saids, type Part, type Said } from '../lib/said';
+import { english, joined, say, saidOf, saids, type Part, type Said } from '../lib/said';
 import { diskSpelling } from '../lib/libraryAdmin';
 import { isDesktop } from '../lib/desktop';
 import { newSeriesId } from '../lib/ids';
@@ -96,13 +99,16 @@ import { cleanSourceOrder } from '../lib/sourcePrefs';
 import { paceLevel, rateKeyOf, restLeft } from '../lib/pace';
 import { haveNumbers } from '../lib/libraryNumbers';
 import { heldBy, isRange, rangeEnd, rawRangeEnd } from '../lib/chapterRanges';
+import { heldBooks } from '../lib/chapterCleanup';
 import {
-  addNumbering, numberingFor, numberedChapters, stampAddNumbering, registerBusyProbe, onRenumbered, POSTING_ORDER_REFUSAL,
+  addNumbering, numberingFor, numberedChapters, readsByTitles, stampAddNumbering, registerBusyProbe, onRenumbered, POSTING_ORDER_REFUSAL,
   type NumberingChoice,
 } from '../lib/numbering';
 import { numKey } from '../lib/postingOrder';
+import { titleNumbered } from '../lib/titleNumbers';
 import { groupStats } from '../lib/groupStats';
-import { fetchAniListArt, fetchTrending, TREND_COUNTRIES, type TrendCountry, TrendingItem } from '../lib/anilist';
+import { fetchAniListArt, TREND_COUNTRIES, type TrendCountry } from '../lib/anilist';
+import { trendingFor } from '../lib/trending';
 import { adultOk, becauseYouRead } from '../lib/anilistRelated';
 import { automaticAniListAllowed, withAniListMutation } from '../lib/anilistPolicy';
 import { learnDirection, learnDirectionWith, directionFromAniListMatch } from '../lib/readingDirection';
@@ -132,7 +138,7 @@ export const REFRESH_BUDGET_MS = 10_000;
 import { logAudit } from '../lib/audit';
 import { autoFollow, refusals, MAX_AUTO_CANDIDATES, type FollowCandidate, type FollowResult } from '../lib/autoFollow';
 import { altTitlesFor, exactHit, learnAltTitles, learnFromMainSource, namesOf, parseAltTitles, SEARCH_NAMES } from '../lib/altTitles';
-import { currentWork, heldFor, learnPageNames, libraryChanged, libraryIndex, nameableFor, noIndex, noteTitles, pendingOf, workOf, type Held, type LibraryIndex } from '../lib/discoverIdentity';
+import { currentWork, heldFor, pairKey, learnPageNames, libraryChanged, libraryIndex, nameableFor, noIndex, noteTitles, pendingOf, workOf, type Held, type LibraryIndex } from '../lib/discoverIdentity';
 import { env } from '../env';
 import { runtime } from '../lib/runtime';
 import { dismissRun, listRuns, requestStop } from '../lib/downloadJobs';
@@ -145,7 +151,7 @@ import {
   visibleToAll, viewCtxFor, sourceAllowedFor, sourceBrowsableFor, browsable, visible, seriesVisible, Params, type ViewCtx, hideAdult, adultFilter,
   ADULT_RATING,
 } from '../lib/visibility';
-import { adultContentRating } from '../lib/ageRating';
+import { adultSourceSeries } from '../lib/ageRating';
 // v0.52.0 (#72): language editions of one work, and the language model they stand on.
 import { editionFolder, linkEdition, workRows, type WorkRow } from '../lib/editions';
 import { effectiveLang, sourceLanguage } from '../lib/seriesLang';
@@ -443,6 +449,7 @@ async function downloadsAudience(ctx: ViewCtx, me: string | null, admin: boolean
      */
     folder: (folder: string, by: string | null | undefined) => {
       const s = byFolder.get(folder);
+      if (reservedPrivateFolder(folder) && privateFolderOwner(folder) !== me) return false;
       return s ? s.ok || mine(by) : admin || mine(by);
     },
     /** May this viewer see series `id`: a run's current series now, the archive's rows with #117. */
@@ -450,6 +457,16 @@ async function downloadsAudience(ctx: ViewCtx, me: string | null, admin: boolean
   };
 }
 type DownloadsAudience = Awaited<ReturnType<typeof downloadsAudience>>;
+async function downloadViewer(userId:string):Promise<ViewCtx|null>{
+  try{
+    const account=await one<{role:string;disabled:boolean;perms:{canDownload?:boolean}}> ('SELECT role,disabled,perms FROM users WHERE id=$1',[userId]);
+    if(!account || account.disabled || account.role!=='admin' && account.perms?.canDownload===false)return null;
+    const viewer=await viewCtxFor(userId,account.role);
+    if(viewer.libraryIds && (!viewer.libraryIds.length || viewer.libraryIds.includes('')))return null;
+    return viewer;
+  }catch{return null;}
+}
+
 
 /**
  * `downloadsAudience`'s rows, sorted out: the row that speaks for each asked-for folder, and the ids this viewer
@@ -700,7 +717,13 @@ export function startDownloadJob(input: DownloadJobInput, reserved?: DownloadJob
           // only when its caller supplied an exact current-source capability; a blank id by itself stays closed.
           automaticAllowed: async (candidate) => (!seriesId && !!input.sourceAllowedNow)
             || await automaticChapterAllowedFor(seriesId, candidate),
-          sourceAllowedNow: input.sourceAllowedNow ?? ((candidate) => seriesFollowsSource(seriesId, candidate.source ?? '')),
+          sourceAllowedNow: async candidate=>{
+            if(input.by && seriesId){
+              const viewer=await downloadViewer(input.by);
+              if(!viewer || !(await seriesVisible(seriesId,viewer)) || !sourceAllowedFor(getSource(candidate.source??''),viewer.maxAgeRating))return false;
+            }
+            return input.sourceAllowedNow ? input.sourceAllowedNow(candidate) : seriesFollowsSource(seriesId,candidate.source??'');
+          },
         });
       } catch (e: any) {
         const j = jobs.get(folder);
@@ -856,13 +879,8 @@ export function startDownloadJob(input: DownloadJobInput, reserved?: DownloadJob
   return { total: chapters.length };
 }
 
-// Trending recommendations are global + slow-moving; cache the AniList pull for a few hours. One entry per country of
-// origin since v0.61.0 (Discover's manhwa, manga and manhua rails), each six hours on its own; `pending` is the pull
-// under way, so two pages opened together ask AniList once.
-const trendingCache = new Map<TrendCountry, { at: number; items: TrendingItem[] }>();
-const trendingPending = new Map<TrendCountry, Promise<TrendingItem[]>>();
 /** Canonical title key used for dedupe, grouping and "already in library" checks. */
-export const norm = (t: string) => t.toLowerCase().replace(/[^a-z0-9]+/g, '');
+export const norm = (t: string) => t.normalize('NFKC').toLowerCase().replace(/[^\p{L}\p{M}\p{N}]+/gu, '');
 
 // Provider order for cross-source "find": by each source's declared preferredOrder (Aqua = 0), then
 // registry/load order. Derived from the loaded sources so it works with whatever the user has installed.
@@ -899,7 +917,7 @@ const uniqueHeld = (all: Held[]): Held[] => all.filter((h, i) => all.findIndex((
  * online lookups, which never hold this answer up. A library that cannot be read is an empty one, as it always was here.
  */
 async function decorate<T extends { title: string; sourceId: string }>(items: T[], source: string, ctx: ViewCtx) {
-  const idx = await libraryIndex().catch(() => noIndex());
+  const idx = await libraryIndex(ctx).catch(() => noIndex());
   const may = await nameableFor(idx, ctx);
   noteTitles(items.map((r) => r.title));
   return items.map((r) => {
@@ -1440,6 +1458,9 @@ async function artByTitle(where: { id: string } | { folder: string }, title: str
  *  Shared by POST /api/sources/add and the bulk importer. Returns a result instead of touching the reply. */
 export async function addSeriesFromSource(opts: {
   source?: string; sourceId?: string; force?: boolean; chapterCount?: number; autoUpdate?: boolean;
+  scope?: AddScope;
+  /** Old clients omit a destination: retain an existing shared shelf’s deliberate library assignment. */
+  preserveSharedDestination?: boolean;
   /** Which end of the list `chapterCount` counts from. Adapters list ascending, so the default is the oldest N. */
   chapterFrom?: ChapterFrom;
   /**
@@ -1495,7 +1516,7 @@ export async function addSeriesFromSource(opts: {
   // which the add dialog calls seconds earlier for the very same two things: without that, opening the
   // dialog and pressing Add paid for four challenge solves to learn two facts.
   const { series, chapters: listed } = await seriesAndChapters(src, sourceId);
-  if (opts.refuseAdultTitle && adultContentRating(series?.contentRating)) {
+  if (opts.refuseAdultTitle && adultSourceSeries(series)) {
     return { ok: false, status: 403, error: 'forbidden', message: 'That source is not available on this account.' };
   }
   // No title, no add. This used to fall back to the literal string 'Series', which becomes the folder --
@@ -1510,6 +1531,24 @@ export async function addSeriesFromSource(opts: {
       message: `${src.name} did not return this title just now. Try again in a moment.`,
     };
   }
+  const automaticFolder = `${src.name}/${sanitize(title)}`;
+  const preferredShared = !opts.edition ? await one<{folder:string;library_id:string}>(`SELECT s.folder,s.library_id FROM lib_series s
+    JOIN libraries l ON l.id=s.library_id WHERE NOT s.is_private AND NOT l.managed_private AND s.merged_into IS NULL
+      AND ((s.source_id=$1 AND s.source_series_id=$2) OR s.folder=$3)
+    ORDER BY (s.deleted_at IS NOT NULL), (s.source_id=$1 AND s.source_series_id=$2) DESC,s.created_at LIMIT 1`,[source,sourceId,automaticFolder]) : null;
+  const automaticLibraryId = preferredShared?.library_id ?? libraryIdFor(automaticFolder, await libraryRows());
+  let scope: AddScope = opts.scope ?? { key: `shared:${automaticLibraryId}`, libraryId: automaticLibraryId,
+    ownerUserId: null, visibility: 'shared', folderPrefix: '' };
+  if(opts.scope?.visibility==='shared' && opts.preserveSharedDestination && preferredShared && preferredShared.library_id!==scope.libraryId && opts.userId){
+    scope=await resolveAddScope(await viewCtxFor(opts.userId),{visibility:'shared',libraryId:preferredShared.library_id});
+  }
+  const scoped = <T>(sql: string, values: unknown[] = [], alias = 's') => {
+    const params = new Params();
+    values.forEach(value => params.add(value));
+    const clause = scopeSql(alias, scope, params);
+    return q<T>(sql.replace('__SCOPE__', clause), params.values);
+  };
+  const scopedOne = async <T>(sql: string, values: unknown[] = [], alias = 's'): Promise<T | null> => (await scoped<T>(sql, values, alias))[0] ?? null;
   /**
    * A language edition of a series already here (v0.52.0, #72). Its language is the one asked for, else the one
    * the source declares; a source that declares none, or every one, cannot say, and the dialog asks. Weighed
@@ -1525,6 +1564,7 @@ export async function addSeriesFromSource(opts: {
     if (!lang) {
       return { ok: false, status: 400, error: 'edition_lang', message: `${src.name} does not say which language it is in. Choose the language of this edition.` };
     }
+    if (!(await scopedOne('SELECT s.id FROM lib_series s WHERE s.id=$1 AND __SCOPE__', [opts.edition.of]))) return { ok:false,status:404,error:'not_found' };
     const rows = await workRows(opts.edition.of);
     const of = rows.find((r) => r.id === opts.edition!.of);
     if (!of || of.hidden) return { ok: false, status: 404, error: 'not_found', message: 'That series is not in the library any more.' };
@@ -1548,20 +1588,52 @@ export async function addSeriesFromSource(opts: {
   const srcDir = process.platform === 'win32' ? sanitize(src.name) : src.name;
   // An edition's folder carries its language (lib/editions.ts editionFolder), so it never lands in the original's.
   let folder = edition ? editionFolder(srcDir, title, edition.lang) : `${srcDir}/${sanitize(title)}`;
+  folder = !edition && scope.visibility==='shared' && preferredShared?.library_id===scope.libraryId
+    ? preferredShared.folder : await folderForScope(scope,folder);
   // ⚠️ Desktop, case-insensitive disks (NTFS, APFS): a source that now spells the title `Solo leveling`
   // still downloads into the existing `Solo Leveling` folder, and the scanner reads that folder back with
   // its on-disk spelling -- so a row keyed on the new spelling never met its own chapters, and the series
   // split in two. Reuse the spelling already stored, then the one already on disk; only a folder that
   // exists nowhere keeps the new one. The server's disks are case-sensitive and keep the exact match.
   if (isDesktop()) {
-    const stored = await one<{ folder: string }>(
-      'SELECT folder FROM lib_series WHERE lower(folder) = lower($1) ORDER BY (deleted_at IS NOT NULL), created_at LIMIT 1', [folder]);
+    const stored = await scopedOne<{ folder: string }>(
+      'SELECT s.folder FROM lib_series s WHERE lower(s.folder) = lower($1) AND __SCOPE__ ORDER BY (s.deleted_at IS NOT NULL), s.created_at LIMIT 1', [folder]);
     folder = stored?.folder ?? await diskSpelling([DL_ROOT, LIBRARY_ROOT], folder);
   }
 
+  // Source identity survives a title change. An exact entry already followed by this library keeps its shelf.
+  if (!edition) {
+    const exact = await scopedOne<{ folder: string }>(
+      `SELECT s.folder FROM lib_series s WHERE s.source_id = $1 AND s.source_series_id = $2 AND s.merged_into IS NULL AND __SCOPE__
+        ORDER BY (s.deleted_at IS NOT NULL), s.created_at LIMIT 1`, [source, sourceId]);
+    if (exact) folder = exact.folder;
+  }
+
   // A deleted series does not count as present: re-adding it is how you undo a delete from the app side.
-  const existing = await one<{ id: string; deleted_at: string | null }>(
-    'SELECT id, deleted_at FROM lib_series WHERE folder = $1', [folder]);
+  type ExistingShelf = { id: string; deleted_at: string | null; source_id: string | null; source_series_id: string | null };
+  const shelfAt = (name: string) => scopedOne<ExistingShelf>(
+    'SELECT s.id, s.deleted_at, s.source_id, s.source_series_id FROM lib_series s WHERE s.folder = $1 AND s.merged_into IS NULL AND __SCOPE__', [name]);
+  let existing = await shelfAt(folder);
+  // Publishing retains physical paths. A later private add must not write into that now-shared folder.
+  if (!existing && await one('SELECT 1 FROM lib_series WHERE folder=$1 LIMIT 1',[folder])) {
+    // Stable public identifiers distinguish storage namespaces; this digest is a
+    // deterministic folder suffix, with no credential or password material.
+    const namespace=scope.visibility==='private'?'private:'+scope.ownerUserId:'shared:'+scope.libraryId;
+    const suffix=createHash('sha256').update(namespace+'\0'+pairKey(source!,sourceId!)).digest('hex').slice(0,12);
+    folder=`${folder} [${suffix}]`;
+    existing=await shelfAt(folder);
+    if (!existing && await one('SELECT 1 FROM lib_series WHERE folder=$1 LIMIT 1',[folder])) return {ok:false,status:409,error:'folder_collision'};
+  }
+  const differentEntry = (row: ExistingShelf | null) => !!(row?.source_id && row.source_series_id
+    && pairKey(row.source_id, row.source_series_id) !== pairKey(source!, sourceId!));
+  // Two entries can have an identical title, or sanitize to one filename. They must never share chapter files.
+  // A stable source-derived suffix also makes repeating the second add idempotent.
+  if (differentEntry(existing)) {
+    const identity = createHash('sha256').update(pairKey(source!, sourceId!)).digest('hex').slice(0, 12);
+    folder = `${folder} [${identity}]`;
+    existing = await shelfAt(folder);
+    if (differentEntry(existing)) return { ok: false, status: 409, error: 'folder_collision', message: 'Another series uses that download folder. Rename its folder before adding this entry.' };
+  }
   if (existing?.deleted_at) {
     await q('UPDATE lib_series SET deleted_at = NULL WHERE id = $1', [existing.id]).catch(() => {});
   }
@@ -1609,23 +1681,36 @@ export async function addSeriesFromSource(opts: {
     // dialog can offer "Open it" -- and precisely because the row may be one the caller cannot see, the
     // route gates the id on `seriesVisible` before it answers. The title and the source were always
     // answered here and are unchanged.
-    let dup = await one<{ id: string; title: string; source: string }>(
-      `SELECT id, title, source FROM lib_series
-        WHERE lower(regexp_replace(title, '[^a-zA-Z0-9]', '', 'g')) = $1 AND folder <> $2
-          AND ${visibleToAll('lib_series')} LIMIT 1`,
-      [norm(title), folder]);
+    // Read title matches from the database as well: a scanner/import can have added a row since the cached index.
+    // Its source pairs must agree before a title is allowed to identify it.
+    const titleMatches = await scoped<{
+      id: string; title: string; source: string;
+      pairs: Array<{ source: string; id: string | null }>;
+    }>(
+      `SELECT s.id, s.title, s.source,
+              (SELECT COALESCE(jsonb_agg(p), '[]'::jsonb) FROM (
+                SELECT s.source_id AS source, s.source_series_id AS id WHERE s.source_id IS NOT NULL
+                UNION ALL SELECT ss.source_id AS source, ss.source_series_id AS id FROM series_sources ss WHERE ss.series_id = s.id
+              ) p) AS pairs
+         FROM lib_series s
+        WHERE $1::text IS NOT NULL AND s.folder <> $2 AND __SCOPE__
+          AND ${visibleToAll('s')} ORDER BY s.id`, [norm(title), folder]);
+    const matched = titleMatches.find((r) => norm(r.title) === norm(title) && !r.pairs.some((p) => p.source === source && p.id
+      && pairKey(p.source, p.id) !== pairKey(source!, sourceId!)));
+    let dup: { id: string; title: string; source: string } | null = matched
+      ? { id: matched.id, title: matched.title, source: matched.source } : null;
     if (!dup) {
       // v0.56.0: the same work under another name, or this very source series already followed by a series under another
       // title (lib/discoverIdentity.ts heldFor). Only the same title, by the ASCII key, was a duplicate before, so an add
       // from a site that names the series differently made a second copy of it. Reintroduce by dropping this: "a series
       // you hold under another name is a duplicate" in discoverIdentity.int.test.ts adds the second copy.
-      const idx = await libraryIndex().catch(() => null);
+      const idx = await libraryIndex(scope.visibility === 'private' ? await viewCtxFor(scope.ownerUserId) : undefined).catch(() => null);
       const ids = idx ? heldFor(idx, { source: source!, sourceId: sourceId!, title }).map((h) => h.id) : [];
       if (ids.length) {
-        dup = await one<{ id: string; title: string; source: string }>(
+        dup = await scopedOne<{ id: string; title: string; source: string }>(
           `SELECT id, title, source FROM lib_series
-            WHERE id = ANY($1::text[]) AND folder <> $2 AND ${visibleToAll('lib_series')} ORDER BY id LIMIT 1`,
-          [ids, folder]);
+            WHERE id = ANY($1::text[]) AND folder <> $2 AND __SCOPE__ AND ${visibleToAll('lib_series')} ORDER BY id LIMIT 1`,
+          [ids, folder], 'lib_series');
       }
     }
     if (dup) {
@@ -1666,7 +1751,7 @@ export async function addSeriesFromSource(opts: {
   // rating is never lowered, and an admin's override still wins in visible(). Every chapter's ComicInfo carries it
   // too (downloader.ts), so a rescan from the files keeps it. Reintroduce by writing NULL: "a MangaDex title rated
   // erotica is stored 18+" in ageRatingOnAdd.int.test.ts reads null.
-  const addedAgeRating = adultContentRating(series?.contentRating) ? ADULT_RATING : null;
+  const addedAgeRating = adultSourceSeries(series) ? ADULT_RATING : null;
 
   /**
    * "Nothing yet": the series is created and followed, and no chapter is fetched.
@@ -1717,11 +1802,11 @@ export async function addSeriesFromSource(opts: {
     const libs = await libraryRows();
     const libraryId = existing
       ? (await one<{ library_id: string }>('SELECT library_id FROM lib_series WHERE id = $1', [existing.id]))?.library_id ?? libraryIdFor(folder, libs)
-      : libraryIdFor(folder, libs);
+      : scope.libraryId;
     const { id } = (await q<{ id: string }>(
       `INSERT INTO lib_series (id, source, title, summary, author, status, genres, web, folder, books_count, library_id, scanned_at,
-                               auto_update, source_id, source_series_id, chapter_floor, source_checked_at, source_chapters, source_missing, lang, age_rating)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,0,$10,now(),$11,$12,$13,$14,now(),$15,0,$16,$17)
+                               auto_update, source_id, source_series_id, chapter_floor, source_checked_at, source_chapters, source_missing, lang, age_rating, owner_user_id, is_private)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,0,$10,now(),$11,$12,$13,$14,now(),$15,0,$16,$17,$18,$19)
        ON CONFLICT (library_id, folder) DO UPDATE SET
          auto_update = EXCLUDED.auto_update, source_id = EXCLUDED.source_id, source_series_id = EXCLUDED.source_series_id,
          chapter_floor = EXCLUDED.chapter_floor, scanned_at = now(), deleted_at = NULL,
@@ -1729,7 +1814,7 @@ export async function addSeriesFromSource(opts: {
          lang = COALESCE(lib_series.lang, EXCLUDED.lang), age_rating = GREATEST(lib_series.age_rating, EXCLUDED.age_rating)
        RETURNING id`,
       [newSeriesId(), src.name, title, meta.summary || null, meta.author ?? null, meta.status ?? null, meta.genres ?? [], meta.url ?? null,
-       folder, libraryId, autoUpdate !== false, source, sourceId, floor, chosen.length, stateLang, addedAgeRating],
+       folder, libraryId, autoUpdate !== false, source, sourceId, floor, chosen.length, stateLang, addedAgeRating, scope.ownerUserId, scope.visibility === 'private'],
     ))[0];
     const linked = await linkHere(id);
     await stampAddNumbering({ id }, source!, numbered.decision).catch((e) => console.warn(`[add] ${folder}: numbering not recorded: ${(e as Error)?.message || e}`));
@@ -1902,11 +1987,11 @@ export async function addSeriesFromSource(opts: {
     const libs = await libraryRows();
     const libraryId = existing
       ? (await one<{ library_id: string }>('SELECT library_id FROM lib_series WHERE id = $1', [existing.id]))?.library_id ?? libraryIdFor(folder, libs)
-      : libraryIdFor(folder, libs);
+      : scope.libraryId;
     const { id } = (await q<{ id: string }>(
       `INSERT INTO lib_series (id, source, title, summary, author, status, genres, web, folder, books_count, library_id, scanned_at,
-                               auto_update, source_id, source_series_id, chapter_floor, source_checked_at, source_chapters, source_missing, lang, age_rating)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,0,$10,now(),$11,$12,$13,$14,NULL,$15,$16,$17,$18)
+                               auto_update, source_id, source_series_id, chapter_floor, source_checked_at, source_chapters, source_missing, lang, age_rating, owner_user_id, is_private)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,0,$10,now(),$11,$12,$13,$14,NULL,$15,$16,$17,$18,$19,$20)
        ON CONFLICT (library_id, folder) DO UPDATE SET
          auto_update = EXCLUDED.auto_update, source_id = EXCLUDED.source_id, source_series_id = EXCLUDED.source_series_id,
          chapter_floor = EXCLUDED.chapter_floor, scanned_at = now(), deleted_at = NULL,
@@ -1914,7 +1999,7 @@ export async function addSeriesFromSource(opts: {
          lang = COALESCE(lib_series.lang, EXCLUDED.lang), age_rating = GREATEST(lib_series.age_rating, EXCLUDED.age_rating)
        RETURNING id`,
       [newSeriesId(), src.name, title, meta.summary || null, meta.author ?? null, meta.status ?? null, meta.genres ?? [], meta.url ?? null,
-       folder, libraryId, autoUpdate !== false, source, sourceId, floor, chosen.length, toFetch.length, stateLang, addedAgeRating],
+       folder, libraryId, autoUpdate !== false, source, sourceId, floor, chosen.length, toFetch.length, stateLang, addedAgeRating, scope.ownerUserId, scope.visibility === 'private'],
     ))[0];
     await linkHere(id);
     await stampAddNumbering({ id }, source!, numbered.decision).catch((e) => console.warn(`[add] ${folder}: numbering not recorded: ${(e as Error)?.message || e}`));
@@ -1931,6 +2016,13 @@ export async function addSeriesFromSource(opts: {
     if (opts.alsoFollow?.length) judgeAlsoFollow(folder, id, opts);
     return id;
   };
+
+  // An explicitly chosen library is authoritative even when the folder is manually assigned or its path map is stale.
+  // Register that assignment before bytes arrive so a scan cannot briefly expose the title through the default library.
+  if(!existing && libraryIdFor(folder,await libraryRows())!==scope.libraryId){
+    const allocated=await keepForLater();
+    await q('UPDATE lib_series SET library_pinned=true WHERE id=$1',[allocated]);
+  }
 
   const run = async (): Promise<AddResult> => {
     const finishOn = opts.wait === false && await finishDownloadsOn().catch(() => false);
@@ -1950,7 +2042,15 @@ export async function addSeriesFromSource(opts: {
       alternates: async () => [], refusing, allowed: opts.sourceAllowed, hunt: undefined,
       // The add request names this source and the adapter supplied these chapter ids. A brand-new series has
       // no follow row yet, so its current authority is this exact one-source selection rather than a DB follow.
-      sourceAllowedNow: async (candidate) => candidate.source === source,
+      sourceAllowedNow: async candidate=>{
+        if(candidate.source!==source)return false;
+        if(!opts.userId)return true;
+        const viewer=await downloadViewer(opts.userId);
+        if(!viewer || !sourceAllowedFor(getSource(candidate.source??''),viewer.maxAgeRating))return false;
+        try{await resolveAddScope(viewer,{visibility:scope.visibility,libraryId:scope.libraryId});}catch{return false;}
+        const current=await one<{id:string}>('SELECT id FROM lib_series WHERE folder=$1 AND merged_into IS NULL',[folder]);
+        return !current || await seriesVisible(current.id,viewer);
+      },
     });
     let firstPages = 0; let blockReason: string | null = null; let diskFull: string | null = null;
     // Found already on disk: part of the result, so checked against the library at the end like what landed.
@@ -2242,7 +2342,8 @@ export async function mihonSourceToAdapter(ids: { sourceIdUnsigned?: string; sou
     'SELECT source_id FROM suwayomi_sources WHERE source_id = ANY($1) AND enabled = true',
     [candidates],
   ).catch(() => []);
-  if (!rows.length) return null;
+  // Signed/unsigned forms name one source, never permission to choose between two installed sources.
+  if (new Set(rows.map((r) => r.source_id)).size !== 1) return null;
   const id = swAdapterId(rows[0].source_id);
   if (await isDisabled(id).catch(() => false)) return null;
   return getSource(id) ? id : null;
@@ -2252,6 +2353,7 @@ export interface ResolvedCandidate {
   source: string; sourceId: string; title: string; coverUrl?: string; confidence: MatchConfidence;
   /** The alternate title the match was found under; null when the search title itself found it. */
   matchedVia: string | null;
+  ambiguous?: boolean;
 }
 
 /** How many of an entry's other names one resolve tries: each is one more outbound search per source that misses. */
@@ -2280,21 +2382,21 @@ export const normPath = (p: string) => p.trim().replace(/^\/+/, '').replace(/\/+
  * carried the top confidence tier, rendered green, and been hidden from "Needs attention". No confident
  * hit anywhere means `null`, and the row stays `unresolved` for a person to search by hand.
  *
- * `altTitles` (a tracker entry's romaji title and synonyms) are searched AFTER the search title, in order,
- * and the first confident tier under any of them wins: a source that carries "Attack on Titan" only as
+ * `altTitles` (a tracker entry's romaji title and synonyms) are searched AFTER the search title, in order.
+ * Weak matches remain fallbacks while stronger alternatives are tried: a source that carries "Attack on Titan" only as
  * "Shingeki no Kyojin" is the same match, and without the second try every such row sat in "no match
  * found". Each hit is scored against the term that was searched, and `matchedVia` says which alternate
  * found it (null for the search title) so the review row can say so instead of flagging a romaji hit as a
- * wrong pick. Capped at `RESOLVE_ALT_TITLES`: every alternate is one more outbound search on every source
- * that misses, and the batch already runs several rows in parallel.
+ * wrong pick. At most 24 preferred-source queries and 60 seconds per title, shared across up to three alternates;
+ * manual search still offers every enabled source. Duplicate exact entries remain explicitly reviewable.
  *
  * ⚠️ The TERM loop is the outer one in the cross-source pass: the title on every source, then the first
  * alternate on every source, and so on. Nested the other way (every term on source 1, then source 2), an
  * alternate's weak `contains` hit on the first source pre-empted an exact hit for the title on the second
  * -- AniList synonyms are user-contributed ("AoT", "Atak Tytanów"), and "AoT" on a site that lacks the
  * series answered "Chaotic Love Story" while the next site carried "Attack on Titan" exactly and was never
- * asked. The home source keeps its own block above: a backup names its own source and carries no alternates,
- * so there is nothing to interleave.
+ * asked. The home source keeps its own block above so a saved source+path can prove identity across every
+ * alias before another source's title match is considered.
  */
 export async function resolveCandidate(entry: { title: string; altTitles?: string[]; url?: string; sourceIdUnsigned?: string; sourceIdSigned?: string }): Promise<ResolvedCandidate | null> {
   // The search title first, then each distinct alternate; an alternate that normalises to the title (or to
@@ -2306,21 +2408,75 @@ export async function resolveCandidate(entry: { title: string; altTitles?: strin
     if (t && !terms.some((x) => norm(x) === norm(t))) terms.push(t);
   }
   const viaOf = (term: string): string | null => (term === entry.title ? null : term);
+  const deadline = Date.now() + 60_000;
+  let queriesLeft = 24;
+  const perTerm = Math.max(1, Math.floor(24 / terms.length));
+  let fallback: ResolvedCandidate | null = null;
+  const rank = (c: MatchConfidence) => c === 'same_source' ? 4 : c === 'exact' ? 3 : c === 'contains' ? 2 : 1;
+  const retain = (candidate: ResolvedCandidate): ResolvedCandidate | null => {
+    if (!fallback || rank(candidate.confidence) > rank(fallback.confidence) ||
+      (rank(candidate.confidence) === rank(fallback.confidence) && fallback.ambiguous && !candidate.ambiguous)) fallback = candidate;
+    return !candidate.ambiguous && (candidate.confidence === 'same_source' || candidate.confidence === 'exact') ? candidate : null;
+  };
+  const choose = (raw: Awaited<ReturnType<NonNullable<ReturnType<typeof getSource>>['search']>>, term: string, source: string): ResolvedCandidate | null => {
+    const best = pickBestScored(raw, term);
+    if (!best?.item.sourceId) return null;
+    const ambiguous = (best.confidence === 'exact' && new Set(raw.filter(r => norm(r.title) === norm(term)).map(r => r.sourceId).filter(Boolean)).size > 1) ||
+      importMatchNeedsReview({ confidence: best.confidence, backup_title: entry.title, alt_titles: terms.slice(1), match_title: best.item.title });
+    return { source, sourceId: best.item.sourceId, title: best.item.title, coverUrl: best.item.coverUrl,
+      confidence: best.confidence, matchedVia: viaOf(term), ambiguous };
+  };
 
   const home = await mihonSourceToAdapter(entry);
   if (home) {
     const src = getSource(home);
     if (src) {
+      const want = entry.url ? normPath(entry.url) : '';
+      const identity = (raw: SourceSeries[], term: string): ResolvedCandidate | null => {
+        const hits = raw.filter((r) => r.source === home && !!r.sourceId && !!r.path && normPath(r.path) === want);
+        const hit = hits[0];
+        return hit ? { source: home, sourceId: hit.sourceId, title: hit.title, coverUrl: hit.coverUrl,
+          confidence: 'same_source', matchedVia: viaOf(term), ambiguous: new Set(hits.map((r) => r.sourceId)).size > 1 } : null;
+      };
+      // The same entry at an address the site has since moved (#425): a new section or domain prefix in front of the slug
+      // or id it always had (`/manga/fire-force.3xj4` saved, `/series/fire-force.3xj4` now). Not proof, so held for a
+      // person to confirm; but it is this source's own entry, which a title search under another name never finds.
+      const tail = (p: string) => normPath(p).split('/').pop()?.toLowerCase() ?? '';
+      const wantTail = want ? tail(want) : '';
+      const likely = (raw: SourceSeries[], term: string): ResolvedCandidate | null => {
+        const hit = wantTail ? raw.find((r) => r.source === home && !!r.sourceId && !!r.path && tail(r.path) === wantTail) : undefined;
+        return hit ? { source: home, sourceId: hit.sourceId, title: hit.title, coverUrl: hit.coverUrl,
+          confidence: 'same_source', matchedVia: viaOf(term), ambiguous: true } : null;
+      };
+      if (want && src.lookupByPath) {
+        try {
+          const budget = Math.min(deadline - Date.now(), 5000);
+          if (budget > 0 && queriesLeft-- > 0) {
+            const found = identity(await withTimeout(src.lookupByPath(entry.url!, budget), budget), entry.title);
+            if (found) return found;
+          }
+        } catch { /* cold/unsupported engine catalogue or failed refresh: try titles and aliases safely */ }
+      }
       for (const term of terms) {
         try {
-          const raw = await withTimeout(src.search(term), budgetFor(src, 20000));
-          // The url proof only against the search title's results: a backup names ONE entry, and its
-          // alternates (none today -- backups carry no synonyms) would prove nothing more.
-          const want = term === entry.title && entry.url ? normPath(entry.url) : '';
-          const byUrl = want ? raw.find((r) => !!r.sourceId && !!r.path && normPath(r.path) === want) : undefined;
-          if (byUrl) return { source: home, sourceId: byUrl.sourceId, title: byUrl.title, coverUrl: byUrl.coverUrl, confidence: 'same_source', matchedVia: null };
-          const best = pickBestScored(raw, term);
-          if (best?.item.sourceId) return { source: home, sourceId: best.item.sourceId, title: best.item.title, coverUrl: best.item.coverUrl, confidence: best.confidence, matchedVia: viaOf(term) };
+          const remaining = deadline - Date.now();
+          if (remaining <= 0 || queriesLeft-- <= 0) return fallback;
+          const raw = await withTimeout(src.search(term), Math.min(remaining, budgetFor(src, 10000)));
+          // Tracker links in Mihon backups carry alternate names. A saved path proves the same entry
+          // under ANY of those searches, including a renamed title absent from the original results.
+          const byUrl = want ? identity(raw, term) : null;
+          if (byUrl) return byUrl;
+          // Reintroduce by dropping this: "a moved address on the backup's own source" in importBatch.int.test.ts
+          // suggests another series.
+          const moved = likely(raw, term);
+          if (moved) { retain(moved); continue; }
+          const candidate = choose(raw, term, home);
+          if (candidate) {
+            // A home-source title hit with a conflicting saved path cannot be silently accepted. Keep
+            // trying aliases for identity before presenting that suggestion for manual confirmation.
+            if (want) candidate.ambiguous = true;
+            const exact = retain(candidate); if (exact) return exact;
+          }
         } catch { /* fall through to the next term, then the cross-source search */ }
       }
     }
@@ -2335,21 +2491,29 @@ export async function resolveCandidate(entry: { title: string; altTitles?: strin
     if (await isDisabled(id).catch(() => false)) continue;
     order.push({ id, src });
   }
+  // A suggestion held on the backup's own source is the person's to confirm. Another source's exact title must not quietly
+  // take its place and import from a source they never used (it returned at once, ready to import): it can still become
+  // the suggestion if it ranks higher, held the same way. Reintroduce by dropping `homeHeld`: "a held suggestion on the
+  // backup's own source" in importBatch.int.test.ts imports from the other source unreviewed.
+  const homeHeld = (fallback as ResolvedCandidate | null)?.source === home && !!home;
   for (const term of terms) {
-    for (const { id, src } of order) {
+    for (const { id, src } of order.slice(0, perTerm - (home ? 1 : 0))) {
       try {
-        const best = pickBestScored(await withTimeout(src.search(term), budgetFor(src, 20000)), term);
-        if (best?.item.sourceId) return { source: id, sourceId: best.item.sourceId, title: best.item.title, coverUrl: best.item.coverUrl, confidence: best.confidence, matchedVia: viaOf(term) };
+        const remaining = deadline - Date.now();
+        if (remaining <= 0 || queriesLeft-- <= 0) return fallback;
+        const candidate = choose(await withTimeout(src.search(term), Math.min(remaining, budgetFor(src, 10000))), term, id);
+        if (candidate && homeHeld) candidate.ambiguous = true;
+        if (candidate) { const exact = retain(candidate); if (exact) return exact; }
       } catch { /* try the next source, then the next term */ }
     }
   }
-  return null;
+  return fallback;
 }
 
 /** Best single cross-source match for a title (searches sources in preferred order, returns the first real hit). */
 export async function findBestMatch(term: string): Promise<{ source: string; sourceId: string; title: string } | null> {
   const r = await resolveCandidate({ title: term });
-  return r ? { source: r.source, sourceId: r.sourceId, title: r.title } : null;
+  return r && !r.ambiguous ? { source: r.source, sourceId: r.sourceId, title: r.title } : null;
 }
 
 export default async function sourceRoutes(app: FastifyInstance) {
@@ -2394,8 +2558,8 @@ export default async function sourceRoutes(app: FastifyInstance) {
    * child's account. Reintroduce by returning `items`: "a capped account's MangaDex listing leaves erotica out" in
    * ageRatingOnAdd.int.test.ts lists it.
    */
-  const ratedForViewer = <T extends { contentRating?: string }>(req: FastifyRequest, items: T[]): T[] =>
-    cappedBelowAdult(req) || vc(req).hideAdultLibraries ? items.filter((r) => !adultContentRating(r.contentRating)) : items;
+  const ratedForViewer = <T extends { contentRating?: string; genres?: string[] }>(req: FastifyRequest, items: T[]): T[] =>
+    cappedBelowAdult(req) || vc(req).hideAdultLibraries ? items.filter((r) => !adultSourceSeries(r)) : items;
   /** The sources this viewer may reach, in registry order. This is the ACCESS rule and nothing else. */
   const reachable = (req: FastifyRequest): SourceAdapter[] =>
     listSources().filter((s) => sourceAllowedFor(s, vc(req).maxAgeRating));
@@ -2471,10 +2635,11 @@ export default async function sourceRoutes(app: FastifyInstance) {
     // 13 under "Aqua Manga" and 176 under "Aqua Manga (EN)", when it is one source with 189. `source_id` is
     // written by addSeriesFromSource and is the id the ranking is applied to. NULL means "not from a
     // source" -- filed by hand, or imported -- which is not a vote for anything.
+    const usedParams=new Params();
     const used = new Map(
       (await q<{ source_id: string; n: string }>(
         `SELECT source_id, count(*)::text AS n FROM lib_series s
-          WHERE ${visibleToAll('s')} AND s.source_id IS NOT NULL GROUP BY source_id`,
+          WHERE ${visible('s',{...vc(req),libraryIds:null,maxAgeRating:null},usedParams)} AND s.source_id IS NOT NULL GROUP BY source_id`, usedParams.values,
       ).catch(() => [])).map((r) => [r.source_id, Number(r.n)]),
     );
     const now = Date.now();
@@ -2535,6 +2700,8 @@ export default async function sourceRoutes(app: FastifyInstance) {
           // v0.96.0 (#331): whether a search on it goes on past the first page (types.ts searchPage), so Discover
           // loads more of a search on this source alone only where there is more to load.
           searchPages: typeof s.searchPage === 'function',
+          creatorSearch: (['author', 'artist'] as const).some((field) => supportsCreatorSearch(s, field)),
+          creatorFields: (['author', 'artist'] as const).filter((field) => supportsCreatorSearch(s, field)),
           // What the reader has actually used. Health-then-alphabetical put "18 Porn Comic" and "1Manga.co"
           // at the front of this install's English group while Aqua Manga -- 176 of its 214 series, answering
           // in 2.5s -- was never in the first six fetched.
@@ -2566,24 +2733,26 @@ export default async function sourceRoutes(app: FastifyInstance) {
   // called this one. Deleted rather than gated, because a second door to the same room is what went wrong.
 
   app.get('/api/sources/search', async (req, reply) => {
-    const { source, q: query, page } = req.query as { source?: string; q?: string; page?: string };
+    const { source, q: query, page, creator: rawCreator } = req.query as { source?: string; q?: string; page?: string; creator?: string };
+    const creator = rawCreator === 'author' || rawCreator === 'artist' ? rawCreator : undefined;
+    if (rawCreator !== undefined && !creator) return reply.code(400).send({ error: 'bad_creator' });
     const src = source ? getSource(source) : null;
     if (!src || !query?.trim()) return { content: [] };
     // `page` (v0.96.0, #331): a later page of the same search, for Discover scrolling a search on this source alone.
     // Only a source that pages its search has one (types.ts searchPage); every other answers a later page with nothing,
     // never its first page again. Clamped like the listings' paging.
     const p = Math.min(SEARCH_MAX_PAGE, Math.max(1, parseInt(page || '1', 10) || 1));
-    if (p > 1 && typeof src.searchPage !== 'function') return { content: [] };
+    if (creator ? !supportsCreatorSearch(src, creator) : p > 1 && typeof src.searchPage !== 'function') return { content: [] };
     if (!sourceAllowedFor(src, vc(req).maxAgeRating)) return denySource(reply);
     // Reachable but not surfaceable: the chip is off and this source is adult. An empty page, NOT
     // `denySource` -- 403 is the permission answer and this is not a permission (the same account with
     // `?adult=1` gets the results), and `{ content: [] }` is already what this route answers for a source
     // that has nothing. The source is never even asked, so hiding it costs nothing outbound either.
     if (!discoverable(req).some((s) => s.id === src.id)) return { content: [] };
-    const raw = await (p > 1 ? src.searchPage!(query.trim(), p) : src.search(query.trim())).catch(() => []);
+    const raw = await (creator ? src.searchCreator!(query.trim(), creator, p) : p > 1 ? src.searchPage!(query.trim(), p) : src.search(query.trim())).catch(() => []);
     // dedupe by sourceId (duplicate ids collide on the React key → wrong cover/title on a card)
     const seen = new Set<string>();
-    const results = ratedForViewer(req, raw.filter((r) => !!r.sourceId && !seen.has(r.sourceId) && (seen.add(r.sourceId), true))).slice(0, 24);
+    const results = ratedForViewer(req, raw.filter((r) => !!r.sourceId && !seen.has(r.sourceId) && (seen.add(r.sourceId), true))).slice(0, 100);
     // flag titles already in the library so the UI can mark them instead of offering a duplicate add
     return { content: await decorate(results, src.id, vc(req)) };
   });
@@ -2627,7 +2796,7 @@ export default async function sourceRoutes(app: FastifyInstance) {
     const p = new Params();
     const rows = await q<any>(
       `SELECT s.id, s.title, s.folder, s.source_id, s.source_series_id, s.summary, s.author, s.genres, s.web, s.status,
-              s.chapter_floor, s.scanlator_prefs, s.numbering, s.numbering_source
+              s.chapter_floor, s.scanlator_prefs, s.numbering, s.numbering_source, s.numbering_note
          FROM lib_series s WHERE s.id = ${p.add(seriesId)} AND ${visible('s', vc(req), p)}`, p.values,
     ).then((r) => r, () => null);
     if (rows === null) return reply.code(503).send({ error: 'unavailable' });
@@ -2679,6 +2848,7 @@ export default async function sourceRoutes(app: FastifyInstance) {
     let timer: NodeJS.Timeout | undefined;
     await Promise.race([st.settled, new Promise((r) => { timer = setTimeout(r, SCAN_FIRST_ANSWER_MS); })]);
     clearTimeout(timer);
+    if (!(await seriesVisible(st.head.seriesId,vc(req)))) return reply.code(404).send({error:'not_found'});
     return fillScanView(st);
   });
 
@@ -2689,6 +2859,7 @@ export default async function sourceRoutes(app: FastifyInstance) {
     if (!st || st.userId !== userIdOf(req)) {
       return reply.code(404).send({ error: 'scan_gone', message: 'That scan has ended. Scan again.' });
     }
+    if (!(await seriesVisible(st.head.seriesId,vc(req)))) return reply.code(404).send({error:'not_found'});
     return fillScanView(st);
   });
 
@@ -2730,6 +2901,8 @@ export default async function sourceRoutes(app: FastifyInstance) {
     const { s, seriesId, have, allowed } = o;
     const plan = st.plan;
     const posting = s.numbering === 'posting_order' && (!s.numbering_source || s.numbering_source === s.source_id);
+    // The source a series numbered by its chapter titles was numbered by (#379); for any other series, its own.
+    const titlesSource = s.numbering === 'titles' ? (s.numbering_source ?? s.source_id) : s.source_id;
     // The title, up to SEARCH_NAMES of the series' other names (v0.49.1, lib/altTitles.ts) and the typed name, in
     // that order, one key each. An other name is matched EXACTLY (exactHit), never by pickBest's containment and
     // word-overlap tiers: those are what a sequel listed among the names would pass. The three-source stop below
@@ -2769,6 +2942,13 @@ export default async function sourceRoutes(app: FastifyInstance) {
           // The series' own source, in the numbers the series keeps (#116): a posting-order series holds chapter
           // 20, and the source's own list calls that post 2. Read-only -- the check is what persists new posts.
           if (posting && f.pinned && raw.length) raw = await numberedChapters({ seriesId, sourceId: f.source }, raw);
+          // By the chapter titles (#379), as the check reads each source (lib/numbering.ts readsByTitles): read raw, a
+          // series numbered so was offered its own source's count, the posts after its last chapter by their old numbers.
+          // Reintroduce by reading `raw` as it came: "Find missing reads a source by its titles" in
+          // titleNumbering.int.test.ts lists the series' own source as 1 to 36, chapters 31 to 36 new.
+          else if (raw.length && readsByTitles(s, raw, { numberingSource: f.source === titlesSource, sourceCounts: !!s.numbering_note?.titles })) {
+            raw = titleNumbered(raw);
+          }
         }
         // One copy per number BEFORE the list is assessed or stored in the plan. `authorise` filters the
         // stored list by number, so a plan holding two copies of chapter 5 would answer a fill of [5] with
@@ -2896,6 +3076,7 @@ export default async function sourceRoutes(app: FastifyInstance) {
     }
     const plan = getPlan(planId);
     if (!plan) return reply.code(409).send({ error: 'plan_stale', message: 'That list has moved on. Scan again.' });
+    if (!(await seriesVisible(plan.seriesId,vc(req)))) return reply.code(404).send({error:'not_found'});
 
     const auth = authorise(plan, source, sourceSeriesId, numbers.map(Number), FILL_MAX_CHAPTERS);
     if (!auth.ok) return reply.code(400).send({ error: auth.error, message: auth.message });
@@ -2945,15 +3126,143 @@ export default async function sourceRoutes(app: FastifyInstance) {
     }
   });
 
+  /** Why a Fetch leaves out a number it was asked for (`skipped[].reason`), short of the body's own reasons. */
+  type FetchSkip = 'not_listed' | 'blocked_group' | 'other_language' | 'already_here' | 'source_unavailable' | 'cooldown';
+
+  /**
+   * POST /api/sources/fetch's rules, read once for one series and the numbers one request names: their listing rows,
+   * the sources the series follows, which of the numbers a live chapter holds, and each source's state, asked once per
+   * source -- and `plain`, the copy a Fetch of a number takes when no copy is picked, or why there is none ('denied':
+   * the copy's source is outside the viewer's age cap, which refuses the whole request). The restore of a deleted
+   * chapter (POST /api/books/:id/refetch, #437) asks `plain` of its one number, so it takes what a Fetch takes.
+   */
+  const fetchRules = async (seriesId: string, s: { source_id?: string | null; numbering?: string | null }, numbers: number[], maxAgeRating: ViewCtx['maxAgeRating']) => {
+    const listed = new Map((await q<{ number: number; title: string | null; source_id: string; status: string; chosen: SourceChapter; copies: ListingCopy[] }>(
+      'SELECT number, title, source_id, status, chosen, copies FROM series_listing WHERE series_id = $1 AND number = ANY($2::real[])',
+      [seriesId, numbers],
+    )).map((r) => [Number(r.number), r]));
+    // A listing row's source_id is trusted only while the series still follows that source (the primary,
+    // or a series_sources row): an unfollow drops the rows it carried, but a stale row must never authorise
+    // a download from a source the admin removed. Same check as the admin's refetch.
+    // Reintroduce by dropping the `followed` check in stateOf: "a stale listing row never authorises a
+    // source the series does not follow" in chapterActions.int.test.ts starts a download from it.
+    const followed = new Set([
+      ...(s.source_id ? [s.source_id as string] : []),
+      ...(await q<{ source_id: string }>('SELECT source_id FROM series_sources WHERE series_id = $1', [seriesId]).catch(() => [])).map((r) => r.source_id),
+    ]);
+    // A live row, not a tombstone: a chapter the cleanup let go is fetchable again, and "already here"
+    // would send the person to a row with no pages behind it. Since #437 the series page sends a deleted chapter's
+    // number and picks this way, and the copy lands on the tombstone's own row. Reintroduce by dropping
+    // `b.pruned_at IS NULL`: "a deleted chapter comes back from the source the series follows now" in
+    // chapterActions.int.test.ts reads 409 `already_here` for the Fetch and the pick.
+    // Override-aware under posting order, as the sweep's have-set is (lib/updater.ts): a book the renumber could
+    // not rename holds its posting number in book_overrides, and its raw number is some other post's now.
+    // A number inside a live range file is here too (lib/chapterRanges.ts): the range rows come along whatever they
+    // start at, and heldBy asks each of them. Reintroduce the exact number: "a fetch of a number a range file holds is
+    // already here" in chapterRanges.int.test.ts starts a download of 3.
+    const here = heldBy(await q<{ number: number; end: number | null }>(
+      s.numbering === 'posting_order'
+        ? `SELECT COALESCE(ov.number, b.number) AS number, ${rangeEnd('b', 'ov')} AS end
+             FROM lib_books b LEFT JOIN book_overrides ov ON ov.book_id = b.id
+            WHERE b.series_id = $1 AND (COALESCE(ov.number, b.number) = ANY($2::real[]) OR ${rangeEnd('b', 'ov')} IS NOT NULL)
+              AND b.pruned_at IS NULL`
+        : `SELECT b.number, ${rawRangeEnd('b')} AS end FROM lib_books b
+            WHERE b.series_id = $1 AND (b.number = ANY($2::real[]) OR ${isRange('b')}) AND b.pruned_at IS NULL`,
+      [seriesId, numbers],
+    ));
+    // Numbers held only by a chapter deleted on purpose (lib/chapterCleanup.ts heldBooks): the finishing sweep counts them
+    // as held and never fetches them back, so a cooldown on one is "try again later", never "will download on its own".
+    // Reintroduce by dropping it: "a deleted chapter caught in a cooldown is never promised" in fetchRotation.int.test.ts
+    // reads `later`.
+    const deliberate = new Set((await q<{ number: number }>(
+      `SELECT ${s.numbering === 'posting_order' ? 'COALESCE(ov.number, b.number)' : 'b.number'} AS number
+         FROM lib_books b LEFT JOIN book_overrides ov ON ov.book_id = b.id
+        WHERE b.series_id = $1 AND ${s.numbering === 'posting_order' ? 'COALESCE(ov.number, b.number)' : 'b.number'} = ANY($2::real[])
+          AND b.pruned_at IS NOT NULL AND ${heldBooks('b')}`,
+      [seriesId, numbers],
+    ).catch(() => [])).map((r) => Number(r.number)).filter((n) => !here.has(n)));
+    // Health is per source, asked once per source rather than once per number.
+    const sourceState = new Map<string, 'ok' | 'source_unavailable' | 'cooldown' | 'denied'>();
+    // The series' language rules (v0.62.0), read once and only when a blocked number needs explaining.
+    let languageRules: Promise<LanguageRules> | null = null;
+    const languageOf = () => (languageRules ??= languageRulesFor(seriesId, [...followed]).catch((): LanguageRules => ({})));
+    const stateOf = async (sid: string) => {
+      let st = sourceState.get(sid);
+      if (st) return st;
+      const src = getSource(sid);
+      if (!followed.has(sid) || !src || await isDisabled(sid).catch(() => false)) st = 'source_unavailable';
+      else if (!sourceAllowedFor(src, maxAgeRating)) st = 'denied';
+      else if (await blockedNow(sid).catch(() => null)) st = 'cooldown';
+      else st = 'ok';
+      sourceState.set(sid, st);
+      return st;
+    };
+    const plain = async (n: number): Promise<SourceChapter | FetchSkip | 'denied'> => {
+      const row = listed.get(n);
+      if (!row) return 'not_listed';
+      if (row.status === 'blocked') {
+        // v0.62.0: a number whose every copy is in another language than the series' is left out by the language
+        // rule (lib/copyLanguage.ts), and unblocking a group would not bring it back: say which it is.
+        const language = (await languageOf()).inLanguage;
+        return language && row.copies.length > 0 && row.copies.every((c) => !language(c)) ? 'other_language' : 'blocked_group';
+      }
+      if (here.has(n)) return 'already_here';
+      const st = await stateOf(row.source_id);
+      if (st === 'cooldown') {
+        // v0.79.0: the copy the rules chose is on a source in a cooldown. Another followed source's copy of the same
+        // number, as the sweep's fallback would take it (the blocklist and the series' language as they stand), is
+        // fetched instead. It worked only by accident before -- the route's listing refresh rewrote the listing from the
+        // source that answered -- and stopped working once a cooling source's rows are kept (lib/updater.ts). With none, a
+        // Fetch leaves the number to the finishing sweep (`later`, lib/finishDownloads.ts), which comes back when the
+        // source can answer. Reintroduce by skipping it as `cooldown`: "a Fetch while the main cools takes the
+        // follower's copy" in fetchRotation.int.test.ts reads 409.
+        for (const c of await automaticCopiesFor(seriesId, row.copies ?? [])) {
+          if (c.source !== row.source_id && (await stateOf(c.source)) === 'ok') return copyToChapter(c, { number: n, title: row.title });
+        }
+      }
+      if (st !== 'ok') return st;
+      return { ...row.chosen, source: row.source_id };
+    };
+    return { listed, followed, here, deliberate, stateOf, plain };
+  };
+
+  /** What a Fetch that took nothing says, by the first reason a number was left out. */
+  const fetchSkipMessage = (reason: string | undefined): string => (
+    reason === 'not_listed' ? 'Not in the last listing -- run Check for new chapters first.'
+    : reason === 'blocked_group' ? 'Only blocked groups released that chapter. Unblock the group and check again.'
+    : reason === 'other_language' ? 'That chapter is only in another language than the series. Pick a copy under Versions to fetch it anyway.'
+    : reason === 'already_here' ? 'That chapter is already here.'
+    : reason === 'cooldown' ? 'That source is in a cooldown. Try again later.'
+    : reason === 'later' ? 'That source is in a cooldown. These chapters will download on their own when it is ready.'
+    : reason === 'hidden' ? 'That chapter is hidden from this series. Restore it under More to fetch it.'
+    : 'That source is not available right now.');
+
+  /** A Fetch refused because something is writing into the series' folder: which, as far as the person can act on it. */
+  const busyMessage = (folder: string): string => (archiveBusy(folder)
+    ? 'The slow archive is fetching a chapter of this series right now. Try again in a minute.'
+    : 'A download for that series is already running.');
+
   /**
    * Put back one chapter that Uchiyomi deliberately deleted.
    *
-   * The book id is the capability boundary: it resolves through this viewer's normal series visibility,
-   * and the server derives the only permitted source chapter from the tombstone itself. No source id,
-   * chapter id, number or path supplied by a client is ever accepted. Only a canonical file previously
-   * written under DL_ROOT can land on the same row and retain everybody's reading progress. The stamped
-   * source copy is pinned so a blocklist may be overridden by this explicit act but fallback can never
-   * replace it with an arbitrary copy.
+   * The book id is the capability boundary: it resolves through this viewer's normal series visibility, and the
+   * server derives everything else -- the number, the copy, the target -- from the tombstone and the listing. No
+   * source id, chapter id, number or path supplied by a client is ever accepted. Only a canonical file previously
+   * written under DL_ROOT can land on the same row and retain everybody's reading progress.
+   *
+   * The copy is the one a Fetch of the number takes (#437): POST /api/sources/fetch's rules (fetchRules), after the
+   * same listing refresh, from a source the series follows NOW, and not pinned, so a copy that fails is taken from
+   * another followed source as any Fetch's is. The copy stamped on the tombstone is asked only when no followed source
+   * lists the number. Then it is its own capability even when its source is no longer followed, pinned so a blocklist
+   * may be overridden by this explicit act but fallback can never replace it with an arbitrary copy. It used to be
+   * the only copy ever asked, so a chapter deleted after its series moved to another source could not come back from
+   * that one: while the old source was unloaded, switched off or cooling, the answer was a bare 409, which the series
+   * page read as "Could not start." Reintroduce by going straight to the stamp: "a deleted chapter comes back from the
+   * source the series follows now" in chapterActions.int.test.ts asks the old source for its copy.
+   *
+   * Every refusal says why and what to do in words (`message`; `messageSaid` too where the sentence is this route's
+   * own), and a `not_refetchable` one which rule refused (`reason`). Reintroduce a bare one: "a deleted chapter nothing
+   * can serve says so" in chapterActions.int.test.ts finds no message.
    */
   app.post('/api/books/:id/refetch', async (req, reply) => {
     const parsed = z.object({ id: z.string().min(1).max(64) }).safeParse(req.params);
@@ -2982,55 +3291,83 @@ export default async function sourceRoutes(app: FastifyInstance) {
     // boundary. The query also hides removed/merged series through visible().
     if (!row) return reply.code(404).send({ error: 'not_found' });
 
+    /** Refused by a rule: which one, and why in words -- this route's own sentence with its code, or a Fetch's. */
+    const refuse = (reason: string, why: Part | string, more: Record<string, unknown> = {}) => reply.code(409).send({
+      error: 'not_refetchable', reason,
+      ...(typeof why === 'string' ? { message: why } : { message: why.text, messageSaid: saidOf(why) }),
+      ...more,
+    });
+
     const n = Number(row.number);
+    // A chapter that has its file, or one whose file went missing rather than being deleted on purpose (Verify, Rescan):
+    // the sweep fetches the second back by itself, and neither is this route's to put back.
+    if (!deliberatelyDeleted({ pruned: row.pruned_at != null, prunedReason: row.pruned_reason })) {
+      return row.pruned_at == null ? refuse('already_here', fetchSkipMessage('already_here')) : refuse('not_deleted', say('restore.notDeleted'));
+    }
     const safePath = row.root === DL_ROOT ? await realContainedPath(DL_ROOT, row.file) : null;
     const canonical = !!safePath
       && row.root === DL_ROOT
       && Number.isFinite(n)
       && row.number_end == null
-      && row.file === chapterFileRel(row.folder, n)
-      && deliberatelyDeleted({ pruned: row.pruned_at != null, prunedReason: row.pruned_reason })
-      && !!row.source_id
-      && !!row.source_chapter_id;
-    if (!canonical) return reply.code(409).send({ error: 'not_refetchable' });
+      && row.file === chapterFileRel(row.folder, n);
+    if (!canonical) return refuse('not_in_place', say('restore.notInPlace'));
+    if (jobBusy(row.folder)) return reply.code(409).send({ error: 'busy', message: busyMessage(row.folder) });
+    // The series' own numbering and main source. ⚠️ Never `row` itself: its source_id is the tombstone's stamp, which
+    // read as the series' main would count the stamp's source as followed.
+    const seriesRow = { numbering: row.numbering, numbering_pending: row.numbering_pending, renumber_plan: row.renumber_plan, source_id: row.series_source_id };
+    const renumbering = renumberRefusal(seriesRow);
+    if (renumbering) return refuse(renumbering.error, renumbering.message);
+    // The listing is refreshed first and the renumber asked again after it, exactly as POST /api/sources/fetch does
+    // (its comments say why): what comes back is the copy the release rules choose now.
+    await withTimeout(updateSeries(row.series_id, 0), REFRESH_BUDGET_MS).catch(() => {});
+    const series = await one<{ numbering: string | null; numbering_pending: string | null; renumber_plan: unknown; source_id: string | null }>(
+      'SELECT numbering, numbering_pending, renumber_plan, source_id FROM lib_series WHERE id = $1', [row.series_id]).catch(() => null) ?? seriesRow;
+    const heldNow = renumberRefusal(series);
+    if (heldNow) return refuse(heldNow.error, heldNow.message);
+    if ((await hiddenNumbersOf(row.series_id)).has(numKey(n))) return refuse('hidden', fetchSkipMessage('hidden'));
 
-    const src = getSource(row.source_id!);
-    // An age-capped account gets the same non-disclosing answer as for any other inaccessible row.
-    if (src && !sourceAllowedFor(src, vc(req).maxAgeRating)) {
-      return reply.code(404).send({ error: 'not_found' });
+    const maxAgeRating = vc(req).maxAgeRating;
+    const rules = await fetchRules(row.series_id, series, [n], maxAgeRating);
+    const listedRow = rules.listed.get(n);
+    let chapter: SourceChapter & { pinned?: boolean };
+    if (listedRow && rules.followed.has(listedRow.source_id)) {
+      const got = await rules.plain(n);
+      if (got === 'denied') return denySource(reply);
+      if (typeof got === 'string') return refuse(got, fetchSkipMessage(got));
+      // Under the tombstone's own spelling of its number, so the file lands at its canonical path and on its row:
+      // a source may spell 84.3 as 84.29999999999998 (lib/chapterRanges.ts heldBy), and the downloader names the file
+      // after the number it is given.
+      chapter = { ...got, number: n };
+    } else {
+      // No source the series follows lists the number: the copy stamped on the tombstone, while it can still be asked.
+      const nothing = () => refuse('not_listed', say('restore.notListed', { number: n }));
+      if (!row.source_id || !row.source_chapter_id) return nothing();
+      const src = getSource(row.source_id);
+      // An age-capped account gets the same non-disclosing answer as for any other inaccessible row.
+      if (src && !sourceAllowedFor(src, maxAgeRating)) return reply.code(404).send({ error: 'not_found' });
+      if (!src || await isDisabled(row.source_id).catch(() => true)) return nothing();
+      if (await blockedNow(row.source_id).catch(() => true)) return refuse('cooldown', fetchSkipMessage('cooldown'));
+      // A series numbered by posting order takes no other source's numbers (renumberRefusal).
+      const posting = renumberRefusal(series, row.source_id);
+      if (posting) return refuse(posting.error, posting.message);
+      chapter = { source: row.source_id, sourceId: row.source_chapter_id, number: n, title: row.chapter_name ?? row.title ?? undefined, pinned: true };
     }
-    const unavailable = !src
-      || await isDisabled(row.source_id!).catch(() => true)
-      || !!(await blockedNow(row.source_id!).catch(() => true));
-    if (unavailable) return reply.code(409).send({ error: 'not_refetchable' });
-
-    if (jobBusy(row.folder)) return reply.code(409).send({ error: 'busy' });
-    if (renumberRefusal(row, row.source_id!)) return reply.code(409).send({ error: 'not_refetchable' });
     const writable = await allWritable([DL_ROOT]);
-    if (!writable.ok) return reply.code(409).send({ error: 'not_refetchable', message: writable.reason, fix: writable.fix });
+    if (!writable.ok) return refuse('not_writable', writable.reason, { fix: writable.fix });
 
     const claim = claimDownloadJob(row.folder, row.series_id);
-    if (!claim) return reply.code(409).send({ error: 'busy' });
+    if (!claim) return reply.code(409).send({ error: 'busy', message: busyMessage(row.folder) });
     const restoreUserId = userIdOf(req);
     const restoreRole = roleOf(req);
-    const chapter: SourceChapter & { pinned: true } = {
-      source: row.source_id!,
-      sourceId: row.source_chapter_id!,
-      number: n,
-      title: row.chapter_name ?? row.title ?? undefined,
-      pinned: true,
-    };
     try {
       // Several source/policy and writability reads happened after the first realpath check. Revalidate after owning
       // the folder and immediately before publishing the writer, so a symlink swap is a synchronous contract refusal
       // instead of an asynchronous failed download card.
-      if (!safePath || await realContainedPath(DL_ROOT, row.file) !== safePath) {
-        return reply.code(409).send({ error: 'not_refetchable' });
-      }
+      if (await realContainedPath(DL_ROOT, row.file) !== safePath) return refuse('not_in_place', say('restore.notInPlace'));
       await q('DELETE FROM chapter_failures WHERE series_id = $1 AND number = $2::real', [row.series_id, n]).catch(() => {});
       await logAudit('book.refetch', {
         userId: userIdOf(req),
-        detail: { bookId: row.id, seriesId: row.series_id, source: row.source_id, sourceId: row.source_chapter_id, number: n },
+        detail: { bookId: row.id, seriesId: row.series_id, source: chapter.source, sourceId: chapter.sourceId, number: n, ...(chapter.pinned ? { stamped: true } : {}) },
         req,
       });
       const { total } = startDownloadJob({
@@ -3041,16 +3378,18 @@ export default async function sourceRoutes(app: FastifyInstance) {
         chapters: [chapter],
         meta: { series: row.series_title, summary: row.summary ?? undefined, author: row.author ?? undefined,
           genres: row.genres, url: row.web ?? undefined, status: row.status ?? undefined },
-        // Redundant for a pinned job today, and intentional: if the downloader ever grows another recovery
-        // path it still cannot cross this member's age boundary.
+        // The copies a listed chapter may fall back to stay inside this member's age boundary, as a Fetch's do. Redundant
+        // for the stamped copy, which is pinned, and intentional: if the downloader ever grows another recovery path it
+        // still cannot cross that boundary.
         allowed: (id) => {
           const candidate = getSource(id);
-          return !!candidate && sourceAllowedFor(candidate, vc(req).maxAgeRating);
+          return !!candidate && sourceAllowedFor(candidate, maxAgeRating);
         },
-        // A deliberate tombstone is its own source capability even when that old source is no longer
-        // followed. Re-read the exact book identity, visibility and canonical target inside the source gate;
-        // changing any of them while the detached job waits refuses the request without fallback.
-        sourceAllowedNow: async (candidate) => {
+        // A copy from the listing is any Fetch's: its source must still be followed when the job reaches it, which is
+        // the job's own check when this one is absent. The stamped copy is its own source capability even when that
+        // old source is no longer followed. Re-read the exact book identity, visibility and canonical target inside
+        // the source gate; changing any of them while the detached job waits refuses the request without fallback.
+        ...(chapter.pinned ? { sourceAllowedNow: async (candidate: SourceChapter) => {
           if (candidate.source !== row.source_id || candidate.sourceId !== row.source_chapter_id || candidate.number !== n) return false;
           const currentCtx = await viewCtxFor(restoreUserId, restoreRole).catch(() => null);
           if (!currentCtx) return false;
@@ -3075,7 +3414,7 @@ export default async function sourceRoutes(app: FastifyInstance) {
           const currentSource = getSource(current.source_id!);
           return !!currentPath && currentPath === safePath && !!currentSource
             && sourceAllowedFor(currentSource, currentCtx.maxAgeRating);
-        },
+        } } : {}),
         by: restoreUserId,
       }, claim);
       return { ok: true, started: true, folder: row.folder, total };
@@ -3168,11 +3507,7 @@ export default async function sourceRoutes(app: FastifyInstance) {
     if (rows === null) return reply.code(503).send({ error: 'unavailable' });
     const s = rows[0];
     if (!s) return reply.code(404).send({ error: 'not_found' });
-    if (jobBusy(s.folder)) {
-      return reply.code(409).send({ error: 'busy', message: archiveBusy(s.folder)
-        ? 'The slow archive is fetching a chapter of this series right now. Try again in a minute.'
-        : 'A download for that series is already running.' });
-    }
+    if (jobBusy(s.folder)) return reply.code(409).send({ error: 'busy', message: busyMessage(s.folder) });
     const renumbering = renumberRefusal(s);
     if (renumbering) return reply.code(409).send(renumbering);
 
@@ -3222,64 +3557,20 @@ export default async function sourceRoutes(app: FastifyInstance) {
       }
       numbers = [...new Set([...plain, ...pickOf.keys()])].sort((x, y) => x - y);
     }
-    const listed = new Map((await q<{ number: number; title: string | null; source_id: string; status: string; chosen: SourceChapter; copies: ListingCopy[] }>(
-      'SELECT number, title, source_id, status, chosen, copies FROM series_listing WHERE series_id = $1 AND number = ANY($2::real[])',
-      [seriesId, numbers],
-    )).map((r) => [Number(r.number), r]));
-    // A listing row's source_id is trusted only while the series still follows that source (the primary,
-    // or a series_sources row): an unfollow drops the rows it carried, but a stale row must never authorise
-    // a download from a source the admin removed. Same check as the admin's refetch.
-    // Reintroduce by dropping the `followed` check in stateOf: "a stale listing row never authorises a
-    // source the series does not follow" in chapterActions.int.test.ts starts a download from it.
-    const followed = new Set([
-      ...(s.source_id ? [s.source_id as string] : []),
-      ...(await q<{ source_id: string }>('SELECT source_id FROM series_sources WHERE series_id = $1', [seriesId]).catch(() => [])).map((r) => r.source_id),
-    ]);
-    // A live row, not a tombstone: a chapter the cleanup let go is fetchable again, and "already here"
-    // would send the person to a row with no pages behind it.
-    // Override-aware under posting order, as the sweep's have-set is (lib/updater.ts): a book the renumber could
-    // not rename holds its posting number in book_overrides, and its raw number is some other post's now.
-    // A number inside a live range file is here too (lib/chapterRanges.ts): the range rows come along whatever they
-    // start at, and heldBy asks each of them. Reintroduce the exact number: "a fetch of a number a range file holds is
-    // already here" in chapterRanges.int.test.ts starts a download of 3.
-    const here = heldBy(await q<{ number: number; end: number | null }>(
-      s.numbering === 'posting_order'
-        ? `SELECT COALESCE(ov.number, b.number) AS number, ${rangeEnd('b', 'ov')} AS end
-             FROM lib_books b LEFT JOIN book_overrides ov ON ov.book_id = b.id
-            WHERE b.series_id = $1 AND (COALESCE(ov.number, b.number) = ANY($2::real[]) OR ${rangeEnd('b', 'ov')} IS NOT NULL)
-              AND b.pruned_at IS NULL`
-        : `SELECT b.number, ${rawRangeEnd('b')} AS end FROM lib_books b
-            WHERE b.series_id = $1 AND (b.number = ANY($2::real[]) OR ${isRange('b')}) AND b.pruned_at IS NULL`,
-      [seriesId, numbers],
-    ));
-
+    // The listing rows, the followed sources, what is here and each source's state: fetchRules, which the restore of a
+    // deleted chapter asks too.
+    const rules = await fetchRules(seriesId, s, numbers, maxAgeRating);
     const chapters: Array<SourceChapter & { pinned?: boolean }> = [];
     // "Finish downloads on their own" (lib/finishDownloads.ts): a number no source can serve now is handed to it.
     const finishOn = await finishDownloadsOn().catch(() => false);
     let handOff = false;
-    // Health is per source, asked once per source rather than once per number.
-    const sourceState = new Map<string, 'ok' | 'source_unavailable' | 'cooldown' | 'denied'>();
-    // The series' language rules (v0.62.0), read once and only when a blocked number needs explaining.
-    let languageRules: Promise<LanguageRules> | null = null;
-    const languageOf = () => (languageRules ??= languageRulesFor(seriesId, [...followed]).catch((): LanguageRules => ({})));
-    const stateOf = async (sid: string) => {
-      let st = sourceState.get(sid);
-      if (st) return st;
-      const src = getSource(sid);
-      if (!followed.has(sid) || !src || await isDisabled(sid).catch(() => false)) st = 'source_unavailable';
-      else if (!sourceAllowedFor(src, vc(req).maxAgeRating)) st = 'denied';
-      else if (await blockedNow(sid).catch(() => null)) st = 'cooldown';
-      else st = 'ok';
-      sourceState.set(sid, st);
-      return st;
-    };
     // A number an admin hid from the series (#240, lib/hiddenChapters.ts) is fetched by nobody, a pick included: said so
     // rather than started and skipped by the download (lib/chapterFallback.ts), which is what a page from before the
     // hide would otherwise get. Reintroduce by dropping it: "a fetch of a hidden number is skipped as hidden" in
     // hiddenChapters.int.test.ts starts a job.
     const hiddenNums = await hiddenNumbersOf(seriesId);
     for (const n of numbers) {
-      const row = listed.get(n);
+      const row = rules.listed.get(n);
       const pick = pickOf.get(n);
       if (hiddenNums.has(numKey(n))) {
         skipped.push({ number: n, reason: 'hidden', ...(pick ? { source: pick.source, sourceId: pick.sourceId } : {}) });
@@ -3295,43 +3586,21 @@ export default async function sourceRoutes(app: FastifyInstance) {
         // chapterActions.int.test.ts reads 409.
         const copy = row?.copies?.find((c) => c.source === pick.source && c.sourceId === pick.sourceId);
         if (!row || !copy) { skipped.push({ number: n, reason: 'not_listed', source: pick.source, sourceId: pick.sourceId }); continue; }
-        if (here.has(n)) { skipped.push({ number: n, reason: 'already_here', source: pick.source, sourceId: pick.sourceId }); continue; }
-        const st = await stateOf(copy.source);
+        if (rules.here.has(n)) { skipped.push({ number: n, reason: 'already_here', source: pick.source, sourceId: pick.sourceId }); continue; }
+        const st = await rules.stateOf(copy.source);
         if (st === 'denied') return denySource(reply);
         if (st !== 'ok') { skipped.push({ number: n, reason: st, source: pick.source, sourceId: pick.sourceId }); continue; }
         chapters.push({ ...copyToChapter(copy, { number: n, title: row.title }), pinned: true });
         continue;
       }
-      if (!row) { skipped.push({ number: n, reason: 'not_listed' }); continue; }
-      if (row.status === 'blocked') {
-        // v0.62.0: a number whose every copy is in another language than the series' is left out by the language
-        // rule (lib/copyLanguage.ts), and unblocking a group would not bring it back: say which it is.
-        const language = (await languageOf()).inLanguage;
-        const otherLanguage = !!language && row.copies.length > 0 && row.copies.every((c) => !language(c));
-        skipped.push({ number: n, reason: otherLanguage ? 'other_language' : 'blocked_group' });
-        continue;
-      }
-      if (here.has(n)) { skipped.push({ number: n, reason: 'already_here' }); continue; }
-      const st = await stateOf(row.source_id);
+      const got = await rules.plain(n);
       // The same by-id rejection the rest of this file gives, and it does not say what is being withheld.
-      if (st === 'denied') return denySource(reply);
-      if (st === 'cooldown') {
-        // v0.79.0: the copy the rules chose is on a source in a cooldown. Another followed source's copy of the same
-        // number, as the sweep's fallback would take it (the blocklist and the series' language as they stand), is
-        // fetched instead. It worked only by accident before -- the refresh above rewrote the listing from the source
-        // that answered -- and stopped working once a cooling source's rows are kept (lib/updater.ts). With none, the
-        // number is left to the finishing sweep (`later`, lib/finishDownloads.ts), which comes back when the source
-        // can answer. Reintroduce by skipping it as `cooldown`: "a Fetch while the main cools takes the follower's copy"
-        // in fetchRotation.int.test.ts reads 409.
-        let alt: ListingCopy | null = null;
-        for (const c of await automaticCopiesFor(seriesId, row.copies ?? [])) {
-          if (c.source !== row.source_id && (await stateOf(c.source)) === 'ok') { alt = c; break; }
-        }
-        if (alt) { chapters.push(copyToChapter(alt, { number: n, title: row.title })); continue; }
-        if (finishOn && s.auto_update !== false) { skipped.push({ number: n, reason: 'later' }); handOff = true; continue; }
-      }
-      if (st !== 'ok') { skipped.push({ number: n, reason: st }); continue; }
-      chapters.push({ ...row.chosen, source: row.source_id });
+      if (got === 'denied') return denySource(reply);
+      if (typeof got !== 'string') { chapters.push(got); continue; }
+      // A cooldown no other followed source's copy could stand in for (fetchRules): left to the finishing sweep, which
+      // comes back for it when the source can answer (v0.79.0).
+      if (got === 'cooldown' && finishOn && s.auto_update !== false && !rules.deliberate.has(n)) { skipped.push({ number: n, reason: 'later' }); handOff = true; continue; }
+      skipped.push({ number: n, reason: got });
     }
     // What a cooldown left (v0.79.0): first in the finishing sweep's line, so it comes back for them the moment it can.
     if (handOff) {
@@ -3345,15 +3614,7 @@ export default async function sourceRoutes(app: FastifyInstance) {
       // The first reason that is about a chapter, not about the body: a duplicate pick is never why
       // nothing was fetched, since its number was handled once through its first pick.
       const first = skipped.find((x) => x.reason !== 'duplicate')?.reason ?? skipped[0]?.reason;
-      const message = first === 'not_listed' ? 'Not in the last listing -- run Check for new chapters first.'
-        : first === 'blocked_group' ? 'Only blocked groups released that chapter. Unblock the group and check again.'
-        : first === 'other_language' ? 'That chapter is only in another language than the series. Pick a copy under Versions to fetch it anyway.'
-        : first === 'already_here' ? 'That chapter is already here.'
-        : first === 'cooldown' ? 'That source is in a cooldown. Try again later.'
-        : first === 'later' ? 'That source is in a cooldown. These chapters will download on their own when it is ready.'
-        : first === 'hidden' ? 'That chapter is hidden from this series. Restore it under More to fetch it.'
-        : 'That source is not available right now.';
-      return reply.code(409).send({ error: 'nothing_to_fetch', message, skipped });
+      return reply.code(409).send({ error: 'nothing_to_fetch', message: fetchSkipMessage(first), skipped });
     }
 
     const claim = claimDownloadJob(s.folder, seriesId);
@@ -3388,8 +3649,10 @@ export default async function sourceRoutes(app: FastifyInstance) {
    * so a client that ignores them -- the import review sheet -- keeps working, and one that reads `pending`
    * polls the same URL with a short `wait` until it is 0.
    */
-  app.get('/api/sources/search-all', async (req) => {
-    const { q: rawQ, groupBy, wait, source, sources: rawSources, rating: rawRating } = req.query as { q?: string; groupBy?: string; wait?: string; source?: string; sources?: string; rating?: string };
+  app.get('/api/sources/search-all', async (req, reply) => {
+    const { q: rawQ, groupBy, wait, source, sources: rawSources, rating: rawRating, creator: rawCreator } = req.query as { q?: string; groupBy?: string; wait?: string; source?: string; sources?: string; rating?: string; creator?: string };
+    const creator = rawCreator === 'author' || rawCreator === 'artist' ? rawCreator : undefined;
+    if (rawCreator !== undefined && !creator) return reply.code(400).send({ error: 'bad_creator' });
     // The 18+ filter (v0.55.4, #158): `rating=all|safe|adult`, anything else read as all. Applied to this viewer's
     // answer only, after the shared entry (lib/searchAll.ts ratingOf, groupByTitle). An account capped below 18 is never
     // shown an 18+ result whatever it asks: the add checks only the source, so the cap is held here. And with "Show 18+"
@@ -3428,9 +3691,9 @@ export default async function sourceRoutes(app: FastifyInstance) {
     // `sources`: a comma-separated list of ids, for a search that picks which sources to ask (the Add more sources sheet).
     // Narrows the same way `source` does -- never widens `surfaceable` -- and an empty value is no list.
     const picked = narrowTo(rawSources);
-    const ask = all.filter((s) => (!only || s.id === only) && (!picked || picked.has(s.id)));
+    const ask = all.filter((s) => (!only || s.id === only) && (!picked || picked.has(s.id)) && (!creator || supportsCreatorSearch(s, creator)));
     const health = new Map((await healthAll().catch(() => [])).map((h) => [h.source_id, h] as const));
-    const ans = await searchAll(term, ask, { waitMs, health });
+    const ans = await searchAll(term, ask, { waitMs, health, creator });
     const byId = new Map(ask.map((s) => [s.id, s] as const));
     // Shaped in provider-preference order, as before: the first provider of a card is the default pick.
     const order = findOrder().map((id) => byId.get(id)).filter((s): s is SourceAdapter => !!s);
@@ -3452,14 +3715,16 @@ export default async function sourceRoutes(app: FastifyInstance) {
     // One card per WORK (v0.56.0, lib/discoverIdentity.ts): the work the library holds, else the one the name is known to
     // be, else the name by nameKey -- so two sites naming one series differently are one card, carrying both. `owned`:
     // the library holds the work in any language; the providers still say for their own language (ownedGroup).
-    const idx = await libraryIndex().catch(() => noIndex());
+    const idx = await libraryIndex(vc(req)).catch(() => noIndex());
     const may = await nameableFor(idx, vc(req));
     noteTitles([...ans.per.values()].flatMap((c) => c.items.map((r) => r.title)));
     const keyOf = (r: DiscoverItem) => {
       const it = { source: r.source, sourceId: r.sourceId, title: r.title };
       return workOf(idx, it, heldFor(idx, it).filter((h) => may(h.id)));
     };
-    const groups = groupByTitle(ans.per, order, 30, rated, keyOf);
+    // A selected provider's next page starts after its whole first page. Capping this at 30 when the
+    // provider returned 100 would permanently lose results 31–100 before page two is requested.
+    const groups = groupByTitle(ans.per, order, ask.length === 1 ? 100 : 30, rated, keyOf);
     return {
       content: groups.map((g) => {
         const held = uniqueHeld(g.providers.flatMap((p) => heldFor(idx, { source: p.source, sourceId: p.sourceId, title: p.title })));
@@ -3676,53 +3941,30 @@ export default async function sourceRoutes(app: FastifyInstance) {
     return { ok: true };
   });
 
-  // How many trending titles reach the client. The hero takes the first ten and the rail shows the rest, so
-  // this is both budgets at once. AniList returns 40 in the one query already, so raising it costs nothing.
+  // How many trending titles reach the client: the hero takes its ten from them, and each trending row shows them all
+  // (v0.98.0). AniList returns 40 in the one query already, so raising it costs nothing.
   const TREND_KEEP = 36;
-
-  /** One country's trending titles, from the cache while it is under six hours old; one pull at a time per country. */
-  const trendingFor = async (country: TrendCountry): Promise<TrendingItem[] | null> => {
-    const cached = trendingCache.get(country);
-    if (cached && Date.now() - cached.at <= 6 * 3600_000) return cached.items;
-    let pull = trendingPending.get(country);
-    if (!pull) {
-      pull = (async () => {
-        let items = await fetchTrending(country);
-        // A second page, only when the first cannot fill the wall. On a large library most of page 1 is
-        // already owned: measured on a 215-series install, 40 fetched became 28 after the library filter,
-        // and only 7 of those carried the wide art the hero prefers. The common case still costs one
-        // request per six-hour cache miss, and the page argument has been there unused since this shipped.
-        if (items.length < TREND_KEEP + 8) {
-          const more = await fetchTrending(country, 2).catch(() => [] as typeof items);
-          const seen = new Set(items.map((t) => norm(t.title)));
-          items = items.concat(more.filter((t) => !seen.has(norm(t.title))));
-        }
-        trendingCache.set(country, { at: Date.now(), items });
-        return items;
-      })().finally(() => trendingPending.delete(country));
-      trendingPending.set(country, pull);
-    }
-    // Stale beats empty: an old answer is still what was trending, where nothing reads as "nothing is".
-    return pull.catch(() => trendingCache.get(country)?.items ?? null);
-  };
 
   // Globally trending titles you don't already have, for Discover's hero and rails: `country` KR (manhwa, the default --
   // what this route always answered), JP (manga) or CN (manhua), v0.61.0.
   app.get('/api/discover/trending', async (req, reply) => {
     reply.header('cache-control', 'no-store'); // never let a stale/empty copy get pinned client-side
+    reply.header('vary', '*'); // feedback and account visibility make this answer personal
     const asked = (req.query as { country?: unknown }).country;
     const country = (asked === undefined ? 'KR' : typeof asked === 'string' ? asked.toUpperCase() : '') as TrendCountry;
     if (!TREND_COUNTRIES.includes(country)) return reply.code(400).send({ error: 'bad_request', message: 'country is one of KR, JP, CN' });
-    const items = await trendingFor(country);
-    if (!items) return { content: [] };
-    // `isAdult:false` is an argument to the AniList query, so adult titles never arrive. The cache is shared for six
-    // hours, so it is never filtered per viewer -- that would pin one capped account's view for everyone; the ANSWER is
+    // From the stored copy (v0.98.0, lib/trending.ts): at once, after a restart too. `pending` only while a server that
+    // has never stored one is still pulling it -- the page asks again.
+    const { items, pending } = await trendingFor(country);
+    if (!items) return { content: [], pending };
+    // `isAdult:false` is an argument to the AniList query, so adult titles never arrive. The copy is shared by every
+    // viewer, so it is never filtered per viewer -- that would pin one capped account's view for everyone; the ANSWER is
     // (v0.61.0): a viewer hiding 18+ is not shown a title carrying a genre the admin named as adult, as no listing of
     // the library's own shows them one. Reintroduce the unfiltered answer: "a trending title in an adult genre is not
     // shown to a viewer hiding 18+" in anilistRelated.int.test.ts finds it.
     const ctx = vc(req);
-    const idx = await libraryIndex().catch(() => noIndex());
-    // Deduped by normalised title, not raw: the hero and its dots are keyed by title, so two spellings of
+    const idx = await libraryIndex(vc(req)).catch(() => noIndex());
+    // Deduped by normalised title, not raw: the hero and its slides are keyed by title, so two spellings of
     // the same series would collide on a React key and swap art under the reader. Rare on one page, less so
     // across two. Left out when the library holds it (v0.56.0): by any name the library knows it by, or by its
     // AniList entry -- before, only by the library's own title.
@@ -3733,16 +3975,24 @@ export default async function sourceRoutes(app: FastifyInstance) {
         || (t.id != null && (idx.byWork.get(`al:${t.id}`)?.length ?? 0) > 0);
       return !held && adultOk({ adult: false, genres: t.genres }, ctx) && !seen.has(k) && (seen.add(k), true);
     });
-    return { content: out.slice(0, TREND_KEEP) };
+    return { content: (await withoutHiddenDiscover(userIdOf(req), out)).slice(0, TREND_KEEP), pending: false };
   });
 
   /**
    * Discover's "Because you read {title}" (v0.61.0, lib/anilistRelated.ts becauseYouRead): what AniList's readers
-   * recommend after a series this viewer read lately, less what the server holds and what is 18+ for them. `seed` is the
-   * series it is about, or null with nothing to show. Behind this file's canDownload hook, as everything on Discover is:
-   * it is a list of things to add. Reads the table only, never AniList.
+   * recommend after the series this viewer read lately, less what the server holds and what is 18+ for them. Since v0.98.0
+   * every recent read adds its picks and each pick names its own (`because`); `seeds` are the series they name, and `seed`
+   * the first of them (null with nothing to show), as a page from before v0.98.0 reads it. Behind this file's canDownload
+   * hook, as everything on Discover is: it is a list of things to add. Reads the table only, never AniList.
    */
-  app.get('/api/discover/because', async (req) => becauseYouRead(userIdOf(req), vc(req)));
+  app.get('/api/discover/because', async (req, reply) => {
+    reply.header('cache-control', 'no-store');
+    reply.header('vary', '*');
+    const answer = await becauseYouRead(userIdOf(req), vc(req));
+    const content = await withoutHiddenDiscover(userIdOf(req), answer.content);
+    const seeds = answer.seeds.filter((seed) => content.some((it) => it.because.id === seed.id));
+    return { ...answer, content, seeds, seed: seeds[0] ?? null };
+  });
 
   /**
    * What the page's work keys are now (v0.56.0, lib/discoverIdentity.ts currentWork). Discover's wall and search ask again
@@ -3754,7 +4004,7 @@ export default async function sourceRoutes(app: FastifyInstance) {
   app.get('/api/discover/works', async (req) => {
     const raw = String((req.query as { keys?: string }).keys ?? '');
     const keys = [...new Set(raw.split(',').map((k) => k.trim()).filter(Boolean))].slice(0, 200);
-    const idx = await libraryIndex().catch(() => noIndex());
+    const idx = await libraryIndex(vc(req)).catch(() => noIndex());
     const may = await nameableFor(idx, vc(req));
     const works: Record<string, { work: string; owned: boolean }> = {};
     for (const key of keys) works[key] = currentWork(idx, key, may);
@@ -3797,7 +4047,7 @@ export default async function sourceRoutes(app: FastifyInstance) {
     // Each provider says its language and whether the library holds its title in it (v0.52.0), as a Discover card
     // does: the add dialog marks the held ones and offers the others as a new edition.
     const hits = found.filter((f): f is NonNullable<typeof f> => !!f);
-    const idx = await libraryIndex().catch(() => noIndex());
+    const idx = await libraryIndex(vc(req)).catch(() => noIndex());
     const may = await nameableFor(idx, vc(req));
     return { content: hits.map((f) => { const held = heldOf(idx, f, f.source); return { ...f, ...owned(held, f.source, held.filter((h) => may(h.id))) }; }) };
   });
@@ -3891,10 +4141,17 @@ export default async function sourceRoutes(app: FastifyInstance) {
     // the "Show 18+" chip has no business here: it hides what appears unasked, and nothing here is
     // unasked. Same for the add below, which is the button this dialog leads to (#64).
     if (!sourceAllowedFor(src, vc(req).maxAgeRating)) return denySource(reply);
+    const requestedScope = req.query as {visibility?:string;libraryId?:string};
+    if (requestedScope.visibility !== undefined && !['private','shared'].includes(requestedScope.visibility)) return reply.code(400).send({error:'bad_visibility'});
+    const detailVisibility = requestedScope.visibility as 'private'|'shared'|undefined
+      ?? (await defaultPrivateFor(userIdOf(req)) ? 'private' : 'shared');
+    const detailScope = await resolveAddScope(vc(req), {visibility:detailVisibility,
+      ...(requestedScope.libraryId ? {libraryId:requestedScope.libraryId}
+        : detailVisibility === 'shared' ? {libraryId:libraryIdFor(`${src.name}/_`,await libraryRows())} : {}) });
     // Through the shared lookup so the add that usually follows this reuses it rather than re-solving.
     const { series, chapters: raw } = await seriesAndChapters(src, sourceId);
     // The cap's per-title half, as the add below applies it: the chip does not apply here (named, not surfaced).
-    if (cappedBelowAdult(req) && adultContentRating(series?.contentRating)) return denySource(reply);
+    if (cappedBelowAdult(req) && adultSourceSeries(series)) return denySource(reply);
     // Numbered as the add will number them (#116, lib/numbering.ts): a source that gives many different posts one
     // number is counted in posting order, 1..K, and `numbering` says so -- with the other reading's count under
     // `alt`, for the dialog's "Keep the source's numbers" switch. The cache keeps the raw list: it is shared.
@@ -3907,11 +4164,14 @@ export default async function sourceRoutes(app: FastifyInstance) {
     // the dialog's "120 chapters" is the 120 the add lands and not the 200 rows the source listed.
     const chosen = chooseReleases(chapters, prefs).releases;
     const nums = chosen.map((c) => c.number);
-    const other = n.applied === 'posting_order' ? raw : numberingFor(raw, 'posting_order').chapters;
-    const altNums = n.detect.verdict === 'none' ? [] : chooseReleases(other, prefs).releases.map((c) => c.number);
+    // The other reading, for the switch: the source's own numbers when the add renumbers (by posting order, or by the
+    // chapter titles, #379), else posting order when the detector has something to say.
+    const other = n.applied !== 'source' ? raw : n.detect.verdict !== 'none' ? numberingFor(raw, 'posting_order').chapters : [];
+    const altNums = chooseReleases(other, prefs).releases.map((c) => c.number);
     const numbering = {
       verdict: n.detect.verdict, ...(n.detect.reason ? { reason: n.detect.reason } : {}), applied: n.applied, ordered: n.detect.ordered,
       posts: n.detect.posts, numbers: n.detect.numbers, biggest: n.detect.biggest, examples: n.detect.examples,
+      ...(n.applied === 'titles' ? { titles: { specials: n.titles.specials, moved: n.titles.moved, example: n.titles.example } } : {}),
       alt: altNums.length ? { count: altNums.length, first: Math.min(...altNums), last: Math.max(...altNums) } : null,
       ...(isSwAdapterId(src.id) ? { extSourceId: src.id.slice(SW_PREFIX.length) } : {}),
     };
@@ -3924,10 +4184,11 @@ export default async function sourceRoutes(app: FastifyInstance) {
     let versions = 0;
     for (const n of perNumber.values()) if (n > 1) versions++;
     return {
-      source, sourceId,
+      source, sourceId, visibility:detailScope.visibility, libraryId:detailScope.libraryId,
       // Plain text: MangaDex describes in Markdown, and the dialog shows this as prose.
       title: series?.title || '', summary: cleanDescription(series?.summary), coverUrl: series?.coverUrl || null,
       genres: series?.genres || [], status: series?.status || '',
+      author: series?.author || '',
       count: chosen.length, first: nums.length ? Math.min(...nums) : null, last: nums.length ? Math.max(...nums) : null,
       groups: groupStats(chapters.map((c) => ({ number: c.number, groups: groupsOf(c), scanlator: c.scanlator, publishedAt: c.publishedAt, lang: c.lang, source })), []),
       versions,
@@ -3944,13 +4205,15 @@ export default async function sourceRoutes(app: FastifyInstance) {
     // bounded as every source id and series id is elsewhere in this file. No search runs for them.
     const b = z.object({
       source: z.string(), sourceId: z.string(), force: z.boolean().optional(),
+      visibility: z.enum(['shared','private']).optional(), libraryId: z.string().min(1).max(64).optional(),
+      ownerUserId:z.never().optional(), owner_user_id:z.never().optional(),
       chapterCount: z.number().int().positive().optional(), chapterFrom: z.enum(['oldest', 'newest', 'none']).optional(),
       autoUpdate: z.boolean().optional(),
       alsoFollow: z.array(z.object({ source: z.string().min(1).max(200), sourceId: z.string().min(1).max(200) })).max(MAX_AUTO_CANDIDATES).optional(),
       // "Archive the rest slowly" (#117): what the selection leaves is queued for the slow archive.
       archive: z.boolean().optional(),
       // #116: the add dialog's numbering switch. Absent is `auto`, what every caller before v0.49.0 meant.
-      numbering: z.enum(['auto', 'source', 'posting_order']).optional(),
+      numbering: z.enum(['auto', 'source', 'posting_order', 'titles']).optional(),
       // v0.52.0 (#72): add it as a language edition of the series `of` (lib/editions.ts). Codes are checked by the
       // add (canonLang); these bounds only keep the strings strings.
       edition: z.object({
@@ -3983,8 +4246,16 @@ export default async function sourceRoutes(app: FastifyInstance) {
     // fires today; it stays wired because the lib honours it, so the day the switch is offered to a
     // capped account again nothing has to be remembered here.
     const maxAge = vc(req).maxAgeRating;
+    const editionScope = b.data.edition ? await scopeForSeries(vc(req),b.data.edition.of,{write:true}) : null;
+    if (b.data.edition && !editionScope) return reply.code(404).send({error:'not_found'});
+    if (editionScope && ((b.data.visibility && b.data.visibility !== editionScope.visibility)
+      || (b.data.libraryId && b.data.libraryId !== editionScope.libraryId))) return reply.code(409).send({error:'edition_scope_conflict'});
+    const desiredVisibility = editionScope?.visibility ?? b.data.visibility ?? (await defaultPrivateFor(userIdOf(req)) ? 'private' : 'shared');
+    const inferredLibrary = editionScope?.libraryId ?? libraryIdFor(`${getSource(source)?.name ?? ''}/_`, await libraryRows());
+    const scope = await resolveAddScope(vc(req), { visibility: desiredVisibility,
+      ...(b.data.libraryId ? {libraryId:b.data.libraryId} : desiredVisibility === 'shared' ? {libraryId:inferredLibrary} : {}) });
     const r = await addSeriesFromSource({
-      source, sourceId, force, chapterCount, chapterFrom, autoUpdate, wait: false,
+      scope, preserveSharedDestination:!b.data.libraryId, source, sourceId, force, chapterCount, chapterFrom, autoUpdate, wait: false,
       alsoFollow, userId: userIdOf(req), req, sourceAllowed: (s) => sourceAllowedFor(getSource(s), maxAge),
       refuseAdultTitle: cappedBelowAdult(req),
       numbering: b.data.numbering,
@@ -4013,7 +4284,7 @@ export default async function sourceRoutes(app: FastifyInstance) {
     libraryChanged();
     // Audited here rather than after the download, so a slow or failing download does not delay the record
     // of who asked for it. What actually landed is the job's business.
-    logAudit('download.add', { userId: (req as any).user?.sub, detail: { title: r.title, source, chapters: r.chapters }, req });
+    logAudit('download.add', { userId: (req as any).user?.sub, detail: { title: r.title, source, chapters: r.chapters, visibility:scope.visibility, ownerUserId:scope.ownerUserId }, req });
     // The id of the series this add landed on, for "Open in library" (#67) -- gated the same way as the
     // duplicate's above, and for the same reason: an add can answer with a row the caller cannot see (an
     // "already in library" for a series in a library they were not granted). Absent on a fresh download,

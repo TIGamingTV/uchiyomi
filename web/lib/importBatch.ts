@@ -4,6 +4,25 @@
 // the admin members list) rather than translating to camelCase.
 import { t as tr } from './i18n';
 import { normTitle } from './normTitle';
+import { ApiError, getCurrentUser } from './api';
+
+/** A backup can finish reading after its form has gone away. Keep its bytes under the initiating account. */
+export function readImportBackup(file: File, expectedOwnerId: string | null): Promise<string> {
+  const assertOwner = () => {
+    if (getCurrentUser() !== expectedOwnerId) throw new ApiError(409, '{"error":"account_changed"}');
+  };
+  return new Promise((resolve, reject) => {
+    try {
+      assertOwner();
+      const reader = new FileReader();
+      reader.onload = () => {
+        try { assertOwner(); resolve(String(reader.result)); } catch (error) { reject(error); }
+      };
+      reader.onerror = () => reject(new Error('read'));
+      reader.readAsDataURL(file);
+    } catch (error) { reject(error); }
+  });
+}
 
 /** `tracker` (v0.36.0) is the reading list of an AniList / MyAnimeList / Kitsu account connected under Profile. */
 export type ImportOrigin = 'backup' | 'mangadex' | 'paste' | 'tracker';
@@ -36,6 +55,14 @@ export interface ImportBatch {
    */
   skippedNovels?: number;
   truncated?: boolean;
+  /** How many titles not in the library came after the 500 (#410); null when not counted. */
+  leftOver?: number | null;
+  remainingCount?: number;
+  nextBatchId?: string | null;
+  canContinue?: boolean;
+  content_scope?: { visibility: 'shared' | 'private'; libraryId: string } | null;
+  /** Mark chapters I've read (#433): whether this batch marks what its rows say was read. Absent from an older server. */
+  mark_read?: boolean;
 }
 
 /** One row of GET /api/admin/import/batches: enough to name a batch on the intake card and open it. */
@@ -49,6 +76,7 @@ export interface ImportBatchSummary {
   added: number;
   failed: number;
   created_at: string;
+  remainingCount?: number; canContinue?: boolean;
   /** Computed by the list route like the GET route's: `resolving` with nobody actually resolving it. */
   stale?: boolean;
 }
@@ -59,7 +87,7 @@ export interface ImportBatchSummary {
  * history log rather than the "you left this one half-way" reminder it is for.
  */
 export const openBatches = (list: ImportBatchSummary[]): ImportBatchSummary[] =>
-  list.filter((b) => b.state !== 'done' && b.state !== 'cancelled');
+  list.filter((b) => b.state !== 'cancelled' && (b.state !== 'done' || b.canContinue));
 
 export interface ImportCandidate {
   id: string;
@@ -95,6 +123,47 @@ export interface ImportCandidate {
    * for the titles a person already holds -- the common case for an established library.
    */
   linked?: boolean | null;
+  progress?: number | null;
+  tracker_links?: Array<{ provider: string; externalId: string; title: string; progress: number; private: boolean }>;
+  ambiguous?: boolean;
+  content_scope?: { visibility: 'private' | 'shared'; libraryId: string } | null;
+  // ---- reading progress (#433). Absent from an older server. ----
+  /** The highest chapter the backup has marked read; null when none is. The server sends this, not the whole list. */
+  read_to?: number | null;
+  /** How many chapters this import marked read for the row, here: at intake for a title already held, else at /run. */
+  marked_read?: number;
+}
+
+export type ImportRowState = 'same_source' | 'exact' | 'contains' | 'fuzzy' | 'manual' | 'unmatched' | 'skipped' | 'owned' | 'failed';
+export type ImportFilter = ImportRowState | 'all' | 'attention';
+export function importRowState(c: ImportCandidate): ImportRowState {
+  if (alreadyImported(c)) return 'owned';
+  if (c.status) return 'failed';
+  if (c.decision === 'skip') return 'skipped';
+  if (c.decision === 'manual') return 'manual';
+  if (c.decision === 'unresolved' || !c.match_source_id) return 'unmatched';
+  return c.confidence ?? 'unmatched';
+}
+export const selectableImport = (c: ImportCandidate): boolean => !c.status && !c.in_library;
+export const readyImport = (c: ImportCandidate): boolean => selectableImport(c) && !!c.match_source_id
+  && (c.decision === 'manual' || (c.decision === 'auto' && !c.ambiguous));
+export function filterImportRows(items: ImportCandidate[], filter: ImportFilter, source: string, query: string): ImportCandidate[] {
+  const term = query.normalize('NFKC').trim().toLowerCase();
+  return items.filter(c => (filter === 'all' || (filter === 'attention' ? needsAttention(c) : importRowState(c) === filter))
+    && (!source || (source === '__none' ? !c.match_source : c.match_source === source))
+    && (!term || [c.backup_title, c.match_title, ...(c.alt_titles ?? [])].some(t => t?.normalize('NFKC').toLowerCase().includes(term))));
+}
+export function importProvenance(c: ImportCandidate): string {
+  if (c.decision === 'manual') return tr('Picked by you');
+  if (c.confidence === 'same_source') return tr('Matched the source and address from your backup');
+  if (c.matched_via) return tr('Found using “{title}”', { title: c.matched_via });
+  if (c.decision === 'auto') return tr('Found by matching the original title');
+  return '';
+}
+export function trackerProgressLine(provider: string, n: number, backup = false): string {
+  const tracker = ({anilist:'AniList',myanimelist:'MyAnimeList',kitsu:'Kitsu',mangaupdates:'MangaUpdates'} as Record<string,string>)[provider] ?? provider;
+  return backup ? (n===1 ? tr('Read in backup on {tracker}: 1 chapter',{tracker}) : tr('Read in backup on {tracker}: {n} chapters',{tracker,n}))
+    : (n===1 ? tr('Read on {tracker}: 1 chapter',{tracker}) : tr('Read on {tracker}: {n} chapters',{tracker,n}));
 }
 
 /** Every spelling a row may legitimately have been matched under: the backup title first, then the tracker's alternates. */
@@ -173,9 +242,11 @@ export function containsDiverges(backupTitle: string, matchTitle: string | null)
  * ⚠️ Reintroduce by testing `containsDiverges(c.backup_title, c.match_title)` alone.
  */
 export function needsAttention(c: ImportCandidate): boolean {
+  if (c.in_library || c.status) return false;
   if (c.decision === 'skip') return false;
   if (c.decision === 'unresolved') return true; // once the batch is out of 'resolving', this means "no match found"
   if (c.decision !== 'auto') return false; // a manual pick was already looked at by a person
+  if (c.ambiguous) return true;
   if (c.confidence === 'fuzzy') return true;
   return c.confidence === 'contains' && titleVariants(c).every((t) => containsDiverges(t, c.match_title));
 }
@@ -218,6 +289,23 @@ export const linkedCount = (items: ImportCandidate[]): number =>
 export function linkedLine(n: number): string | null {
   if (n <= 0) return null;
   return n === 1 ? tr('1 linked for progress sync') : tr('{n} linked for progress sync', { n });
+}
+
+/** A backup row's caption (#433): how far its chapters are marked read in the backup. Null when none is. */
+export const readToLine = (c: ImportCandidate): string | null =>
+  c.read_to == null ? null : tr('Read to ch. {n}', { n: c.read_to });
+
+/**
+ * The line for what an import marked read (#433): how many chapters, in how many series -- the rows that marked any,
+ * each one series. One chapter is one series, so its line names none. Singular by hand, as linkedLine is, and counted
+ * over the whole batch, never a filtered view of it; null when the import marked nothing.
+ */
+export function markedLine(items: ImportCandidate[]): string | null {
+  const rows = items.filter((c) => (c.marked_read ?? 0) > 0);
+  const n = rows.reduce((sum, c) => sum + (c.marked_read ?? 0), 0);
+  if (n <= 0) return null;
+  if (n === 1) return tr('Marked 1 chapter read.');
+  return rows.length === 1 ? tr('Marked {n} chapters read in 1 series.', { n }) : tr('Marked {n} chapters read in {m} series.', { n, m: rows.length });
 }
 
 /** Where a batch stands, in words, for the "Open imports" list. Every call site passes a literal state. */
@@ -272,21 +360,24 @@ export const alreadyImported = (c: ImportCandidate): boolean =>
   c.in_library || c.status === 'added' || c.status === 'already' || c.status === 'duplicate';
 
 /**
- * What the intake note and its toast say about a list cut at the 500 (v0.51.0, discussion #121). A backup, a
- * MangaDex list or a paste keeps the first 500 titles NOT already in the library -- the owned ones ride along as
- * skipped rows, uncounted -- so importing the same list again once those are in picks up the rest, and the words
- * say so. A tracker read stops at its own cap, which reading it again does not get past: its words stay as they
- * were, and the advice for a large account is one list at a time (USAGE).
- * Reintroduce by returning the tracker's words for every origin: "a list cut at the 500 says how to get the rest"
- * in importBatch.test.ts reads "(first 500 kept)" for a backup.
+ * What the intake note and its toast say about a list cut at the 500 (v0.51.0, discussion #121). Every intake keeps the
+ * first 500 titles NOT already in the library -- the owned ones ride along as skipped rows, uncounted -- so importing
+ * the same list again once those are in picks up the rest. Since v0.105.0 that holds for a tracker read too, which now
+ * reads far past 500 (#410), and the words say how many are left whenever the server counted them (`leftOver`).
+ * Reintroduce the count's absence: "a list cut at the 500 says how many are left" in importBatch.test.ts reads no number.
  */
-export function truncatedWords(origin: ImportOrigin | null | undefined): { note: string; toast: string } {
-  return origin === 'tracker'
-    ? { note: tr('(first 500 kept)'), toast: tr('Only the first 500 titles were kept.') }
-    : {
-        note: tr('(first 500 not in your library kept; import again for the rest)'),
-        toast: tr('Only the first 500 titles not already in your library were kept. Once they are in, import the same list again for the rest.'),
-      };
+export function truncatedWords(leftOver?: number | null): { note: string; toast: string } {
+  if (typeof leftOver === 'number' && leftOver > 0) return leftOver===1 ? {
+    note:tr('(1 title after this batch)'),
+    toast:tr('Review this batch, then choose Continue with next batch for 1 title.'),
+  } : {
+    note:tr('({n} titles after this batch)',{n:leftOver}),
+    toast:tr('Review this batch, then choose Continue with next batch for {n} titles.',{n:leftOver}),
+  };
+  return {
+    note:tr('(the source list was limited; more titles may exist)'),
+    toast:tr('Review the saved batches. The source list limit means this may not be the whole list.'),
+  };
 }
 
 /** Short label for the confidence chip. `keys()` isn't needed here — every call site passes a literal. */
@@ -321,6 +412,7 @@ export function runStatusLabel(status: string, linked = false): string {
     case 'already':
     case 'duplicate': return tr('Already in your library');
     case 'no_chapters': return tr('No readable chapters on this source');
+    case 'tracker_conflict': return tr('Tracker links point to different titles. Review those links before importing.');
     case 'disabled': return tr('That source is switched off');
     case 'blocked': return tr('The source is blocking us right now');
     case 'undownloadable': return tr('Nothing could be fetched from this source');

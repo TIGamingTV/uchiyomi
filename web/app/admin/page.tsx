@@ -2,6 +2,7 @@
 import { Suspense, useEffect, useMemo, useState } from 'react';
 import { useAdminSettingsViews } from '@/components/AdminSettings';
 import { ConsoleLayout, type PageView } from '@/components/ConsoleLayout';
+import { seenText, useNetwork } from '@/components/NetworkSettings';
 import { ADMIN_SETTINGS } from '@/lib/settingsIndex.admin';
 import { useRouter } from 'next/navigation';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
@@ -12,9 +13,9 @@ import { scheduleText, taskResult } from '@/lib/tasks';
 import { bytes, numberText, relativeTime } from '@/lib/format';
 import { shownDeviceName } from '@/lib/device';
 import { useToast } from '@/components/Toast';
-import { ConfirmDialog, Modal, msgOf } from '@/components/ConfirmDialog';
+import { ConfirmDialog, Modal, actionFailure, msgOf } from '@/components/ConfirmDialog';
 import { Avatar } from '@/components/Avatar';
-import { IcChevronLeft, IcChevronRight, IcTrash, IcPlus, IcRefresh, IcX, IcGrid, IcShield, IcRows, IcGlobe, IcSparkle, IcUsers, IcUser, IcClock } from '@/components/icons';
+import { IcChevronLeft, IcChevronRight, IcTrash, IcPlus, IcRefresh, IcX, IcGrid, IcShield, IcRows, IcGlobe, IcUsers, IcUser, IcClock } from '@/components/icons';
 import { LibraryFolders } from '@/components/LibraryFolders';
 import { addFolder, foldersOf, heldByOthers, heldByText, previewQuery, previewText, sameFolders, toggleFolder, typedFolder } from '@/lib/libraryFolders';
 import { CardProgress, HealthCardActions, HealthRow, hasCardActions, scanState, scanWorking } from '@/components/HealthActions';
@@ -87,6 +88,8 @@ function AdminInner() {
   const desktop = isDesktop();
   // Maintenance's Run now, after its settings: what was the Tasks tab (v0.88.0).
   const settings = useAdminSettingsViews({
+    // Art's covers and banners, under its title artwork switches (v0.105.0, #411).
+    art: <ArtReview />,
     maintenance: (
       <section id="tasks" className="col-span-full min-w-0 scroll-mt-4 lg:scroll-mt-20" aria-labelledby="tasks-title">
         <h3 id="tasks-title" className="mb-1.5 px-1 text-[13px] font-semibold text-fog-300">{tr('Tasks')}</h3>
@@ -113,8 +116,6 @@ function AdminInner() {
       summary: tr('Folders, age ratings and who can open them'), pane: <LibraryPanel /> },
     sources: { icon: <IcGlobe width={18} height={18} />, tint: 'bg-cyan-500/15 text-cyan-300',
       summary: tr('Sites and extensions'), pane: <SourcesPanel /> },
-    art: { icon: <IcSparkle width={18} height={18} />, tint: 'bg-pink-500/15 text-pink-300',
-      summary: tr('Covers and banners'), pane: <ArtReview /> },
     members: { icon: <IcUsers width={18} height={18} />, tint: 'bg-teal-500/15 text-teal-300',
       summary: stats ? (stats.members === 1 ? tr('1 member') : tr('{n} members', { n: stats.members })) : undefined, pane: <Members /> },
     sessions: { icon: <IcUser width={18} height={18} />, tint: 'bg-blue-500/15 text-blue-300',
@@ -128,7 +129,7 @@ function AdminInner() {
     <div className="min-h-screen-d px-4 lg:px-0" data-admin-console>
       {/* The foot of the list says which Uchiyomi this is (v0.55.4, #150): the place people looked for it. */}
       <ConsoleLayout index={ADMIN_SETTINGS} label={tr('Admin')} views={views} home="overview"
-        conds={{ web: !desktop, 'local-accounts': !settings.sso, extensions: settings.extensions, pointer: true, talk: false }}
+        conds={{ web: !desktop, 'local-accounts': !settings.sso, extensions: settings.extensions, pointer: true, talk: false, 'native-app-controls': false }}
         hero={(mode) => <AdminHero mode={mode} onBack={() => (window.history.length > 1 ? router.back() : router.push('/profile/'))} />}
         art={art?.seriesId ? <Backdrop seriesId={art.seriesId} className="absolute inset-0" /> : null}
         footer={<VersionLine />} />
@@ -450,13 +451,17 @@ function Members() {
   });
   // SSO-only mode (v0.63.0, #208): accounts come from the provider. No New account, no password to reset -- the server
   // refuses both -- and a card that says where accounts come from instead. Reintroduce the form and "Members offers no
-  // New account and no password in SSO-only mode" in web/test/ssoOnly.test.ts fails.
+  // New account and no password in SSO-only mode" in web/test/ssoOnly.test.ts fails. The one account Members still
+  // makes there is a profile with no password, which opens at home (New profile, below).
   const ssoOnly = data?.auth?.mode === 'oidc-only';
   const provider = data?.auth?.sso ?? '';
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
   const [displayName, setDisplayName] = useState('');
   const [role, setRole] = useState<'user' | 'admin'>('user');
+  // A profile that opens at home without a password, and the account that manages it.
+  const [localOpen, setLocalOpen] = useState(false);
+  const [managedBy, setManagedBy] = useState('');
   const [busy, setBusy] = useState(false);
   // A password reset and a deletion are the two things here that cannot be undone by clicking again, so
   // both go through the app's own dialogs. prompt()/confirm() were untranslatable, unstyled, and in a
@@ -469,9 +474,18 @@ function Members() {
 
   const create = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!username.trim() || !password || busy) return;
+    // In SSO-only mode the server makes a profile with no password and nothing else (403 sso_only): New profile sends that.
+    const open = localOpen || ssoOnly;
+    if (!username.trim() || (!password && !open) || busy) return;
     setBusy(true);
-    try { await api('/api/admin/users', { json: { username: username.trim(), password, displayName: displayName.trim() || undefined, role } }); toast(tr('Account {name} created', { name: iso(`@${username.trim()}`) }), 'success'); setUsername(''); setPassword(''); setDisplayName(''); setRole('user'); inval(); }
+    try {
+      await api('/api/admin/users', { json: {
+        username: username.trim(), password: ssoOnly ? undefined : password || undefined, displayName: displayName.trim() || undefined,
+        role: open ? 'user' : role, ...(open ? { localOpen: true, managedBy: managedBy || undefined } : {}),
+      } });
+      toast(tr('Account {name} created', { name: iso(`@${username.trim()}`) }), 'success');
+      setUsername(''); setPassword(''); setDisplayName(''); setRole('user'); setLocalOpen(false); setManagedBy(''); inval();
+    }
     catch (e: any) { toast(e instanceof ApiError && e.status === 409 ? tr('Username taken') : msgOf(e, tr('Could not create account')), 'error'); }
     setBusy(false);
   };
@@ -484,6 +498,10 @@ function Members() {
     catch (e) { toast(codeOf(e) === 'last_admin' ? tr('The last admin cannot be removed') : tr('Could not remove that account'), 'error'); }
     setDeletingBusy(false);
   };
+
+  // Who may manage a profile: an enabled account that signs in with a credential of its own (bff routes/admin.ts mayManage).
+  const managers = (data?.content ?? []).filter((m: any) => !m.disabled && (m.kind === 'password' || m.kind === 'hybrid'));
+  const nameOf = (id: string): string => (data?.content ?? []).find((m: any) => m.id === id)?.display_name ?? '?';
 
   return (
     <div className="board">
@@ -504,11 +522,43 @@ function Members() {
         <div className="space-y-2">
           <input value={username} onChange={(e) => setUsername(e.target.value)} placeholder={tr('username')} autoCapitalize="none" autoCorrect="off" className="field" />
           <input value={displayName} onChange={(e) => setDisplayName(e.target.value)} placeholder={tr('display name (optional)')} className="field" />
-          <input value={password} onChange={(e) => setPassword(e.target.value)} type="password" placeholder={tr('password (min 8)')} className="field" />
-          <div className="flex gap-2">{(['user', 'admin'] as const).map((r) => <button key={r} type="button" onClick={() => setRole(r)} className={`flex-1 rounded-xl border py-2 text-sm capitalize ${role === r ? 'border-accent bg-accent-soft text-accent' : 'border-ink-700 text-fog-300'}`}>{roleText(r)}</button>)}</div>
+          <input value={password} onChange={(e) => setPassword(e.target.value)} type="password" placeholder={localOpen ? tr('password (optional: for outside home)') : tr('password (min 8)')} className="field" />
+          {/* Opens at home without a password: never an admin, so it replaces the role; with a password as well, the
+              password lets it in from anywhere else. */}
+          <button type="button" onClick={() => setLocalOpen(!localOpen)} aria-pressed={localOpen} data-local-open
+            className={`btn-key w-full ${localOpen ? 'btn-key-accent' : ''}`}>{tr('Opens at home without a password')}</button>
+          {localOpen ? (
+            <>
+              <select value={managedBy} onChange={(e) => setManagedBy(e.target.value)} className="field">
+                <option value="">{tr('Managed by an admin')}</option>
+                {managers.map((m: any) => <option key={m.id} value={m.id}>{m.display_name}</option>)}
+              </select>
+              <HomeNetwork />
+            </>
+          ) : (
+            <div className="flex gap-2">{(['user', 'admin'] as const).map((r) => <button key={r} type="button" onClick={() => setRole(r)} className={`flex-1 rounded-xl border py-2 text-sm capitalize ${role === r ? 'border-accent bg-accent-soft text-accent' : 'border-ink-700 text-fog-300'}`}>{roleText(r)}</button>)}</div>
+          )}
         </div>
-        <button type="submit" disabled={busy || !username.trim() || password.length < 8} className="btn-accent mt-3 w-full disabled:opacity-50"><IcPlus width={18} height={18} /> {busy ? tr('Creating…') : tr('Create account')}</button>
+        <button type="submit" disabled={busy || !username.trim() || (localOpen ? password.length > 0 && password.length < 8 : password.length < 8)} className="btn-accent mt-3 w-full disabled:opacity-50"><IcPlus width={18} height={18} /> {busy ? tr('Creating…') : tr('Create account')}</button>
       </form>
+      )}
+      {/* SSO-only mode's one way to make an account here: a profile with no
+          password, which opens on the home network only, through a session the provider signed in or Who is reading?. */}
+      {ssoOnly && data && (
+        <form onSubmit={create} className="card grad-border p-4" data-sso-profile>
+          <h2 className="mb-1 font-display text-base font-semibold">{tr('New profile')}</h2>
+          <p className="mb-3 text-sm leading-relaxed text-fog-300">{tr('Accounts come from {name}, but a profile without a password can be made here: it opens on the home network only.', { name: iso(provider) })}</p>
+          <div className="space-y-2">
+            <input value={username} onChange={(e) => setUsername(e.target.value)} placeholder={tr('username')} autoCapitalize="none" autoCorrect="off" className="field" />
+            <input value={displayName} onChange={(e) => setDisplayName(e.target.value)} placeholder={tr('display name (optional)')} className="field" />
+            <select value={managedBy} onChange={(e) => setManagedBy(e.target.value)} className="field">
+              <option value="">{tr('Managed by an admin')}</option>
+              {managers.map((m: any) => <option key={m.id} value={m.id}>{m.display_name}</option>)}
+            </select>
+            <HomeNetwork />
+          </div>
+          <button type="submit" disabled={busy || !username.trim()} className="btn-accent mt-3 w-full disabled:opacity-50"><IcPlus width={18} height={18} /> {busy ? tr('Creating…') : tr('Create profile')}</button>
+        </form>
       )}
       {/* #208, item 6: what a member who signs up starts with. A card of its own beside New account, which is an admin
           choosing and is left alone by it. After the users list has answered, which says whether the provider makes
@@ -533,19 +583,29 @@ function Members() {
             </div>
             <p className="mt-2 text-[11px] text-fog-500">
               {/* The provider's name on an account linked to it (v0.63.0), as 2FA marks the accounts that have it. */}
-              {[roleText(u.role), self ? tr('you') : null, u.disabled ? tr('disabled') : null, u.totp_enabled ? '2FA' : null, u.sso && provider ? provider : null].filter(Boolean).join(' · ')}
+              {[roleText(u.role), self ? tr('you') : null, u.disabled ? tr('disabled') : null, u.totp_enabled ? '2FA' : null, u.sso && provider ? provider : null,
+                u.kind === 'open' ? tr('no password, opens at home') : u.kind === 'hybrid' ? tr('no password at home') : null,
+                u.managed_by ? tr('managed by {name}', { name: iso(nameOf(u.managed_by)) }) : null].filter(Boolean).join(' · ')}
             </p>
             {/* Keys (UI refresh): each acts on the account. The choices inside the library and age panels stay chips. */}
             <div className="mt-2.5 flex flex-wrap gap-1.5">
               {!ssoOnly && <button onClick={() => setResetting(u)} className="btn-key">{tr('Reset')}</button>}
               {!self && (
                 <>
-                  <button onClick={() => patch(u, { role: u.role === 'admin' ? 'user' : 'admin' }, tr('Role updated'))} className="btn-key">{u.role === 'admin' ? tr('Make member') : tr('Make admin')}</button>
+                  {!u.local_open && <button onClick={() => patch(u, { role: u.role === 'admin' ? 'user' : 'admin' }, tr('Role updated'))} className="btn-key">{u.role === 'admin' ? tr('Make member') : tr('Make admin')}</button>}
                   <button onClick={() => patch(u, { disabled: !u.disabled }, u.disabled ? tr('Account enabled') : tr('Account disabled'))} className="btn-key">{u.disabled ? tr('Enable') : tr('Disable')}</button>
                   {/* A member's, like the two below: an admin downloads whatever the flag says (routes/sources.ts), so on an
                       admin's card it toggled nothing -- and one the provider made carries the new-member default for
                       the day it is made a member, which read here as a refusal it is not. */}
                   {u.role !== 'admin' && <button onClick={() => patch(u, { perms: { ...u.perms, canDownload: !canDl } }, tr('Permission updated'))} className="btn-key">{canDl ? tr('Deny downloads') : tr('Allow downloads')}</button>}
+                  {/* Profiles that open at home, members only: never an admin's. */}
+                  {u.role !== 'admin' && <button onClick={() => patch(u, { localOpen: !u.local_open }, tr('Permission updated'))} aria-pressed={!!u.local_open}
+                    className={`btn-key ${u.local_open ? 'btn-key-accent' : ''}`}>{tr('Opens at home without a password')}</button>}
+                  {u.role !== 'admin' && u.local_open && u.password_login && !ssoOnly && <button onClick={() => patch(u, { removePassword: true }, tr('Password removed'))} className="btn-key">{tr('Remove password')}</button>}
+                  {u.role !== 'admin' && u.kind !== 'open' && <button onClick={() => patch(u, { perms: { ...u.perms, canManageProfiles: !u.perms?.canManageProfiles } }, tr('Permission updated'))}
+                    aria-pressed={!!u.perms?.canManageProfiles} className={`btn-key ${u.perms?.canManageProfiles ? 'btn-key-accent' : ''}`}>{tr('Can make profiles')}</button>}
+                  {u.role !== 'admin' && <button onClick={() => patch(u, { perms: { ...u.perms, canUploadManually: !u.perms?.canUploadManually } }, tr('Permission updated'))}
+                    aria-pressed={!!u.perms?.canUploadManually} className={`btn-key ${u.perms?.canUploadManually ? 'btn-key-accent' : ''}`}>{tr('Can upload series')}</button>}
                   {/* Library access. "All libraries" is the ABSENCE of grant rows, not a full set of them, so a
                       library added next month is visible to unrestricted accounts without editing anyone. */}
                   {u.role !== 'admin' && <LibraryAccess granted={u.libraries ?? null} onSaved={inval}
@@ -586,6 +646,23 @@ function Members() {
         />
       )}
     </div>
+  );
+}
+
+/**
+ * How the server sees the admin asking (bff GET /api/admin/network), beside a profile that opens at home: whether the
+ * admin is at home, and the way to the page that says which networks are (components/NetworkSettings.tsx).
+ */
+function HomeNetwork() {
+  const { data } = useNetwork();
+  if (!data) return null;
+  return (
+    <p className="text-[11px] leading-relaxed text-fog-500" data-home-network>
+      {seenText(data)}{' '}
+      <a href="/admin/?tab=server&section=local-networks" className="underline decoration-dotted underline-offset-2 hover:text-fog-300">
+        {tr('Home network')}
+      </a>
+    </p>
   );
 }
 
@@ -776,7 +853,7 @@ function ArtPicker({ row, onClose, onApplied }: { row: ArtRow; onClose: () => vo
     if (busy) return;
     setBusy(true);
     try { await api(`/api/admin/series/${row.id}/art`, { method: 'PUT', json: { kind, mode: 'reset' } }); toast(kind === 'banner' ? tr('Banner reset to automatic') : tr('Cover reset to automatic'), 'success'); onApplied(); }
-    catch { toast(tr('Failed'), 'error'); }
+    catch (error) { toast(actionFailure(error, kind === 'banner' ? tr('Could not reset the banner.') : tr('Could not reset the cover.')), 'error'); }
     setBusy(false);
   };
   // Use the first page (v0.55.7, #168), as Edit details offers it: the series' own first page is its cover for good.
@@ -832,7 +909,7 @@ function Tasks() {
   const toast = useToast();
   const qc = useQueryClient();
   const { data } = useQuery({ queryKey: ['admin-tasks'], queryFn: () => api<{ content: any[] }>('/api/admin/tasks'), refetchInterval: 5000 });
-  const run = async (id: string) => {
+  const run = async (id: string, name: string) => {
     try {
       const r = await api<{ ok?: boolean; error?: string; started?: boolean; series?: number; books?: number }>(`/api/admin/tasks/${id}/run`, { method: 'POST' });
       // A refusal is a 200 with ok:false (the task is already running), and used to toast "Started" too.
@@ -849,7 +926,7 @@ function Tasks() {
           : r.error === 'repair_running' ? tr('The library repair is running — try again in a few minutes')
           : r.error === 'busy' ? tr('Already running')
           : r.error === 'not_enabled' ? tr('That task is switched off')
-          : tr('Failed'), 'error');
+          : tr('Could not start “{task}”.', { task: tr(name) }), 'error');
       }
       // ⚠️ The scan is the one task that runs to completion before answering, and it answers with its
       // counts. Toasting "Started" for it hid the only fact that mattered: in #34 a library scanned to zero
@@ -873,7 +950,7 @@ function Tasks() {
       else if (id === 'rescan' && r?.started) qc.invalidateQueries({ queryKey: RESCAN_KEY });
       else toast(tr('Started'), 'success');
       qc.invalidateQueries({ queryKey: ['admin-tasks'] });
-    } catch { toast(tr('Failed'), 'error'); }
+    } catch (error) { toast(actionFailure(error, tr('Could not start “{task}”.', { task: tr(name) })), 'error'); }
   };
   // Chronological, per-row actions: a list, not a card grid. But an explicit column template rather than
   // `justify-between`, which at 1592px left a lake of nothing between a task's name and its own button.
@@ -916,7 +993,7 @@ function Tasks() {
                 <RescanPanel running={!!t.running} />
               </div>
             )}
-            <button onClick={() => run(t.id)} disabled={t.running}
+            <button onClick={() => run(t.id, t.name)} disabled={t.running}
               className="btn-key col-start-2 row-span-2 row-start-1 justify-self-end lg:col-start-3 lg:row-span-1">
               {t.running ? tr('Running…') : t.id === 'rescan' ? tr('Start') : tr('Run now')}
             </button>

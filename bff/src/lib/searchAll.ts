@@ -16,12 +16,14 @@
 // A capped account's set never contains an adult source, so it can neither start that source nor read
 // what an uncapped viewer's search got from it. The cache holds raw per-source lists (what the SITE said,
 // viewer-independent) and nothing about who asked -- the filter happens on every read, never on write.
-import type { SourceAdapter, SourceSeries } from './sources/types';
+import { supportsCreatorSearch, type SourceAdapter, type SourceSeries } from './sources/types';
 import { budgetFor } from './sources/budget';
 import { SOLVER_CONCURRENCY } from './sources/flaresolverr';
 import { scanOrder } from './scanOrder';
 import { classify, noteStage, reportFail, reportSlow, reportTimely, type SourceHealth } from './sourceHealth';
 import { canonLang } from './lang';
+import { normTitle } from './titleMatch';
+import { adultSourceSeries, taggedContentRating } from './ageRating';
 
 /** An env knob: a finite number at or above `min`, else the default. An empty string is unset. */
 const knob = (name: string, def: number, min = 0): number => {
@@ -53,7 +55,7 @@ export const SEARCH_TTL_MS = knob('SEARCH_TTL_MS', 300_000, 1000);
 /** How many entries are kept; the oldest goes first. A bound on memory, not a policy. */
 export const SEARCH_CACHE_MAX = Math.max(1, knob('SEARCH_CACHE_MAX', 50, 1));
 /** Results kept per source, as the old fan-out sliced them. */
-export const SEARCH_PER_SOURCE = 12;
+export const SEARCH_PER_SOURCE = 100;
 
 export type SearchState = 'ok' | 'empty' | 'timeout' | 'failed' | 'skipped' | 'pending';
 export interface SearchSourceLine { id: string; name: string; state: SearchState; ms?: number; why?: 'disabled' | 'cooldown' }
@@ -70,18 +72,14 @@ export interface SearchAnswer {
   startedAt: number;
 }
 
-/**
- * The route's `norm` (routes/sources.ts), copied rather than imported: this file must not import a route
- * module, and a test holds the two against each other on real titles so they cannot drift apart.
- */
-export const normTerm = (t: string) => t.toLowerCase().replace(/[^a-z0-9]+/g, '');
+/** The canonical Unicode title key, shared with matching without importing a route module. */
+export const normTerm = normTitle;
 
 /**
  * The cache key for a term.
  *
- * ⚠️ Not `normTerm` alone: it strips everything that is not a-z0-9, so every Japanese, Korean or Cyrillic
- * title normalises to the EMPTY string and would share one entry -- the first such search would answer
- * every later one. Those fall back to the trimmed, lower-cased spelling.
+ * Lettering in every script uses the canonical key. A punctuation-only term still needs its own
+ * spelling rather than the empty key shared by all such searches.
  */
 const keyOf = (term: string): string => normTerm(term) || term.trim().toLowerCase();
 
@@ -173,7 +171,7 @@ function cancelEntry(entry: Entry): void {
  * Ask one source, under a slot, and write what it said into the entry. Never throws: the state is the report. `slow`:
  * the health read this search made shows the source on a slow streak, which an answer inside the budget ends.
  */
-async function askOne(entry: Entry, src: SourceAdapter, term: string, slow = false): Promise<void> {
+async function askOne(entry: Entry, src: SourceAdapter, term: string, slow = false, creator?: 'author' | 'artist'): Promise<void> {
   const cell = entry.per.get(src.id)!;
   const lane = laneFor(src);
   if (!(await lane.take(entry))) return;
@@ -181,7 +179,7 @@ async function askOne(entry: Entry, src: SourceAdapter, term: string, slow = fal
   const budget = budgetFor(src, SEARCH_SOURCE_MS);
   try {
     if (entry.cancelled) return;
-    const raw = await bounded(src.search(term), budget);
+    const raw = await bounded(creator ? src.searchCreator!(term, creator, 1) : src.search(term), budget);
     const items = (Array.isArray(raw) ? raw : []).slice(0, SEARCH_PER_SOURCE);
     // Empty is a normal answer -- the title is not on this source -- and is reported nowhere: the newest
     // listing's empty-streak evidence is about page 1 of a listing, not about a search for one title.
@@ -242,9 +240,14 @@ function makeRoom(now: number): void {
 export async function searchAll(
   term: string,
   ask: SourceAdapter[],
-  opts: { waitMs: number; health: Map<string, SourceHealth> },
+  opts: { waitMs: number; health: Map<string, SourceHealth>; creator?: 'author' | 'artist' },
 ): Promise<SearchAnswer> {
-  const key = keyOf(term);
+  // Creator results cannot share title results, another role, or another case-sensitive name.
+  // Extensions can declare `Author (Case-sensitive)`, so their exact submitted spelling is part of the key.
+  const key = opts.creator
+    ? `${opts.creator}:${term.trim()}`
+    : `title:${keyOf(term)}`;
+  if (opts.creator) ask = ask.filter((src) => supportsCreatorSearch(src, opts.creator!));
   const callStart = Date.now();
   let entry = entries.get(key);
   if (entry && callStart - entry.startedAt >= SEARCH_TTL_MS) {
@@ -267,7 +270,7 @@ export async function searchAll(
     if (h?.disabled) { skipped.set(id, 'disabled'); continue; }
     if (h?.blocked_until && new Date(h.blocked_until).getTime() > callStart) { skipped.set(id, 'cooldown'); continue; }
     entry.per.set(id, { state: 'pending', items: [] });
-    void askOne(entry, byId.get(id)!, term, (h?.slow_streak ?? 0) > 0);
+    void askOne(entry, byId.get(id)!, term, (h?.slow_streak ?? 0) > 0, opts.creator);
   }
 
   // Wait for the earliest of: everything mine settled, my own wait, or the grace after the first source
@@ -367,13 +370,14 @@ export function ratingOf(
   item: Pick<SourceSeries, 'genres' | 'contentRating'>, src: { id?: string; isNsfw?: boolean } | null | undefined, lists: AdultLists,
 ): Judged | undefined {
   if (src?.id && lists.sources.includes(String(src.id).toLowerCase())) return 'adult';
-  if (item.contentRating === 'erotica' || item.contentRating === 'pornographic') return 'adult';
+  if (adultSourceSeries(item)) return 'adult';
   const fold = (g: string) => g.trim().toLowerCase();
   const adult = new Set(lists.genres.map(fold).filter(Boolean));
   const genres = (Array.isArray(item.genres) ? item.genres : []).filter((g): g is string => typeof g === 'string').map(fold).filter(Boolean);
   if (genres.some((g) => adult.has(g))) return 'adult';
   if (src?.isNsfw) return 'flagged';
-  if (item.contentRating === 'safe' || item.contentRating === 'suggestive') return 'safe';
+  const rated = item.contentRating ?? taggedContentRating(item.genres);
+  if (rated === 'safe' || rated === 'suggestive') return 'safe';
   if (genres.length && adult.size) return 'safe';
   return undefined;
 }
@@ -435,9 +439,14 @@ export function groupByTitle(
       // v0.56.0: the caller's key -- Discover's work (lib/discoverIdentity.ts workOf), under which two sites naming one series
       // differently are one card -- else the normalised title, as every caller before it. A work key is never empty, so a
       // title in another script is a card of its own, where the ASCII key dropped it.
-      const key = keyOf ? keyOf(r, src) : normTerm(r.title);
+      let key = keyOf ? keyOf(r, src) : normTerm(r.title);
       if (!key) continue;
       let g = groups.get(key);
+      // Titles alone cannot collapse two different entries from one source (#357).
+      if (g?.providers.some((p) => p.source === r.source && p.sourceId !== r.sourceId)) {
+        key = `s:${r.source}:${r.sourceId}`;
+        g = groups.get(key);
+      }
       if (!g) {
         g = { title: r.title, coverUrl: r.coverUrl, updatedAt: r.updatedAt, providers: [], ...(keyOf ? { work: key } : {}) };
         groups.set(key, g); judged.set(g, []);

@@ -325,7 +325,7 @@ export function startAutofix(
   };
   active = a;
   // The audit line is written when the run ends, long after the request: its IP and user agent are taken now.
-  const from = o.req ? { ip: o.req.ip, headers: { 'x-forwarded-for': o.req.headers['x-forwarded-for'], 'user-agent': o.req.headers['user-agent'] } } as unknown as FastifyRequest : undefined;
+  const from = o.req ? { ip: o.req.ip, headers: { 'user-agent': o.req.headers['user-agent'] } } as unknown as FastifyRequest : undefined;
   lastRun = runAll(a, from).catch((e) => console.warn(`[autofix] ${(e as Error)?.message || e}`));
   return { runId: id };
 }
@@ -535,7 +535,7 @@ function scrubbed<R extends Scrubbable>(r: R, named: ReadonlySet<string>): R {
   const keep = (l: Said): boolean => !TITLED.has(l.code) || shown(l.params?.seriesIds);
   return {
     ...r,
-    ...(r.current ? { current: shown(r.current.seriesIds) ? r.current : { ...r.current, title: undefined } } : {}),
+    ...(r.current ? { current: shown(r.current.seriesIds) ? r.current : { ...r.current, title: undefined, seriesIds:undefined } } : {}),
     ...(r.log ? { log: r.log.filter(keep) } : {}),
     ...(r.summary ? { summary: { ...r.summary, done: r.summary.done.map((d) => (d.items ? { ...d, items: d.items.filter(keep) } : d)) } } : {}),
   };

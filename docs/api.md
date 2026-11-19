@@ -301,6 +301,10 @@ the settings' `adultSources` list (one list, two ways to write it); `GET /api/ad
 loaded now. **400** for anything but 18 or null, **409** `too_many` past 200 rated sources (`messageSaid`
 `rating.tooMany`). Audited `source.age_rating`.
 
+`GET /api/admin/limits` (admin) is read-only: `{limits: [{key, value, unit}], note}` for the knobs that only
+environment variables set (`SUWAYOMI_PAGE_CONCURRENCY`, `SOURCE_LATEST_TIMEOUT_MS`, `SOURCE_TEST_TIMEOUT_MS`,
+`SCAN_CONCURRENCY`, `BACKUP_KEEP`, `CACHE_MAX_BYTES`) with the value in effect. Numbers only; no secret is returned.
+
 `PATCH /api/admin/sources/custom/:id` (admin) changes a custom site's `base` address, its `lang`, or both, and
 nothing else. The source id is derived from its name and the library is keyed on that id, so editing in place is
 the only way to follow a site to a new domain without orphaning every series that came from it. A new `lang`
@@ -346,7 +350,7 @@ of the candidate's listed by the primary — else `numbering_differs`, so a sequ
 primary ("Tokyo Ghoul:re" 1..60 for "Tokyo Ghoul" 1..20) is refused although it lists every number, while
 "(Official)" 1..22 for 1..20 (20 of 22 = 0.91) follows. The `coverage` reported for a two-way judgement is
 the lower of the two shares. At most as many sources as **Other sources per series** allows (`maxFollowedSources` on PATCH
-/api/admin/settings since v0.89.0, 1 to 10; before it `MAX_FOLLOWED_SOURCES`, three by default) are followed per series, in the order
+/api/admin/settings since v0.89.0, 1 to 25 since v0.105.0 and 1 to 10 before; before it `MAX_FOLLOWED_SOURCES`, three by default) are followed per series, in the order
 given; a follower this path wrote has no author and reads `auto: true` on the series' sources. The results are not in the
 add's answer: they land on the series' job card (below), which a `none` add gets minted for the purpose.
 
@@ -532,13 +536,18 @@ Admin settings carry `discover_lookups` (`PATCH` takes `discoverLookups`). It is
 titles online*.
 
 **Trending and Because you read** (since v0.61.0). `GET /api/discover/trending?country=KR|JP|CN` (KR, manhwa, when
-absent; anything else is **400**) answers AniList's trending titles of that country of origin -- never 18+ on AniList,
-never a light novel, never one the server holds -- each country cached six hours; with Show 18+ off, a title carrying a
-genre the admin named as adult is left out of the answer. `GET /api/discover/because` answers `{seed: {id, title} |
-null, content}`, `content` in the trending shape: what AniList's readers recommend after the caller's most recently read
-series with a finished chapter (that they may list, in a library with AniList lookups on and a checked link), less what
-the server holds and what is 18+ for them -- the first of their last five such series that leaves at least four. Both
-sit behind the `canDownload` gate below; neither asks AniList for anything about the library.
+absent; anything else is **400**) answers `{content, pending}`: AniList's trending titles of that country of origin --
+never 18+ on AniList, never a light novel, never one the server holds -- each with `cover` and, since v0.98.0, `coverXL`
+(the same cover at its largest). With Show 18+ off, a title carrying a genre the admin named as adult is left out of the
+answer. Since v0.98.0 each country's list is stored on the server and answered from that copy at once, after a restart
+too, and refreshed in the background once it is six hours old; `pending: true` (with an empty `content`) only while a
+server that has never stored one is still fetching it -- ask again in a few seconds. `GET /api/discover/because`
+answers `{seed, seeds, content}`, `content` in the trending shape plus `because: {id, title}`: what AniList's readers
+recommend after the caller's last five read series with a finished chapter (that they may list, in a library with
+AniList lookups on and a checked link), one from each in turn, at most 30, less what the server holds and what is 18+
+for them. Each item's `because` is the series it came from; `seeds` lists those series and `seed` is the first of them
+(`null` with nothing to show). Before v0.98.0 it was one series' recommendations, `content` without `because`. Both sit
+behind the `canDownload` gate below; neither asks AniList for anything about the library.
 
 **Recommended for you** (since v0.71.0). `GET /api/discover/recommendations` answers `{content, sources, pending}` from
 the trackers the caller has connected (AniList and MyAnimeList seed it; any other connected list only adds to what is
@@ -555,6 +564,27 @@ browse it, in a library with AniList lookups on, through a checked link. It is a
 (`tracker_list_cache`: the list, read at most every 12 hours; `tracker_rec_cache`: what readers recommend after a title,
 once per server per 14 days) and waits up to 8 seconds for a first refresh; `pending: true` says one is still running.
 An account with nothing connected gets an empty `content`, and nothing is asked of any service. `Cache-Control: no-store`.
+
+**Personal Discover choices.** `GET /api/discover/state` answers `{tab, saved, hidden}` for the authenticated account.
+`tab` is `for-you` (the default) or `sources`; `PATCH /api/discover/state` with `{tab}` remembers it across devices,
+merging other account settings. `saved` contains normalized cards: `{key, id, title, cover, coverXL, banner,
+description, genres, score, chapters, status, country}` with unknown metadata null or empty. `hidden` contains work
+keys and their known title aliases. These responses are `private, no-store` with `Vary: *`.
+
+`PUT /api/discover/items/:key` takes `{saved?: boolean, hidden?: boolean, item?: {title, ...}}`, with at least one
+action. The key is `al:<positive AniList id>`, or `t:<NFKC, lower-case, letters/marks/digits-only title>` when no ID is
+known. The optional title is a matching hint only: the server resolves saved metadata and its adult rating from
+existing trusted catalog caches. Client-supplied art, synopsis and safety labels cannot replace it. Saving an unknown
+or forbidden title answers the same **404**. Feedback never calls an external service, creates a library series or
+downloads chapters. An account may keep up to 1,000 saved/hidden choices; adding beyond this answers **409**.
+
+Saving and hiding are independent: `{hidden:false}` restores a rejected title while retaining its saved state.
+`DELETE /api/discover/items/:key` clears both choices for that title; `DELETE /api/discover/hidden` resets rejections
+while preserving saved titles. Hidden choices suppress the caller's trending, recent-read and tracker recommendations.
+Saved cards are judged against the caller's current age cap, 18+ reveal and configured adult genres on each read.
+All endpoints require authentication and Discover's existing add-series permission; no account ID is accepted from
+the client. Private tracker entries and private local reading never seed new online recommendation requests.
+
 Responses worth handling: **200** with `message: "already in library"` if you have that exact series already,
 and **409** `duplicate` if a series with the same title came from a *different* source — retry with
 `"force": true` to add the second copy anyway.
@@ -812,6 +842,22 @@ cooldown ran out or a passing Test cleared it, while the evidence stays open unt
 offers `replace_source`, the source's `standing` is `cooling` (so it still carries its series and is never a
 `frozen-series` cause), and `GET /api/admin/sources` leaves it out of `failing`. The downloader's stored words for a
 refused chapter name the refusal it blamed -- *HTTP 429*, *HTTP 403* -- never a worse page status beside it.
+
+**Removing a source keeps downloads by default.** `DELETE /api/admin/series/:id/sources/:sourceId`
+keeps all chapter files, rows and reading progress. For explicit follower cleanup, `GET
+.../sources/:sourceId/leftovers` returns `{chapters, numbers, readers, lastSource, confirmation}` after fresh
+nonempty remaining-source listings. `POST .../sources/:sourceId/cleanup {confirmation}` rechecks the exact
+preview, deletes only downloaded chapters uniquely supplied by that follower, and detaches it atomically.
+It also removes those chapters' progress, bookmarks/offline records, and unique by-number marks/failures.
+The response is `{ok, purged: {removed, bytes, left[]}}`; `left` names files that could not be deleted, in which
+case `ok` is false and the source remains followed. Cleanup never deletes a chapter another source lists.
+
+A changed/expired preview is 409 `preview_changed`; an unavailable, empty or incomplete remaining listing is
+409 `listing_unavailable`; an active writer is 409 `busy`. To clean up the main source, first make a replacement
+main and keep the old main as a follower (`primary_source` otherwise). The last source's files always stay.
+Cleanup holds its writer claim before eligibility reads and protects the source/listing snapshot during file
+and row deletion. The audit event is `series.source_leftovers`. `POST
+/api/admin/series/:id/chapters/unlisted {bookIds}` answers `{unlisted}` for the delete dialog's warning.
 
 **Failed chapters follow the series** (since v0.55.3). A failed chapter (one row of the ledger Health's
 `chapter-failures` check reads) that is filed under a source its series no longer uses -- neither its main source nor
@@ -1072,6 +1118,10 @@ POST   /auth/totp/setup           POST   /auth/totp/enable
 POST   /auth/totp/disable
 GET    /auth/oidc/start             GET    /auth/oidc/callback
 GET    /auth/oidc/link
+GET    /auth/profiles             POST   /auth/switch
+GET    /auth/ring                 POST   /auth/resume
+GET    /auth/pick                 POST   /auth/profile-login
+POST   /auth/leave
 ```
 
 **SSO-only mode** (since v0.63.0, `AUTH_MODE=oidc-only`): `/api/setup`, `/auth/login`, `/auth/register`,
@@ -1119,13 +1169,17 @@ GET    /api/updates/expected
 POST   /api/refresh               GET    /api/refresh
 GET    /api/series/:id            GET    /api/series/:id/books
 GET    /api/series/:id/similar    GET    /api/series/:id/color
-GET    /api/series/:id/related
+GET    /api/series/:id/related    GET    /api/series/:id/other-titles
 POST   /api/series/search         GET    /api/leaderboard
 GET    /api/books/:id             POST   /api/books/:id/refetch
 GET    /api/books/:id/pages
 GET    /api/books/:id/next        PUT    /api/books/:id/progress
 PUT    /api/books/:id/pages/:n/junk
 PUT    /api/books/:id/pages/:n/spread
+GET    /api/admin/books/:id/page-cleanup
+POST   /api/admin/books/:id/page-cleanup
+GET    /api/admin/books/:id/page-rules
+PUT    /api/admin/books/:id/page-rules
 GET    /api/offline/plan             GET    /api/series/:id/listing
 GET    /api/series/:id/groups        GET    /api/series/:id/versions
 GET    /api/series/:id/gaps
@@ -1147,12 +1201,25 @@ background in the same six-hourly round as the outside ratings: missing entries 
 per request, a row asked again after a week -- never for a library whose AniList lookups are off, and never when a page
 opens.
 
+**Titles on AniList.** `GET /api/series/:id/other-titles` answers `{titles: {english, romaji, native} | null}`, the
+three titles of the AniList entry the series is linked to (each `null` when AniList has none). `titles` is `null` for
+a series with no checked AniList link, in a library whose AniList lookups are off, or whose entry has no names. The
+answer is kept (`series_other_titles`) and asked again after a month, or after a day when it was empty; a request asks
+AniList only then, and AniList being busy or down answers with what is kept. A series this account may not open is a
+`404`.
+
 **Filtering the library by source** (since v0.49.2; the filters are @TIGamingTV's, PR #124). On the owned
 backend, `POST /api/series/search` accepts two more conditions: `mainSource` (the source a series was added from,
 by id) and `anySource` (that, or a source it follows as a fallback). Both take `is` / `isNot`, and a source whose
 extension is gone still filters. Since v0.55.1 (#149) a third, `hasMainSource`, in Komga's boolean shape
 (`{operator: isTrue|isFalse}`, no value): `isFalse` is the series with no main source at all -- folders added by hand,
 and anything never matched to a site -- whatever sources they follow. Any other operator is 400 `unsupported_filter`.
+Since v0.100.0 ([#338](https://github.com/AngeloSha/uchiyomi/issues/338)) `authorName` (`is` / `isNot`, a name of up to
+200 characters, owned backend; Komga is asked `author` with `{name}`) lists the series whose author line names the same
+person: a whole name, never a fragment, in any spelling the name gives -- itself and each name in its brackets, compared
+by letters and digits in any case, so `Chugong (추공)` finds `추공` and `CHUGONG` but `Oh` is not inside `John Oh`. The
+line is the one the series page shows (an admin's edit, else the series' own, else the details the server filled in).
+`author`, Komga's fragment match, is unchanged. A search's `query` matches the author line as well as the title.
 `GET /api/library/sources` answers `{content, none}`: `content` lists `{id, name, main, any, installed}` for every
 source the viewer's library comes from, busiest first -- `main` counts the series added from it, `any` the series
 that read from it at all -- and `none` (since v0.55.1) counts the series with no main source, what `hasMainSource:
@@ -1249,6 +1316,35 @@ missing placeholder. `GET /api/books/:id/download-manifest` copies the same opti
 each affected entry in `pages`, so offline readers preserve the evidence. A complete chapter has
 `missingPages: null` and no page-level `missing` keys.
 
+**Reversible page cleanup (#354).** The four `/api/admin/books/:id/page-cleanup` and `page-rules` operations above
+require an admin account and admin token scope, with the same chapter visibility gate as reading. Cleanup GET
+returns `{revision, contentVersion, pages, retainedBytes, unusedRetainedBytes, unusedRetainedImages}`; each page has
+`number`, `name`, `bytes`, `gif`, `removed` and `restorable`. `revision` is an opaque SHA256 over the archive digest and
+cleanup state. POST accepts `{action, pages, revision, confirm:true}`, where `action` is `remove`, `restore`, `purge`
+or `purge-unused`. Use one to 500 page numbers, or an empty `pages` array for `purge-unused`.
+
+Removal replaces only the selected image bytes with small placeholders under the original ZIP entry names;
+numbered positions, progress, bookmarks and manual spread marks stay fixed. Originals are retained, deduplicated
+and verified under `CONFIG_DIR/page-trash`, and a durable journal precedes each atomic file replacement. `purge`
+explicitly makes selected removed originals unavailable before unlinking any blob no remaining restorable slot
+needs. `purge-unused` clears originals left after restoration or interrupted operations. No automatic expiry runs;
+neither action deletes a separate backup or a device's saved copy. Storage counts include all retained blobs,
+including originals already restored. The editor refuses unsupported formats, partial chapters, unsafe ZIPs,
+archives beyond 128 MiB compressed/decoded or 2,000 entries, busy writers and stale previews.
+
+Page lists and download manifests carry `removed:true` plus `restorable` for removed slots. A copied cleanup CBZ
+can retain those slot labels through its bounded embedded manifest, but another installation cannot restore it
+without the original server's trash/journal. An externally changed/refetched archive refuses restoration. All
+owned page lists/manifests carry an opaque `contentVersion`; append it as `cv` to page-image URLs, including `w` and
+`fit` variants. An old version URL answers **409** instead of receiving different bytes during an offline download.
+Clients must restart that download and discard partial blobs. Existing completed offline copies keep their bytes.
+
+Rules GET previews the current chapter's `.gif` page names, source/series rules and affected scope's chapter count.
+PUT accepts `{scope:'source'|'series', skipGif:boolean|null, confirm:true}`. Absent rules are disabled, a series rule
+overrides its source rule (including explicit false), and null removes that scoped rule. Matching uses the
+downloaded book's own stable `source_id`, never its series' current primary source. Rules skip on existing/future
+reads without editing files, and explicit `PUT .../pages/:n/junk {junk:false}` rescue always wins.
+
 Since v0.77.0 `GET /api/books/:id/pages?spreads=1` (#229, what the reader asks with *Join split double pages* on) adds
 `join: 'rtl' | 'ltr'` to a page that is, with the page after it, one double-page spread the source served as two files,
 and says which side that next page sits on (`rtl`: on its left, as a right-to-left book runs). The request never
@@ -1269,15 +1365,24 @@ the same display string.
 **Restore one deliberate tombstone by book id (v0.55.8).** A tombstone keeps its original `id`, `number`,
 `numberEnd`, title and the caller's `readProgress`; duplicate chapter numbers and ranges therefore remain distinct.
 `POST /api/books/:id/refetch` is the member-authorized restore used by a deleted ghost. It accepts no body and derives
-the only permitted copy from the row's stable book id, series, stored source and source-chapter id, and canonical
-download-root path. A client cannot supply or redirect any of them. The row must be visible to this account and
-deliberate rather than `missing`/`rescan_missing`. Its exact historical source need not still be followed: that stored
-identity is the authority, while its adapter must still be installed, enabled, outside cooldown and inside the
-account's age limit. The copy is pinned: an explicit restore may override the blocklist but never falls back to
-another copy. The standard download job answer is `{ok, started, folder, total}`; **404** deliberately covers an
-unknown/inaccessible id, and **409** `not_refetchable` covers a manual file, range, unsafe path, changed identity or
-canonical path, unavailable adapter, pending renumber or unwritable download root (`busy` while another writer owns
-the folder). Progress remains on the same book id when it lands.
+everything from the row's stable book id -- its series, number and canonical download-root path -- and the listing. A
+client cannot supply or redirect any of them. The row must be visible to this account and deliberate rather than
+`missing`/`rescan_missing`. Since [#437](https://github.com/AngeloSha/uchiyomi/issues/437) the copy is the one
+`POST /api/sources/fetch` takes for that number: the listing is refreshed first, and the release rules choose from the
+sources the series follows *now*, so a chapter deleted after the series moved to another source comes back from that
+one. That copy is not pinned: one that fails is taken from another followed source, as any Fetch's is. Only when no
+followed source lists the number is the copy stored on the row (its source and source-chapter id) asked: that source
+need not still be followed, but its adapter must still be installed, enabled, outside cooldown and inside the account's
+age limit, and the copy is pinned -- an explicit restore may override the blocklist but never falls back to another
+copy, and a change of the row's stored identity or canonical path while the job waits refuses it. The standard
+download job answer is `{ok, started, folder, total}`; **404** deliberately covers an unknown/inaccessible id;
+**403** `forbidden` when the copy a Fetch would take is on a source outside the age limit. Every **409** carries a
+`message` that says why and what to do: `busy` while another writer owns the folder, or `not_refetchable` with a
+`reason` -- `not_deleted`, `already_here`, `not_in_place` (a manual file, range or unsafe path), `renumber_pending`,
+`posting_order`, `hidden`, the Fetch's own `blocked_group`, `other_language`, `source_unavailable` or `cooldown`,
+`not_listed` (nothing the series follows lists the number and the stored copy cannot be asked) or `not_writable`
+(with `fix`). The route's own sentences carry `messageSaid` too, their code for the reader's language. Progress
+remains on the same book id when it lands.
 
 **Chapters the sources have that you don't.** `GET /api/series/:id/listing` answers
 `{checkedAt, content: [Ghost]}`: every chapter number the series' sources listed at the last check (the
@@ -1373,6 +1478,9 @@ GET    /api/sources/jobs          POST   /api/sources/add
 GET    /api/discover/trending     POST   /api/sources/fill/scan
 GET    /api/discover/works        GET    /api/discover/because
 GET    /api/discover/recommendations
+GET    /api/discover/state        PATCH  /api/discover/state
+PUT    /api/discover/items/:key   DELETE /api/discover/items/:key
+DELETE /api/discover/hidden
 GET    /api/sources/fill/scan/:id POST   /api/sources/fill
 POST   /api/sources/fetch
 GET    /api/sources/archive       POST   /api/sources/archive
@@ -1536,6 +1644,7 @@ between series; the rest read `skipped` *The server is shutting down.*
 ### Personal
 ```
 GET    /api/favorites             POST   /api/favorites
+PUT    /api/keep-reading/:seriesId   GET /api/keep-reading/hidden
 DELETE /api/favorites/:seriesId   PUT    /api/favorites/order
 GET    /api/history
 GET    /api/stats                 GET    /api/wrapped
@@ -1554,6 +1663,8 @@ GET    /api/tokens                POST   /api/tokens
 GET    /api/bookmarks             PUT    /api/bookmarks/:bookId/:page
 DELETE /api/bookmarks/:bookId/:page
 DELETE /api/tokens/:id            POST   /api/opds/token
+GET    /api/profiles              POST   /api/profiles
+PATCH  /api/profiles/:id          DELETE /api/profiles/:id
 GET    /api/opds/token            DELETE /api/opds/token
 PATCH  /api/opds/token
 GET    /api/trackers              POST   /api/trackers/anilist
@@ -1612,6 +1723,11 @@ sorts by `popularity`, `score`, `rating`, `chapters` and `lastRead` (see the Ope
   unreadable id and the web app omits it on the next edit; the API refuses a request that tries to add one (another
   member's private List, a malformed id).
 - `showAllChapters: boolean`, the account-wide unpaged chapter-list switch.
+- `notifyOnlyNext: boolean`, "Only tell me about my next chapter", off by default. When on, the account's web push and
+  the messages of notification targets aimed at it mention a series' new chapters only when one of them is the chapter the
+  series page's reading button would open (nothing half read; with chapters finished, the first unfinished one after the
+  highest finished; with none finished, the first). An announcement that names no chapter is always sent. Anything but
+  a boolean is refused with 400 `bad_settings`.
 - `incognito: boolean` (since v0.61.0), **Incognito reading**, for the whole account and enforced by the server: progress
   is still written, so Keep reading and every resume work, but no reading event is recorded -- history, streaks,
   Wrapped, the leaderboard, the household's Top 10 and member activity never see it -- and nothing is pushed to a
@@ -1701,7 +1817,7 @@ series per selected rail; an empty selected List reserves its position and appea
 
 **Smart and shared Lists** (since v0.61.0). `POST /api/collections {name, accent?, query?, shared?}`: a `query` makes a
 *smart* list, a saved Library search in the Library URL's own words -- `{v: 1, q?, read?: 'UNREAD' | 'IN_PROGRESS' |
-'READ', status?, genres?, lib?, src?, anysrc?, sort, dir?: 'asc' | 'desc'}`, `src: '-'` being *No source* and `sort`
+'READ', status?, genres?, lib?, src?, anysrc?, author?, sort, dir?: 'asc' | 'desc'}`, `src: '-'` being *No source* and `sort`
 one of `updated`, `read`, `new`, `popular`, `score`, `rating`, `chapters`, `unread`, `az` -- answered with the
 Library's own search, one card per work, for whoever opens it; an unknown key or an oversized value is **400**. A
 list's kind is fixed when it is made: `PATCH /api/collections/:id {query}` replaces a smart list's search and is
@@ -1781,6 +1897,8 @@ GET    /api/admin/notify-targets  POST   /api/admin/notify-targets
 PATCH  /api/admin/notify-targets/:id DELETE /api/admin/notify-targets/:id
 POST   /api/admin/notify-targets/:id/test
 GET    /api/admin/install-ping/preview
+GET    /api/admin/limits
+GET    /api/admin/network         PATCH  /api/admin/network
 GET    /api/admin/users           POST   /api/admin/users
 PATCH  /api/admin/users/:id       DELETE /api/admin/users/:id
 GET    /api/admin/sessions        DELETE /api/admin/sessions/:id
@@ -1811,6 +1929,24 @@ POST   /api/admin/sources/reload  GET    /api/admin/sources/custom
 POST   /api/admin/sources/custom  DELETE /api/admin/sources/custom/:id
 PATCH  /api/admin/sources/custom/:id
 PUT    /api/admin/series/:id/art  PUT    /api/admin/series/:id/meta
+POST   /api/library/upload
+POST   /api/admin/series/:id/logo/refresh
+GET    /api/admin/title-logos/status
+POST   /api/admin/title-logos/scan
+GET    /api/admin/title-extraction/capabilities
+GET    /api/admin/title-extraction/batch/status
+POST   /api/admin/title-extraction/batch/run
+POST   /api/admin/title-extraction/batch/cancel
+GET    /api/admin/series/:id/title-extraction/cover
+GET    /api/admin/series/:id/title-extraction
+POST   /api/admin/series/:id/title-extraction
+GET    /api/admin/series/:id/title-extraction/:jobId
+DELETE /api/admin/series/:id/title-extraction/:jobId
+GET    /api/admin/series/:id/title-extraction/:jobId/cover
+GET    /api/admin/series/:id/title-extraction/:jobId/preview
+GET    /api/admin/series/:id/title-extraction/:jobId/mask/baseline
+PATCH  /api/admin/series/:id/title-extraction/:jobId/mask
+POST   /api/admin/series/:id/title-extraction/:jobId/apply
 POST   /api/admin/series/:id/hero/shuffle
 PATCH  /api/admin/series/:id      DELETE /api/admin/series/:id
 POST   /api/admin/series/:id/editions DELETE /api/admin/series/:id/edition
@@ -1821,6 +1957,8 @@ GET    /api/admin/series/bulk/chapters/delete
 POST   /api/admin/series/bulk/chapters/delete/cancel
 GET    /api/admin/series/:id/scanlators GET    /api/admin/scanlators
 POST   /api/admin/series/:id/sources DELETE /api/admin/series/:id/sources/:sourceId
+GET    /api/admin/series/:id/sources/:sourceId/leftovers
+POST   /api/admin/series/:id/sources/:sourceId/cleanup {confirmation}
 POST   /api/admin/series/:id/main-source
 POST   /api/admin/series/:id/attach-source
 GET    /api/admin/series/:id/alt-titles POST   /api/admin/series/:id/alt-titles
@@ -1836,6 +1974,7 @@ POST   /api/admin/series/:id/delete-files
 POST   /api/admin/series/:id/forget
 POST   /api/admin/series/:id/rename-folder
 POST   /api/admin/series/:id/chapters/delete POST   /api/admin/series/:id/chapters/refetch
+POST   /api/admin/series/:id/chapters/unlisted
 POST   /api/admin/series/:id/chapters/keep-once
 POST   /api/admin/series/:id/chapters/hide POST   /api/admin/series/:id/chapters/unhide
 GET    /api/admin/series/:id/chapters/hidden
@@ -2004,15 +2143,19 @@ importer accepts `oldest` and `newest` only — `none` is the add dialog's).
 with a match-review step in between, and is what the admin UI uses — the plain importer above adds the
 first cross-source hit with no review and stays for scripted callers. `POST .../batches` takes the same
 `dataUrl`/`mangadexList`/`titles` intake as `/api/admin/import/parse`, starts matching in the background
-(one batch resolves at a time server-wide) and returns `{batchId, total, truncated, skippedNovels}`. It
+(one batch resolves at a time server-wide) and returns `{batchId, total, truncated, skippedNovels, leftOver}`. It
 searches at most 500 titles; since v0.51.0 the titles the library already holds are kept as skipped rows and
 do not count toward them, so `total` can be more than 500, and `truncated` says more titles not owned
-remained, which importing the same list again picks up once these are in. A
+remained, which importing the same list again picks up once these are in. Since v0.105.0 `leftOver` says how
+many (null when not counted: a batch from before, or a tracker read that stopped at its own cap), a title skipped
+in an earlier import of the list starts skipped and does not count either (remembered by its tracker id, else its
+title, until a pick un-skips it), and a tracker row whose entry a series here is already linked to (by a person or
+the check) is that series: owned at intake, and `status: already` at `/run` rather than a second copy. A
 fourth intake, `{origin: 'tracker', tracker: 'anilist' | 'myanimelist' | 'kitsu', statuses?: ('reading' |
 'plan_to_read' | 'completed' | 'on_hold' | 'dropped')[]}`, reads the requesting admin's OWN connected
 account (the connection `GET /api/trackers` shows for them, never another member's; `statuses` defaults to
-reading + plan_to_read) — up to 501 entries, of which the batch keeps 500 (`truncated` when the read hit the
-cap); light novels are dropped and counted as `skippedNovels` — both figures are also stored on the batch
+reading + plan_to_read) — up to 2001 entries since v0.105.0 (501 before), of which the batch keeps the first 500 not
+owned (`truncated` when the read hit the cap or more came after them); light novels are dropped and counted as `skippedNovels` — both figures are also stored on the batch
 row, as `skippedNovels` and `truncated` on every batch `GET` returns; entries are deduped by their id and
 by the normalised form of every name they go by, and each row carries `tracker`, `external_id`,
 `alt_titles` (romaji and synonyms, at most three, never an abbreviation whose normalised form is shorter
@@ -2037,10 +2180,25 @@ a rejected push leaves — 422 rather than 401 because a 401 is retried after a 
 then read `not_connected`; the same code, without disabling, when the stored token cannot be unsealed),
 **502** `tracker_unavailable` (no answer; nothing changed — a 400 or a 403 from the service never disables
 anything: only a 401, or AniList's "Invalid token" 400, is a verdict on the token).
+Since v0.108.0 (#433) every intake also takes `markRead: true` — the page's **Mark chapters I've read**, off when
+omitted, so a script that does not send it imports titles alone, as before; a `continueFrom` batch keeps the choice of
+the one it continues. It marks what each row says was read, for the requesting admin: the chapters a backup has marked
+read (BackupManga's chapters; a chapter's page is not read, since two sources page one chapter differently) and every
+chapter at or below the highest progress its trackers give, a provider named twice with two different entries giving
+none — at intake for a title already in the library, at `/run` once a series is added or found. Each number is
+authorised as the series page's own read ticks are: a number the series holds is marked on its chapter (tombstones
+included), one its sources list and this server does not hold is a `listing_progress` mark with `source: 'import'`
+that becomes a read chapter when it lands, and any other number is skipped. Nothing is marked unread, a chapter already
+read is left as it is, no `reading_events` row is written and nothing is pushed to a tracker; each read is stamped just
+before its file's mtime (never later than now), so the read-chapter cleanup never takes it for a read of this server's
+copy. A file holding a range is marked only once the tracker's number reaches its last chapter, and a series numbered by
+posting order or by its chapter titles, or with a renumber pending, is left alone: its numbers are not another app's.
 `GET .../batches/:id` polls `{batch, items}` — each item's `decision` is `unresolved | auto | manual | skip`
 and, once the batch leaves `resolving`, an `unresolved` row means "no match found" rather than "not looked
 at yet"; a tracker row reads `linked: true` when a `series_trackers` row carries its id (read live, not
-remembered). A row's
+remembered). The batch carries `mark_read`; each item `read_to` (the highest chapter its backup has marked read, null
+when none — the read set itself stays on the server) and `marked_read` (how many chapters this import marked read for
+the row). A row's
 `confidence` is `same_source` only when the backup entry's own Mihon source is installed here (a Suwayomi
 extension) and a hit's extension-relative path equals the url the backup stored -- Mihon's identity for a
 manga, which survives a retitle -- otherwise `exact | contains | fuzzy` from the title alone; a title with no
@@ -2056,7 +2214,8 @@ uuid, or more than 500 of them, is **400** `bad_request`), omitted means every e
 Each row's `status` afterwards is `added`, `already` (the library has the title — the same folder, or the
 same title from another source under a spelling the up-front `in_library` check missed) or the add's error
 code (`no_title`, `no_chapters`, `disabled`, `blocked`, `undownloadable`, `disk_full`, `bad_request`, `error`);
-`already` counts under the batch's `already`, an error code under `failed`. A tracker row that ends `added`
+`already` counts under the batch's `already`, an error code under `failed`. On a `markRead` batch a row that ends
+`added` or `already` is marked as described above, counted in its `marked_read`. A tracker row that ends `added`
 or `already` is linked to its tracker entry (`series_trackers`, `linked_by` = **the account whose list was
 read**, the batch's `user_id` — batches are shared between admins, and whoever calls `/run`, the link and
 the floor are the owner's; the caller appears only in the `import.batch.run` audit row, whose `detail`
@@ -2083,7 +2242,7 @@ next GET -- `review` with its unreached rows still ready, or `done` when every r
 `review` batch a run has been through with nothing left waiting (every remaining row skipped) is closed to
 `done` on GET as well, while one nothing was ever imported through (every title already owned) stays
 `review`. `GET /api/admin/import/batches` lists every batch newest first (`{content: [{id, origin, tracker,
-state, total, resolved, added, already, failed, skippedNovels, truncated, created_at, updated_at, stale}]}`,
+state, total, resolved, added, already, failed, skippedNovels, truncated, leftOver, created_at, updated_at, stale}]}`,
 no rows; `tracker` names the service a tracker batch was read from, null otherwise; `skippedNovels` (the
 novels a tracker read dropped, 0 for the other origins) and `truncated` (the intake kept 500 of a longer
 list, or the tracker read hit its cap) are the intake's own answer, kept on the row so a later view of the
@@ -2152,7 +2311,7 @@ use, `series` counting the series the group appears on. Memoised for 30 seconds.
 
 **Deleting a chapter from the server, and fetching it again.** The series-wide delete/refetch controls below are admin
 actions on chosen chapters; the narrower `POST /api/books/:id/refetch` described under Library is available to a
-member who may download and restores only that tombstone's canonical stored copy. All touch the download directory
+member who may download and restores only that tombstone, onto its own row. All touch the download directory
 only: a chapter the scanner found in the read library is never
 touched (`owned: false` on the Book), on the same footing as the read-chapter cleanup. Neither takes a
 typed confirmation; the client confirms with the count.
@@ -2442,16 +2601,21 @@ servers, against what AniList and MangaDex call those entries -- asked by id, 50
 MangaDex request, paced. A link to another work is removed, with the tracker floors recorded against it; a cover or
 banner of another work is cleared to a miss (an adaptation's banner stands when its anime is related to a manga named
 as the series); a person's link, an admin's art, a source's own cover and an entry the service no longer answers for
-(`unanswered`) are left as they are. It runs in the background a couple of minutes after a start, then every 6 h, on
-whatever is still unchecked (`checked_at` NULL on either table: rows from before v0.55.7, a link an edition copies,
-rows an older version writes after a rollback) -- resumable, every verdict written as it is reached; a service that
+(`unanswered`) are left as they are. A link named as the series only by a synonym moves to the entry a title search
+names so by its own title, when there is one (since v0.103.1; one search more, paced): its floors go, the cover and
+banner the old entry gave the series become the new entry's (`series_art.rev` goes up, so the pictures made from the
+old ones are not served again), and the direction and type are learned again from the new entry. It runs in the
+background a couple of minutes after a start, then every 6 h, on whatever is still unchecked (`checked_at` NULL on
+either table: rows from before v0.55.7, a link an edition copies, rows an older version writes after a rollback) --
+and once on every automatic link, checked or not, after an upgrade that changed the rule
+(`server_settings.match_check_rule` below the current one) -- resumable, every verdict written as it is reached; a service that
 does not answer stops the run with nothing decided for what it had to judge (`stopped: 'unavailable'`). `POST
 /api/admin/tasks/matches/run` checks every automatic match again, detached: `{ok: true, started: true}` or `{ok:
 false, error: 'busy'}`. `GET /api/admin/tasks` lists it as `{id: 'matches', name: 'Check online matches', schedule:
-'in the background, rechecked every 6h'}` with the last run that checked something: `{matches, removed, links:
+'in the background, rechecked every 6h'}` with the last run that checked something: `{matches, removed, moved, links:
 {checked, removed}, art: {checked, cleared}, unanswered, stopped?, ms}`, persisted in
 `server_settings.match_check_last_run` / `match_check_last_result`; audit `library.match_check` with the counts and
-the links and pictures removed (up to 50 named).
+the links and pictures removed (up to 50 named), and the links moved (`moves`, up to 50 named).
 
 **Repair the library.** `POST /api/admin/tasks/repair/run` (since v0.41.0; the Tasks panel's *Repair
 library*, and the *Fix* / *Fill now* / *Retry now* keys and the *Reset the solver* action on the Health page —
@@ -2970,7 +3134,8 @@ them:
   the spec and the same base as `read_progress.page`. Panels, Chunky and KOReader read page by page over
   this instead of downloading the CBZ; everything else keeps using the acquisition link. Without `maxWidth`
   the original bytes are served (shared cache with the web reader); with it, a JPEG no wider than asked
-  (64–2000).
+  (64–2000). Under the account's `opdsEstimatedBookmarks` (below, with the external readers) a page fetched this
+  way keeps the reader's place, and reading a chapter through to the end counts as reading it (since v0.108.0).
 - **Facets (OPDS 1.2 §7).** `/opds/series` and `/opds/search` carry `rel="http://opds-spec.org/facet"`
   links in four `opds:facetGroup`s -- Sort, Library, Genre, Status -- each with `thresholdCount` (how many
   of *your* series it leaves) and `opds:activeFacet` on the one in force. The matching query parameters are
@@ -3034,8 +3199,10 @@ entry it is linked to for tracker sync are kept only from an entry named as the 
 names -- its title, an admin's display title, its other names (`GET /api/admin/series/:id/alt-titles`), and those of
 the other language editions of its work -- once case, accents, bracketed asides and punctuation are set aside. A
 leading *The*, *A* or *An* is ignored only when at least six letters remain; otherwise matching is never by
-containment, because a spin-off's name contains its parent's. An answer that is another work is stored as the miss a "no
-match" is, so it is not asked again on every view. `/img/series/:id/thumb` is an admin's cover, else the source's
+containment, because a spin-off's name contains its parent's. An AniList entry named so only by a synonym is the last
+resort (since v0.103.1): the search's next answers -- six, never a light novel -- are asked for then, and the first
+named as the series by its own title (romaji, English, native) is taken instead. An answer that is another work is
+stored as the miss a "no match" is, so it is not asked again on every view. `/img/series/:id/thumb` is an admin's cover, else the source's
 cover or a checked AniList one, else the series' first page. What was stored before v0.55.7 is held to the same rule
 by **Check online matches** (Admin → Settings → Maintenance, above); Health's *Duplicate series* groups only links a person made or
 that were checked. `PUT /api/admin/series/:id/art {kind: 'cover', mode: 'first_page'}` makes the series' own first page
@@ -3055,6 +3222,7 @@ at once; a source with no picture, or that did not answer in time, is left out t
 own copy as an upload, so the cover survives the source changing or going away.
 ```
 GET    /img/series/:id/thumb      GET    /img/series/:id/backdrop
+GET    /img/series/:id/logo
 GET    /img/series/:id/hero
 GET    /img/extensions/icon/:pkgName
 GET    /img/books/:id/thumb       GET    /img/books/:id/page/:n
@@ -3405,3 +3573,39 @@ provider's *Subject mode* decides what that subject is.)
 - SSO sessions appear in **Profile → Account → Active sessions** as a device named "SSO" and can be revoked like any other.
 - Signing in through SSO does not ask for a second factor here; your identity provider is responsible for
   that. Local password logins still use Uchiyomi's own 2FA.
+
+Nightly local cover-title generation has separate default-off generation and available-checks application switches.
+The durable run/status/cancel APIs, private14-day review retention and source/model fingerprint behavior are described
+in [Nightly cover titles](cover-title-batch.md). Status reads do not start inference or metadata discovery.
+
+
+### Account-owned libraries and external readers
+
+```text
+GET /api/personal/privacy
+PUT /api/personal/privacy
+GET /api/personal/private-series
+GET /api/series/{id}/privacy
+PUT /api/series/{id}/privacy
+POST /api/series/{id}/private-management
+GET /api/external-readers
+PUT /api/external-readers
+POST /api/admin/import/batches/{id}/confirm
+POST /api/admin/import/batches/{id}/skip
+GET /api/v1/kosync/users/auth
+POST /api/v1/kosync/users/create
+GET /api/v1/kosync/syncs/progress/{document}
+PUT /api/v1/kosync/syncs/progress
+```
+
+Private additions use `visibility: private`; owner IDs are inferred from authentication. Existing shared content remains shared, and the account default starts off. A private copy has independent files/identity; it never implicitly reuses a shared copy. Owner-only management supports reversible removal and restoration. Permanent deletion requires an already removed, never-published private copy and explicit confirmation. This is server access control, not end-to-end encryption against the server operator.
+
+KOReader custom server: `https://your-server/api/v1/kosync`, Binary matching, API token as username and any dummy password. Give its token read/write scopes. A read-only token may pull but cannot push. Revocation/expiry and account/library restrictions apply. Documents not yet hashed or with ambiguous editions cannot update canonical progress. Hashing is bounded and follows scans. EPUB positions are preserved without inventing page boundaries.
+
+`externalReadingStats` and `opdsEstimatedBookmarks` are separate opt-ins, both off. Explicit small completion transitions can contribute counts at sync time, without estimated duration, streaks, badges or household ranking. First binding, bulk catch-up and duplicate delivery stay silent. Existing Incognito behavior remains private position with no events or tracker writes.
+
+OPDS page streaming (`opdsEstimatedBookmarks`; since v0.108.0, [#377](https://github.com/AngeloSha/uchiyomi/issues/377)): a `GET /opds/book/:id/page/:n` answered **200** at reading size — `maxWidth` absent, blank, the unfilled `{maxWidth}`, or 600 and up; narrower is a thumbnail and is ignored — moves the account's estimated place in that chapter, which the feed gives as `pse:lastRead` where the account has no real progress there. The fetch that first reaches the last page (`pse:count`) completes the chapter when its sitting — the chapter's counted fetches with no gap of six hours — reached at least half the pages going forward and began at least max(20 s, 0.5 s × pages) earlier. So a preload of every page, a jump to the end or a run of thumbnails never completes one, and a reader that loads ahead may complete one a few pages early. Pages before the end stay estimates. A completion is written as a KOReader one is: the furthest page, never downgraded, a tracker push, and under `externalReadingStats` one `reading_events` row with `origin: "opds"` (which `GET /api/external-readers` counts in `byReader`, `[{origin, chapters}]`); Incognito keeps the place and completion privately and writes neither. It is marked as inferred, and the read-chapter cleanup deletes no file on an inferred completion until a real one replaces it: the web reader's, a KOReader push, or Mark read.
+
+Image chapter uploads keep `POST /api/library/upload`: select `images=1`, a `.cbz` chapter `name`, and either a visible `seriesId` or `fresh=1&title=...`. Send ordered multipart `pages` files. Validation and configured upload/free-space limits apply; publication never overwrites an existing file. New-series `visibility`/`libraryId` are authenticated choices; existing-series uploads inherit its scope.
+
+Reviewed imports remain admin-only and account-owned. A mixed batch uses its destination as a default; validated remote private flags force those rows into the owner’s private scope. `POST /api/admin/import/batches` also accepts `{continueFrom: completedBatchId}` to idempotently create/reuse the next saved batch after reload. Bulk skip uses the route above. Candidate responses include `tracker_links`, `content_scope`, `ambiguous`, `auto_ambiguous` and `auto_matched_via` (and, since v0.108.0, `read_to` and `marked_read`); batch responses include `remainingCount`, `nextBatchId` and `canContinue` (and `mark_read`). Progress imported with `markRead` is the owner's alone and keeps each series' privacy: a private entry's chapters are marked on its private copy. Legacy skips are attributed only where retained owned batches establish their source; unattributable old records are retained without applying them to other accounts.

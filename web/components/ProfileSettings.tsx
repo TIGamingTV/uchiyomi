@@ -11,6 +11,7 @@ import { readShownOnce } from '@/lib/shownOnce';
 import { setTypeToSearchOn, typeToSearchOn } from '@/lib/typeToSearch';
 import { compactChaptersOn, setCompactChaptersOn } from '@/lib/compactChapters';
 import { showAllChaptersOn } from '@/lib/showAllChapters';
+import { notifyOnlyNextOn } from '@/lib/notifyOnlyNext';
 import { contextMenusOn, setContextMenusOn } from '@/lib/contextMenus';
 import { ReaderPrefs, loadPrefs, savePrefs, syncPrefsFromServer } from '@/lib/readerPrefs';
 import { Avatar, AVATAR_EMOJIS, AVATAR_COLORS, type AvatarData } from '@/components/Avatar';
@@ -22,17 +23,19 @@ import { IcCheck, IcChevronRight, IcDownload, IcLock, IcMoments, IcSliders, IcSp
 import { t as tr, LOCALES, keys, type Locale } from '@/lib/i18n';
 import { useT } from '@/lib/I18nProvider';
 import {
-  ChoiceRow, EditorSheet, MoreOptions, Row, RowBlock, RowGroup, RowSubgroup, SegmentedRow, SelectRow, SummaryRow, SwitchRow,
+  ChoiceRow, EditorSheet, LinkRow, MoreOptions, Row, RowBlock, RowGroup, RowSubgroup, SegmentedRow, SelectRow, SummaryRow, SwitchRow,
   useAutosave, useEditor,
 } from '@/components/settings';
 import type { PageView } from '@/components/ConsoleLayout';
 import { ModeArt, RepeatedArt, ThemeArt, ToneArt, WideArt } from '@/components/settingsArt';
 import { inDesktopWindow, isDesktop } from '@/lib/desktop';
+import { hasNativeAppActions, requestNativeAppAction, usesNativeCache } from '@/lib/native';
 import { useIncognito } from '@/components/IncognitoBanner';
 import { INCOGNITO_TEXT } from '@/lib/incognito';
 import { COMMENTS_TEXT, talkWantedOf } from '@/lib/comments';
 import { TONES, toneOf, type Tone } from '@/lib/tone';
 import { useReduceEffects } from '@/lib/useReduceEffects';
+import { PrivateLibraryDefaults } from '@/components/ContentScopePicker';
 
 /**
  * The profile's settings pages: General · Appearance · Reading · This device (v0.86.0), rows of the profile's one list
@@ -44,7 +47,7 @@ import { useReduceEffects } from '@/lib/useReduceEffects';
  * weekly goal and Incognito under Reading. Now each row is where its name says, a row's help folds to two lines, and a
  * category's line in the list says what is set in it.
  */
-export function useProfileSettingsViews(): { views: Record<string, PageView>; pointer: boolean } {
+export function useProfileSettingsViews(): { views: Record<string, PageView>; pointer: boolean; nativeControls: boolean } {
   // Uchiyomi Desktop (lib/desktop.ts): no This device -- no offline copies (the chapters are already on this disk;
   // copying them into the window's storage would store every one twice), no push service, and the app is installed.
   const desktop = isDesktop();
@@ -52,6 +55,8 @@ export function useProfileSettingsViews(): { views: Record<string, PageView>; po
   const { user } = useAuth();
   const { lang } = useT();
   const incognito = useIncognito();
+  const [nativeControls, setNativeControls] = useState(false);
+  useEffect(() => { setNativeControls(hasNativeAppActions()); }, []);
 
   // The reader's defaults, held here for Reading's rows and the line that sums them up.
   const [prefs, setPrefs] = useState(loadPrefs);
@@ -87,10 +92,10 @@ export function useProfileSettingsViews(): { views: Record<string, PageView>; po
     device: {
       icon: <IcDownload width={18} height={18} />, tint: 'bg-sky-500/15 text-sky-300',
       summary: [usage.usage > 0 ? bytes(usage.usage) : null, so.enabled ? tr('Keep favorites offline') : null].filter(Boolean).join(' · ') || undefined,
-      pane: <DevicePane usage={usage} />,
+      pane: <DevicePane usage={usage} nativeControls={nativeControls} />,
     },
   };
-  return { views, pointer };
+  return { views, pointer, nativeControls };
 }
 
 /**
@@ -113,7 +118,7 @@ function useHoverPointer(): boolean {
   return on;
 }
 
-const THEME_LABEL = { amoled: 'AMOLED', sepia: 'Sepia', gray: 'Gray' } as const;
+const THEME_LABEL = { amoled: 'AMOLED', paper: 'Paper', sepia: 'Sepia', gray: 'Gray' } as const;
 
 /* ================================ General ================================ */
 
@@ -131,6 +136,15 @@ function GeneralPane({ pointer }: { pointer: boolean }) {
   useEffect(() => { setContextMenus(contextMenusOn()); }, []);
   // Show all chapters at once (lib/showAllChapters.ts): on the account like Reduce effects, so every device the
   // reader signs in on opens the whole list; optimistic, and put back when the server refuses.
+  // Only tell this account about a new chapter when it is the one it would read next (bff lib/nextUp.ts). On the account
+  // like the switch above; the server reads it when it sends a push or a person-aimed target's message.
+  const notifyOnlyNext = notifyOnlyNextOn(user?.settings);
+  const saveNotifyOnlyNext = async (next: boolean) => {
+    const prev = notifyOnlyNext;
+    setSettings({ notifyOnlyNext: next });
+    try { await api('/api/settings', { method: 'PUT', json: { notifyOnlyNext: next } }); }
+    catch (e) { setSettings({ notifyOnlyNext: prev }); throw e; }
+  };
   const showAllChapters = showAllChaptersOn(user?.settings);
   const saveShowAllChapters = async (next: boolean) => {
     const prev = showAllChapters;
@@ -179,6 +193,12 @@ function GeneralPane({ pointer }: { pointer: boolean }) {
         )}
       </RowGroup>
 
+      <RowGroup title={tr('Notifications')}>
+        <SwitchRow id="notify-only-next" label={tr('Only tell me about my next chapter')}
+          help={tr('A new chapter notifies you only when it is the one the series page would open for you: you are caught up, with nothing older unread or half read. Applies to push alerts and to messages sent to you. Saved to your account.')}
+          on={notifyOnlyNext} onChange={saveNotifyOnlyNext} />
+      </RowGroup>
+
       <RowGroup title={tr('Shortcuts')}>
         {/* This device only (lib/typeToSearch.ts says why): single-key shortcuts must be possible to switch off. */}
         {pointer && (
@@ -196,6 +216,7 @@ function GeneralPane({ pointer }: { pointer: boolean }) {
       {/* v0.61.0: the account's, not this device's (lib/incognito.ts); the reader's sheet has the same switch. */}
       <RowGroup title={tr('Privacy')}>
         <SwitchRow id="incognito" label={tr(INCOGNITO_TEXT[0])} help={tr(INCOGNITO_TEXT[1])} on={incognito.on} onChange={incognito.set} />
+        <PrivateLibraryDefaults />
       </RowGroup>
     </>
   );
@@ -414,7 +435,7 @@ function ReadingSection({ prefs, set }: { prefs: ReaderPrefs; set: (p: Partial<R
           help={tr('Long strips and webtoons open in Webtoon mode, manga and right-to-left series in Paged. A series or a source you have set yourself keeps its own.')}
           on={prefs.autoMode} onChange={(autoMode) => set({ autoMode })} />
         <ChoiceRow id="reader-theme" label={tr('Theme')} value={prefs.theme} onChange={(theme) => set({ theme })}
-          options={(['amoled', 'sepia', 'gray'] as const).map((t) => ({ value: t, label: tr(THEME_LABEL[t]), art: <ThemeArt theme={t} /> }))} />
+          options={(['amoled', 'paper', 'sepia', 'gray'] as const).map((t) => ({ value: t, label: tr(THEME_LABEL[t]), art: <ThemeArt theme={t} /> }))} />
         {!isDesktop() && user?.talk && (
           <SwitchRow id="comments" label={tr(COMMENTS_TEXT[0])} help={tr(COMMENTS_TEXT[1])} on={talkWanted} onChange={saveTalk} />
         )}
@@ -425,6 +446,9 @@ function ReadingSection({ prefs, set }: { prefs: ReaderPrefs; set: (p: Partial<R
         <SegmentedRow id="fit" label={tr('Fit')} value={prefs.fitWidth ? 'width' : 'original'}
           options={[{ value: 'width', label: tr('Fit width') }, { value: 'original', label: tr('Original') }]}
           onChange={(v) => set({ fitWidth: v === 'width' })} />
+        <SegmentedRow id="paged-fit" label={tr('Page fit')} value={prefs.pagedFitWidth ? 'width' : 'whole'}
+          options={[{ value: 'whole', label: tr('Whole page') }, { value: 'width', label: tr('Fit width') }]}
+          onChange={(v) => set({ pagedFitWidth: v === 'width' })} />
         {/* v0.61.0: what a double-page spread becomes on a screen held upright. */}
         <ChoiceRow id="wide-pages" label={tr('Wide pages')} value={prefs.widePages} onChange={(widePages) => set({ widePages })}
           help={tr('On a screen held upright, a double-page spread can be split into its two pages, or turned on its side to fill the screen.')}
@@ -470,12 +494,26 @@ function ReadingSection({ prefs, set }: { prefs: ReaderPrefs; set: (p: Partial<R
 const PER_SERIES = ['3', '5', '10'] as const;
 type PerSeries = (typeof PER_SERIES)[number];
 
-function DevicePane({ usage }: { usage: { usage: number; quota: number } }) {
+function DevicePane({ usage, nativeControls }: { usage: { usage: number; quota: number }; nativeControls: boolean }) {
   return (
     <>
+      <NativeServerSettings available={nativeControls} />
       <DownloadsSection usage={usage} />
       <DeviceSection />
     </>
+  );
+}
+
+/** Native server controls use the same Profile rows and theme as the rest of the app. */
+function NativeServerSettings({ available }: { available: boolean }) {
+  if (!available) return null;
+  return (
+    <RowGroup id="server-connections" title={tr('Server connections')}>
+      <LinkRow label={tr('Manage servers')} help={tr('Choose a server saved on this device.')}
+        onClick={() => { requestNativeAppAction('servers'); }} />
+      <LinkRow label={tr('Reload interface')} help={tr('Check for an updated interface from this server.')}
+        onClick={() => { requestNativeAppAction('reload'); }} />
+    </RowGroup>
   );
 }
 
@@ -551,7 +589,8 @@ function DeviceSection() {
   // service: Electron ships none, so the switch could only ever fail with "The browser did not grant it." There
   // the row says where new-chapter alerts come from instead (V2 review, v0.45.0).
   const [inApp] = useState(() => inDesktopWindow());
-  const [supported] = useState(() => !inApp && typeof window !== 'undefined' && 'serviceWorker' in navigator && 'PushManager' in window && 'Notification' in window);
+  const [native] = useState(usesNativeCache);
+  const [supported] = useState(() => !inApp && !usesNativeCache() && typeof window !== 'undefined' && 'serviceWorker' in navigator && 'PushManager' in window && 'Notification' in window);
   const [enabledSrv, setEnabledSrv] = useState(false);
   const [key, setKey] = useState('');
   const [on, setOn] = useState(false);
@@ -566,7 +605,7 @@ function DeviceSection() {
       try {
         const k = await api<{ enabled: boolean; key: string }>('/api/push/key');
         setEnabledSrv(k.enabled); setKey(k.key);
-        if (k.enabled && typeof navigator !== 'undefined' && 'serviceWorker' in navigator) {
+        if (k.enabled && supported && typeof navigator !== 'undefined' && 'serviceWorker' in navigator) {
           const reg = await navigator.serviceWorker.ready;
           setOn(!!(await reg.pushManager.getSubscription()));
         }
@@ -623,7 +662,7 @@ function DeviceSection() {
     setCanInstall(!!(window as any).__yomiInstall);
     setIsIOS(/iphone|ipad|ipod/i.test(navigator.userAgent));
     // Uchiyomi Desktop's window (either mode) is an installed app already: nothing to install from it.
-    setStandalone(window.matchMedia('(display-mode: standalone)').matches || (navigator as any).standalone === true || inDesktopWindow());
+    setStandalone(window.matchMedia('(display-mode: standalone)').matches || (navigator as any).standalone === true || inDesktopWindow() || usesNativeCache());
   }, []);
 
   const install = async () => {
@@ -636,7 +675,7 @@ function DeviceSection() {
   };
 
   // Nothing to decide here: push is not configured on the server and the app is already installed.
-  if (!enabledSrv && standalone) return null;
+  if (native || (!enabledSrv && standalone)) return null;
 
   return (
     <RowGroup id="device" title={tr('Alerts and app')}>

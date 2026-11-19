@@ -127,10 +127,11 @@ test('the server\'s word alone marks the page as desktop, and it sticks', async 
   // (it did, at the end of the file -- the reintroduction caught it).
   assert.equal(desk.isDesktop(), false, 'the page was already desktop before this test -- it would prove nothing');
   shell(false);
+  api.setCurrentUser(null); // Independent desktop document, rather than a cross-account refresh in the server fixture.
   answer = () => json(200, { ...DESKTOP_USER, desktop: true });
   assert.equal((await api.refreshSession()).kind, 'authed');
   assert.equal(desk.isDesktop(), true, 'the server\'s desktop flag was ignored');
-  answer = () => json(200, { accessToken: 'x', user: { id: 'u' } });
+  answer = () => json(200, { accessToken: 'x', user: DESKTOP_USER.user });
   await api.refreshSession();
   assert.equal(desk.isDesktop(), true, 'the flag did not stick');
   assert.equal(desk.desktopShell(), false, 'the server\'s word counterfeited the shell marker');
@@ -240,7 +241,7 @@ test('the consoles lose exactly the pages Desktop has none of', async () => {
   const { ADMIN_SETTINGS } = await import('../lib/settingsIndex.admin');
   const { PROFILE_SETTINGS } = await import('../lib/settingsIndex.profile');
   const gone = (index: typeof ADMIN_SETTINGS) => index.categories
-    .filter((c) => !shown(c.when, { web: false, 'local-accounts': true, extensions: true, pointer: true, talk: false })).map((c) => c.id);
+    .filter((c) => !shown(c.when, { web: false, 'local-accounts': true, extensions: true, pointer: true, talk: false, 'native-app-controls': false })).map((c) => c.id);
   assert.deepEqual(gone(ADMIN_SETTINGS), ['members', 'sessions'], 'Desktop lists a page for other people, or loses one it has');
   assert.deepEqual(gone(PROFILE_SETTINGS), ['device', 'account'], 'Desktop lists This device or Account, or loses another page');
 });

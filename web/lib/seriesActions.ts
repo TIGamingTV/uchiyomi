@@ -13,9 +13,9 @@ import { t as tr } from './i18n';
 
 export type SeriesActionId =
   | 'notes' | 'markAllRead' | 'markAllUnread'
-  | 'findMissing' | 'hidden' | 'archive' | 'checkNew'
+  | 'findMissing' | 'hidden' | 'archive' | 'checkNew' | 'upload'
   | 'copyLink' | 'openTab'
-  | 'edit' | 'cover' | 'newBanner' | 'rename' | 'remove';
+  | 'edit' | 'cover' | 'move' | 'newBanner' | 'rename' | 'remove';
 
 export type SeriesActionGroupId = 'reading' | 'chapters' | 'share' | 'admin';
 
@@ -44,6 +44,8 @@ export interface SeriesActionsInput {
   isAdmin: boolean;
   /** `canDownload(user)`: Find missing chapters and the slow archive. */
   mayDownload: boolean;
+  /** Admin or an explicitly permitted uploader; enforced again by the upload route. */
+  mayUpload?: boolean;
   booksCount: number;
   /** The page's own `mayArchive` (something to archive, no archive on it yet). */
   mayArchive: boolean;
@@ -88,6 +90,7 @@ export function seriesActionGroups(x: SeriesActionsInput): SeriesActionGroup[] {
     ] : []),
   ];
   const chapters: SeriesAction[] = [
+    ...(x.mayUpload ? [{ id: 'upload' as const, label: tr('Upload chapters'), hook: 'upload-chapters', disabled: offline }] : []),
     // Refused below three chapters by the route itself, so not offered there.
     ...(x.mayDownload && x.booksCount >= 3 ? [{ id: 'findMissing' as const, label: tr('Find missing chapters'), disabled: offline }] : []),
     // #240: an admin's way back to the numbers hidden from this series, only while there is one -- a series with nothing
@@ -106,6 +109,8 @@ export function seriesActionGroups(x: SeriesActionsInput): SeriesActionGroup[] {
     // #242: a cover from one of the sources the series uses, or an upload. Here rather than a key under the art, where a
     // phone reads Continue first (v0.67.0); a desktop's poster opens it too.
     { id: 'cover' as const, label: tr('Change cover'), hook: 'change-cover', disabled: offline },
+    // Files it under another library (the Library's Select mode does the same for many): nothing on disk moves.
+    { id: 'move' as const, label: tr('Move library'), hook: 'move-library', disabled: offline },
     // Only while the hero is an automatic one: a real banner is changed in Edit details, and Shuffle answers 409 for it.
     ...(x.autoHero ? [{ id: 'newBanner' as const, label: tr('New banner'), hook: 'new-banner', disabled: offline }] : []),
     ...(x.hasFolder ? [{ id: 'rename' as const, label: tr('Rename folder'), disabled: offline }] : []),

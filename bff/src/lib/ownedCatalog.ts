@@ -1,14 +1,19 @@
 // Owned catalog backend: a drop-in for the `komga` client, returning Komga-shaped series/book DTOs from
 // the lib_* tables. enrichSeries/booksForUser in catalog.ts then add per-user state exactly as before.
 import { q, one } from './db';
-import { cbzPageDims, DL_ROOT, LIBRARY_ROOT, persistScan } from './library';
+import { cbzPageDims, DL_ROOT, LIBRARY_ROOT, pagesInNameOrder, persistScan } from './library';
 import { ViewCtx, Params, visible, browsable, ADULT_RATING } from './visibility';
 import { cleanDescription } from './htmlText';
 import { effectiveLang } from './seriesLang';
 import { noticeBook, noticeShown, visibleBookCount } from './noticeChapters';
 import { rangeEnd, numberText } from './chapterRanges';
+import { chapterName as extractChapterName, pageCmp } from './naming';
 import { anilistScoreOf } from './anilistScores';
 import { AUTO_DETAILS, authorOf, genresOf, summaryOf } from './autoDetailsSql';
+import { lineHas, nameKeys } from './authorNames';
+import { pageCleanupMetadata, pageFileVersion } from './pageCleanupFiles';
+import { env } from '../env';
+import path from 'node:path';
 
 interface Page<T> { content: T[]; totalElements: number; totalPages: number; number: number; size: number; first: boolean; last: boolean }
 
@@ -22,7 +27,7 @@ function page<T>(content: T[], total: number, p: number, size: number): Page<T> 
 // ⚠️ Every name here must ALSO be produced by the inner SELECT of `seriesSrcWith` below, which enumerates
 // its columns explicitly. Adding one to only one of the two makes EVERY series read fail with "column does
 // not exist" -- the series page, the library grid, search, the home rails, OPDS, all of it.
-const SERIES_COLS = 'id, title, summary, status, genres, author, age_rating, reading_direction, books_count, cover_book_id, web, created_at, latest_mtime, auto_update, library_id, library_pinned, source_chapters, source_missing, source_checked_at, source_id, lang, work_id';
+const SERIES_COLS = 'id, title, summary, status, genres, author, age_rating, reading_direction, books_count, cover_book_id, web, created_at, latest_mtime, auto_update, library_id, library_pinned, is_private, source_chapters, source_missing, source_checked_at, source_id, lang, work_id';
 
 /**
  * The one place a series is read from.
@@ -51,7 +56,7 @@ const seriesSrcWith = (gate: Gate, ctx: ViewCtx, p: Params, alias: string) => `(
          -- The stored count less the notice chapters this series hides (lib/noticeChapters.ts), so every badge,
          -- filter and sort over it, and the Komga-compatible series Mihon's tracker reads, counts what is listed.
          ${visibleBookCount('s')} AS books_count, s.cover_book_id, s.web, s.created_at, s.latest_mtime,
-         s.auto_update, s.library_id, s.library_pinned,
+         s.auto_update, s.library_id, s.library_pinned, s.is_private,
          -- What the source last said, so "how far behind is this?" is a column rather than a network call.
          -- Kept in step with SERIES_COLS above; see the warning there.
          s.source_chapters, s.source_missing, s.source_checked_at,
@@ -84,11 +89,14 @@ const browseSrc = (ctx: ViewCtx, p: Params, alias = 'sv') => seriesSrcWith(brows
  * order, next/previous, the OPDS feed and what the tracker is told. Mirrors SERIES_SRC.
  */
 const booksSrc = (ctx: ViewCtx, p: Params, alias = 'bv') => `(
-  SELECT b.id, b.series_id, b.source, b.file, b.root, b.pages, b.mtime, b.published_at, b.page_dims,
+  SELECT b.id, b.series_id, b.source, b.file, b.root, b.pages, b.mtime, b.published_at, b.page_dims, b.page_dims_version,
          b.updated_at, b.fingerprint, b.scanlator, b.source_id, b.pruned_at, b.pruned_reason, b.size, b.missing_pages, b.chapter_name,
          COALESCE(ov.number, b.number) AS number,
          ${rangeEnd('b', 'ov')} AS number_end,
-         COALESCE(ov.title,  b.title)  AS title
+         COALESCE(ov.title,  b.title)  AS title,
+         -- Only a title the admin changed. Edit chapter sends the title back with every save, so a number-only
+         -- edit stores the file's own title, and reading that as a name showed "Chapter 12" for chapter 13.
+         CASE WHEN ov.title IS DISTINCT FROM b.title THEN ov.title END AS title_override
     FROM lib_books b
     -- The join that was missing. This carried zero references to lib_series, so a book id alone opened a
     -- chapter of a hidden series and next/previous then walked the whole thing. Every series-level rule --
@@ -118,6 +126,7 @@ function seriesDto(r: any) {
   return {
     id: r.id,
     libraryId: r.library_id ?? 'lib',
+    isPrivate: r.is_private === true,
     // Whether an admin filed this series into that library by hand. Shown so the edit modal can say
     // "automatic" honestly rather than implying every placement was a decision someone made.
     libraryPinned: r.library_pinned === true,
@@ -194,7 +203,13 @@ function bookDto(r: any) {
     metadata: { title: r.title, number: numberText(num, end), numberSort: num, summary: '', releaseDate: released },
     // The chapter's own name as its source gave it (lib/library.ts chapterName), null when it had none. NOT
     // `name`/`metadata.title`, which are the filename's and keep saying so for every client that prints them.
-    chapterName: r.chapter_name ?? null,
+    // An admin's explicit title override is the name they chose in Edit chapter. Use the same
+    // number-aware extraction as source titles, so "Chapter 12: The Return" displays as "The Return" (#438).
+    // A plain "Chapter 12" intentionally clears the displayed name. Without an override, or when the
+    // override is only the file's title sent back unchanged, keep the source's chapter name; never derive
+    // one from the filename. Reintroduce by selecting ov.title as is: "a number-only edit keeps the
+    // chapter's name" in chapterNames.int.test.ts reads "Chapter 1".
+    chapterName: r.title_override != null ? extractChapterName(r.title_override, num) : (r.chapter_name ?? null),
     // Who released the file on disk and which adapter it came from (setBookMeta in lib/library.ts). Both
     // null for a book the scanner found rather than the downloader wrote. These are read through booksSrc's
     // explicit column list above: a name dropped there does not error, it silently reads as null here.
@@ -356,7 +371,52 @@ function condSqlOf(cond: any, params: any[], hasUser: boolean): string {
     return op === 'isFalse' ? '(sv.source_id IS NULL)' : '(sv.source_id IS NOT NULL)';
   }
 
+  // v0.100.0 (#338): an `authorName` leaf, already answered by resolveAuthorNames below as the series it names.
+  // Never built from a request body: JSON cannot make one, so a client sending its own id list gets a 400 below.
+  if (cond instanceof AuthorIds) {
+    if (!cond.ids.length) return cond.negate ? 'TRUE' : 'FALSE';
+    params.push(cond.ids);
+    const ex = `sv.id = ANY($${params.length}::text[])`;
+    return cond.negate ? `NOT (${ex})` : `(${ex})`;
+  }
+
   throw new UnsupportedFilter(Object.keys(cond).filter((k) => k !== 'operator')[0] || 'unknown');
+}
+
+/** The series one `authorName` leaf names, worked out before the tree is compiled (resolveAuthorNames). */
+export class AuthorIds {
+  constructor(readonly ids: string[], readonly negate: boolean) {}
+}
+
+/**
+ * v0.100.0 (#338): the Library's "by this author" (`{authorName: {operator: is|isNot, value}}`), answered here rather
+ * than in SQL. A whole name, in any of its spellings (lib/authorNames.ts): the folding is Unicode's letters and
+ * digits, which a database's collation would answer differently, and the name it is asked for came from the very
+ * line JavaScript split on the series page. Every series' line is read once per search -- one short column, only
+ * when the condition is there -- and each leaf becomes the ids it names; the listing's own gate (browseSrc) still
+ * decides what the viewer sees of them. Bounded first, as condSql is, so a huge tree is refused before any work.
+ */
+export async function resolveAuthorNames(cond: unknown): Promise<unknown> {
+  if (!cond || typeof cond !== 'object' || !JSON.stringify(cond).includes('"authorName"')) return cond;
+  assertCondBounded(cond);
+  let lines: Array<{ id: string; author: string | null }> | null = null;
+  const all = async () => (lines ??= await q<{ id: string; author: string | null }>(
+    `SELECT s.id, ${authorOf('o', 's', 'sad')} AS author
+       FROM lib_series s LEFT JOIN series_overrides o ON o.series_id = s.id
+       LEFT JOIN ${AUTO_DETAILS} sad ON sad.series_id = s.id`));
+  const walk = async (c: any): Promise<any> => {
+    if (!c || typeof c !== 'object') return c;
+    if (Array.isArray(c.allOf)) return { ...c, allOf: await Promise.all(c.allOf.map(walk)) };
+    if (Array.isArray(c.anyOf)) return { ...c, anyOf: await Promise.all(c.anyOf.map(walk)) };
+    if (!c.authorName || typeof c.authorName !== 'object') return c;
+    const { operator, value } = c.authorName;
+    if (operator !== 'is' && operator !== 'isNot') throw new UnsupportedFilter(`authorName:${operator}`);
+    if (typeof value !== 'string' || !value.trim() || value.length > 200) throw new UnsupportedFilter('authorName');
+    const wanted = nameKeys(value);
+    const ids = wanted.length ? (await all()).filter((r) => lineHas(r.author, wanted)).map((r) => r.id) : [];
+    return new AuthorIds(ids, operator === 'isNot');
+  };
+  return walk(cond);
 }
 
 /** Exposed for tests: the translator is pure apart from the params it pushes. */
@@ -510,12 +570,13 @@ const total = async (ctx: ViewCtx, where = 'TRUE', p = new Params(), cte = '', f
 
 export const owned = {
   libraries: async (ctx: ViewCtx) => {
-    const rows = await q<{ id: string; name: string; age_rating: number | null }>(
-      'SELECT id, name, age_rating FROM libraries ORDER BY sort_order, name',
-    );
+    const rows = await q<{ id: string; name: string; age_rating: number | null; owner_user_id: string | null }>(
+      'SELECT id, name, age_rating, owner_user_id FROM libraries ORDER BY sort_order, name');
     // A restricted viewer is told about the libraries they hold, not all of them: the list itself would
     // otherwise leak the existence and names of everything they cannot open.
-    const held = ctx.libraryIds ? rows.filter((r) => ctx.libraryIds!.includes(r.id)) : rows;
+    const held = rows.filter(r => (ctx.system || !r.owner_user_id || r.owner_user_id === ctx.userId)
+      && (!ctx.libraryIds || ctx.libraryIds.includes(r.id)
+        || (!ctx.libraryIds.includes('') && r.owner_user_id === ctx.userId)));
     // A library rated above this viewer's cap is one they can never open, so naming it is the same leak in
     // a different shape. This list had no notion of the age cap at all, which meant a 13+ account was shown
     // the name of the 18+ shelf and a tab that could only ever be empty.
@@ -701,7 +762,7 @@ export const owned = {
     // which unread, well-rated series that member had opened privately (v0.69.1). The viewer's own private places
     // still count -- they know what they opened. Reintroduce by dropping the incognito clause: "an Incognito read
     // leaves another member's Hidden gems alone" in gemsIncognito.int.test.ts sees the gem disappear.
-    const counts = `(NOT rp.incognito OR rp.user_id = ${p.add(ctx.userId ?? null)})`;
+    const counts = `((NOT rp.incognito AND NOT rp.is_private) OR rp.user_id = ${p.add(ctx.userId ?? null)})`;
     const rows = await q(
       `SELECT ${SERIES_COLS} FROM (
          SELECT DISTINCT ON (COALESCE(sv.work_id::text, sv.id)) sv.*, ${score} AS gem_score, ${pop} AS gem_pop
@@ -739,9 +800,12 @@ export const owned = {
       ? `${src} LEFT JOIN mine m ON m.series_id = sv.id LEFT JOIN fav f ON f.series_id = sv.id`
       : src;
 
-    let where = body?.condition ? condSql(body.condition, p.values as any[], wantsUser) : 'TRUE';
+    const condition = body?.condition ? await resolveAuthorNames(body.condition) : undefined;
+    let where = condition ? condSql(condition, p.values as any[], wantsUser) : 'TRUE';
     if (body?.fullTextSearch) {
-      where = `(${where}) AND title ILIKE ${p.add(`%${body.fullTextSearch}%`)}`;
+      // v0.100.0 (#338): the author line too, so typing a name finds what that person wrote.
+      const term = p.add(`%${body.fullTextSearch}%`);
+      where = `(${where}) AND (title ILIKE ${term} OR author ILIKE ${term})`;
     }
     if (collapse) return collapsedSearch(cte, from, where, p, pg, size, sortSql(sort, wantsUser), wantsUser);
     const t = await total(ctx, where, clone(p), cte, from);
@@ -817,8 +881,8 @@ export const owned = {
     // Goes through booksSrc so page dimensions cannot enumerate a chapter of a hidden series.
     const p = new Params();
     const bsrc = booksSrc(ctx, p);
-    const r = await one<{ file: string; root: string; pruned_at: string | null; missing_pages: number[] | null; page_dims: Array<{ name: string; width: number | null; height: number | null }> | null }>(
-      `SELECT file, root, pruned_at, missing_pages, page_dims FROM ${bsrc} WHERE id = ${p.add(id)}`,
+    const r = await one<{ file: string; root: string; pruned_at: string | null; missing_pages: number[] | null; page_dims_version: string | null; page_dims: Array<{ name: string; width: number | null; height: number | null }> | null }>(
+      `SELECT file, root, pruned_at, missing_pages, page_dims, page_dims_version FROM ${bsrc} WHERE id = ${p.add(id)}`,
       p.values as any[],
     );
     if (!r) return [];
@@ -831,16 +895,32 @@ export const owned = {
     // stays a page -- it has a real image behind it and keeps its number -- the mark only says what the
     // image is. Same idiom as `junk` on the route.
     const missing = new Set(Array.isArray(r.missing_pages) ? r.missing_pages.map(Number) : []);
-    const mark = <T extends { number: number }>(pg: T): T | (T & { missing: true }) => (missing.has(pg.number) ? { ...pg, missing: true as const } : pg);
-    if (Array.isArray(r.page_dims) && r.page_dims.length) {
-      return r.page_dims.map((pd, i) => mark({ number: i + 1, fileName: pd.name, mediaType: mediaType(pd.name), width: pd.width ?? null, height: pd.height ?? null, sizeBytes: null }));
+    const contentVersion = await pageFileVersion(path.join(r.root || LIBRARY_ROOT, r.file)).catch(() => undefined);
+    const cleanup = await pageCleanupMetadata({ bookId: id, file: path.join(r.root || LIBRARY_ROOT, r.file), store: path.join(env.CONFIG_DIR, 'page-trash') });
+    const mark = <T extends { number: number }>(pg: T) => ({ ...pg,
+      ...(missing.has(pg.number) ? { missing: true as const } : {}),
+      ...(contentVersion ? { contentVersion } : {}),
+      ...(cleanup.removed.has(pg.number) ? { removed: true as const, restorable: cleanup.restorable.has(pg.number), junk: true, width: 32, height: 48 } : {}),
+    });
+    const stable = async <T>(listed: T[]): Promise<T[]> => {
+      const after = await pageFileVersion(path.join(r.root || LIBRARY_ROOT, r.file)).catch(() => undefined);
+      if (after !== contentVersion) throw Object.assign(new Error('The chapter changed while its page list was being read. Reload it.'), { statusCode: 409 });
+      return listed;
+    };
+    if (Array.isArray(r.page_dims) && r.page_dims.length && (!cleanup.revision || !contentVersion || r.page_dims_version === contentVersion)) {
+      // The cache keeps the order its pages were measured in. Read it in today's page order, so sizes measured before
+      // pageCmp (#436) never show a folder-wrapped archive's pages in the old order, or out of step with the numbers
+      // page cleanup removes pages by. Reintroduce by returning page_dims as stored: "cached page sizes follow the
+      // page order" in archiveFormats.test.ts reads 10.png second.
+      const dims = pagesInNameOrder(r.file) ? [...r.page_dims].sort((a, b) => pageCmp(a.name, b.name)) : r.page_dims;
+      return stable(dims.map((pd, i) => mark({ number: i + 1, fileName: pd.name, mediaType: mediaType(pd.name), width: pd.width ?? null, height: pd.height ?? null, sizeBytes: null })));
     }
     const dims = await cbzPageDims(`${r.root || LIBRARY_ROOT}/${r.file}`).catch(() => [] as Array<{ name: string; width: number | null; height: number | null }>);
     // This is a cache, so a failed write must never hide readable pages; but once this call resolves a
     // second reader should be able to use the cache instead of opening the archive again. Fire-and-forget
     // made that ordering depend on database load and was exposed by the partial-chapter completion suite.
-    if (dims.length) await q('UPDATE lib_books SET pages = $1, page_dims = $2 WHERE id = $3', [dims.length, JSON.stringify(dims), id]).catch(() => {});
-    return dims.map((pd, i) => mark({ number: i + 1, fileName: pd.name, mediaType: mediaType(pd.name), width: pd.width, height: pd.height, sizeBytes: null }));
+    if (dims.length) await q('UPDATE lib_books SET pages = $1, page_dims = $2, page_dims_version = $4 WHERE id = $3', [dims.length, JSON.stringify(dims), id, contentVersion ?? null]).catch(() => {});
+    return stable(dims.map((pd, i) => mark({ number: i + 1, fileName: pd.name, mediaType: mediaType(pd.name), width: pd.width, height: pd.height, sizeBytes: null })));
   },
 
   // Next/previous compare (number, file) rather than number alone. Two chapters legitimately share a

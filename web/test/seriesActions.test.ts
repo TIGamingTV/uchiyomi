@@ -54,19 +54,19 @@ test('an admin: Check for new chapters, and the admin group with Remove from lib
     'reading: notes markAllRead markAllUnread',
     'chapters: findMissing archive checkNew',
     'share: copyLink openTab',
-    'admin: edit cover newBanner rename remove',
+    'admin: edit cover move newBanner rename remove',
   ]);
   const admin = seriesActionGroups(ADMIN).find((g) => g.id === 'admin')!;
   assert.equal(admin.heading, 'Admin');
   assert.deepEqual(admin.items.map((i) => [i.label, !!i.danger]), [
-    ['Edit details', false], ['Change cover', false], ['New banner', false], ['Rename folder', false], ['Remove from library', true],
+    ['Edit details', false], ['Change cover', false], ['Move library', false], ['New banner', false], ['Rename folder', false], ['Remove from library', true],
   ]);
   // New banner only while the hero is the automatic one; Rename folder only with a folder (sent to admins only).
-  assert.deepEqual(shape({ ...ADMIN, autoHero: false, hasFolder: false }).at(-1), 'admin: edit cover remove');
+  assert.deepEqual(shape({ ...ADMIN, autoHero: false, hasFolder: false }).at(-1), 'admin: edit cover move remove');
   // Never an admin's for anyone else, whatever else is true.
   for (const x of [{ ...ADMIN, isAdmin: false }, { ...DOWNLOADER, autoHero: true, hasFolder: true }]) {
     const ids = seriesActionGroups(x).flatMap((g) => g.items.map((i) => i.id));
-    for (const own of ['checkNew', 'edit', 'cover', 'newBanner', 'rename', 'remove'] as const) assert.ok(!ids.includes(own), `${own} is offered to a non-admin`);
+    for (const own of ['checkNew', 'edit', 'cover', 'move', 'newBanner', 'rename', 'remove'] as const) assert.ok(!ids.includes(own), `${own} is offered to a non-admin`);
   }
 });
 
@@ -77,6 +77,7 @@ test('the items a browser walk finds by their hook, whatever the language', () =
   assert.equal(hook('newBanner'), 'new-banner');
   assert.equal(hook('edit'), 'edit-details');
   assert.equal(hook('cover'), 'change-cover');
+  assert.equal(hook('move'), 'move-library');
   assert.equal(hook('remove'), 'remove-series');
 });
 
@@ -109,7 +110,7 @@ test('the Offline key: never in Uchiyomi Desktop, never on a series with nothing
 test('More as a menu: each group named above its first item, icons before the words, Remove apart', () => {
   const picked: string[] = [];
   const items = moreMenuItems(seriesActionGroups(ADMIN), (id) => { picked.push(id); });
-  assert.deepEqual(items.map((i) => i.heading ?? null), ['Reading', null, null, 'Chapters', null, null, 'Share', null, 'Admin', null, null, null, null]);
+  assert.deepEqual(items.map((i) => i.heading ?? null), ['Reading', null, null, 'Chapters', null, null, 'Share', null, 'Admin', null, null, null, null, null]);
   assert.ok(items.every((i) => i.icon), 'an item has no icon');
   const remove = items.at(-1)!;
   assert.equal(remove.label, 'Remove from library');
@@ -135,7 +136,7 @@ test('More as a sheet: headed groups of rows, the notes door a link, every row w
   assert.match(html, /data-remove-series=""[^>]*>.*?Remove from library<\/span>/);
   assert.match(html, /class="[^"]*text-rose-300[^"]*"[^>]*data-menu-item="remove-series"/, 'Remove from library is not in red');
   // Over the bottom nav: its last row is not under the bar on a phone.
-  assert.match(html, /pb-\[calc\(5\.5rem\+env\(safe-area-inset-bottom\)\)\]/, 'the sheet does not clear the bottom nav');
+  assert.match(html, /pb-\[calc\(5\.75rem\+env\(safe-area-inset-bottom\)\)\]/, 'the sheet does not clear the bottom nav');
 });
 
 test('the page: four keys under the button, More by width, the sheet closed before its action, the counts asked on opening', () => {

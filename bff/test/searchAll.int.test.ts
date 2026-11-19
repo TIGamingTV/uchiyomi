@@ -126,6 +126,76 @@ after(async () => {
   await q('DELETE FROM users WHERE username = ANY($1)', [USERS]);
 });
 
+test('author, artist and title searches never reuse each other or ask unsupported sources', { skip }, async () => {
+  const src = adapters[FAST] as any;
+  const unsupportedBefore = calls[EMPTY];
+  let creatorCalls = 0;
+  src.searchCreator = async (_q: string, kind: string, page = 1) => [{ source: FAST, sourceId: `${kind}-${page}-${++creatorCalls}`, title: `${kind} result ${page}` }];
+  try {
+    const title = await lib.searchAll('Creator Cache Isolation', [src], { waitMs: 6000, health: await hmap() });
+    const author = await lib.searchAll('Creator Cache Isolation', [src, adapters[EMPTY]], { waitMs: 6000, health: await hmap(), creator: 'author' });
+    const artist = await lib.searchAll('Creator Cache Isolation', [src], { waitMs: 6000, health: await hmap(), creator: 'artist' });
+    assert.notEqual(title.per.get(FAST)?.items[0].title, author.per.get(FAST)?.items[0].title);
+    assert.equal(author.per.get(FAST)?.items[0].title, 'author result 1');
+    assert.equal(artist.per.get(FAST)?.items[0].title, 'artist result 1');
+    assert.equal(author.asked, 1);
+    assert.equal(calls[EMPTY], unsupportedBefore);
+    const response = await app.inject({ method: 'GET', url: `/api/sources/search?source=${FAST}&q=Creator&creator=artist&page=2`, headers: tok(ids.plain) });
+    assert.equal(response.statusCode, 200);
+    assert.equal(response.json().content[0].title, 'artist result 2');
+    const all = await app.inject({ method: 'GET', url: `/api/sources/search-all?source=${FAST}&q=Creator%20Cache%20Isolation&creator=artist`, headers: tok(ids.plain) });
+    assert.equal(all.statusCode, 200);
+    assert.equal(all.json().content[0].title, 'artist result 1');
+    const first = await lib.searchAll('Lee 王', [src], { waitMs: 6000, health: await hmap(), creator: 'author' });
+    const other = await lib.searchAll('Lee 李', [src], { waitMs: 6000, health: await hmap(), creator: 'author' });
+    assert.notEqual(first.per.get(FAST)?.items[0].sourceId, other.per.get(FAST)?.items[0].sourceId,
+      'different creator names must not share the title normalizer that strips non-Latin characters');
+    for (const route of ['search', 'search-all']) {
+      const invalid = await app.inject({ method: 'GET', url: `/api/sources/${route}?source=${FAST}&q=Creator&creator=invalid`, headers: tok(ids.plain) });
+      assert.equal(invalid.statusCode, 400, 'an invalid creator field must not silently become a title query');
+    }
+  } finally { delete src.searchCreator; }
+});
+
+test('a creator search keeps the selected provider whole before paging past its first hundred works', { skip }, async () => {
+  const src = adapters[FAST] as any;
+  src.searchCreator = async (_q: string, _kind: string, page = 1) => Array.from({ length: page === 1 ? 100 : 1 }, (_, n) => ({
+    source: FAST, sourceId: `creator-large-${(page - 1) * 100 + n}`, title: `Creator Work ${(page - 1) * 100 + n}`,
+  }));
+  try {
+    const first = await app.inject({ method: 'GET', url: `/api/sources/search-all?source=${FAST}&q=Large%20Creator%20Catalogue&creator=author`, headers: tok(ids.plain) });
+    assert.equal(first.statusCode, 200);
+    assert.equal(first.json().content.length, 100, 'the default global cap must not skip works 31 through 100');
+    const next = await app.inject({ method: 'GET', url: `/api/sources/search?source=${FAST}&q=Large%20Creator%20Catalogue&creator=author&page=2`, headers: tok(ids.plain) });
+    assert.equal(next.json().content[0].sourceId, 'creator-large-100');
+  } finally { delete src.searchCreator; }
+});
+
+test('creator caches preserve case and unsupported roles cannot read a previously cached answer', { skip }, async () => {
+  const src = adapters[FAST] as any;
+  let asked = 0;
+  src.searchCreator = async (name: string) => { asked++; return [{ source: FAST, sourceId: name, title: name }]; };
+  try {
+    const first = await lib.searchAll('Case Creator', [src], { waitMs: 6000, health: await hmap(), creator: 'author' });
+    const second = await lib.searchAll('case creator', [src], { waitMs: 6000, health: await hmap(), creator: 'author' });
+    assert.equal(first.per.get(FAST)?.items[0].title, 'Case Creator');
+    assert.equal(second.per.get(FAST)?.items[0].title, 'case creator');
+    assert.equal(asked, 2, 'a case-sensitive creator reused a differently cased search');
+    await lib.searchAll('Artist Cache Role', [src], { waitMs: 6000, health: await hmap(), creator: 'artist' });
+    src.creatorFields = ['author'];
+    const before = asked;
+    const blocked = await lib.searchAll('Artist Cache Role', [src], { waitMs: 6000, health: await hmap(), creator: 'artist' });
+    assert.equal(blocked.asked, 0);
+    assert.equal(blocked.per.size, 0, 'an unsupported role read cached results');
+    for (const route of ['search', 'search-all']) {
+      const r = await app.inject({ method: 'GET', url: `/api/sources/${route}?source=${FAST}&q=Artist%20Cache%20Role&creator=artist`, headers: tok(ids.plain) });
+      assert.equal(r.statusCode, 200);
+      assert.deepEqual(r.json().content, []);
+    }
+    assert.equal(asked, before, 'an unsupported field called the adapter');
+  } finally { delete src.searchCreator; delete src.creatorFields; }
+});
+
 test('the first answer comes a grace after the fast source, with the slow ones still pending', { skip }, async () => {
   // Reintroduce by making `graceEnd` Infinity in searchAll's wait loop (waiting for every source, as the
   // old fan-out did): the answer arrives when the slow pair settles at SLOW_MS, "pending" reads 0 and fails.
@@ -388,12 +458,36 @@ test('evicting pending entries cancels their queued source work', { skip }, asyn
 test("normTerm is the route's norm, title for title", { skip }, () => {
   // The entry key and the title grouping use the lib's copy; the library check uses the route's. Two rules
   // would be two answers to "is this the same title". The titles cover every class the rule strips (space,
-  // apostrophe, colon, hyphen, brackets, digits kept, non-Latin dropped), so letting any one of them through
+  // apostrophe, colon, hyphen, brackets, digits and every script kept), so letting any one of them through
   // on one side shows. Reintroduce by changing either regex (say, keeping `-` in normTerm): Re:Zero disagrees.
-  for (const t of ['Solo Leveling', "JoJo's Bizarre Adventure: Part 7", 'ONE PIECE!!', 'Re:Zero -Starting Life in Another World-', 'Kimetsu no Yaiba — 鬼滅の刃 (2019)']) {
+  for (const t of ['Solo Leveling', "JoJo's Bizarre Adventure: Part 7", 'ONE PIECE!!', 'Re:Zero -Starting Life in Another World-', 'Kimetsu no Yaiba — 鬼滅の刃 (2019)', '大魔導士', 'Ｓｏｌｏ Ｌｅｖｅｌｉｎｇ', 'Cafe\u0301 大魔導士']) {
     assert.equal(lib.normTerm(t), routes.norm(t), `the two rules disagree on "${t}"`);
   }
   assert.equal(lib.normTerm('SOLO LEVELING!'), 'sololeveling', 'the rule itself changed');
+});
+
+test('title search caches distinguish mixed-script identities while equivalent Unicode spellings reuse the result', {skip},async()=> {
+  const src=adapters[FAST],before=calls[FAST];lib.clearSearchCache();
+  try {
+    const first=await lib.searchAll('Café 大魔導士 １',[src],{waitMs:6000,health:await hmap()});
+    const other=await lib.searchAll('Café 鬼滅の刃 １',[src],{waitMs:6000,health:await hmap()});
+    assert.notEqual(first.per.get(FAST)?.items[0].title,other.per.get(FAST)?.items[0].title,'shared Latin fragments cannot reuse the other title’s cached identity');
+    assert.equal(calls[FAST]-before,2);
+    const equivalent=await lib.searchAll('Ｃａｆé 大魔導士 1',[src],{waitMs:6000,health:await hmap()});
+    assert.equal(equivalent.per.get(FAST)?.items[0].title,first.per.get(FAST)?.items[0].title);
+    assert.equal(calls[FAST]-before,2,'NFKC-equivalent spelling reuses the same title entry');
+  } finally {lib.clearSearchCache();}
+});
+
+test('title grouping keeps native lettering and independent entries from the same source', {skip},()=> {
+  const item=(source:string,sourceId:string,title:string)=>({source,sourceId,title});
+  const grouped=lib.groupByTitle(new Map([
+    [FAST,{state:'ok',items:[item(FAST,'native-a','大魔導士'),item(FAST,'native-b','鬼滅の刃'),item(FAST,'native-a-other','大魔導士')]}],
+    [SLOW1,{state:'ok',items:[item(SLOW1,'native-a-copy','大魔導士')]}],
+  ]),[adapters[FAST],adapters[SLOW1]]);
+  assert.equal(grouped.length,3,'native titles stay visible and distinct source entries are not silently folded');
+  assert.equal(grouped.find(g=>g.providers.some(p=>p.sourceId==='native-a'))?.providers.length,2,'an exact native title can still group across sources');
+  assert.equal(grouped.find(g=>g.providers.some(p=>p.sourceId==='native-a-other'))?.providers.length,1);
 });
 
 test('the detail lookup is one fetch for a pre-warm and the pick that joins it, then a cached answer', { skip }, async () => {
@@ -417,6 +511,24 @@ test('the detail lookup is one fetch for a pre-warm and the pick that joins it, 
 });
 
 // ---- the 18+ filter (v0.55.4, #158) --------------------------------------------------------------------------------------
+
+test('manual matching retains results beyond twelve and can request another source page', { skip }, async () => {
+  const { registerAdapter } = await import('../src/lib/sources');
+  const term = 'Manual matching long list';
+  const entries = Array.from({ length: 40 }, (_, i) => ({ title: `Manual candidate ${i + 1}` }));
+  const src = probe('sb-manual-pages', 'Manual pages', term, entries) as any;
+  src.searchPage = async (_term: string, page: number) => page === 2
+    ? [{ source: src.id, sourceId: 'manual-page-2', title: 'The correct entry on page two' }] : [];
+  registerAdapter(src);
+  const url = `/api/sources/search-all?q=${encodeURIComponent(term)}&groupBy=source&sources=${src.id}&wait=1000`;
+  const first = await app.inject({ method: 'GET', url, headers: tok(ids.plain) });
+  assert.equal(first.statusCode, 200, first.body);
+  const rail = first.json().content.find((r: any) => r.source === src.id);
+  assert.equal(rail.results.length, 40, 'the manual rail must not discard every match after twelve');
+  const next = await app.inject({ method: 'GET', url: `/api/sources/search?source=${src.id}&q=${encodeURIComponent(term)}&page=2`, headers: tok(ids.plain) });
+  assert.equal(next.statusCode, 200, next.body);
+  assert.equal(next.json().content[0].sourceId, 'manual-page-2');
+});
 
 /** A fake answering only `term`, with these results: anything else is an empty answer, so no other test meets it. */
 function probe(id: string, name: string, term: string, items: Array<{ title: string; genres?: string[]; contentRating?: string }>,

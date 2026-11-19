@@ -256,14 +256,16 @@ test("normTitle is the server's norm, character for character", () => {
   // through on one side): "have drifted apart" fails, naming both.
   const rule = (file: string, name: string) => {
     const src = readFileSync(join(ROOT, file), 'utf8');
-    const m = src.match(new RegExp(`export const ${name} = \\(\\w+: string\\) => \\w+(\\.toLowerCase\\(\\)\\.replace\\(\\/.*?\\/[a-z]*, ''\\));`));
-    assert.ok(m, `${file} no longer defines ${name} as the lowercase-and-strip rule`);
+    const m = src.match(new RegExp(`export const ${name} = \\(\\w+: string\\) => \\w+(\\.normalize\\('NFKC'\\)\\.toLowerCase\\(\\)\\.replace\\(\\/.*?\\/[a-z]*, ''\\));`));
+    assert.ok(m, `${file} no longer defines ${name} as the Unicode-normalize/lowercase/strip rule`);
     return m[1];
   };
   const web = rule('lib/normTitle.ts', 'normTitle');
   const bff = rule('../bff/src/routes/sources.ts', 'norm');
   assert.equal(web, bff, `web/lib/normTitle.ts and bff/src/routes/sources.ts have drifted apart:\n  ${web}\n  ${bff}`);
-  assert.equal(normTitle('SOLO LEVELING!'), 'sololeveling', 'the rule itself changed');
+  assert.equal(normTitle('SOLO LEVELING!'), 'sololeveling', 'ASCII spelling compatibility');
+  assert.equal(normTitle('Ｓｏｌｏ Leveling'), 'sololeveling', 'width variants compare equal');
+  assert.notEqual(normTitle('大魔導士'), normTitle('別の漫画'), 'native titles retain identity');
 });
 
 test('the Discover page folds its wall and opens a card from the fold', () => {
@@ -295,11 +297,11 @@ test('the page reads both views through the live answers, hides owned works on t
   const src = readFileSync(join(ROOT, 'app/discover/page.tsx'), 'utf8');
   const code = src.replace(/\/\*[\s\S]*?\*\//g, '').split('\n').filter((l) => !l.trim().startsWith('//')).join('\n');
   assert.match(code, /const wallKeys = useMemo\(\(\) => unknownWorks\(mine\(byId\)\.flatMap\(\(\[, list\]\) => list\)\), \[byId, mine\]\);/);
-  assert.match(code, /const wallWorks = useLiveWorks\(wallKeys, mayAdd && mode === 'newest'\);/, 'the wall is not asked about while it is on screen');
+  assert.match(code, /const wallWorks = useLiveWorks\(wallKeys, mayAdd && tab === 'sources' && mode === 'newest'\);/, 'the wall is not asked about while it is on screen');
   assert.match(code, /const rows = useMemo\(\(\) => Object\.fromEntries\(mine\(byId\)\.map\(\(\[k, list\]\) => \[k, applyWorks\(list, wallWorks\)\]\)\), \[byId, mine, wallWorks\]\);/,
     'the wall does not read its rows through the answers');
   assert.match(code, /for \(const it of rows\[key\] \?\? \[\]\) \{/, 'the wall does not read its rows through the answers');
-  assert.match(code, /const searchWorks = useLiveWorks\(searchKeys, mayAdd && mode === 'search'\);/, 'search is not asked about while it is on screen');
+  assert.match(code, /const searchWorks = useLiveWorks\(searchKeys, mayAdd && tab === 'sources' && mode === 'search'\);/, 'search is not asked about while it is on screen');
   assert.match(code, /const searchGroups = useMemo\(\(\) => mergeGroups\(applyWorks\(searchQ\.data\?\.content \?\? \[\], searchWorks\)\), \[searchQ\.data, searchWorks\]\);/);
   assert.equal((code.match(/foldByWork\(/g) ?? []).length, 1, 'search drops what you have: the wall\'s fold runs twice');
   assert.match(code, /const key = workKey\(it\);[\s\S]{0,600}?fromKey\.current = key \|\| null;/, 'open() does not remember which card the dialog is for');

@@ -26,6 +26,13 @@ export interface EngineOp {
 const op = (name: string, doc: string, optional = false): EngineOp =>
   Object.freeze(optional ? { name, doc, optional } : { name, doc });
 
+// Authentication is opt-in transport setup, not an operation every adapter sends. These documents still
+// validate against the captured supported schemas alongside ALL_OPS.
+export const AUTH_OPS = {
+  login: op('login', 'mutation($input:LoginInput!){login(input:$input){accessToken refreshToken}}'),
+  refreshToken: op('refreshToken', 'mutation($input:RefreshTokenInput!){refreshToken(input:$input){accessToken}}'),
+} as const;
+
 // `sourceId`: which extension source the manga belongs to. Engine manga ids are global, so an adapter checks it (v0.69.1).
 const MANGA_FIELDS = 'id title thumbnailUrl realUrl url description author artist genre status sourceId';
 /**
@@ -58,6 +65,10 @@ const PREF_SHAPES = `__typename
 const prefWrite = (field: string, type: string) => `mutation($source:LongString!,$position:Int!,$value:${type}){
   updateSourcePreference(input:{source:$source,change:{position:$position,${field}:$value}}){ preferences { ${PREF_SHAPES} } } }`;
 
+// Filter unions keep every position, but only TextFilter names and bounded group nesting are needed here.
+const creatorFilterShapes = (depth: number): string => `__typename ... on TextFilter { name }
+  ${depth ? `... on GroupFilter { filters { ${creatorFilterShapes(depth - 1)} } }` : ''}`;
+
 export const OPS = {
   // ---- the engine itself
   /** `buildType` replaced `revision`, which the version already carries as its patch number. */
@@ -69,9 +80,15 @@ export const OPS = {
    * (siteSessions.ts). Not `baseUrl`, which every supported engine marks deprecated ("replace with homeUrl").
    */
   sources: op('sources', '{ sources { totalCount nodes { id name displayName lang iconUrl homeUrl contentWarning supportsLatest extension { pkgName name } } } }'),
-  fetchSourceManga: op('fetchSourceManga', `mutation($source:LongString!,$type:FetchSourceMangaType!,$query:String,$page:Int!){
-  fetchSourceManga(input:{source:$source,type:$type,query:$query,page:$page}){ mangas { ${MANGA_FIELDS} } }
+  // Read apart and after registration: one broken extension's getFilterList cannot hide ordinary sources.
+  sourceCreatorFilters: op('sourceCreatorFilters', `query SourceCreatorFilters { sources { nodes { id filters { ${creatorFilterShapes(2)} } } } }`, true),
+  fetchSourceManga: op('fetchSourceManga', `mutation($source:LongString!,$type:FetchSourceMangaType!,$query:String,$page:Int!,$filters:[FilterChangeInput!]){
+  fetchSourceManga(input:{source:$source,type:$type,query:$query,page:$page,filters:$filters}){ mangas { ${MANGA_FIELDS} } }
 }`),
+  /** Read existing engine rows only: never create a manga by fetching a caller-supplied URL. */
+  mangaIdentity: op('mangaIdentity', `query($source:LongString!,$paths:[String!]!){
+    mangas(condition:{sourceId:$source},filter:{url:{in:$paths}},first:2){ nodes { ${MANGA_FIELDS} } }
+  }`),
   /**
    * The series, through `fetchMangaAndChapters`, which replaced `fetchManga` and runs the same engine code. ⚠️ It
    * catches a failure of the update and answers the STORED series with the error attached (`data` and `errors` both;

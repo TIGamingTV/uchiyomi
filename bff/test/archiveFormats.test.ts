@@ -201,6 +201,37 @@ test('CBZ: the same three assertions, for the format that has coverage elsewhere
   });
 });
 
+test('ZIP: a numbered wrapper folder does not mask page numbers', async () => {
+  const { cbzPages, cbzPageAt, cbzPageDims, eachPageBytes } = await import('../src/lib/library');
+  const AdmZip = require('adm-zip');
+  const sharp = (await import('sharp')).default;
+  await withLibrary(async (root) => {
+    const file = join(root, 'Series [3948394].zip');
+    const folder = 'Series [3948394]/';
+    const names = ['1.png', '2.png', '10.png', '95.jpg'].map(name => folder + name);
+    const pages = [PAGES[0][1], PAGES[1][1], PAGES[2][1], await sharp(PAGES[0][1]).jpeg().toBuffer()];
+    const zip = new AdmZip();
+    for (const i of [3, 0, 2, 1]) zip.addFile(names[i], pages[i]);
+    await writeFile(file, zip.toBuffer());
+
+    assert.deepEqual(await cbzPages(file), names);
+    assert.deepEqual((await cbzPageDims(file)).map(page => page.name), names);
+    assert.deepEqual(await cbzPageAt(file, 1), { name: names[1], bytes: pages[1], total: 4 });
+    const streamed: Array<Buffer | null> = [];
+    await eachPageBytes(file, async bytes => { streamed.push(bytes); });
+    assert.deepEqual(streamed, pages);
+    // A CBZ is the same zip with another name, and people zip a folder and rename it every day: the same order.
+    const cbz = join(root, 'Series [3948394] 2.cbz');
+    await writeFile(cbz, zip.toBuffer());
+    assert.deepEqual(await cbzPages(cbz), names, 'a .cbz kept the old order');
+    // Page cleanup removes pages by NUMBER and the reader hides them by number, so the two must count alike.
+    // Reintroduce `.sort(naturalCmp)` in lib/pageCleanupFiles.ts and cleanup's page 2 is 10.png.
+    const { previewPageCleanup } = await import('../src/lib/pageCleanupFiles');
+    const preview = await previewPageCleanup({ bookId: 'wrapped', file: cbz, store: join(root, 'page-trash') });
+    assert.deepEqual(preview.pages.map((p) => p.name), names, 'page cleanup numbers the pages in another order');
+  });
+});
+
 test('listChapters accepts all three formats, and nothing else', async () => {
   const { listChapters, cbzPages, cbzPageAt } = await import('../src/lib/library');
   await withLibrary(async (root) => {

@@ -200,6 +200,337 @@ after(async () => {
   if (root) rmSync(root, { recursive: true, force: true });
 });
 
+test('a weak original-title hit loses to an exact alternate and its provenance survives manual/auto restoration',{skip},async()=> {
+  const {app,headers,uid}=await boot();
+  FAKE_TITLES['weak probe']={sourceId:'weak-probe',title:'Weak Probe Extended'};
+  const restore=await stubAniList(async()=>[entry('ranked','Weak Probe',{altTitles:['Later Source Title']})]);
+  let id='';
+  try {
+    await connectAniList(uid);const r=await trackerIntake(app,headers);assert.equal(r.statusCode,200,r.body);id=r.json().batchId;
+    const row=(await waitForState(app,headers,id,['review'])).items[0];assert.deepEqual([row.match_source,row.confidence,row.matched_via],[LATER,'exact','Later Source Title']);
+    assert.equal((await app.inject({method:'PATCH',url:`/api/admin/import/candidates/${row.id}`,headers,payload:{decision:'manual',source:FAKE,sourceId:'fm-1',title:'Fake Manga'}})).statusCode,200);
+    assert.equal((await app.inject({method:'PATCH',url:`/api/admin/import/candidates/${row.id}`,headers,payload:{decision:'auto'}})).statusCode,200);
+    const restored=(await app.inject({method:'GET',url:`/api/admin/import/batches/${id}`,headers})).json().items[0];assert.equal(restored.matched_via,'Later Source Title');
+  } finally {delete FAKE_TITLES['weak probe'];restore();if(id)await q('DELETE FROM import_batches WHERE id=$1',[id]);await cleanupTracker(uid);await app.close();}
+});
+
+test('duplicate exact source entries require confirmation, including after restoring the automatic choice',{skip},async()=> {
+  const {app,headers}=await boot(),{registerAdapter,unregisterAdapter}=await import('../src/lib/sources');
+  const source='import-ambiguous-fixture';let id='';
+  registerAdapter({...fakeAdapter(),id:source,preferredOrder:-10,async search(term:string){return term==='Ambiguous Native 大魔導士'?[{source,sourceId:'a',title:term},{source,sourceId:'b',title:term}]:[];}} as any);
+  try {
+    const r=await app.inject({method:'POST',url:'/api/admin/import/batches',headers,payload:{titles:['Ambiguous Native 大魔導士']}});id=r.json().batchId;
+    const row=(await waitForState(app,headers,id,['review'])).items[0];assert.equal(row.ambiguous,true);
+    assert.equal((await app.inject({method:'POST',url:`/api/admin/import/batches/${id}/run`,headers})).json().error,'nothing_to_import');
+    await app.inject({method:'PATCH',url:`/api/admin/import/candidates/${row.id}`,headers,payload:{decision:'manual',source,sourceId:'a',title:row.match_title}});
+    await app.inject({method:'PATCH',url:`/api/admin/import/candidates/${row.id}`,headers,payload:{decision:'auto'}});
+    assert.equal((await app.inject({method:'GET',url:`/api/admin/import/batches/${id}`,headers})).json().items[0].ambiguous,true);
+  } finally {unregisterAdapter(source);if(id)await q('DELETE FROM import_batches WHERE id=$1',[id]);await app.close();}
+});
+
+test('a renamed backup entry uses source/path catalogue identity before a misleading title result', { skip }, async () => {
+  const { registerAdapter: register, unregisterAdapter } = await import('../src/lib/sources');
+  const registerAdapter = (adapter: any) => { unregisterAdapter(SW_ADAPTER); register(adapter); };
+  const { resolveCandidate } = await import('../src/routes/sources');
+  let searches = 0;
+  registerAdapter({ ...swAdapter(), async lookupByPath(path: string, timeout: number) {
+    assert.equal(path, '/manga/enen'); assert.ok(timeout > 0 && timeout <= 5000);
+    return [{ source: SW_ADAPTER, sourceId: '425-renamed', title: 'Enen no Shouboutai', path: 'manga/enen/' }];
+  }, async search() { searches++; return [{ source: SW_ADAPTER, sourceId: '425-wrong', title: 'Fire!', path: '/manga/fire' }]; } } as any);
+  try {
+    const match = await resolveCandidate({ title: 'Fire Force', sourceIdUnsigned: SW_ID, url: '/manga/enen' });
+    assert.deepEqual([match?.sourceId, match?.title, match?.confidence, match?.ambiguous], ['425-renamed','Enen no Shouboutai','same_source',false]);
+    assert.equal(searches, 0, 'a proved identity does not need a misleading title search');
+  } finally { registerAdapter(swAdapter() as any); }
+});
+
+test('backup path proof is checked across aliases even when the original search has a conflicting exact title', { skip }, async () => {
+  const { registerAdapter: register, unregisterAdapter } = await import('../src/lib/sources');
+  const registerAdapter = (adapter: any) => { unregisterAdapter(SW_ADAPTER); register(adapter); };
+  const { resolveCandidate } = await import('../src/routes/sources');
+  const terms: string[] = [];
+  registerAdapter({ ...swAdapter(), async lookupByPath() { return []; }, async search(term: string) {
+    terms.push(term);
+    return term === 'Fire Force' ? [{ source: SW_ADAPTER, sourceId: '425-wrong', title: term, path: '/manga/unrelated' }]
+      : [{ source: SW_ADAPTER, sourceId: '425-alias', title: 'Enen no Shouboutai', path: '/manga/enen/' }];
+  } } as any);
+  try {
+    const match = await resolveCandidate({ title: 'Fire Force', altTitles: ['Enen no Shouboutai'], sourceIdUnsigned: SW_ID, url: 'manga/enen' });
+    assert.deepEqual([match?.sourceId, match?.confidence, match?.matchedVia, match?.ambiguous], ['425-alias','same_source','Enen no Shouboutai',false]);
+    assert.deepEqual(terms, ['Fire Force','Enen no Shouboutai']);
+  } finally { registerAdapter(swAdapter() as any); }
+});
+
+test('a moved address on the backup\'s own source is held as the suggestion', { skip }, async () => {
+  // #425: the site moved its entries (a new section in front of the same slug), so the saved path no longer proves the
+  // entry, and the title search under another name ("Enen no Shouboutai" for "Fire Force") scores nothing.
+  const { registerAdapter: register, unregisterAdapter } = await import('../src/lib/sources');
+  const registerAdapter = (adapter: any) => { unregisterAdapter(SW_ADAPTER); register(adapter); };
+  const { resolveCandidate } = await import('../src/routes/sources');
+  registerAdapter({ ...swAdapter(), async lookupByPath() { return []; }, async search() {
+    return [{ source: SW_ADAPTER, sourceId: '425-fire', title: 'Fire!', path: '/series/fire' },
+      { source: SW_ADAPTER, sourceId: '425-moved', title: 'Enen no Shouboutai', path: '/series/enen/' }];
+  } } as any);
+  try {
+    const match = await resolveCandidate({ title: 'Fire Force', sourceIdUnsigned: SW_ID, url: '/manga/enen' });
+    assert.deepEqual([match?.sourceId, match?.confidence, match?.ambiguous], ['425-moved','same_source',true]);
+  } finally { registerAdapter(swAdapter() as any); }
+});
+
+test('a held suggestion on the backup\'s own source is not replaced unreviewed by another source\'s exact title', { skip }, async () => {
+  const { registerAdapter: register, unregisterAdapter } = await import('../src/lib/sources');
+  const registerAdapter = (adapter: any) => { unregisterAdapter(SW_ADAPTER); register(adapter); };
+  const { resolveCandidate } = await import('../src/routes/sources');
+  const other = 'import-other-exact';
+  // The backup's own source has the title exactly, at a path that proves nothing; another source has it exactly too.
+  registerAdapter({ ...swAdapter(), async lookupByPath() { return []; }, async search(term: string) {
+    return [{ source: SW_ADAPTER, sourceId: '425-held', title: term, path: '/manga/elsewhere' }];
+  } } as any);
+  register({ ...fakeAdapter(), id: other, preferredOrder: -50, async search(term: string) { return [{ source: other, sourceId: 'other-exact', title: term }]; } } as any);
+  try {
+    const match = await resolveCandidate({ title: 'Held Home Probe', sourceIdUnsigned: SW_ID, url: '/manga/held' });
+    assert.equal(match?.ambiguous, true, 'a match was made ready to import without a person confirming it');
+    assert.equal(match?.source, SW_ADAPTER, 'another source took the place of the backup\'s own');
+  } finally { unregisterAdapter(other); registerAdapter(swAdapter() as any); }
+});
+
+test('Confirm selected accepts the held suggestions among a selection, and leaves the rest', { skip }, async () => {
+  const { app, headers } = await boot(), { registerAdapter, unregisterAdapter } = await import('../src/lib/sources');
+  const source = 'import-confirm-fixture'; let id = '';
+  registerAdapter({ ...fakeAdapter(), id: source, preferredOrder: -10, async search(term: string) {
+    return term === 'Held Twice' ? [{ source, sourceId: 'a', title: term }, { source, sourceId: 'b', title: term }]
+      : term === 'Plainly Here' ? [{ source, sourceId: 'p', title: term }] : [];
+  } } as any);
+  try {
+    const r = await app.inject({ method: 'POST', url: '/api/admin/import/batches', headers, payload: { titles: ['Held Twice', 'Plainly Here'] } }); id = r.json().batchId;
+    const items = (await waitForState(app, headers, id, ['review'])).items;
+    const held = items.find((c: any) => c.backup_title === 'Held Twice'), plain = items.find((c: any) => c.backup_title === 'Plainly Here');
+    assert.equal(held.ambiguous, true, 'PREMISE: two exact entries hold the suggestion'); assert.equal(plain.ambiguous, false);
+    const confirmed = await app.inject({ method: 'POST', url: `/api/admin/import/batches/${id}/confirm`, headers, payload: { candidateIds: [held.id, plain.id] } });
+    assert.equal(confirmed.statusCode, 200, confirmed.body); assert.equal(confirmed.json().updated, 1, 'a row with nothing held was changed');
+    const after = (await app.inject({ method: 'GET', url: `/api/admin/import/batches/${id}`, headers })).json().items;
+    const h = after.find((c: any) => c.id === held.id), p = after.find((c: any) => c.id === plain.id);
+    assert.deepEqual([h.decision, h.ambiguous, h.match_source_id], ['manual', false, held.match_source_id], 'the suggestion shown is the one accepted');
+    assert.deepEqual([p.decision, p.ambiguous], [plain.decision, false]);
+  } finally { unregisterAdapter(source); if (id) await q('DELETE FROM import_batches WHERE id=$1', [id]); await app.close(); }
+});
+
+test('cold identity misses and failed catalogue reads leave divergent suggestions for review', { skip }, async () => {
+  const { registerAdapter: register, unregisterAdapter } = await import('../src/lib/sources');
+  const registerAdapter = (adapter: any) => { unregisterAdapter(SW_ADAPTER); register(adapter); };
+  const { resolveCandidate } = await import('../src/routes/sources');
+  for (const fails of [false,true]) {
+    registerAdapter({ ...swAdapter(), async lookupByPath() { if (fails) throw new Error('engine timeout'); return []; },
+      async search() { return [{ source: SW_ADAPTER, sourceId: '425-wrong', title: 'Fire!', path: '/manga/fire' }]; } } as any);
+    try {
+      const match = await resolveCandidate({ title: 'Fire Force', sourceIdUnsigned: SW_ID, url: '/manga/enen' });
+      assert.deepEqual([match?.sourceId, match?.confidence, match?.ambiguous], ['425-wrong','contains',true]);
+    } finally { registerAdapter(swAdapter() as any); }
+  }
+});
+
+test('identity recovery shares the existing query budget and a timed-out lookup still reaches safe title review', { skip }, async () => {
+  const { registerAdapter: register, unregisterAdapter } = await import('../src/lib/sources');
+  const registerAdapter = (adapter: any) => { unregisterAdapter(SW_ADAPTER); register(adapter); };
+  const { resolveCandidate } = await import('../src/routes/sources');
+  let calls = 0;
+  const ids = Array.from({ length: 25 }, (_, i) => `425-budget-${i}`);
+  for (const id of ids) register({ ...fakeAdapter(), id, preferredOrder: -100, async search() { calls++; return []; } } as any);
+  registerAdapter({ ...swAdapter(), async lookupByPath() { calls++; return []; }, async search() { calls++; return []; } } as any);
+  try {
+    await resolveCandidate({ title: 'Unmatched Budget Probe', altTitles: ['Budget Alternate One','Budget Alternate Two','Budget Alternate Three'], sourceIdUnsigned: SW_ID, url: '/budget' });
+    assert.equal(calls, 24, 'identity read consumes a slot, not another full source-search budget');
+    for (const id of ids) unregisterAdapter(id);
+    registerAdapter({ ...swAdapter(), async lookupByPath() { return new Promise(() => {}); }, async search() {
+      return [{ source: SW_ADAPTER, sourceId: '425-wrong', title: 'Fire!', path: '/manga/fire' }];
+    } } as any);
+    const started = Date.now();
+    const match = await resolveCandidate({ title: 'Fire Force', sourceIdUnsigned: SW_ID, url: '/manga/enen' });
+    assert.equal(match?.ambiguous, true);
+    assert.ok(Date.now() - started < 8000, 'lookup timeout leaves the overall resolve budget available');
+  } finally { for (const id of ids) unregisterAdapter(id); registerAdapter(swAdapter() as any); }
+});
+
+test('duplicate identity paths require review and foreign lookup results cannot prove home identity', { skip }, async () => {
+  const { registerAdapter: register, unregisterAdapter } = await import('../src/lib/sources');
+  const registerAdapter = (adapter: any) => { unregisterAdapter(SW_ADAPTER); register(adapter); };
+  const { resolveCandidate } = await import('../src/routes/sources');
+  const row = { source: SW_ADAPTER, sourceId: '425-a', title: 'Renamed', path: '/manga/identity' };
+  registerAdapter({ ...swAdapter(), async lookupByPath() { return [row, { ...row, sourceId: '425-b' }]; }, async search() { return []; } } as any);
+  try {
+    const match = await resolveCandidate({ title: 'Original Identity', sourceIdUnsigned: SW_ID, url: '/manga/identity' });
+    assert.equal(match?.confidence, 'same_source'); assert.equal(match?.ambiguous, true);
+    registerAdapter({ ...swAdapter(), async lookupByPath() { return [{ ...row, source: 'sw:foreign' }]; }, async search() { return []; } } as any);
+    assert.equal(await resolveCandidate({ title: 'Original Identity', sourceIdUnsigned: SW_ID, url: '/manga/identity' }), null);
+  } finally { registerAdapter(swAdapter() as any); }
+});
+
+test('disabled backup sources are not asked for identity, and two source-id renderings never pick an arbitrary home', { skip }, async () => {
+  const { registerAdapter: register, unregisterAdapter } = await import('../src/lib/sources');
+  const registerAdapter = (adapter: any) => { unregisterAdapter(SW_ADAPTER); register(adapter); };
+  const { resolveCandidate, mihonSourceToAdapter } = await import('../src/routes/sources');
+  let lookups = 0, searches = 0;
+  registerAdapter({ ...swAdapter(), async lookupByPath() { lookups++; return []; }, async search() { searches++; return []; } } as any);
+  try {
+    await q('UPDATE suwayomi_sources SET enabled=false WHERE source_id=$1', [SW_ID]);
+    await resolveCandidate({ title: 'Identity Only Probe', sourceIdUnsigned: SW_ID, url: '/manga/identity' });
+    assert.equal(lookups, 0);
+    const { setDisabled } = await import('../src/lib/sourceHealth');
+    await setDisabled(SW_ADAPTER, true); searches = 0;
+    await resolveCandidate({ title: 'Identity Only Probe', sourceIdUnsigned: SW_ID, url: '/manga/identity' });
+    assert.deepEqual([lookups, searches], [0,0], 'a source switched off in Health is never queried');
+    await q("INSERT INTO suwayomi_sources(source_id,name,enabled) VALUES ('-425','Ambiguous id fixture',true)");
+    await q('UPDATE suwayomi_sources SET enabled=true WHERE source_id=$1', [SW_ID]);
+    assert.equal(await mihonSourceToAdapter({ sourceIdUnsigned: SW_ID, sourceIdSigned: '-425' }), null);
+  } finally {
+    await q("DELETE FROM suwayomi_sources WHERE source_id='-425'");
+    await q('UPDATE suwayomi_sources SET enabled=true WHERE source_id=$1', [SW_ID]);
+    await q('DELETE FROM source_health WHERE source_id=$1', [SW_ADAPTER]);
+    registerAdapter(swAdapter() as any);
+  }
+});
+
+test('unconfirmed divergent matches cannot be imported by explicit ids or restored automatic decisions, including legacy rows', { skip }, async () => {
+  globalThis.fetch = pixelFetch;
+  const { app, headers } = await boot();
+  let id = '';
+  FAKE_TITLES['fire force'] = { sourceId: '425-wrong', title: 'Fire!' };
+  try {
+    const intake = await app.inject({ method: 'POST', url: '/api/admin/import/batches', headers, payload: { titles: ['Fire Force'] } });
+    assert.equal(intake.statusCode, 200, intake.body); id = intake.json().batchId;
+    const row = (await waitForState(app,headers,id,['review'])).items[0];
+    assert.equal(row.ambiguous, true);
+    // Simulate an older server's persisted suggestion, then call /run without a GET that could repair it.
+    await q('UPDATE import_candidates SET ambiguous=false,auto_ambiguous=false WHERE id=$1', [row.id]);
+    const run = () => app.inject({ method: 'POST', url: `/api/admin/import/batches/${id}/run`, headers, payload: { candidateIds: [row.id] } });
+    assert.equal((await run()).json().error, 'nothing_to_import');
+    assert.equal((await q('SELECT ambiguous,auto_ambiguous FROM import_candidates WHERE id=$1',[row.id]))[0].auto_ambiguous, true);
+    assert.equal((await app.inject({ method: 'PATCH', url: `/api/admin/import/candidates/${row.id}`, headers,
+      payload: { decision: 'manual', source: FAKE, sourceId: 'fm-1', title: 'Fake Manga' } })).statusCode, 200);
+    assert.equal((await app.inject({ method: 'PATCH', url: `/api/admin/import/candidates/${row.id}`, headers, payload: { decision: 'auto' } })).statusCode, 200);
+    assert.equal((await run()).json().error, 'nothing_to_import');
+    await app.inject({ method: 'PATCH', url: `/api/admin/import/candidates/${row.id}`, headers,
+      payload: { decision: 'manual', source: FAKE, sourceId: 'fm-1', title: 'Fake Manga' } });
+    const confirmed = await run(); assert.equal(confirmed.statusCode, 200, confirmed.body);
+    const done = await waitForState(app,headers,id,['done']); assert.equal(done.items[0].status, 'added');
+    assert.equal((await q("SELECT count(*)::int AS n FROM lib_series WHERE source_series_id='425-wrong'"))[0].n, 0);
+  } finally {
+    delete FAKE_TITLES['fire force'];
+    if (id) await q('DELETE FROM import_batches WHERE id=$1',[id]);
+    await q("DELETE FROM lib_series WHERE source_series_id IN ('fm-1','425-wrong')"); await app.close();
+  }
+});
+
+test('bulk skip is atomic, rejects a foreign candidate, and remains local to the selected content scope',{skip},async()=> {
+  const {app,headers,uid}=await boot();const ids:string[]=[];
+  try {
+    const first=await app.inject({method:'POST',url:'/api/admin/import/batches',headers,payload:{titles:['Fake Manga','Unmatched Bulk Title']}});ids.push(first.json().batchId);
+    const rows=(await waitForState(app,headers,ids[0],['review'])).items;
+    const second=await app.inject({method:'POST',url:'/api/admin/import/batches',headers,payload:{titles:['Fake Manga Two']}});ids.push(second.json().batchId);
+    const foreign=(await waitForState(app,headers,ids[1],['review'])).items[0];
+    const refused=await app.inject({method:'POST',url:`/api/admin/import/batches/${ids[0]}/skip`,headers,payload:{candidateIds:[rows[0].id,foreign.id]}});assert.equal(refused.statusCode,404);
+    assert.equal((await q('SELECT decision FROM import_candidates WHERE id=$1',[rows[0].id]))[0].decision,'auto');
+    const skipped=await app.inject({method:'POST',url:`/api/admin/import/batches/${ids[0]}/skip`,headers,payload:{candidateIds:rows.map((r:any)=>r.id)}});assert.deepEqual(skipped.json(),{ok:true,updated:2});
+    const privateBatch=await app.inject({method:'POST',url:'/api/admin/import/batches',headers,payload:{visibility:'private',titles:['Fake Manga']}});ids.push(privateBatch.json().batchId);
+    assert.equal((await waitForState(app,headers,ids[2],['review'])).items[0].decision,'auto','a shared skip is not a private-library skip');
+  } finally {for(const id of ids)await q('DELETE FROM import_batches WHERE id=$1',[id]);await q('DELETE FROM libraries WHERE owner_user_id=$1',[uid]);await app.close();}
+});
+
+test('continuation survives a fresh read, replays idempotently, and retains the original scope after defaults change',{skip,timeout:60000},async()=> {
+  const {app,headers,uid}=await boot();const ids:string[]=[];
+  try {
+    const r=await app.inject({method:'POST',url:'/api/admin/import/batches',headers,payload:{visibility:'shared',titles:Array.from({length:501},(_,i)=>`Continuation Fixture ${i}`)}});assert.equal(r.statusCode,200,r.body);ids.push(r.json().batchId);
+    let current=await waitForState(app,headers,ids[0],['review']);assert.equal(current.batch.remainingCount,1);
+    const skipped=await app.inject({method:'POST',url:`/api/admin/import/batches/${ids[0]}/skip`,headers,payload:{candidateIds:current.items.map((c:any)=>c.id)}});assert.equal(skipped.statusCode,200,skipped.body);
+    current=(await app.inject({method:'GET',url:`/api/admin/import/batches/${ids[0]}`,headers})).json();assert.equal(current.batch.canContinue,true);assert.equal(current.batch.state,'done');
+    const list=(await app.inject({method:'GET',url:'/api/admin/import/batches',headers})).json().content.find((b:any)=>b.id===ids[0]);assert.equal(list.canContinue,true,'closing the tab cannot orphan remaining titles');
+    await q('INSERT INTO app_settings(user_id,data) VALUES($1,\'{"defaultPrivate":true}\') ON CONFLICT(user_id) DO UPDATE SET data=EXCLUDED.data',[uid]);
+    const attempts=await Promise.all([1,2].map(()=>app.inject({method:'POST',url:'/api/admin/import/batches',headers,payload:{continueFrom:ids[0]}})));
+    const success=attempts.find((a:any)=>a.statusCode===200)!;assert.ok(success,attempts.map((a:any)=>a.body).join('\n'));ids.push(success.json().batchId);
+    const child=await waitForState(app,headers,ids[1],['review']);assert.equal(child.items.length,1);assert.equal(child.items[0].backup_title,'Continuation Fixture 500');assert.equal(child.batch.content_scope.visibility,'shared');
+    const replay=await app.inject({method:'POST',url:'/api/admin/import/batches',headers,payload:{continueFrom:ids[0]}});assert.equal(replay.json().batchId,ids[1]);
+    assert.equal((await q('SELECT count(*)::int AS n FROM import_batches WHERE user_id=$1',[uid]))[0].n,2);
+  } finally {for(const id of ids.reverse())await q('DELETE FROM import_batches WHERE id=$1',[id]);await q('DELETE FROM app_settings WHERE user_id=$1',[uid]);await app.close();}
+});
+
+test('Mihon tracker links preserve multiple providers, privacy and a non-rewinding stale-backup floor',{skip},async()=> {
+  globalThis.fetch=pixelFetch;const {app,headers,uid}=await boot();const ids:string[]=[];
+  const track=(provider:number,id:number,progress:number,priv=false)=>{const f=Buffer.alloc(4);f.writeFloatLE(progress);return lenField(18,Buffer.concat([varField(1,provider),varField(2,999999),varField(100,id),strField(5,'Fake Manga'),tag(6,5),f,varField(12,priv?1:0)]));};
+  const file=(progress:number)=>dataUrlOf(backupOf(Buffer.concat([mangaEntry('Fake Manga',0),track(2,42,progress,true),track(1,17,30)])));
+  try {
+    const r=await app.inject({method:'POST',url:'/api/admin/import/batches',headers,payload:{dataUrl:file(150)}});ids.push(r.json().batchId);
+    const review=await waitForState(app,headers,ids[0],['review']);assert.equal(review.items[0].tracker_links.length,2);
+    assert.equal((await app.inject({method:'POST',url:`/api/admin/import/batches/${ids[0]}/run`,headers})).statusCode,200);
+    await waitForState(app,headers,ids[0],['done']);const sid=(await q("SELECT id FROM lib_series WHERE source_series_id='fm-1'"))[0].id;
+    assert.deepEqual((await q('SELECT provider,external_id FROM series_trackers WHERE series_id=$1 ORDER BY provider',[sid])).map((r:any)=>[r.provider,r.external_id]),[['anilist','42'],['myanimelist','17']]);
+    assert.equal((await q("SELECT required_private FROM tracker_entry_privacy WHERE user_id=$1 AND provider='anilist' AND external_id='42'",[uid]))[0].required_private,true);
+    await q("UPDATE tracker_progress SET chapters=220 WHERE user_id=$1 AND series_id=$2 AND provider='anilist'",[uid,sid]);
+    const again=await app.inject({method:'POST',url:'/api/admin/import/batches',headers,payload:{dataUrl:file(10)}});ids.push(again.json().batchId);await waitForState(app,headers,ids[1],['review','done']);
+    assert.equal((await q("SELECT chapters FROM tracker_progress WHERE user_id=$1 AND series_id=$2 AND provider='anilist'",[uid,sid]))[0].chapters,220);
+  } finally {for(const id of ids)await q('DELETE FROM import_batches WHERE id=$1',[id]);await q("DELETE FROM series_trackers WHERE external_id IN ('42','17')");await q("DELETE FROM lib_series WHERE source_series_id='fm-1'");await q('DELETE FROM libraries WHERE owner_user_id=$1',[uid]);globalThis.fetch=realFetch;await app.close();}
+});
+
+test('a mixed tracker list keeps private entries private per row while public entries use the selected shared library',{skip},async()=> {
+  globalThis.fetch=pixelFetch;const {app,headers,uid}=await boot();const {newSeriesId}=await import('../src/lib/ids');
+  const shared=newSeriesId(),otherName='import-mixed-other';let id='',other='';
+  const restore=await stubAniList(async()=>[entry('secret','Fake Manga',{private:true,progress:30}),entry('public','Fake Manga Two',{private:false})]);
+  try {
+    await q("INSERT INTO lib_series(id,source,title,folder,source_id,source_series_id) VALUES($1,$2,'Fake Manga',$1,$2,'fm-1')",[shared,FAKE]);
+    await connectAniList(uid);
+    const r=await trackerIntake(app,headers,{visibility:'shared'});assert.equal(r.statusCode,200,r.body);id=r.json().batchId;
+    const review=await waitForState(app,headers,id,['review']);
+    assert.deepEqual(review.items.map((c:any)=>[c.backup_title,c.content_scope.visibility,c.in_library]),[['Fake Manga','private',false],['Fake Manga Two','shared',false]]);
+    assert.equal((await app.inject({method:'POST',url:`/api/admin/import/batches/${id}/run`,headers})).statusCode,200);
+    await waitForState(app,headers,id,['done']);
+    const rows=await q("SELECT id,is_private,owner_user_id,source_series_id FROM lib_series WHERE source_series_id IN ('fm-1','fm-2')");
+    const secret=rows.find((s:any)=>s.source_series_id==='fm-1' && s.is_private);assert.equal(secret?.owner_user_id,uid);
+    assert.equal(rows.find((s:any)=>s.id===shared).is_private,false,'private identity never converts the shared copy');
+    assert.equal(rows.find((s:any)=>s.source_series_id==='fm-2').is_private,false);
+    await q('DELETE FROM users WHERE username=$1',[otherName]);
+    other=(await q("INSERT INTO users(username,display_name,password_hash,role,auth_kind) VALUES($1,$1,'x','user','password') RETURNING id",[otherName]))[0].id;
+    const otherHeaders={authorization:`Bearer ${app.jwt.sign({sub:other,role:'user'})}`};
+    const results=await app.inject({method:'POST',url:'/api/series/search',headers:otherHeaders,payload:{query:'Fake Manga',size:100}});
+    assert.equal(results.statusCode,200,results.body);assert.ok(results.json().content.every((s:any)=>s.id!==secret.id),'another account cannot discover the flagged private copy');
+    assert.ok(results.json().content.some((s:any)=>s.id===shared),'the independent shared copy remains available');
+  } finally {restore();if(id)await q('DELETE FROM import_batches WHERE id=$1',[id]);await q("DELETE FROM lib_series WHERE source_series_id IN ('fm-1','fm-2')");await q('DELETE FROM lib_series WHERE id=$1',[shared]);await q('DELETE FROM libraries WHERE owner_user_id=$1',[uid]);await cleanupTracker(uid);if(other)await q('DELETE FROM users WHERE id=$1',[other]);globalThis.fetch=realFetch;await app.close();}
+});
+
+test('legacy global skips are recovered only for an attributable owner and shared scope',{skip},async()=> {
+  const {app,headers,uid}=await boot();const ids:string[]=[];let other='';const title='Legacy Import Decision',key='n:legacyimportdecision';
+  try {
+    const original=await app.inject({method:'POST',url:'/api/admin/import/batches',headers,payload:{titles:[title]}});ids.push(original.json().batchId);
+    const first=await waitForState(app,headers,ids[0],['review']);
+    await q("UPDATE import_candidates SET decision='skip' WHERE id=$1",[first.items[0].id]);await q('UPDATE import_batches SET content_scope=NULL WHERE id=$1',[ids[0]]);
+    await q('INSERT INTO import_skips(key) VALUES($1) ON CONFLICT DO NOTHING',[key]);
+    const own=await app.inject({method:'POST',url:'/api/admin/import/batches',headers,payload:{titles:[title]}});ids.push(own.json().batchId);
+    assert.equal((await waitForState(app,headers,ids[1],['review'])).items[0].decision,'skip');
+    const privateCopy=await app.inject({method:'POST',url:'/api/admin/import/batches',headers,payload:{titles:[title],visibility:'private'}});ids.push(privateCopy.json().batchId);
+    assert.equal((await waitForState(app,headers,ids[2],['review'])).items[0].decision,'unresolved','a legacy shared skip cannot suppress a private entry');
+    other=(await q("INSERT INTO users(username,display_name,password_hash,role,auth_kind) VALUES('legacy-skip-other','Legacy other','x','admin','password') RETURNING id"))[0].id;
+    const different=await app.inject({method:'POST',url:'/api/admin/import/batches',headers:{authorization:`Bearer ${app.jwt.sign({sub:other,role:'admin'})}`},payload:{titles:[title]}});ids.push(different.json().batchId);
+    assert.equal((await waitForState(app,{authorization:`Bearer ${app.jwt.sign({sub:other,role:'admin'})}`},ids[3],['review'])).items[0].decision,'unresolved');
+    assert.equal((await q('SELECT key FROM import_skips WHERE key=$1',[key])).length,1,'unattributed original records are never deleted');
+  } finally {for(const id of ids)await q('DELETE FROM import_batches WHERE id=$1',[id]);await q('DELETE FROM import_skips WHERE key=$1',[key]);await q('DELETE FROM libraries WHERE owner_user_id=$1',[uid]);if(other)await q('DELETE FROM users WHERE id=$1',[other]);await app.close();}
+});
+
+test('a bulk skip that wins the database race cannot be imported from a stale ready-row snapshot',{skip,timeout:20000},async()=> {
+  globalThis.fetch=pixelFetch;const {app,headers}=await boot();let id='',released=false;const {Client}=await import('pg'),lock=new Client({connectionString:DSN!});await lock.connect();
+  const until=async(query:string)=>{const end=Date.now()+5000;while(Date.now()<end){await lock.query('SELECT pg_stat_clear_snapshot()');if(Number((await lock.query(`SELECT count(*) AS n FROM pg_stat_activity WHERE datname=current_database() AND wait_event_type='Lock' AND query LIKE $1`,[query])).rows[0].n)>0)return;await sleep(10);}throw new Error('Import decision did not reach its database barrier');};
+  let running:Promise<any>|undefined,skipping:Promise<any>|undefined;
+  try {
+    const r=await app.inject({method:'POST',url:'/api/admin/import/batches',headers,payload:{titles:['Fake Manga']}});id=r.json().batchId;const row=(await waitForState(app,headers,id,['review'])).items[0];
+    await lock.query('BEGIN');await lock.query('LOCK TABLE import_batches IN SHARE ROW EXCLUSIVE MODE');
+    running=Promise.resolve(app.inject({method:'POST',url:`/api/admin/import/batches/${id}/run`,headers,payload:{candidateIds:[row.id]}}));
+    await until("UPDATE import_batches SET state = 'importing'%");
+    skipping=Promise.resolve(app.inject({method:'POST',url:`/api/admin/import/batches/${id}/skip`,headers,payload:{candidateIds:[row.id]}}));
+    await until('UPDATE import_batches SET updated_at=now()%');
+    await lock.query('COMMIT');released=true;
+    const [run,skipResult]=await Promise.all([running,skipping]);assert.equal(skipResult.statusCode,200,skipResult.body);assert.equal(run.statusCode,400,run.body);assert.equal(run.json().error,'nothing_to_import');
+    assert.equal((await q("SELECT count(*)::int AS n FROM lib_series WHERE source_series_id='fm-1'"))[0].n,0);
+    assert.equal((await q('SELECT decision FROM import_candidates WHERE id=$1',[row.id]))[0].decision,'skip');
+  } finally {if(!released)await lock.query('ROLLBACK');await lock.end();await Promise.allSettled([running,skipping].filter(Boolean) as Promise<any>[]);if(id)await q('DELETE FROM import_batches WHERE id=$1',[id]);await app.close();globalThis.fetch=realFetch;}
+});
+
 async function boot() {
   const Fastify = (await import('fastify')).default;
   const jwt = (await import('@fastify/jwt')).default;
@@ -207,6 +538,8 @@ async function boot() {
   const sourceRoutes = (await import('../src/routes/sources')).default;
   const catalogRoutes = (await import('../src/routes/catalog')).default;
   await q('DELETE FROM users WHERE username = $1', [USER]);
+  // Every test starts with no skip remembered (#410): one test's skips are no other test's business, and several reuse a title.
+  await q('DELETE FROM import_skips').catch(() => {});
   const uid = (await q<{ id: string }>(
     `INSERT INTO users (username, display_name, password_hash, role, auth_kind, perms, max_age_rating)
      VALUES ($1,$1,'x','admin','password','{}',NULL) RETURNING id`, [USER]))[0].id;
@@ -220,7 +553,10 @@ async function boot() {
   return { app, headers, uid };
 }
 
-async function waitForState(app: any, headers: any, id: string, states: string[], timeoutMs = 8000) {
+// 20 s, not 8: a batch resolves through fake sources in well under a second, but on a loaded machine (a CI runner, or this
+// suite beside a browser walk) "a /resume and a POST inside the same window" timed out at 8 s now and then. Only a failure
+// waits the whole time.
+async function waitForState(app: any, headers: any, id: string, states: string[], timeoutMs = 20000) {
   const start = Date.now();
   for (;;) {
     const r = await app.inject({ method: 'GET', url: `/api/admin/import/batches/${id}`, headers });
@@ -463,6 +799,10 @@ test('titles already in the library do not count toward the 500', { skip }, asyn
     assert.equal(r.statusCode, 200, r.body);
     batchId = r.json().batchId;
     assert.deepEqual([r.json().total, r.json().truncated], [503, true], 'the owned titles ride along uncounted, and the 501st new one is left for the next import');
+    // #410: and says how many are left after the 500 -- here the one. Reintroduce by breaking out of the cut loop again:
+    // the count reads 0.
+    assert.equal(r.json().leftOver, 1, 'how many come after the 500');
+    assert.equal((await q<{ left_over: number }>('SELECT left_over FROM import_batches WHERE id = $1', [batchId]))[0].left_over, 1, 'stored for the page');
     const rows = await q<{ backup_title: string; in_library: boolean }>(
       'SELECT backup_title, in_library FROM import_candidates WHERE batch_id = $1 ORDER BY ord', [batchId]);
     assert.deepEqual(rows.filter((x) => x.in_library).map((x) => x.backup_title), ['Owned Long List A', 'Owned Long List B', 'Owned Long List C']);
@@ -850,6 +1190,7 @@ test('a malformed batch or candidate id is not found, not a server error', { ski
     for (const [method, url, payload] of calls) {
       const r = await app.inject({ method: method as any, url, headers, payload });
       assert.equal(r.statusCode, 404, `${method} ${url}: ${r.body}`);
+      assert.ok(r.body, `${method} ${url}: an invalid id must return a JSON refusal`);
       assert.equal(r.json().error, 'not_found');
     }
   } finally {
@@ -997,8 +1338,15 @@ test('a batch nothing was ever imported through is not closed on view', { skip }
 });
 
 test('a /resume and a POST inside the same window start one resolve loop, not two', { skip }, async (t) => {
+  const priorFetch = globalThis.fetch;
+  // This tests our runner guard, not a public source's availability. A name no fake knows must not
+  // wait for the real MangaDex search timeout, which made completion depend on the CI network.
+  globalThis.fetch = (async () => new Response(PIXEL, { status: 200, headers: { 'content-type': 'image/png' } })) as typeof fetch;
   const { app, headers } = await boot();
   const ids: string[] = [];
+  let releaseSearch = () => {};
+  const holdSearch = () => { searchGate = new Promise<void>((resolve) => { releaseSearch = resolve; }); };
+  const finishSearch = () => { searchGate = undefined; releaseSearch(); };
   try {
     const r = await app.inject({ method: 'POST', url: '/api/admin/import/batches', headers, payload: { titles: ['Fake Manga', 'Nobody Has This One'] } });
     assert.equal(r.statusCode, 200, r.body);
@@ -1006,8 +1354,10 @@ test('a /resume and a POST inside the same window start one resolve loop, not tw
     await waitForState(app, headers, ids[0], ['review']);
     // A restart mid-pass: the batch reads resolving, nobody in this process is resolving it.
     await q(`UPDATE import_batches SET state = 'resolving' WHERE id = $1`, [ids[0]]);
-    searchDelayMs = 200; // so whichever loop starts is still searching when the other request is judged
+    holdSearch(); // keep whichever loop starts in-flight until both requests have been judged
 
+    let winner = ids[0];
+    let resumeLost = false;
     await t.test('the loser answers busy', async () => {
       // Reintroduce by deleting `resolvingBatch = id` in /resume (checking the guard, then awaiting the
       // SELECT): both requests pass their checks before either loop starts, and both answer 200 -- two
@@ -1016,31 +1366,56 @@ test('a /resume and a POST inside the same window start one resolve loop, not tw
         app.inject({ method: 'POST', url: `/api/admin/import/batches/${ids[0]}/resume`, headers }),
         app.inject({ method: 'POST', url: '/api/admin/import/batches', headers, payload: { titles: ['Fake Manga Two', 'Nobody Has This Either'] } }),
       ]);
-      if (post.statusCode === 200) ids.push(post.json().batchId);
+      if (post.statusCode === 200) { winner = post.json().batchId; ids.push(winner); resumeLost = true; }
       assert.deepEqual([resume.statusCode, post.statusCode].sort(), [200, 409], `${resume.body} / ${post.body}`);
       assert.equal([resume, post].find((x) => x.statusCode === 409)!.json().error, 'busy');
     });
 
-    searchDelayMs = 0;
-    for (const id of ids) await waitForState(app, headers, id, ['review'], 10_000);
+    finishSearch();
+    await waitForState(app, headers, winner, ['review']);
+    if (resumeLost) {
+      // Losing Resume has not run anything. The older batch remains stale until explicitly resumed;
+      // waiting for BOTH batches here incorrectly depended on Resume winning the scheduling race.
+      const untouched = (await app.inject({method:'GET',url:`/api/admin/import/batches/${ids[0]}`,headers})).json().batch;
+      assert.deepEqual([untouched.state,untouched.stale],['resolving',true]);
+      const resumed = await app.inject({method:'POST',url:`/api/admin/import/batches/${ids[0]}/resume`,headers});
+      assert.equal(resumed.statusCode,200,resumed.body);
+      await waitForState(app,headers,ids[0],['review']);
+    }
+
+    await t.test('a winning POST leaves the older stale batch untouched until an explicit Resume', async () => {
+      await q(`UPDATE import_batches SET state = 'resolving' WHERE id = $1`, [ids[0]]);
+      holdSearch();
+      const post=await app.inject({method:'POST',url:'/api/admin/import/batches',headers,payload:{titles:['Fake Manga Two','Nobody Has This Either']}});
+      assert.equal(post.statusCode,200,post.body);const active=post.json().batchId;ids.push(active);
+      const refused=await app.inject({method:'POST',url:`/api/admin/import/batches/${ids[0]}/resume`,headers});
+      assert.equal(refused.statusCode,409,refused.body);assert.equal(refused.json().error,'busy');
+      finishSearch();await waitForState(app,headers,active,['review']);
+      const stale=(await app.inject({method:'GET',url:`/api/admin/import/batches/${ids[0]}`,headers})).json().batch;
+      assert.deepEqual([stale.state,stale.stale],['resolving',true],'an unrelated POST cannot silently start the refused older batch');
+      const resumed=await app.inject({method:'POST',url:`/api/admin/import/batches/${ids[0]}/resume`,headers});
+      assert.equal(resumed.statusCode,200,resumed.body);await waitForState(app,headers,ids[0],['review']);
+    });
 
     await t.test('two Resume taps on the same stale batch both answer ok, and start one loop', async () => {
       // Reintroduce by claiming `'pending'` in /resume instead of the batch's own id: the second tap sees a
       // guard that is not its id and answers 409 "another import is already resolving" about itself.
       await q(`UPDATE import_batches SET state = 'resolving' WHERE id = $1`, [ids[0]]);
-      searchDelayMs = 200;
+      holdSearch();
       const before = searchCalls;
       const [r1, r2] = await Promise.all([
         app.inject({ method: 'POST', url: `/api/admin/import/batches/${ids[0]}/resume`, headers }),
         app.inject({ method: 'POST', url: `/api/admin/import/batches/${ids[0]}/resume`, headers }),
       ]);
       assert.deepEqual([r1.statusCode, r2.statusCode], [200, 200], `${r1.body} / ${r2.body}`);
-      searchDelayMs = 0;
-      await waitForState(app, headers, ids[0], ['review'], 10_000);
+      await waitUntil(() => searchCalls > before, 'the resumed loop to enter its gated search');
+      finishSearch();
+      await waitForState(app, headers, ids[0], ['review']);
       assert.equal(searchCalls - before, 1, 'the one unresolved title was searched once, not once per tap');
     });
   } finally {
-    searchDelayMs = 0;
+    finishSearch();
+    globalThis.fetch = priorFetch;
     for (const id of ids) await q('DELETE FROM import_batches WHERE id = $1', [id]);
     await app.close();
   }
@@ -1183,7 +1558,7 @@ test('a tracker list becomes a batch: novels skipped, duplicates folded, alt tit
     assert.equal(r.statusCode, 200, r.body);
     batchIds.push(r.json().batchId);
     assert.deepEqual([r.json().total, r.json().skippedNovels, r.json().truncated], [3, 1, false]);
-    assert.deepEqual(listCalls, [{ token: `tok-${T36}`, statuses: ['reading', 'plan_to_read'], max: 501 }], 'the saved token, unsealed, and exactly the lists asked for');
+    assert.deepEqual(listCalls, [{ token: `tok-${T36}`, statuses: ['reading', 'plan_to_read'], max: 2001 }], 'the saved token, unsealed, and exactly the lists asked for');
     const batch = (await q('SELECT origin, tracker FROM import_batches WHERE id = $1', [batchIds[0]]))[0];
     assert.deepEqual([batch.origin, batch.tracker], ['tracker', 'anilist']);
     const rows = await q('SELECT backup_title, tracker, external_id, alt_titles, progress FROM import_candidates WHERE batch_id = $1 ORDER BY ord', [batchIds[0]]);
@@ -1211,17 +1586,25 @@ test('a tracker list becomes a batch: novels skipped, duplicates folded, alt tit
     });
 
     await t.test('a read that hit the cap keeps 500 rows and says so, even when novels brought it under', async () => {
-      // Reintroduce by computing `truncated` from the kept rows alone (`entries.length > 500`): 501 read with one
-      // novel among them keeps 500 and claims the list was read whole.
+      // Reintroduce by computing `truncated` from the kept rows alone (`entries.length > 500`): a full read with one
+      // novel among them keeps 500 and claims the list was read whole. A read that stopped at its cap leaves how many
+      // remain unknown (`leftOver` null); one that did not says it (#410).
       restore();
-      const big = await stubAniList(async () => Array.from({ length: 501 }, (_, i) => entry(`bulk-${i}`, `Bulk Title ${i}`, i === 7 ? { format: 'novel' } : {})));
+      const big = await stubAniList(async (_t, opts) => Array.from({ length: opts.max }, (_, i) => entry(`bulk-${i}`, `Bulk Title ${i}`, i === 7 ? { format: 'novel' } : {})));
       try {
         const r2 = await trackerIntake(app, headers);
         assert.equal(r2.statusCode, 200, r2.body);
-        assert.deepEqual([r2.json().total, r2.json().truncated, r2.json().skippedNovels], [500, true, 1]);
+        assert.deepEqual([r2.json().total, r2.json().truncated, r2.json().skippedNovels, r2.json().leftOver], [500, true, 1, null]);
         // Discard at once: DELETE stops the resolve loop before its next row, and 500 searches are not the point.
         await app.inject({ method: 'DELETE', url: `/api/admin/import/batches/${r2.json().batchId}`, headers });
       } finally { big(); }
+      const mid = await stubAniList(async () => Array.from({ length: 620 }, (_, i) => entry(`mid-${i}`, `Middle Title ${i}`)));
+      try {
+        const r3 = await trackerIntake(app, headers);
+        assert.equal(r3.statusCode, 200, r3.body);
+        assert.deepEqual([r3.json().total, r3.json().truncated, r3.json().leftOver], [500, true, 120], 'a list longer than 500 but read whole says how many are left');
+        await app.inject({ method: 'DELETE', url: `/api/admin/import/batches/${r3.json().batchId}`, headers });
+      } finally { mid(); }
     });
   } finally {
     restore();
@@ -1384,6 +1767,85 @@ test('an imported title is linked and floored at run', { skip }, async () => {
   }
 });
 
+test('the same entry twice: a series linked to the entry is that series, at intake and at /run (#410)', { skip }, async () => {
+  // Reintroduce by dropping `linkedTo` from ownedBy in POST /batches: the row reads not owned under the library's other
+  // spelling and is offered again. Reintroduce the /run half by going straight to the add: the row whose entry was
+  // linked after its intake is added a second time, from another source.
+  globalThis.fetch = pixelFetch;
+  const { app, headers, uid } = await boot();
+  const { newSeriesId } = await import('../src/lib/ids');
+  const held = newSeriesId();
+  const late = newSeriesId();
+  const restore = await stubAniList(async () => [
+    entry('held', 'Tracker Spelling One', { progress: 4 }),
+    entry('late', 'Tracker Manga One', { progress: 12 }),
+  ]);
+  let batchId = '';
+  try {
+    // The library holds the first under ANOTHER spelling -- an earlier import's Change pick -- linked to the entry by a person.
+    await q(`INSERT INTO lib_series (id, source, title, folder, books_count) VALUES ($1,'Other','Library Spelling One',$1,1)`, [held]);
+    await q(`INSERT INTO series_trackers (series_id, provider, external_id, title, linked_by) VALUES ($1,'anilist',$2,'Tracker Spelling One',$3)`, [held, `${T36}-held`, uid]);
+    await connectAniList(uid);
+    const r = await trackerIntake(app, headers);
+    assert.equal(r.statusCode, 200, r.body);
+    batchId = r.json().batchId;
+    const review = await waitForState(app, headers, batchId, ['review']);
+    const owned = review.items.find((i: any) => i.backup_title === 'Tracker Spelling One');
+    assert.deepEqual([owned.in_library, owned.decision, owned.status], [true, 'skip', 'already'], 'the entry\'s series is owned at intake');
+    const ready = review.items.find((i: any) => i.backup_title === 'Tracker Manga One');
+    assert.deepEqual([ready.status, ready.decision], [null, 'auto'], 'PREMISE: the other row is matched and ready');
+    // Between the intake and Import, that entry gets a series of its own, under another title.
+    await q(`INSERT INTO lib_series (id, source, title, folder, books_count) VALUES ($1,'Other','Late Library Spelling',$1,1)`, [late]);
+    await q(`INSERT INTO series_trackers (series_id, provider, external_id, title, linked_by) VALUES ($1,'anilist',$2,'Tracker Manga One',$3)`, [late, `${T36}-late`, uid]);
+    const run = await app.inject({ method: 'POST', url: `/api/admin/import/batches/${batchId}/run`, headers });
+    assert.equal(run.statusCode, 200, run.body);
+    const done = await waitForState(app, headers, batchId, ['done']);
+    assert.equal(done.items.find((i: any) => i.backup_title === 'Tracker Manga One').status, 'already', 'the row reads as the series already here');
+    assert.equal((await q<{ n: number }>(`SELECT count(*)::int AS n FROM lib_series WHERE source_series_id = 'fm-t1'`))[0].n, 0, 'a second copy was added from the source');
+  } finally {
+    restore();
+    if (batchId) await q('DELETE FROM import_batches WHERE id = $1', [batchId]);
+    await q('DELETE FROM lib_series WHERE id = ANY($1)', [[held, late]]);
+    await q(`DELETE FROM lib_series WHERE source_series_id = 'fm-t1'`);
+    await cleanupTracker(uid);
+    await app.close();
+  }
+});
+
+test('a skip is remembered for the next import of the same list, and a pick forgets it (#410)', { skip }, async () => {
+  // Reintroduce by dropping the import_skips read from POST /batches: the second import offers the skipped title again,
+  // and every skip has to be made once more. Reintroduce the forgetting by dropping the DELETE from the PATCH: the
+  // third import still reads skipped after a person picked a match for it.
+  const { app, headers } = await boot();
+  const { nameKey } = await import('../src/lib/onlineMatch');
+  const title = 'Skipped Once Remembered Twice';
+  const batchIds: string[] = [];
+  const intake = async () => {
+    const r = await app.inject({ method: 'POST', url: '/api/admin/import/batches', headers, payload: { titles: [title] } });
+    assert.equal(r.statusCode, 200, r.body);
+    batchIds.push(r.json().batchId);
+    return waitForState(app, headers, r.json().batchId, ['review', 'done']);
+  };
+  try {
+    const first = await intake();
+    assert.notEqual(first.items[0].decision, 'skip', 'PREMISE: the title is offered');
+    const skip = await app.inject({ method: 'PATCH', url: `/api/admin/import/candidates/${first.items[0].id}`, headers, payload: { decision: 'skip' } });
+    assert.equal(skip.statusCode, 200, skip.body);
+    const second = await intake();
+    assert.deepEqual([second.items[0].decision, second.items[0].in_library], ['skip', false], 'skipped again, without being in the library');
+    assert.equal(second.batch.resolved, second.batch.total, 'a remembered skip is settled at once, never searched');
+    const pick = await app.inject({ method: 'PATCH', url: `/api/admin/import/candidates/${second.items[0].id}`, headers,
+      payload: { decision: 'manual', source: 'fm', sourceId: 't1', title: 'Tracker Manga One' } });
+    assert.equal(pick.statusCode, 200, pick.body);
+    const third = await intake();
+    assert.notEqual(third.items[0].decision, 'skip', 'a pick did not forget the skip');
+  } finally {
+    for (const id of batchIds) await q('DELETE FROM import_batches WHERE id = $1', [id]);
+    await q('DELETE FROM import_skips WHERE key = $1', [`n:${nameKey(title)}`]);
+    await app.close();
+  }
+});
+
 test('a rejected tracker token disables the connection with the same message as a push', { skip }, async (t) => {
   // Reintroduce by answering `tracker_unavailable` for an `authFailed` throw too (drop the `err.authFailed`
   // branch in readTrackerList): the connection stays enabled with no message, and every push after it fails
@@ -1503,7 +1965,7 @@ test('another admin cannot import from my tracker', { skip }, async () => {
 
 // ---- The v0.36.0 fix pass: what the three reviews found the intake and the run doing wrong. ----
 
-test('another admin running my tracker batch floors me, not them', { skip }, async () => {
+test('another admin cannot inspect or run my tracker batch; my own run floors only me', { skip }, async () => {
   // Reintroduce by passing `userIdOf(req)` again (instead of the batch's `user_id`) to linkImportedSeries in
   // /run (routes/admin.ts): the floor lands on the RUNNER's tracker_progress, `linked_by` is the runner, and
   // the owner -- whose list it was -- gets nothing, so their first chapter here pushes 1 over their 150.
@@ -1523,9 +1985,13 @@ test('another admin running my tracker batch floors me, not them', { skip }, asy
     assert.equal(r.statusCode, 200, r.body);
     batchId = r.json().batchId;
     await waitForState(app, headers, batchId, ['review']);
-    const run = await app.inject({ method: 'POST', url: `/api/admin/import/batches/${batchId}/run`, headers: headers2 });
+    const privateRead=await app.inject({method:'GET',url:`/api/admin/import/batches/${batchId}`,headers:headers2});
+    assert.equal(privateRead.statusCode,404,'batch metadata is account-owned');
+    const denied=await app.inject({method:'POST',url:`/api/admin/import/batches/${batchId}/run`,headers:headers2});
+    assert.equal(denied.statusCode,404,'another administrator cannot run private tracker snapshots');
+    const run = await app.inject({ method: 'POST', url: `/api/admin/import/batches/${batchId}/run`, headers });
     assert.equal(run.statusCode, 200, run.body);
-    const done = await waitForState(app, headers2, batchId, ['done']);
+    const done = await waitForState(app, headers, batchId, ['done']);
     assert.deepEqual([done.items[0].status, done.items[0].linked], ['added', true]);
 
     const series = (await q(`SELECT id FROM lib_series WHERE source_series_id = 'fm-t1'`))[0];
@@ -1535,7 +2001,7 @@ test('another admin running my tracker batch floors me, not them', { skip }, asy
     const floors = await q('SELECT user_id, chapters, pushed_at FROM tracker_progress WHERE series_id = $1 AND provider = $2', [series.id, 'anilist']);
     assert.deepEqual(floors, [{ user_id: uid, chapters: 150, pushed_at: null }], 'the floor is the owner\'s, and the runner carries none');
     const audit = (await q(`SELECT user_id, detail FROM audit_log WHERE event = 'import.batch.run' AND detail->>'batchId' = $1`, [batchId]))[0];
-    assert.equal(audit?.user_id, uid2, 'the runner is still who the audit row names');
+    assert.equal(audit?.user_id, uid, 'only the owner can run this batch');
     assert.equal(audit?.detail?.owner, uid, 'and the row says whose list it was');
   } finally {
     restore();
@@ -1681,6 +2147,26 @@ test('an absorbed title reads already owned and links to its survivor', { skip }
     await q('DELETE FROM lib_series WHERE id = ANY($1)', [[merged, survivor, orphan, hiddenSurvivor]]);
     await cleanupTracker(uid);
     await app.close();
+  }
+});
+
+test('corrupt cross-privacy merge pointers cannot disclose aliases or attach tracker state to a shared survivor', {skip},async()=> {
+  const {app,headers,uid}=await boot();const {newSeriesId}=await import('../src/lib/ids');
+  const {ensurePrivateLibrary}=await import('../src/lib/contentScope');
+  const scope=await ensurePrivateLibrary(uid),survivor=newSeriesId(),privateAlias=newSeriesId();
+  let batchId='';const restore=await stubAniList(async()=>[entry('domain-probe','Private Alias Domain Fixture',{progress:8})]);
+  try {
+    await q(`INSERT INTO lib_series(id,source,title,folder,books_count,library_id,owner_user_id,is_private,merged_into) VALUES
+      ($1,'Other','Public Survivor Domain Fixture',$1,1,'lib',NULL,false,NULL),
+      ($2,'Other','Private Alias Domain Fixture',$2,0,$3,$4,true,$1)`,[survivor,privateAlias,scope.libraryId,uid]);
+    await connectAniList(uid);const intake=await trackerIntake(app,headers);assert.equal(intake.statusCode,200,intake.body);batchId=intake.json().batchId;
+    const review=await waitForState(app,headers,batchId,['review','done']);const candidate=review.items[0];
+    assert.equal(candidate.in_library,false,'a shared intake cannot borrow an alias from a private domain even through a legacy merge pointer');
+    assert.equal(candidate.linked,false);assert.deepEqual(await q("SELECT series_id FROM series_trackers WHERE series_id=$1 AND provider='anilist'",[survivor]),[]);
+    assert.deepEqual(await q("SELECT series_id FROM tracker_progress WHERE series_id=$1 AND user_id=$2",[survivor,uid]),[]);
+  } finally {
+    restore();if(batchId)await q('DELETE FROM import_batches WHERE id=$1',[batchId]);await q('DELETE FROM lib_series WHERE id=ANY($1)',[[privateAlias,survivor]]);
+    await cleanupTracker(uid);await q('DELETE FROM libraries WHERE id=$1',[scope.libraryId]);await app.close();
   }
 });
 
@@ -1868,6 +2354,142 @@ test('the novel count survives a reload (it is on the batch row)', { skip }, asy
     restore();
     for (const id of batchIds) await q('DELETE FROM import_batches WHERE id = $1', [id]);
     await cleanupTracker(uid);
+    await app.close();
+  }
+});
+
+// ---- Reading progress (#433): with Mark chapters I've read on, what the backup or the tracker list says was read is
+// marked here for the batch's owner -- at intake on the titles already in the library, at /run once a series exists.
+// What a mark is, and what it must never do, is importProgress.int.test.ts's; these are its doors. ----
+
+/** A BackupChapter marked read: url, name, read = 4, chapterNumber = 9 (a float). */
+const chapterRead = (n: number) => {
+  const f = Buffer.alloc(4); f.writeFloatLE(n);
+  return lenField(16, Buffer.concat([strField(1, `/c/${n}`), strField(2, `Chapter ${n}`), varField(4, 1), tag(9, 5), f]));
+};
+/** The chapters this reader has read on a series, by number. */
+const readHere = async (uid: string, sid: string) => (await q(
+  `SELECT b.number::float8 AS n FROM read_progress rp JOIN lib_books b ON b.id = rp.book_id
+    WHERE rp.user_id = $1 AND rp.series_id = $2 AND rp.completed ORDER BY b.number`, [uid, sid])).map((r: any) => Number(r.n));
+/** The marks this reader has on the series' listed chapters, with who made them. */
+const markedHere = async (uid: string, sid: string) => (await q(
+  'SELECT number::float8 AS n, source FROM listing_progress WHERE user_id = $1 AND series_id = $2 ORDER BY number', [uid, sid]))
+  .map((r: any) => [Number(r.n), r.source]);
+/** A series here holding chapters 1..`held`, its sources listing 1..`listed`. */
+async function progressSeries(title: string, held: number, listed: number): Promise<string> {
+  const { newSeriesId } = await import('../src/lib/ids');
+  const sid = newSeriesId();
+  await q(`INSERT INTO lib_series (id, source, title, folder, books_count) VALUES ($1,'Other',$2,$1,$3)`, [sid, title, held]);
+  await q(`INSERT INTO lib_books (id, series_id, source, file, number, title, root, pages, mtime)
+           SELECT $1 || '-' || n, $1, 'Other', $1 || '/Chapter ' || n || '.cbz', n, 'Chapter ' || n, '/library', 10, $3
+             FROM generate_series(1, $2::int) AS n`, [sid, held, Date.now() - 3_600_000]);
+  await q(`INSERT INTO series_listing (series_id, number, title, source_id, chosen, status)
+           SELECT $1, n, 'Chapter ' || n, 'src', '{}'::jsonb, 'available' FROM generate_series(1, $2::int) AS n`, [sid, listed]);
+  return sid;
+}
+/** read_progress first: its book_id is ON DELETE RESTRICT, so a series with read chapters cannot go before them. */
+const dropSeries = async (ids: string[]) => {
+  await q('DELETE FROM read_progress WHERE series_id = ANY($1)', [ids]);
+  await q('DELETE FROM lib_series WHERE id = ANY($1)', [ids]);
+};
+
+test('a backup marks what it says was read on the titles already here, at intake, and only when asked (#433)', { skip }, async () => {
+  // Reintroduce by dropping the marking loop from POST /batches (routes/admin.ts): the second batch reads nothing. By
+  // taking Mark chapters I've read as on when the body does not say so: the first batch marks.
+  const { app, headers, uid } = await boot();
+  const sid = await progressSeries('Progress Owned Title', 3, 6);
+  const ids: string[] = [];
+  // 1 and 2 are here, 5 is listed and not here, 7 is neither; 3 is unread.
+  const file = dataUrlOf(backupOf(Buffer.concat([mangaEntry('Progress Owned Title', 0), chapterRead(1), chapterRead(2), chapterRead(5), chapterRead(7)])));
+  try {
+    const off = await app.inject({ method: 'POST', url: '/api/admin/import/batches', headers, payload: { dataUrl: file } });
+    assert.equal(off.statusCode, 200, off.body);
+    ids.push(off.json().batchId);
+    const unasked = await waitForState(app, headers, ids[0], ['review']);
+    assert.deepEqual([unasked.batch.mark_read, unasked.items[0].in_library, unasked.items[0].marked_read], [false, true, 0]);
+    assert.deepEqual([await readHere(uid, sid), await markedHere(uid, sid)], [[], []], 'a batch that did not ask marked chapters read');
+
+    const on = await app.inject({ method: 'POST', url: '/api/admin/import/batches', headers, payload: { dataUrl: file, markRead: true } });
+    assert.equal(on.statusCode, 200, on.body);
+    ids.push(on.json().batchId);
+    const asked = await waitForState(app, headers, ids[1], ['review']);
+    const row = asked.items[0];
+    assert.equal(asked.batch.mark_read, true);
+    assert.deepEqual([row.read_to, row.marked_read], [7, 3], 'the row says how far the backup was read, and how many were marked');
+    assert.equal('read_numbers' in row, false, 'the whole read set rides along on every poll');
+    assert.deepEqual(await readHere(uid, sid), [1, 2]);
+    assert.deepEqual(await markedHere(uid, sid), [[5, 'import']]);
+  } finally {
+    for (const id of ids) await q('DELETE FROM import_batches WHERE id = $1', [id]);
+    await dropSeries([sid]);
+    await app.close();
+  }
+});
+
+test('a title the import adds is marked from the listing its add wrote, at /run (#433)', { skip }, async () => {
+  // Reintroduce by marking only the rows /run finds already here: the mark on chapter 1 is missing.
+  globalThis.fetch = pixelFetch;
+  const { app, headers, uid } = await boot();
+  let id = '';
+  // FAKE lists chapter 1 alone (fakeAdapter's listChapters): 2 is read in the backup, and not there to mark.
+  const file = dataUrlOf(backupOf(Buffer.concat([mangaEntry('Fake Manga', 0), chapterRead(1), chapterRead(2)])));
+  try {
+    const r = await app.inject({ method: 'POST', url: '/api/admin/import/batches', headers, payload: { dataUrl: file, markRead: true } });
+    assert.equal(r.statusCode, 200, r.body);
+    id = r.json().batchId;
+    const review = await waitForState(app, headers, id, ['review']);
+    assert.deepEqual([review.items[0].decision, review.items[0].marked_read], ['auto', 0], 'PREMISE: matched, and nothing to mark before the series exists');
+    const run = await app.inject({ method: 'POST', url: `/api/admin/import/batches/${id}/run`, headers });
+    assert.equal(run.statusCode, 200, run.body);
+    const done = await waitForState(app, headers, id, ['done']);
+    assert.deepEqual([done.items[0].status, done.items[0].marked_read], ['added', 1]);
+    const sid = (await q(`SELECT id FROM lib_series WHERE source_series_id = 'fm-1'`))[0].id;
+    assert.deepEqual(await markedHere(uid, sid), [[1, 'import']]);
+    assert.equal((await q('SELECT count(*)::int AS n FROM reading_events WHERE user_id = $1', [uid]))[0].n, 0);
+  } finally {
+    if (id) await q('DELETE FROM import_batches WHERE id = $1', [id]);
+    await q(`DELETE FROM lib_series WHERE source_series_id = 'fm-1'`);
+    globalThis.fetch = realFetch;
+    await app.close();
+  }
+});
+
+test('a tracker list marks every chapter up to its number: at intake on a title here, at /run on one linked since (#433)', { skip }, async () => {
+  // Reintroduce by dropping the mark from /run's already-linked branch (routes/admin.ts): the late title reads nothing.
+  globalThis.fetch = pixelFetch;
+  const { app, headers, uid } = await boot();
+  const owned = await progressSeries('Owned Progress Title', 4, 6);
+  let late = '';
+  const restore = await stubAniList(async () => [
+    entry('pg-owned', 'Owned Progress Title', { progress: 5 }),
+    entry('pg-late', 'Tracker Manga One', { progress: 2 }),
+  ]);
+  let batchId = '';
+  try {
+    await connectAniList(uid);
+    const r = await trackerIntake(app, headers, { markRead: true });
+    assert.equal(r.statusCode, 200, r.body);
+    batchId = r.json().batchId;
+    const review = await waitForState(app, headers, batchId, ['review']);
+    assert.equal(review.items.find((i: any) => i.backup_title === 'Owned Progress Title').marked_read, 5);
+    assert.deepEqual(await readHere(uid, owned), [1, 2, 3, 4], 'at intake: every chapter here up to 5');
+    assert.deepEqual(await markedHere(uid, owned), [[5, 'import']], 'and the listed 5, never 6');
+    // Between the intake and Import, the other entry gets a series here, linked to it by a person.
+    late = await progressSeries('Late Progress Spelling', 3, 3);
+    await q(`INSERT INTO series_trackers (series_id, provider, external_id, title, linked_by) VALUES ($1,'anilist',$2,'Tracker Manga One',$3)`, [late, `${T36}-pg-late`, uid]);
+    const run = await app.inject({ method: 'POST', url: `/api/admin/import/batches/${batchId}/run`, headers });
+    assert.equal(run.statusCode, 200, run.body);
+    const done = await waitForState(app, headers, batchId, ['done']);
+    const row = done.items.find((i: any) => i.backup_title === 'Tracker Manga One');
+    assert.deepEqual([row.status, row.marked_read], ['already', 2]);
+    assert.deepEqual(await readHere(uid, late), [1, 2]);
+  } finally {
+    restore();
+    if (batchId) await q('DELETE FROM import_batches WHERE id = $1', [batchId]);
+    await dropSeries([owned, ...(late ? [late] : [])]);
+    await q(`DELETE FROM lib_series WHERE source_series_id = 'fm-t1'`);
+    await cleanupTracker(uid);
+    globalThis.fetch = realFetch;
     await app.close();
   }
 });

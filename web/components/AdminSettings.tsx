@@ -24,7 +24,7 @@ import { useToast } from '@/components/Toast';
 import { ConfirmDialog } from '@/components/ConfirmDialog';
 import { Switch } from '@/components/Switch';
 import { OnBody } from '@/components/ui';
-import { IcBell, IcDownload, IcFilter, IcRefresh, IcSettings } from '@/components/icons';
+import { IcBell, IcDownload, IcFilter, IcRefresh, IcSettings, IcSparkle } from '@/components/icons';
 import {
   Disclosure, EditorSheet, MoreOptions, NumberRow, Row, RowBlock, RowGroup, SaveState, Segmented, SelectRow, SummaryRow,
   SwitchRow, TextRow, useAutosave, useEditor,
@@ -37,7 +37,9 @@ import { SERIES_TYPES, seriesTypeKey } from '@/lib/seriesTypes';
 import { hasGroup, normGroup, reorder, withoutGroup } from '@/lib/scanlators';
 import { suggestGroups } from '@/lib/groupSuggest';
 import { NotificationsSection } from '@/components/AdminNotifications';
+import { NetworkSettings } from '@/components/NetworkSettings';
 import { SlowArchiveRow } from '@/components/ArchiveSettings';
+import { PolitenessRow } from '@/components/PolitenessSettings';
 import { TranslateRow } from '@/components/TranslateSettings';
 import { isDesktop } from '@/lib/desktop';
 import { ssoOnly, useAuthConfig } from '@/lib/authConfig';
@@ -48,6 +50,8 @@ import { discoverSources } from '@/lib/sourceGroups';
 import { memberDefaultsOf } from '@/lib/memberDefaults';
 import { joinSentences } from '@/lib/jobs';
 import { clockText, hoursText, intervalChoices } from '@/lib/settingsChoices';
+import { TitleLogoScan } from '@/components/TitleLogoScan';
+import { AutomaticCoverTitles } from '@/components/TitleExtraction';
 
 /** One PATCH. Resolves once the server has answered, so the row that called it can show its tick. */
 type Save = (body: Record<string, unknown>) => Promise<unknown>;
@@ -75,6 +79,9 @@ export function useAdminSettingsViews(extra: Partial<Record<string, ReactNode>> 
     void qc.invalidateQueries({ queryKey: ['admin-settings'] });
     // A blocklist save hides, or shows again, every series' chapters only blocked groups released (bff
     // reapplyBlocklist): any series page already cached refetches its rows, its versions and its groups.
+    if (body.automaticTitleLogos !== undefined) {
+      for (const k of ['featured', 'series']) void qc.invalidateQueries({ queryKey: [k] });
+    }
     if (body.scanlatorPrefs !== undefined) {
       for (const k of ['series-listing', 'series-versions', 'series-groups', 'series-scanlators']) void qc.invalidateQueries({ queryKey: [k] });
     }
@@ -101,6 +108,9 @@ export function useAdminSettingsViews(extra: Partial<Record<string, ReactNode>> 
       pane: ready(data && <SchedulesSection data={data} save={save} />, 'downloads') },
     maintenance: { icon: <IcRefresh width={18} height={18} />, tint: 'bg-amber-500/15 text-amber-300', summary: phrase(about.maintenance), description: about.maintenance,
       pane: ready(data && <MaintenanceSection data={data} save={save} />, 'maintenance') },
+    // v0.105.0 (#411): the title artwork switches on top, and below them the page's own covers and banners (`extra.art`).
+    art: { icon: <IcSparkle width={18} height={18} />, tint: 'bg-pink-500/15 text-pink-300', summary: tr('Covers and banners'),
+      pane: ready(data && <ArtSection data={data} save={save} />, 'art') },
     // v0.43.0 (#70): webhook, Home Assistant, ntfy and Discord targets. Its rows and its one dialog live in their own
     // file; it reads its own endpoint.
     notifications: { icon: <IcBell width={18} height={18} />, tint: 'bg-rose-500/15 text-rose-300', summary: phrase(about.notifications), description: about.notifications,
@@ -159,6 +169,21 @@ function NoticeChaptersSection({ data, save }: { data: any; save: Save }) {
         </div>
       </EditorSheet>
     </>
+  );
+}
+
+/**
+ * The server's own 18+ switch (#406, @StrayaJake). On, as every server has been: 18+ stays out of sight until someone taps
+ * Show 18+. Off, for a server only adults use: nothing is hidden for anyone, and Show 18+ and its banner go away (bff
+ * lib/visibility.ts adultHidingOn). An account's age limit still holds -- it is a permission, on the member. Every query
+ * is dropped after a save, because the switch changes what a dozen listings answer, as Show 18+ does.
+ */
+function AdultHidingRow({ data, save }: { data: any; save: Save }) {
+  const qc = useQueryClient();
+  return (
+    <SwitchRow id="adult-hiding" label={tr('Hide 18+ until someone shows it')} on={data.adult_hiding !== false}
+      help={tr('18+ titles, libraries and sources stay out of sight until someone taps Show 18+. Turn this off if only adults use this server: nothing is hidden, and Show 18+ goes away. Age limits on accounts still apply.')}
+      onChange={(next) => save({ adultHiding: next }).then(() => qc.invalidateQueries())} />
   );
 }
 
@@ -432,11 +457,20 @@ function ServerSection({ data, save }: { data: any; save: Save }) {
           <SwitchRow id="registration" label={tr('Open registration')} help={tr('Let anyone create their own account')}
             on={!!data.allow_registration} onChange={(next) => save({ allowRegistration: next })} />
         )}
+        {/* "Who is reading?" on the sign-in screen (bff /auth/pick): at home only. */}
+        {!desktop && (
+          <SwitchRow id="local-pick" label={tr('Choose a profile at home')} help={tr('At home, the sign-in screen lists the profiles that open without a password.')}
+            on={!!data.local_pick} onChange={(next) => save({ localPick: next })} />
+        )}
         {!desktop && (
           <SummaryRow id="member-defaults-link" label={tr('When someone signs up')} href="/admin/?tab=Members&section=member-defaults"
             value={defaults.perms.canDownload !== false ? tr('Can download') : tr('No downloads')} />
         )}
       </RowGroup>
+
+      {/* Where profiles without a password open, and the proxies that may say who is connecting (bff /api/admin/network).
+          Not on desktop: its server is reached from its own computer alone, always at home. */}
+      {!desktop && <NetworkSettings />}
 
       <RowGroup title={tr('Updates and privacy')}>
         <SwitchWithMore id="update-check" label={tr('Check for updates')} help={tr('Asks GitHub once a day; nothing about this server is sent.')}
@@ -493,12 +527,36 @@ function ServerSection({ data, save }: { data: any; save: Save }) {
 /**
  * Series & chapters: what members see of a series and its chapters, and what is looked up online for it.
  */
+/**
+ * Admin → Art's switches (#411, @julieminer): the title artwork jobs, above the covers and banners they sit beside. They
+ * were under Series & chapters → From the internet until v0.105.0. A link to either row by its id still arrives here,
+ * because the console finds a row by id, not by page.
+ */
+function ArtSection({ data, save }: { data: any; save: Save }) {
+  return (
+    <RowGroup title={tr('Title artwork')}>
+      <RowBlock id="automatic-title-logos">
+        <SwitchRow label={tr('Automatic title logos')}
+          help={tr('Find original manga title artwork using confirmed manga links. Titles without artwork use styled text; your uploaded artwork always wins.')}
+          on={data.automatic_title_logos === true} onChange={(next) => save({ automaticTitleLogos: next })} />
+        <TitleLogoScan enabled={data.automatic_title_logos === true} />
+      </RowBlock>
+      <RowBlock id="automatic-cover-titles">
+        <AutomaticCoverTitles enabled={data.automatic_cover_title_generation === true} save={(next) => save({ automaticCoverTitleGeneration: next })}
+          applyEnabled={data.automatic_cover_title_apply === true} saveApply={(next) => save({ automaticCoverTitleApply: next })} />
+      </RowBlock>
+    </RowGroup>
+  );
+}
+
 function SeriesSection({ data, save }: { data: any; save: Save }) {
   return (
     <>
       <RowGroup title={tr('Shown to members')}>
         <NoticeChaptersSection data={data} save={save} />
-        <AdultFilterSection data={data} save={save} />
+        <AdultHidingRow data={data} save={save} />
+        {/* The genre list only decides what is hidden, so it goes while nothing is. */}
+        {data.adult_hiding !== false && <AdultFilterSection data={data} save={save} />}
         {/* Display only (bff lib/deletedGhosts.ts): a deleted chapter keeps its row, its progress and its place; it is
             drawn as a chapter not here yet instead of "Deleted from the server". A file Verify found missing is not one:
             the sweep fetches those back, and they keep their own look. */}
@@ -570,11 +628,12 @@ function SchedulesSection({ data, save }: { data: any; save: Save }) {
         {/* Which languages MangaDex is a source in lives with the sources (components/MangadexCard.tsx); this row goes there, unfolded (`?card=mangadex`, v0.52.0). */}
         <SummaryRow id="mangadex-languages" label={tr('MangaDex languages')} href="/admin/?tab=Sources&card=mangadex" />
         <MoreOptions id="downloads-more">
+          <PolitenessRow />
           {/* v0.89.0 (#305): how many other sources a series may follow (bff lib/followLimit.ts), here since the env's
               MAX_FOLLOWED_SOURCES alone set it -- that number is what the menu shows until one is picked. The help says the
               cost: each one is a chapter list asked for at every update. */}
           <SelectRow id="sources-per-series" label={tr('Other sources per series')}
-            help={tr('How many sources besides its main one a series may follow, whether you add them or Uchiyomi finds them. 3 by default. Each one is one more chapter list to ask for at every library update.')}
+            help={tr('How many sources besides its main one a series may follow, whether you add them or Uchiyomi finds them. 3 by default. The first 3 are asked at every library update; the others are backups, asked once a day while the series has nothing missing.')}
             value={String(data.followerLimit ?? 3)}
             options={Array.from({ length: data.followerLimitMax ?? 10 }, (_, i) => ({ value: String(i + 1), label: String(i + 1) }))}
             onChange={(v) => save({ maxFollowedSources: Number(v) })} />

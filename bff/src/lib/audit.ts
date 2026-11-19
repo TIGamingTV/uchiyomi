@@ -1,21 +1,34 @@
 // Append-only activity/audit log: logins, admin actions, downloads, blocks. Best-effort (never throws).
 import type { FastifyRequest } from 'fastify';
 import { q } from './db';
-
-/** The address Fastify resolved under trustProxy (lib/auth.ts clientIp), never a header's first entry. */
-function clientIp(req?: FastifyRequest): string | null {
-  if (!req) return null;
-  return (req.ip || '').slice(0, 64) || null;
-}
+// The one reading of the client's address (lib/clientAddr.ts): this file kept a copy of it, and two copies of the rule
+// that decides who a visitor is can drift apart. clientIpHygiene.test.ts holds every other reader to it.
+import { clientIp } from './clientAddr';
 
 export async function logAudit(
   event: string,
   opts: { userId?: string | null; username?: string | null; detail?: unknown; req?: FastifyRequest } = {},
 ): Promise<void> {
   const ua = opts.req ? ((opts.req.headers['user-agent'] as string) || '').slice(0, 200) : null;
+  let detail=opts.detail ?? {};
+  let privateOwners:string[]=[];
+  const ids=new Set<string>();
+  const keys=new Set(['id','ids','seriesId','seriesIds','series_id','bookId','bookIds','book_id','from','into','target']);
+  const collect=(v:unknown,key='',depth=0):void=>{
+    if(depth>25)return;
+    if(typeof v==='string'){if(keys.has(key)&&v.length<=100)ids.add(v);return;}
+    if(Array.isArray(v)){v.forEach(x=>collect(x,key,depth+1));return;}
+    if(v&&typeof v==='object')Object.entries(v).forEach(([k,x])=>collect(x,k,depth+1));
+  };
+  collect(detail);
+  try{
+    if(ids.size)privateOwners=(await q<{owner_user_id:string}>('SELECT DISTINCT owner_user_id FROM private_resource_owners WHERE resource_id=ANY($1::text[])',[[...ids]])).map(r=>r.owner_user_id);
+    const scoped=detail as {visibility?:string;ownerUserId?:unknown};
+    if(scoped.visibility==='private'&&typeof scoped.ownerUserId==='string')privateOwners.push(scoped.ownerUserId);
+  }catch{detail={};} // Without provenance keep the operational event, never unclassified content text.
   await q(
-    'INSERT INTO audit_log (user_id, username, event, detail, ip, user_agent) VALUES ($1,$2,$3,$4,$5,$6)',
-    [opts.userId ?? null, opts.username ?? null, event, JSON.stringify(opts.detail ?? {}), clientIp(opts.req), ua],
+    'INSERT INTO audit_log (user_id, username, event, detail, ip, user_agent,private_owner_ids) VALUES ($1,$2,$3,$4,$5,$6,$7)',
+    [opts.userId ?? null, opts.username ?? null, event, JSON.stringify(detail), opts.req ? clientIp(opts.req) : null, ua,[...new Set(privateOwners)]],
   ).catch(() => {});
 }
 
@@ -55,4 +68,4 @@ export async function pruneAudit(days = 180, keep = 50_000): Promise<void> {
 }
 
 export const recentAudit = (limit = 100) =>
-  q('SELECT id, at, user_id, username, event, detail, ip, user_agent FROM audit_log ORDER BY at DESC LIMIT $1', [Math.min(Math.max(limit, 1), 500)]);
+  q('SELECT id, at, user_id, username, event, detail, ip, user_agent,private_owner_ids FROM audit_log ORDER BY at DESC LIMIT $1', [Math.min(Math.max(limit, 1), 500)]);

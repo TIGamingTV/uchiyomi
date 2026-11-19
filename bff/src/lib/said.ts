@@ -153,6 +153,11 @@ const EN = {
   'numbering.askedWaits': () => 'Numbering by posting order, as asked, waits to be applied.',
   'numbering.sourceWaits': ({ name }: { name: string | null }) => `Going back to ${name ?? 'its source'}'s own numbers waits to be applied.`,
   'numbering.since': ({ at }: { at: string }) => `numbered by posting order since ${day(at)}.`,
+  // #379: a source that counts its specials as chapters (lib/titleNumbers.ts), with the newest chapter it moves when known.
+  'numbering.titles': ({ name, title, number }: { name: string | null; title?: string | null; number?: number | null }) =>
+    `${name ?? 'Its source'} counts its specials as chapters, so its chapter numbers run ahead of their titles` +
+    (title && number != null ? ` (it numbers “${title}” ${number})` : ''),
+  'numbering.titlesWaits': () => 'numbering them by their titles waits for your review.',
 
   // ---- v0.81.0, the scout (lib/sourceScout.ts) on a Health row: when it last looked for the series on other sources,
   // how many it asked, and what came of it. `source` is the source it followed, by name.
@@ -174,6 +179,10 @@ const EN = {
     '"Fix" replaces the chapter only if another source has a longer copy; "It\'s fine" records that it really is ' +
     'this short, and the nightly stops looking at it.',
   'short.detail': ({ number, pages }: { number: number; pages: number }) => `Chapter ${number} has ${pages} page${s(pages, '', 's')}`,
+  'short.specials': ({ n }: { n: number }) => `${n} special${s(n, '', 's')} left out`,
+  'short.specialNote': () =>
+    "A chapter whose title names a special (a Q&A, a giveaway, an announcement, an author's note, bonus art) is " +
+    'left out too: those are meant to be short.',
 
   // ---- Chapters that would not download
   'failures.live': ({ n, m }: { n: number; m: number }) => `${n} chapter${s(n, '', 's')} across ${m} source${s(m, '', 's')} keep failing`,
@@ -584,6 +593,14 @@ const EN = {
   'run.diskFull': () => 'The library disk is full.',
   'run.chapterLimit': () => "Stopped at this run's chapter limit; the rest wait for the next one.",
 
+  // ---- A deleted chapter that could not be put back (#437, routes/sources.ts POST /api/books/:id/refetch). A refusal it
+  // shares with a Fetch (a cooldown, a blocked group) says what the Fetch says.
+  'restore.notListed': ({ number }: { number: number }) =>
+    `No source this series follows lists chapter ${number} right now. Check for new chapters, or add a source that has it.`,
+  'restore.notInPlace': () =>
+    'That chapter cannot be put back where it was: its file is not one Uchiyomi downloaded under its usual name. Pick a copy under Versions to fetch it instead.',
+  'restore.notDeleted': () => 'That chapter was not deleted on purpose: its file went missing. Check for new chapters to fetch it again.',
+
   // ---- A renumbering refused or put off (routes/numbering.ts, lib/numbering.ts)
   'renumber.downloading': () => 'Chapters are being fetched for this series. Try again when that ends.',
   'renumber.checking': () => 'This series is being checked right now. Try again when that ends.',
@@ -630,9 +647,10 @@ const EN = {
     `${name} calls it “${title}”, which is not this series’ title or one of its other names. If the cover and the chapters show it is the same work, attach it anyway.`,
   'attach.unreachable': ({ name }: { name: string }) => `${name} did not say what that title is. Try again in a minute.`,
   'attach.cooling': ({ name }: { name: string }) => `${name} is cooling down after errors, so it is not asked anything right now. Try again later.`,
+  // #413: and where the number is set, for the admin whose sheet this is.
   'attach.cap': ({ n }: { n: number }) => (n === 1
-    ? 'This series already follows 1 other source, as many as it may. Remove one first, or move the series to this source.'
-    : `This series already follows ${n} other sources, as many as it may. Remove one first, or move the series to this source.`),
+    ? 'This series already follows 1 other source, as many as this server allows. Remove one first, move the series to this source, or allow more in Admin → Settings → Downloads → More options → Other sources per series.'
+    : `This series already follows ${n} other sources, as many as this server allows. Remove one first, move the series to this source, or allow more in Admin → Settings → Downloads → More options → Other sources per series.`),
   'detach.noMain': () => 'This series has no main source to detach.',
   // A source retired, or a site removed, while some series still has it as its main source (v0.54.0, lib/retireSource.ts).
   'retire.inUse': ({ n }: { n: number }) => `It is the main source of ${n} series. Replace it first.`,

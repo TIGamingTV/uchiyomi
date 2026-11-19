@@ -19,6 +19,7 @@ environment variables see [CONFIGURATION.md](CONFIGURATION.md).
 - [12. Backups & restore](#12-backups--restore)
 - [13. Troubleshooting & FAQ](#13-troubleshooting--faq)
 - [14. Uchiyomi Desktop](#14-uchiyomi-desktop) — the Windows and macOS app (beta), now in [its own guide](DESKTOP.md)
+- [Uchiyomi for iPhone and iPad](IOS.md) — beta setup, Actions-built IPAs, optional AltStore source, offline reading and device acceptance
 
 ---
 
@@ -55,6 +56,11 @@ the admin from a password you type, fixes volume ownership, and starts the devel
 `yomi-db`, `yomi-suwayomi`, `yomi-flaresolverr`). `yomi-app` is the same single container the install ships,
 built from source.
 
+For a source checkout, the development database stays on its existing PostgreSQL 15 image. A fresh volume
+now finishes initialization with the image's own bootstrap role before creating Uchiyomi's `yomi` database;
+existing volumes retain their data and configuration. If an earlier first start failed before creating that
+database, see the recovery notes in [Contributing](../CONTRIBUTING.md#tests) before touching its volume.
+
 ---
 
 ## 2. Signing in
@@ -89,6 +95,33 @@ libraries, an age limit, downloads) is the admin's choice, under **Admin → Mem
 switch off there is no such link, and accounts come from the admin (**Admin → Members**). The desktop app never offers
 it.
 
+**Profiles without a password.** A household can give the children, or anyone who reads on the family tablet, a
+profile of their own that opens without a password, with its own progress, favourites and history. Tap your profile
+photo, then **Switch profile**: the profiles you manage are a tap away, and **Sign in with another account** takes you
+back to this screen. They open from your home network only. From anywhere else, on mobile data or a friend's Wi-Fi,
+only an account with a password (or single sign-on) gets in, and a profile without one stops at its next request
+until you are home again: the sign-in screen then says *This profile opens from home only*. Signing out of the account
+you switched from closes the profiles opened from it on that device. Which networks are home is set in **Admin →
+Settings → Server → Home network**: by default the private networks your router hands out (192.168.x, 10.x, 172.16–31.x),
+or the networks you write there, or none. The same place names the reverse proxies allowed to say who is connecting, and
+lists the address the server sees for each signed-in device, at home or outside, so a proxy that hides everyone behind
+its own address shows. Behind a reverse proxy, write its address in **Trusted proxies** (the page offers it when you
+reach the server through one): until then nobody behind the proxy counts as at home. Through a Cloudflare Tunnel nobody
+does: at home, open the app by its local address or a local DNS name. `LOCAL_NETWORKS` and `TRUST_PROXY`
+in the environment outrank the page ([Configuration](CONFIGURATION.md)).
+An admin can also turn on **Admin → Settings → Server → Choose a profile at home**: at home, the sign-in screen then
+lists those profiles under *Who is reading?*, a tap each, with nobody else signed in first. From outside it lists
+nothing.
+> 💻 **In the desktop app** the computer's owner adds these profiles under **Profile → Account → Profiles** and switches
+> to one with **Switch profile**; **Back to my account** returns to the owner. The desktop app is home, so they always open
+> there.
+
+**Remember on this device.** Tick it under the password when you sign in, and this device keeps you: the sign-in
+screen lists you under *On this device*, and the others signed in here find you under **Switch profile**, a tap away
+without your password, for as long as your session lasts. **Sign out** forgets you on this device; **Sign in with
+another account** keeps you remembered. An admin is asked for the password again after 12 hours. Nothing is
+remembered unless you tick it, so a shared tablet keeps nobody by default.
+
 ---
 
 ## 3. Your library
@@ -96,7 +129,7 @@ it.
 ![Library](shots/library.webp)
 
 The **Library** tab is your whole collection. Since v0.60.0 a **toolbar** sits above the grid: **Search your library**
-(narrows the shelf by title, filters and sort kept), the **Sort** key, the **Comfortable / Compact / List** switch (remembered
+(narrows the shelf by title, and since v0.100.0 by author too, filters and sort kept), the **Sort** key, the **Comfortable / Compact / List** switch (remembered
 on each device), **Select** and ✦ **Surprise me**. Every way to narrow it lives in one filter panel: which library, read
 state, publication status, format and genre. On a laptop the panel sits down the left of the grid; on a phone it opens
 from **Filters** in the toolbar. Since v0.60.0 its choices are rows rather than chips: each with its own mark (a ring
@@ -143,6 +176,12 @@ Home follows at once, and the arrangement is saved to your account, so your othe
 puts the original order back. Your lists move together as one rail, and which lists those are is still chosen on
 **Lists** (the sheet's **Choose lists** goes there). A hidden rail isn't fetched at all.
 
+**Take something off Keep reading**: right-click a card in *Keep reading* (press and hold on a phone, or use the ⋯ that
+appears on a computer) and choose **Remove from Keep reading**. The series stays in your library and your progress is
+untouched; it only leaves that row, for you. It comes back by itself the next time you read a chapter of it. To bring it
+back sooner, **Hidden (n)** beside the row's title lists what you removed; pick one to put it back. The same removal
+applies to your e-reader's Keep reading shelf (OPDS) and to *Pick back up*.
+
 **Your favorites in your order** (since v0.97.0): **Manage** at the end of the *Your favorites* row opens your favourites
 as a list. Drag one into place (on a phone, hold it a moment first), move it a step with its arrows, or take it off with
 its ×. Home shows them in that order, and so does every other device and the OPDS feed. A series you favourite later
@@ -154,7 +193,7 @@ the page, cards, sheets, the sidebar and a phone browser's own bar included, and
 It is saved to your account like the accent colour; the sign-in screen stays black.
 
 **Lists** are your own shelves — *Plan to read*, *Reading now*, anything. Make one under **Lists** with **New**, and
-add series to it from a series page with the **List** key under the reading button (*Add to list*). A list shows its series with the Library's covers
+add series to it from a series page with the **List** key under the reading button (*Add to list*). The sheet ticks the lists that already contain the series: tick one to add it, or untick it to remove it. It stays open so you can change several lists, then press **Done**. Only your hand-picked lists appear; smart lists follow their filters and shared lists belong to their owner. A list shows its series with the Library's covers
 (since v0.55.7, [#164](https://github.com/AngeloSha/uchiyomi/discussions/164)): the unread count, the **NEW** ribbon and
 the favourite heart, counted from your own reading. **Sort by** orders it: **Your order** (the list as you arranged it,
 the default), **A–Z**, **Z–A**, **Last read** (what you read most recently first), **Most unread** and **Latest chapter**
@@ -214,7 +253,8 @@ only when nothing else wants the key: not while you are typing in a field, not w
 Ctrl, Alt or ⌘ held, and never in the reader, which keeps its own keys. Under a Japanese or Chinese
 interface the palette opens empty instead, so the input method composes the whole title. **Profile → Settings →
 General → Type anywhere to search** switches the typing, and the **/** shortcut with it, off on that device;
-**Ctrl+K** keeps working.
+**Ctrl+K** keeps working. A phone has no such keys, so the **Search** tab has a **Search pages, settings and actions**
+button under its box that opens the same palette, with what you have typed already in it.
 
 **Search finds pages and settings too** (since v0.55.4). Type two letters or more and, under the series, **Pages and
 settings** lists what the words name: every page of **Admin** and of your **Profile**, every setting on them (since
@@ -286,6 +326,46 @@ page, under the hero — in full above You, a slimmer band above the rest; on a 
 screen: tap a row to open its page, under a band of the same art, and Back returns to the list. A row marked *This
 device* is kept by this browser only; every other setting follows your account.
 
+### Upload a series
+
+For a series no source carries, when you already have its chapters as files: **Upload a series** in the Library's
+header (the arrow-up key on a phone) opens a page of its own. Give it a title, choose the files (.cbz, .cbr, .zip, .rar,
+.pdf or .epub, as many as you like), and **Upload**. The files go into the download folder under `Uploads/<title>`, one
+after another in name order, and the library scan makes them a series. The chapter number is read from each file name,
+as for every file the scan meets (see *How a chapter's number is read* below), so name them like `Chapter 12.cbz`.
+
+- A title already in the library is refused before anything is written: pick another.
+- Nothing is overwritten, and a file whose contents are not the archive its name says is refused. One refused file
+  does not stop the rest.
+- ZIP/CBZ/EPUB files can be up to `UPLOAD_MAX_MB` (2 GB by default); PDF and RAR/CBR files are capped at 128 MiB because those readers load the whole file. The archive index and its first page must be readable. Uploads also stop at the download disk's `MIN_FREE_GB` floor, including uploads without a declared size.
+- Admins can always upload. A member needs **Can upload series**, which an admin turns on per member under
+  **Admin → Members**. It is off by default.
+
+To fill missing chapters of an existing series, open its **More → Upload chapters** action. The same permission is
+required, and members can upload only into a series they may open. The files land in that series' download folder;
+existing files and the read-only library are preserved. A stored file whose scan is pending is reported separately:
+run a library scan before retrying it. Two uploads can run at once; a series being changed by another task waits.
+
+### Upload loose images as one chapter
+
+In **Upload a series** or **Upload chapters**, choose the image option, select images or a folder, and check the
+page order before uploading. Give the chapter a name such as `Chapter 12`; the server validates each image and
+stores one CBZ, then indexes it like any other chapter. File names inside the CBZ follow the reviewed page order.
+Folder names do not become server paths. A corrupt page is refused with its name so you can replace it and retry.
+
+A chapter may contain up to 2,000 pages, each at most 64 MiB and 64 million decoded pixels; the complete upload
+must also fit `UPLOAD_MAX_MB` and the existing disk-space floor. Validation and staging run sequentially, and an
+interrupted upload does not replace an existing chapter. A stored chapter still waiting for indexing is reported
+separately so you can scan before retrying.
+
+### Local cover and banner files
+
+Put `cover.webp`, `cover.png`, `cover.jpg`, `cover.jpeg` or `cover.avif` beside the series' chapter files, or inside its
+`artwork/` folder. The same names with `banner` supply its banner. A library scan validates and caches the images;
+changes and removals appear on the next scan. Read-only library folders work. An explicit artwork upload, image link
+or first-page choice takes precedence; these files take precedence over automatically found artwork. Original files
+are never changed.
+
 ### What counts as a chapter
 
 Point `LIBRARY_PATH` at what you already have. A chapter can be any of:
@@ -345,6 +425,22 @@ order leaves it alone; Edit a chapter gives it one number instead.
 The series page shows the cover, an ambient backdrop, one muted line about where the chapters come from,
 genres, description, and the **chapter list**.
 
+**Find more by an author** (since v0.100.0, [#338](https://github.com/AngeloSha/uchiyomi/issues/338)). Each name in
+the *by …* line under the title is a link: it opens the Library showing every series by that person, with an
+*Author:* tag above the grid you can clear. A series with several authors shows each name on its own. A name finds every
+way it is written: *Chugong (추공)* also finds a series that only says *추공*, and *Gi So-Ryeong* finds *Gi So Ryeong*.
+It matches whole names, so *Oh* is not every name with "oh" in it. **Save as list** keeps the author, so a list of
+someone's work fills itself as you add more of it. Genres link the same way, to the Library filtered by that genre.
+
+**Find more by this author** on that filtered library opens Discover with the author's name. Discover's
+**Search by** control offers **Title**, **Author**, and **Artist**. Creator searches use the provider's own
+creator fields and only ask sources that support them; they never substitute a title search. MangaDex
+supports both roles, including enabled languages and further result pages. An extension participates only
+when it declares an Author or Artist text filter; a source with only one role is only asked for that role.
+A provider's combined Author / Artist field searches either kind, as that provider defines it. Filter names,
+positions and group nesting come from the extension; no title syntax or saved preference is changed.
+Extensions without creator search support are left out. The chosen field stays in the address when you reload.
+
 - **The reading button** says what it opens (since v0.60.0): *Continue · Ch. 12* when a chapter is half read (the
   one you read last), *Next · Ch. 11* when you finished chapters 1–10 and nothing is half read, *Start reading* the
   first time, and *Read again* once everything is read. A series with no chapter on disk yet shows *Nothing to read yet*
@@ -363,12 +459,15 @@ genres, description, and the **chapter list**.
   (*Add to list*) and **More**. **More** holds the rest, grouped: *Reading* (notes and saved pages, mark all read
   or unread), *Chapters* (Find missing chapters, Archive slowly, and for an admin Check for new chapters and, while any
   is hidden, Show hidden chapters), *Share* (copy
-  the link, open in a new tab), and for an admin *Edit details*, *New banner*, *Rename folder* and *Remove from
-  library*. On a computer it opens as a menu, on a phone as a sheet.
+  the link, open in a new tab), and for an admin *Edit details*, *Change cover*, *Move library*, *New banner*,
+  *Rename folder* and *Remove from library*. *Move library* files the series under another library (or *Automatic —
+  follow the folder*, which hands it back to the folder rule); no files move, and the choice survives the next scan.
+  An admin's right-click or ⋯ menu on a series card has it too. On a computer it opens as a menu, on a phone as a sheet.
 
   ![The series page's More menu, open: Reading, Chapters, Share and Admin groups](shots/series-more.webp)
 - Click any chapter to read it; the ⬇ on a chapter saves just that one to this device. Toggle
-  **Oldest/Newest** to flip the order.
+  **Oldest/Newest** to flip the order; since v0.105.0 the order you pick is kept for every series, on every device
+  you sign in on ([#408](https://github.com/AngeloSha/uchiyomi/issues/408)).
 - **Mark all read** does what it says to every chapter of the series; **Filter** narrows the list to one
   translation group or hides the grey rows; **Select** picks chapters one by one for the actions described
   in *Selecting chapters* below.
@@ -401,7 +500,8 @@ Progress, favorites, and history are **per-user**, so each account has its own.
 **Filtering the library.** The Library's filter panel (a sidebar on a computer, **Filters** on a phone): read state
 (not started / reading / finished), publication status, genres, and the source a series comes from
 (**Main source** / **Any source**). Picking several genres means all of them. Active filters show as
-removable tags above the grid, and they live in the URL, so you can share a filtered view.
+removable tags above the grid, and they live in the URL, so you can share a filtered view. An author (a name on a
+series page, since v0.100.0) shows there as a tag too.
 
 **Doing something to many series at once.** Hit **Select** on the Library page, tap the ones you want, and the
 bar at the bottom shows what can be done with them. With a keyboard, **Shift**-click picks every series between the
@@ -525,6 +625,15 @@ recommend that you already have. These are kept up in the background with the An
 nothing asks AniList when a page opens, a library with AniList lookups off sends nothing, and the 18+ switch and age
 limits apply as everywhere else.
 
+### Titles on AniList
+
+A series linked to AniList shows, above its summary, the **English**, **romanised** and **Japanese** titles of that
+entry, each one that has a name and differs from the title the page already shows. The server asks AniList for them
+when the page is opened, keeps the answer, and asks again after a month (after a day when AniList had no names). A
+series with no AniList link, or in a library with AniList lookups off, sends nothing and shows nothing; if AniList is
+busy or unreachable the page shows the names it last kept. These are read-only and are separate from the **Other
+names** an admin keeps for searching.
+
 ### Cover and banner
 
 When nobody chose a picture, a series is shown with:
@@ -540,10 +649,16 @@ entry's names — its romaji, English or native title, or a synonym — is exact
 title you set in *Edit details*, its *Other names* (below), with case, accents, punctuation and bracketed asides set
 aside, and a leading *The*, *A* or *An* ignored when at least six letters remain. A name that merely contains the
 series' name is another work: *Morgan Lost: Dark Novels* is not *Morgan Lost*.
+Since v0.103.1 a synonym is the last resort: synonyms are anyone's to add on AniList, and an anthology lists every story
+in it (*Pick Me Up* had been linked to an 18+ anthology with a story of that name). When an entry matches only by a
+synonym, AniList's next few answers are looked at, and the entry that has the name as its own title wins.
 The same rule picks the AniList entry a series is linked to for tracker sync (section 10), and the art backfill under
 **Admin → Art** follows it too. What was matched before v0.55.7 is checked again in the background
 (**Admin → Settings → Maintenance → Check online matches**, section 8): a link to another work is removed, and a cover or banner that
-came from another work is cleared, so the series shows its source's cover or its own first page.
+came from another work is cleared, so the series shows its source's cover or its own first page. After the upgrade to
+v0.103.1 every automatic link is checked once more, and one that matched only by a synonym moves to the entry named so
+by its own title, with the cover, banner and reading direction its old entry gave the series. A link you made is never
+moved.
 
 In **Edit details** (the art column, or the *Art* tab on a phone) the cover has **Upload**, **From a link** and **⋯**:
 
@@ -559,6 +674,66 @@ for it, each labelled with the source's name; a source that is switched off, coo
 its own copy, so the cover survives the source changing or going away. **Upload your own…** on the same sheet takes
 a picture from the device instead. The new cover shows at once on every card of this device, not after the browser's
 day-long copy of the old one runs out.
+
+### Hero title artwork
+
+On a computer, the home carousel and a manga's series-page hero can show its own transparent title logo. Without a
+logo, the title uses a readable style matched to its genres and cover colours. On a phone (and any screen under 1024
+pixels wide) the cover itself is the hero and already carries its lettering, so the hero shows that readable title
+instead of the logo, and the logo is not downloaded (since v0.102.2). A logo in the original language, or one whose
+language is not known, keeps the readable manga title underneath it.
+
+**Admin → Art → Automatic title logos** enables background logo lookup (until v0.105.0 it sat under Settings → Series &
+chapters; both title artwork switches now sit on the Art page, above the covers and banners). It is off until enabled.
+Only a series with a checked or manually confirmed AniList manga link is looked up. The server first asks the
+[Uchiyomi logo library](https://github.com/AngeloSha/uchiyomi-title-logos) by that ID: logos picked and cut out by hand
+from official covers, one per manga, each used only when its file matches the SHA-256 the library lists (since
+v0.103.0). Without a library logo, it finds matching artwork on Wikidata and Wikimedia Commons. Either way it keeps its
+own copy. A title alone is not enough to choose a logo. The library's automatic online-lookup opt-out is respected, as is **Use the first page** for automatic artwork.
+Opening a hero never waits for the lookup: it shows the styled title while work runs, and keeps that title when
+there is no reliable logo. A provider outage leaves any cached picture available.
+
+When automatic title logos are enabled, the server also checks the eligible library in the background; opening
+each manga is not required. It resumes after restarts and retries temporary failures after the artwork provider's
+requested pause. The progress panel beside the setting separates checked titles, ready logos, completed searches
+with no match, retries, titles not checked yet, and missing manga links. **Scan library** checks work that is due;
+**Retry no matches** also repeats eligible completed searches that found nothing. Neither action overrides a
+library's online-lookup preference or an admin's artwork choice. A manga that gains a logo in the library gets it on the
+next background check, even after an earlier search found nothing or found a Wikimedia logo, and a logo reworked in the
+library replaces the old copy; an admin's own logo or choice of text is never replaced. A missing manga link needs confirmation through
+the existing manga-link controls before automatic logo matching can use it.
+
+The lookup accepts matching transparent Commons PNG originals as well as rendered thumbnails. If an exact manga
+entry has no logo field, bounded artwork discovery can use a canonical Wikipedia page to verify the candidate
+against that same manga identity. Filename similarity alone never selects the artwork.
+
+In **Edit details → Art → Title logo**, an admin can:
+
+- Upload a transparent PNG or WebP, or use **From a link**, to choose a logo explicitly.
+- Use **Find again** to request a fresh match for a series in automatic mode. This explicit action can look online
+  even when automatic lookup is off for the server or library.
+- Choose **Use styled title** and a style, including a plain title. That choice stops automatic logo lookup for the
+  series until it is reset.
+- Choose **Reset to automatic** to clear a manual choice. A custom logo remains in charge until it is reset; a
+  background result cannot overwrite a later manual edit.
+
+The preview includes the artwork's source and attribution when supplied. Uploaded and downloaded logos are kept with
+the server's configuration and included in configuration backups. Changing a title logo leaves the manga's cover,
+chapter files and reading progress in place.
+
+With the optional local extraction service installed, **Extract from cover** prepares a transparent title preview.
+Choose the title area, exclude credits, and use Restore or Erase to correct its edges before applying it.
+
+**Automatically extract cover titles** is a separate, default-off nightly option for existing and new manga.
+For a checked manga link with online lookups enabled, it waits for the online logo search first; only a completed
+no-match result allows cover extraction. Provider errors stay queued until retry is allowed. Series without a checked
+link, or with online lookups disabled, can still receive local previews without an online search.
+
+**Apply cover titles that pass checks** is also off by default. It requires complete-title and image checks; uncertain
+results stay for review. The panel shows whether automatic applying is on, online-search progress, and why previews
+need review. A preview may have several reasons. Manual artwork and corrected drafts remain protected.
+See [Nightly cover titles](cover-title-batch.md) for scheduling, retry and retention details. The standalone
+[cover-lettering trial](../scripts/title-art/README.md) remains available for operators testing local covers.
 
 ### Sources & translations
 
@@ -586,7 +761,7 @@ Tap the line and the **Sources & translations** sheet opens. It has two sections
   followed on its own (see *Following a second source*), *{n} chapters listed* as of the last check, and
   *checked {ago}*. A source that is no longer installed is dimmed and says *not installed*. A series with
   no source says *No source — the chapters were scanned from disk.* Admins also get an × on a followed source
-  to stop following it, and two chips under the list: **Check now**, one for the series since a check
+  to stop following it (see *Removing a source* below), and two chips under the list: **Check now**, one for the series since a check
   visits every followed source, and **Add one from Find missing chapters**, which closes the sheet and
   opens that dialog (see *Following a second source*).
 - **Translated by** — one row per scanlation group, ranked groups first, then the busiest, blocked groups
@@ -759,10 +934,13 @@ sources it already follows are kept but not asked, and a new follow is refused w
   searched for this; only the sources the dialog already found are asked, each for its page and chapter list.
 
 **How many** (since v0.89.0, #305). A series follows up to three sources besides its main one. An admin can allow
-more, up to ten, or fewer, in **Admin → Settings → Downloads → More options → Other sources per series**; the number
-counts the sources you follow and the ones Uchiyomi finds on its own alike. Each one is one more chapter list asked for
-at every library update, so more sources per series make each update longer. Lowering it unfollows nothing: a series
-that follows more keeps its sources, and follows no new one while it is over the number.
+more, up to 25 since v0.105.0 (ten before), or fewer, in **Admin → Settings → Downloads → More options → Other sources
+per series**; the number counts the sources you follow and the ones Uchiyomi finds on its own alike. The first three
+it follows are asked at every library update. The rest are its backups
+([#413](https://github.com/AngeloSha/uchiyomi/issues/413)): while the series has nothing missing they are asked once a
+day, so a long list of them does not make every update longer; once it is missing chapters, or when nothing ahead of
+them answers, they are asked like the others, and **Check now** asks them all. Lowering the number unfollows nothing: a
+series that follows more keeps its sources, and follows no new one while it is over the number.
 
 **In the series' language only** (since v0.52.0). A series follows sources in its own language: the add dialog's
 check, the hunt for a missing chapter and Find other sources never follow a source in another, and Find missing
@@ -1120,6 +1298,20 @@ On the desktop app the archive runs only while Uchiyomi does — its window or t
 computer awake, so a PC that sleeps at night is rarely inside a night-time window; its first look after the app
 starts comes three minutes in. Health does not report the gaps an archive is filling as problems (section 8).
 
+### Downloads & politeness
+
+**Admin → Settings → Downloads → More options → Downloads & politeness** (admins) gathers what keeps the server gentle
+with sites in one place:
+
+- **Limits set by the server** — the numbers that only environment variables set, with the value this server is
+  running on: pages of a chapter fetched at once (`SUWAYOMI_PAGE_CONCURRENCY`), how long a source gets to answer the
+  latest-chapters check and a test (`SOURCE_LATEST_TIMEOUT_MS`, `SOURCE_TEST_TIMEOUT_MS`), library folders scanned
+  at once (`SCAN_CONCURRENCY`), nightly backups kept (`BACKUP_KEEP`) and the image cache's size cap
+  (`CACHE_MAX_BYTES`). They are read-only here; change them in the container's settings and restart. Only these
+  numbers are shown, never a password or key.
+- **Blocked sources** — every source that is refusing requests or cooling down right now, the same list the *Sources*
+  tab shows, with **Unblock** to try it again at once (the same button as on the source's own sheet).
+
 ### Chapters the sources have that you don't
 
 The chapter list also shows, greyed out, every chapter the followed sources list that this server does not
@@ -1261,7 +1453,8 @@ two titles the sheet says *These look like different posts that share a number, 
 for an admin with **Number by posting order** (see *Chapter numbering* below). A chapter downloaded since v0.49.0
 also remembers the post it came from, so *on server* marks exactly that copy.
 
-**Fetch** beside a copy on a grey row takes exactly that copy, for anyone who may download. **Replace…**
+**Fetch** beside a copy on a grey row takes exactly that copy, for anyone who may download — on a deleted chapter's
+row too, where it lands on the deleted row. **Replace…**
 beside a copy of a chapter already here is admins only — and only on a file Uchiyomi downloaded, never one
 from a library you built, as with *Fetch again* — and is disabled on the copy already on disk: the sheet
 closes, *Replace with this version?* asks, and **Replace** is the *Fetch again* below with the copy named:
@@ -1352,6 +1545,42 @@ second source, searching other sites for its gaps, borrowing chapter names and f
 with that reason — the sources it already followed stay, and are simply not asked. Health's *Chapter numbering*
 lists every series waiting for a review (section 8).
 
+### Chapter numbering: when a source counts its specials as chapters
+
+Since v0.103.1 ([#379](https://github.com/AngeloSha/uchiyomi/issues/379)). Some sources number a post by its place
+in the series, specials included. On Tapas, *24. The Other Side* comes after three specials, so the source numbers
+it 27, and *Caption Contest!* just after it 28: every chapter after the first special was numbered past the number
+in its own title. Such a series is numbered **by the chapter titles** instead:
+
+- each chapter gets the number its title starts with: *24. The Other Side* is Ch. 24;
+- each special stays in the list, just after the chapter before it: *Caption Contest!* is Ch. 24.01, a second
+  special there 24.02. A special never takes or shifts a chapter's number.
+
+**How it is noticed.** Each source's list is judged on its own: at least 12 posts with a number each, counted one
+post at a time, most titles starting with a chapter number, at least one special, and chapters the source numbers
+ahead of their titles. A number in a special's title that is out of step with the chapters, such as *100
+Subscribers!* or *2023 Recap*, does not make it a chapter. Tapas's own *Show episode number in chapter name*
+(`27 - 24. The Other Side`) and the 🔒 on a locked episode are read past. Nothing is stored: a post's number comes
+from the posts before it, so a new post never moves an earlier one. Deleting a special moves a second special after
+the same chapter from 24.02 to 24.01, and a creator who changes the number in a title moves that chapter. Titles that
+start counting again each season do not fit this reading (a later season's chapters would read as specials): keep
+the source's numbers for such a series.
+
+**Adding, reviewing, undoing** work as for posting order above. A series you add is numbered this way at once, and
+the add dialog says *Numbered by the chapter titles* and why: *Tapas counts its specials as chapters, so its chapter
+numbers run ahead of their titles (it numbers “24. The Other Side” 27).* **Keep the source's numbers** adds it the old
+way. A series already in your library is never renamed on its own: its page says *Chapter numbers need a review*,
+nothing new downloads for it, and **Review renumbering** opens the plan, *Number by the chapter titles*, for an admin
+to confirm. Files are renamed in place, as above. Afterwards the notice reads *Numbered by the chapter titles*, with
+**Use the source's numbers** to undo it.
+
+**Other sources keep working.** Unlike posting order, the numbers in the titles are the creator's, and other sites
+use them too, so a series numbered this way still follows other sources, fills gaps and borrows names from them. A
+second source that counts its specials the same way is read by its titles as well, for new chapters and for *Find
+missing chapters*, unless the series keeps its main source's own counted numbers. Chapters already downloaded from
+such a source keep their numbers; **Replace from another source…** swaps in the right copy where one holds a different
+chapter.
+
 ### Filtering the chapter list
 
 **Filter**, the chip beside *Oldest/Newest*, opens *Filter chapters*: under *Translated by*, **All** and one
@@ -1363,6 +1592,10 @@ line under the header says *{n} of {m} chapters match*. Select mode works on the
 remembered between visits; the switch is, per device.
 
 ### Selecting chapters
+
+**Select all** in the selection toolbar picks every chapter matching the current filter, across chapter pages,
+including grey rows when they are shown. Press **Clear selection** to undo the selection. Selecting alone does not
+download, mark, hide or remove anything; choose an action afterward.
 
 **Select**, beside *Mark all read*, turns the chapter list into a pick list: tap rows to tick them (a grey
 row too), and the bar at the bottom shows what can be done with the selection. **Done** leaves the mode.
@@ -1406,7 +1639,9 @@ folder — is ever deleted, and **a chapter anyone has bookmarked is kept**, bec
 inside the file. A chapter in a library you assembled, or one with a bookmark on it, is skipped, and the toast
 says how many were and why (*3 skipped: not downloaded by Uchiyomi*, *1 skipped: bookmarked by a reader*); a
 delete that deleted nothing says so in red rather than reporting *0 deleted* as a success. A deleted chapter
-is not fetched back by the updater; the tombstone is what tells it the chapter is accounted for.
+is not fetched back by the updater; the tombstone is what tells it the chapter is accounted for. When a chosen
+chapter isn't listed by any source the series follows, the confirmation warns that once deleted, it can't be fetched
+again.
 
 **Fetch again** is the replace that the translation rules deliberately never do on their own: it downloads
 the copy those rules choose *now* — the group you ranked since, from whichever followed source carries it —
@@ -1466,7 +1701,11 @@ you keep scrolling through a series without interruption.
 - **Tap** the middle to show/hide the chrome (top bar + controls).
 - **Pinch / double-tap** to zoom (width multiplier); with a mouse, **double-click**. A double-click only zooms: it
   never turns the page as well, however slow your computer's double-click setting is (since v0.47.1).
-- **Themes:** AMOLED black, sepia, or gray, from the reader settings.
+  On a touch screen the double-tap zooms from the middle of the screen, on the spot of the first tap; two quick taps on a
+  page-turning edge are two page turns. In paged mode, a zoomed page is **dragged** to look around it (it does not turn
+  the page), a press that stops a fling is not a tap, and crossing into another chapter shows its name for a moment.
+  The controls stay up while you drag the page slider.
+- **Themes:** AMOLED black, Paper (a light cream like printed manga paper: white becomes about #F0E8D8, black stays black), sepia, or gray, from the reader settings.
 - **Cover colour at the edges:** a soft wash of the series' cover colour across the top and bottom of the screen,
   so a gold cover tints the edges gold. To read with plain black edges, switch **Cover colour at the edges** off in
   the reader's settings sheet or under Profile → Settings → Reading → More options (since v0.55.7,
@@ -1606,6 +1845,10 @@ not to you: an e-ink tablet wants E-ink, the phone beside it does not.
   double pages* off. It is saved for your account only -- nobody else's reader changes -- follows you to your other
   devices and into chapters you download, and the server looking at the chapter again leaves it alone; a chapter whose file is replaced by one with
   another page count starts afresh.
+- **Page fit** (account, paged mode): **Whole page** keeps the complete page within the screen and remains the default. **Fit width** fills the slide width and lets you scroll vertically inside that page; swipe sideways or use the normal page keys to turn pages. Zoom, right-to-left order, cropped borders and split or rotated spreads keep working. This is separate from webtoon scroll's **Fit** choice.
+  Space, ↓ and Page Down read down a tall page before they turn it (Shift+Space, ↑ and Page Up read up), and since
+  v0.105.0 going back a page opens it at its foot, where you left it, rather than at its top
+  ([#401](https://github.com/AngeloSha/uchiyomi/pull/401), @Forgitusername).
 - **Column width** (this device, since v0.74.0): in webtoon scroll, narrows the column of pages to between 30 % and
   100 % of what *Fit width* or *Original* gives (steps of 5 %). A phone wants 100 %, a wide monitor a narrower strip. Like
   the other *this device* settings it is kept in this browser only, so your other screens are unaffected.
@@ -1708,6 +1951,38 @@ chapter that has not been processed yet simply skips nothing. One limit worth kn
 downloaded *before* its pages were fingerprinted keeps the flags it was saved with until you download it
 again.
 
+### Removing unwanted images and source GIF rules
+
+An admin reading the server copy can open **Pages → Manage saved pages** to select unwanted images in a
+downloaded chapter, preview the selection and confirm removal. **Skip** keeps the original image in the file;
+**Remove** takes its bytes out of the CBZ and retains them in the server's page trash. Each image keeps its
+original numbered slot, so story pages, bookmarks and reading progress never shift. Removed slots remain
+labelled in Pages, with **Restore** while their original is retained.
+
+Physical editing supports writable, complete local **CBZ** files only. CBR, PDF, EPUB, loose-image folders,
+remote chapters and partial downloads still offer Skip. For safety the editor also refuses archives over
+128 MiB compressed or decoded, archives with over 2,000 entries, and malformed entries. If the chapter was
+replaced by another program or fetched again after the preview, refresh the preview; originals cannot be
+restored onto a different archive. A copied CBZ can describe removed slots, but needs the original server's
+page trash and journal to restore them.
+
+**Keeping an original in trash still uses storage.** After checking the selection, an admin can permanently
+delete retained originals, or clear unused retained images left after restoration. The confirmation explains
+that this removes the server trash's undo copy. Another removed slot that still needs a shared original keeps
+that image. There is no automatic purge or expiry. Separate backups and existing offline downloads keep
+their own copies; clearing the server trash does not clear those.
+
+The same panel can preview `.gif` images and enable a **GIF skip rule** for this series or its whole source.
+Rules start disabled, apply to existing and future chapter reads, and never delete an image. A series rule
+overrides its source rule, including an explicit **Disabled**; clearing the series rule returns to the source's
+default. A rule follows the copy's recorded source identifier, so another source's version and chapters with
+unknown provenance are left alone. Use the page grid's existing rescue control for any legitimate GIF:
+that page's explicit rescue wins over the rule.
+
+Saved offline chapters retain the images and flags they were downloaded with. Remove this device's saved
+copy in Downloads and reopen the chapter online before editing the server copy or changing its rules;
+download it again afterward to keep the updated version. Other devices' completed downloads are separate.
+
 ### Translated pages
 
 Since v0.85.0. For a chapter in a language you don't read: a raw chapter the day it comes out, or an English chapter in
@@ -1752,10 +2027,19 @@ translated once per language and kept, so reading it again costs nothing.
 
 **Discover** is how you add new series to your library.
 
-- **Trending** rails: popular manhwa, and since v0.61.0 manga and manhua, that you don't already have. Each card shows
-  the description + chapter count.
-- **Because you read …** (since v0.61.0, for accounts that may add series): what AniList's readers recommend after
-  something you read lately, leaving out what you have. A card searches your sources for it.
+- **For you** is a personal reading hub. The hero mixes manga, manhwa and manhua; recommendations explain which recent
+  read or connected tracker suggested them. Genre and completion filters and themed collections use known catalog
+  metadata only. A completed work does not promise every chapter is available from a source.
+- **Preview a title** for its synopsis and known metadata before choosing **Find a source**. Chapter samples and source
+  selection use the existing preview reader and add dialog. Browsing does not start a source search for every card.
+- **Save for later** keeps a title in your personal Discover list across devices, without adding it to your library or
+  downloading chapters. **Not interested** hides it from your recommendations and trending picks; undo it or reset hidden
+  picks without losing saved titles. These choices belong to your account and follow its age and 18+ settings.
+- **Surprise me** opens a permitted title from the current filtered picks. It does not make an extra online request.
+- **Sources** keeps the Newest/Popular wall, source picker, progressive results and cross-source search. Discover remembers
+  the last tab you chose. Searching from a series link still opens the source results directly.
+- The hero keeps **Pause** and phone swipe controls. Reduced motion keeps the art still, and loading placeholders reserve
+  space so late answers do not shift content under your finger.
 - A Discover link with `?q=` opens on that search: `/discover/?q=solo%20leveling`. The series page's Related row
   uses it for a work you don't have.
 - **Newest / Popular:** the wall under the heading is what your sources published most recently, or what is
@@ -1784,9 +2068,11 @@ translated once per language and kept, so reading it again costs nothing.
   about six seconds); source rows show *Searching…*, empty, failed, disabled or cooling-down states while
   the rest arrive. Repeating the same search continues the in-flight work and a recent term opens from the
   five-minute cache. Results are still filtered for the signed-in account, including its age limit.
+  Results come in each source's own relevance order, so the *Newest*/*Popular* toggle is hidden while they are up;
+  the × in the search box, or searching with the box empty, goes back to browsing and brings it back.
   With one source chosen in the chip, a search asks **only that source** and the chip stays on screen while
   the results are up, so you can see the search is narrowed and clear it with its × (which searches every
-  source again). Switching the toggle to *Newest* or *Popular* goes back to browsing.
+  source again).
   A search on one source (the one chosen, or the only one you have) **keeps going as you scroll** (since v0.96.0,
   [#331](https://github.com/AngeloSha/uchiyomi/issues/331)): a site answers its search a page at a time (BatCave ten
   at a time, 209 for *Star Trek*), and the next page loads as you near the end of the wall, up to 30 pages. Every
@@ -1856,6 +2142,10 @@ translated once per language and kept, so reading it again costs nothing.
   the note's heading (*Keeping the source's own numbers*), the count, the range and the *First* / *Latest* choices
   follow the switch. On a weaker sign the note reads *Some posts share a chapter number* and the switch is **Number
   by posting order**. An admin also gets **Source settings**, the extension's own settings (section 7).
+- **Numbered by the chapter titles** (since v0.103.1): when the source counts its specials as chapters (Tapas), the
+  note says so and names the newest chapter it numbers ahead of its title. Each chapter is added at the number in
+  its title, and each special just after the chapter before it (section 4, *Chapter numbering: when a source counts
+  its specials as chapters*); **Keep the source's numbers** adds it the old way.
 - **Read a chapter first** (since v0.47.0, from a pull request by @Squeaks72): under **Add to library**, this
   opens the title straight from the source without adding it. Pick a chapter from its list — one copy per
   number, the one an add would take — scroll it, and step to the previous or next one; **Add to library** is
@@ -1985,7 +2275,9 @@ a row in normal use, within the last week and while nothing has put the source i
 switched off are folded away at the end, under **Switched off**. A row with one thing to do has its key (**Turn
 on**, for a switched-off source that series still use); every row opens the source's sheet. An extension that
 ships one source per language is one row per language: switch off the languages you do not read (in a source's
-sheet, or for every extension at once with **Languages**) and they fold away.
+sheet, or for every extension at once with **Languages**) and they fold away. An extension that bundles many
+sites in one language lists them by site instead: its sheet is headed by the extension,
+counts its sources and languages, and its **Sources** list has a search box once it is longer than twelve.
 
 **Needs attention**, above the list, appears only while something needs you, one row each:
 
@@ -2019,8 +2311,9 @@ once, and **Check for extension updates** asks the repositories again. **Reload 
 Source packs**, re-scans after you drop a compiled source-plugin pack into `SOURCES_DIR`.
 
 **What a source's sheet knows** (since v0.49.0, #115). A source is checked in four steps — **Search**,
-**Chapter list**, **Page list** and **Images** (the Test and the daily check try the first three; images are seen
-when chapters download) — and Uchiyomi keeps what each was last seen doing and who saw it: the Test button, the
+**Chapter list**, **Page list** and **Images** (the daily check tries the first three; the Test button also loads the
+first page's image, as a download would, since v0.108.0; images are otherwise seen when chapters download) — and
+Uchiyomi keeps what each was last seen doing and who saw it: the Test button, the
 daily check, or normal use. A source with a failing step (above) reads *Failing*, and its sheet's **Details** has a
 line per step (✗ for the one that broke, when, and the engine's or site's own error, cut to two lines with the rest
 on hover), and keeps them after a reload; a Test opens **Details** on its answer. One whose last check passed says so
@@ -2028,8 +2321,10 @@ in one line. A failed Test or daily check marks its step
 failing at once; normal use does after three failures in a row at the same step. Only a later success at **that
 same step** clears it: a downloaded chapter says nothing about a broken search. A test that ran out of time reads
 *could not finish in time — not proof it is broken*, never *Failing*: raise `SOURCE_TEST_TIMEOUT_MS` (up to 120 s)
-for a source that keeps doing that behind a slow Cloudflare check. A Test never changes a cooldown. The same lines
-are on **Admin → Health** under *Source health*.
+for a source that keeps doing that behind a slow Cloudflare check. A Test never changes a cooldown: a site that answers its image
+with HTTP 429 is shown, not counted. Only failures that count now are drawn as failures: one failure in normal use, one
+more than a week old, or a cooldown is history, not *Failing*. The same lines are on **Admin → Health** under *Source
+health*.
 
 ### Replace a source
 
@@ -2071,8 +2366,26 @@ the source calls it something that is not the series' title or one of its other 
 and offers **Attach anyway**. The other rules stay (the series' language, posting-order numbering, a check running right
 now, a waiting renumber, a source cooling down after errors, the follower limit for an extra source). A series with no
 source takes the pick as its main. The **×** on the main source detaches it, after asking: the next source takes over, or
-the series is left with none; downloaded chapters and your progress stay either way. A series numbered by posting order
-keeps its main source.
+the series is left with none. Detaching keeps downloaded chapters and everyone's progress. A
+series numbered by posting order keeps its main source.
+
+#### Removing a source
+
+The **×** beside a source offers **Remove source and keep downloads** as the default. This keeps its files,
+chapter rows and everyone's reading progress. Removing the series' only source always keeps its downloads.
+
+When a follower was attached by mistake, choose **Stop following and delete** to remove the chapters it downloaded
+that no remaining source lists. The preview names how many chapters and readers are affected. This permanently
+deletes those files, their rows (including old deletion markers), reading progress, bookmarks and offline records,
+and read marks on chapter numbers unique to that source. The numbers become available for the real chapters again.
+A chapter another followed source lists stays; **Fetch again** can replace it with the correct copy.
+
+Cleanup asks every remaining source for a fresh, nonempty chapter list. An unavailable, cooling, empty or incomplete
+source refuses deletion; you can still remove the source and keep downloads. If sources or eligible chapters change,
+open a new preview before confirming. A download or another writer changing the series also refuses cleanup.
+
+To clean up the current main source, first make its replacement main, keeping the old source as a follower; then
+remove the old follower with cleanup. Plain main detach keeps all downloads and uses the usual promotion rules.
 
 ### MangaDex in other languages
 
@@ -2176,6 +2489,10 @@ type as on the site (on a phone, a tap is a click and brings up the keyboard, a 
 the keyboard back), sign in, and press **Done**. The engine keeps the sign-in for that extension, and the sheet says
 whether the source answers now. **Start over** opens the site's home page again.
 
+**Open site is optional.** If an extension already searches and downloads normally, no visit or sign-in is
+needed. A verification loop in this manual browser view does not by itself mean the extension is broken.
+Use the view when you actually need to sign in or a blocked source asks you to complete a site check.
+
 **Signing in with a link the site emails you** (since v0.94.0). A sign-in link signs in whichever browser opens it, so
 opening it from your email signs in your own browser, not the engine's. Ask the site for the link inside **Open site**,
 then copy the link from the email without opening it (long-press it on a phone, right-click it on a computer, and
@@ -2262,6 +2579,14 @@ chapters, chapters that downloaded as one or two images, the same title sitting 
 numbers that can't be real, series waiting for a renumbering review, any source that is failing or blocked, and the
 extension engine. Each check says what it found and what it cannot see. Hit **Re-check** to run them again. Since
 v0.49.1 the page says the server's findings in your language, with dates and times in your own time zone.
+
+A short chapter is not a finding when it is short on purpose: a half-chapter (*12.5*, usually an author's notice), and
+a chapter whose title names a special — *Q&A Announcement!*, *Giveaway!*, *Author's Note*, *Bonus Illustration*, a
+hiatus notice. Those are counted on the card (*2 specials left out*) instead of listed, and the nightly repair does
+not hunt other sources for longer copies of them. The whole title has to say so, and its creator must not have
+numbered it: *The Announcement*, *Bonus Round* and *82. Announcement* are episodes and are still checked, as is a
+chapter whose title only says its number. (*Chapter 82: Q&A* can still be a special: sources write *Chapter 82* in
+front of every post.)
 
 Since v0.55.10 a chapter stitched into one or two long strips (its images together at least ten times as tall as they
 are wide) is a whole chapter, not a short one: Health measures such a chapter's pages once, as the reader does, and
@@ -2605,8 +2930,9 @@ answering*, or *is off*, instead of "over the source limit".
 
 **Chapter numbering** (since v0.49.0, [#116](https://github.com/AngeloSha/uchiyomi/issues/116)) lists, by name, the
 series whose numbering needs an admin (section 4, *Chapter numbering*). Most are held — nothing new downloads for
-them until an admin decides: a source that numbers many different posts the same was found under them (**Review
-renumbering** or **Keep the source's numbers**, the same choice as on the series page); an admin's choice, a
+them until an admin decides: a source that numbers many different posts the same, or since v0.103.1 one that counts
+its specials as chapters, was found under them (**Review renumbering** or **Keep the source's numbers**, the same
+choice as on the series page); an admin's choice, a
 renumbering or its undo, waits to be applied, or an extension setting changed the source's numbers (**Review
 renumbering**); or a renumbering is being carried out, or was cut off by a restart, which the series' next check
 finishes, so that row has no key. A weaker sign on a series in the source's numbers is a finding too, with the same
@@ -2648,6 +2974,9 @@ on disk and rewrites the chapter paths, and it keeps chapter ids and everyone's 
 is marked unread and nothing is re-downloaded. It refuses outright unless *every* folder the series occupies
 is writable: a series often spans your library and Uchiyomi's own downloads folder, and renaming only one of
 them would leave the old name in place for the next scan to pick up as a second, half-read copy.
+If the folder was renamed by hand, changing only its capitals (`Manga` to `manga`, in a file manager), there is nothing
+at the stored name to move: the rename is refused with a message naming the spelling the disk uses, and the next
+library scan picks the series up under that name.
 
 **Delete files** is on **Admin → Libraries**, and only for a series you have already removed. The reversible
 step always comes first, and the irreversible one asks you to type the title. It deletes the chapter files
@@ -2783,6 +3112,10 @@ What it will not touch:
 * a chapter **somebody is partway through** -- one unfinished reader keeps it for everybody;
 * a chapter **nobody has read**;
 * a chapter anyone has **bookmarked** (a bookmark points at a page inside the file);
+* a chapter someone has read **only over OPDS page streaming** (since v0.108.0,
+  [#377](https://github.com/AngeloSha/uchiyomi/issues/377); section 9): that is worked out from the pages a reader
+  fetched, which a reader loading pages ahead fetches too, so the file stays until they read the chapter here or in
+  KOReader, or mark it read;
 * a chapter **the sources no longer list**, or list only in a way that cannot be downloaded (only from a group you
   blocked, or only as a link to the publisher, as MangaDex keeps a licensed chapter): the file here is the last copy.
   A file holding several chapters is kept if any one of them is missing. The list is the one from the last check that
@@ -2852,10 +3185,16 @@ it back; Mihon lists it as *not downloaded*, as the switch above would. Nothing 
 place, everyone's reading history and its counts, and it is still not downloaded again by itself. A chapter whose
 file *Verify chapter files* found missing is not one of these — the hourly check fetches those back — and keeps its
 own look, as does a file gone from a library you built by hand (*File no longer on disk*). A copy saved on your
-device keeps the row a chapter you can open. Anyone allowed to download may press ☁: Uchiyomi restores only the exact
-source copy recorded on that deleted row, if the series still follows that source and it is safe and available. It
-never guesses another copy or fallback, and a manual-library file or a file holding a chapter range is left for an
-admin to restore by hand.
+device keeps the row a chapter you can open. Anyone allowed to download may press ☁ to bring it back onto its own row,
+with everyone's place in it: it fetches the copy a **Fetch** of that chapter would take now, from the sources the
+series follows — so a chapter deleted before the series moved to another source comes back from the new one. Only
+when none of them lists the chapter is the copy it was first downloaded from asked again, while that source is still
+installed, switched on and not cooling down. Tapping the row opens its versions, where **Fetch** beside a copy takes
+exactly that copy. To bring back many, select them and press **Fetch**: the ones the sources list come back as one
+download (since [#437](https://github.com/AngeloSha/uchiyomi/issues/437) that is all it takes after a series moved
+source — no need to remove the series and add it again). When a chapter cannot come back, the message says why and
+what to do: a file from a library you built by hand, or one holding a range of chapters, cannot be put back in place,
+but a copy picked under its versions can still be fetched.
 
 Since v0.43.0 the missing chapters can be marked read on the series page (section 4, *Marking chapters you
 don't have as read*), and with this switch on the marks reach Mihon:
@@ -2943,7 +3282,8 @@ request goes to that site at all. The **Show 18+** button is on Discover too —
 sources*, where it stays while you search — and brings the lot back for the rest of the browser session.
 It appears there whenever something is being hidden, so an install with adult providers and no 18+ shelf
 still has the switch. Since v0.55.4 the search also leaves out 18+ titles from providers that are not 18+ themselves
-while the reveal is off — a MangaDex title rated erotica, a result carrying one of the genres below — and with it on,
+while the reveal is off — a MangaDex title rated erotica, a title an extension tags *Erotica* or *Pornographic* (since
+v0.105.0), a result carrying one of the genres below — and with it on,
 its *Hide 18+* and *18+ only* chips (section 6) sort them out. Three things are deliberately left alone, because you named them yourself: opening a
 provider's own page for a title, adding it, and *Find missing chapters* on a series whose own source is
 adult. Hiding those would stop a series you already own from being filled, which is breaking the library
@@ -2974,6 +3314,12 @@ library keep their own ratings. Nothing rates a source *below* its extension's f
 accounts limited below 18. The 18+ filter's old *Sources to treat as adult* chips were the same list, so a source you
 had ticked there is rated Adult only now — and, since v0.73.0, refused to accounts limited below 18.
 
+**A server only adults use can stop hiding 18+** (since v0.105.0, [#406](https://github.com/AngeloSha/uchiyomi/issues/406)
+from @StrayaJake): switch off **Admin → Settings → Series & chapters → Hide 18+ until someone shows it**. Then nothing is
+hidden for anyone — in the web app, OPDS readers and the Komga API alike — and the **Show 18+** button, the line above the
+page and the 18+ filter's genres go away. Age limits are a different thing and still apply: an account whose limit is below
+18 sees only what its limit allows. It is on by default, so an existing server behaves as before.
+
 **Access.** **Access** on a library row lists who can open it. One thing worth knowing: a member with no
 limits set can open every library, including ones you add later. Unticking them here is what turns that into
 an explicit list -- so granting a library to an unrestricted member changes nothing, and revoking one is what
@@ -2983,6 +3329,17 @@ narrows them.
 use **Move to library**. A series filed by hand stays put: rescans, newly created libraries and changing an
 existing one's folders all leave it alone. Set it back to **Automatic** to hand it to the folder rule again;
 removing the library you filed it into does that too (since v0.55.1).
+
+The picker marks the current library; mixed selections have no current badge. Moving between shared libraries
+keeps files in place. Selecting **your private library**, or moving your private copy to a shared library,
+asks for confirmation before changing who can read it. These visibility changes move the series folder across
+all of its storage roots and preserve series, chapter and progress IDs. A failure restores the original folders
+and catalogue; a conflicting destination or busy reader is refused. Another account's private copies are never
+available, including to admins. Linked editions must be unlinked before changing visibility.
+
+**Automatic** preserves visibility and follows the folder rule; it never publishes a private copy. The bulk
+result reports any skipped series. Earlier private reading history stays private after publication, and existing
+private AniList entries are not made public automatically.
 
 Nothing changes until you declare something. A fresh install and an upgraded one both start with a single
 library covering the whole root, no reading progress moves, no files are touched, and removing a library
@@ -2994,7 +3351,12 @@ Once you have more than one, the Library page grows a row of tabs to switch betw
 
 **Members:** create accounts (user or admin), reset passwords, and per-user controls: make admin/member,
 disable, or allow/deny downloads. Each row shows whether the member has 2FA on, and the provider's name on an account
-linked to single sign-on. On a server that signs in through its provider only (since v0.63.0), Members makes no
+linked to single sign-on. **Opens at home without a password**, on *New account* or on a member's card, makes a
+profile that opens from your home network with no password (§2): never an admin, and with a password as well it signs
+in with it from anywhere else. Choose who manages it, the account that switches to it from its profile photo; under
+the switch, Members says the address the server sees you at and whether that is at home. **Remove password** leaves
+such a profile opening at home alone. **Can make profiles** lets a member add up to six of their own, under
+**Profile → Account → Profiles**; each starts with no more than that member may see. On a server that signs in through its provider only (since v0.63.0), Members makes no
 account and resets no password: a card says where accounts come from instead, the provider's sign-in, and whether
 it makes new ones (`OIDC_ALLOW_SIGNUP`). Everything else here works as before.
 
@@ -3051,10 +3413,11 @@ ways:
 
 ![Import and review matches](shots/admin-import.webp)
 
-- **Mihon / Tachiyomi backup** — pick your `.tachibk` (or `.proto.gz`) file. Only each entry's title, its
-  source and its address on that source are read: the source to look the title up on that same source here,
+- **Mihon / Tachiyomi backup** — pick your `.tachibk` (or `.proto.gz`) file; a Suwayomi backup is the same file.
+  Each entry's title, its source and its address on that source are read: the source to look the title up on that same source here,
   if you have it installed, and the address as the proof that a result there is that exact entry rather than
-  a namesake. The file never leaves your server, and no Mihon account is used.
+  a namesake. So are its tracker links, and which of its chapters are marked read (see *Mark chapters I've read*,
+  below). The file never leaves your server, and no Mihon account is used.
 - **MangaDex list** — paste the link to a **public** custom list. Private follows would need a MangaDex
   login, which Uchiyomi never asks for; make a list public and share that instead.
 - **Paste titles** — one per line, from anywhere.
@@ -3067,38 +3430,58 @@ ways:
   everywhere, the romaji and synonyms the service knows — except abbreviations (*AoT*, *SnK*, *MHA*), which
   are never used as search terms, because three letters are contained in almost any title. Light novels
   are skipped — every tracker keeps them on the "manga" list, and a novel would match its own adaptation —
-  and the done line counts them (*· {n} novels skipped*). The review keeps 500 rows; a longer list says
-  *(first 500 kept)*, so bring a large account over one list at a time; both notes are kept on the batch,
-  so a reload or *Open imports* shows them too. Nothing is written to the tracker, and only your own
+  and the done line counts them (*· {n} novels skipped*). Up to 2,000 entries are read (since v0.105.0; 500 before),
+  and a list with more than 500 titles not in your library works like a long backup, below: load it again once
+  the first 500 are in. Both notes are kept on the batch, so a reload or *Open imports* shows them too. An entry
+  a series here is already linked to — by you, by an earlier import or by the online check — is that series, even
+  under another title: it reads *Already in your library* and is never added a second time (#410). Nothing is written to the tracker, and only your own
   connection is read, never another admin's. A token the service rejects switches that connection off and
   says so, exactly as a failed push does; a token that has merely lapsed is reported before the service is
   asked and the connection is left in place. Either way, reconnect under Profile and load again.
+
+**Mark chapters I've read**, beside the library choice above the intake and on by default, brings your reading over
+with the titles (since v0.108.0, #433): the chapters a backup has marked read, and every chapter up to how far your
+tracker says you are, are marked read here for your account alone — on the titles you already have as soon as the
+list is read, on the others when **Import selected** adds them. A chapter this server does not have yet is ticked on
+its listing and becomes read when it lands. Nothing is marked unread, a chapter you already finished here keeps its
+date, nothing is sent to your trackers, and streaks and reading stats do not count it, since you did not read it here.
+Nor does the read-chapter cleanup take an imported read as a reason to delete a downloaded file. A series numbered by
+posting order or by its chapter titles is left alone, since its numbers are not the other app's, and a file holding
+several chapters is marked only once your tracker reaches the last of them. Each backup row says how far it was read
+(*Read to ch. 57*), and the import says what it marked (*Marked 57 chapters read in 2 series.*).
 
 **Start matching** looks every title up against your sources in the background — a backup entry is matched
 on the source it came from first, when you have that source installed, and only a result whose catalogue
 address is the backup's own counts as that exact entry; otherwise the usual title rules decide, and a title
 none of them is confident about stays unmatched rather than being given the first thing the source
 answered. One import looks up at most 500 titles; titles already in your library do not count toward them (they
-are listed, skipped), so a longer backup, MangaDex list or paste says *(first 500 not in your library kept;
-import again for the rest)*, and once those are in, importing the same list again brings the next ones. Matching
+are listed, skipped), so a longer list says how many come after them — *(first 500 not in your library kept; 312
+more after them: import again for those)* — and once those are in, importing the same list again brings the next
+ones. A title you skipped stays skipped the next time you import the same list (since v0.105.0, #410), so a list
+does not have to be gone through twice; **Change** and picking a match for it un-skips it for good. Matching
 a long list takes a few minutes, because each title is looked up on its source; you can
 leave the page and come back (the batch is saved, and the intake card lists the **open imports** — every
-admin's, on an install with more than one — so none is lost when the tab closes). A batch a server restart
+one owned by your account — so none is lost when the tab closes). A batch a server restart
 interrupted reads *Interrupted — resume* on that card and offers **Resume** when opened. **Discard** throws
 the batch away at any point, and one that sits in review for 30 days is dropped on its own.
 
 The review is the point. Every row shows the title you brought and, on a second line, the title it matched
 (*→ {title}*, dimmed when the two are the same) with how confident the match is; **Change** opens a manual
 search, its results in one sideways-scrolling rail per source so you can see which provider a pick would
-come from, with the cover, title and chapter count of the current pick beside whatever you tap next, so a
-mismatch is visible before you commit to it — or **Skip this one** drops the title. A tracker row that was
-found under one of its other names says *matched under its other name*, dimmed, so the second name is in
-view before you commit; a pick you make by hand drops the note, since it explained a match that is no
-longer there. Rows already in your library default to skipped, visibly, and can be un-skipped; on a
-tracker import they read *Already in your library — linked for progress sync*, because the link to your
+come from, with the cover, title and chapter count of the current pick beside whatever you tap next — and each
+one's author when supplied, status, first genres and description (two lines; **More** opens the rest) — so a mismatch is visible
+before you commit to it, even between two titles a few letters apart — or **Skip this one** drops the
+title. A tracker row that was found under one of its other names says *matched under its other name*, dimmed,
+so the second name is in view before you commit; a pick you make by hand drops the note, since it explained a
+match that is no longer there. Rows already in your library default to skipped, visibly, and can be un-skipped;
+on a tracker import they read *Already in your library — linked for progress sync*, because the link to your
 tracker entry is made at intake, before the review, for the titles you already hold — for an established
 library that is most of the list, and the part that matters for sync. A title you deleted earlier does not
 count as held: it resolves like any other, and importing it puts the same series back, as adding it would.
+Search keeps asking slower sources until they answer. Each rail keeps up to 100 results from a source's first
+answer; on sources that support search pages, **More** asks for the next page for that source alone. The same
+search and paging controls are available in **Sources & translations → Add more sources…**, with the selected
+entry's author, status, genres and description available before attaching it.
 A list your library already held in full has nothing to review and closes as done at once; its done card
 then counts *· {n} linked for progress sync* and each such row reads *{title} — linked for progress sync*,
 so it never looks as if nothing happened. **Needs attention** filters to what wants a
@@ -3106,12 +3489,13 @@ look: anything unmatched, every *possible match*, and a *close match* that only 
 the two names differ by more than an edition tag such as *(Official)* or *Colored* — or where the longer
 name looks like a season, part, novel or spin-off of the shorter one, *Solo Leveling: Ragnarok* for *Solo
 Leveling*, which is a different work under a familiar name. **Hide already imported** hides the rows of titles
-your library holds, those it held before the import and those the import has added, so a long list brought over
-again shows only what is left to decide.
+your library holds, those it held before the import and those the import has added. State and source filters can
+show just unresolved titles or a particular provider; counts describe the rows in view. Match notes distinguish an
+exact alternate title, a weak suggestion and an ambiguous result. Ambiguous matches stay available for review.
 
-Nothing is added until you check some rows and press **Import selected — {n}**. **Select all** marks every
-row (a skipped or still-unmatched one is a harmless no-op); **Select ready to import** marks only the rows
-that found a match; and on a backup, **Select all “same source as before”** marks only the exact pairs, each
+Nothing is added until you check some rows and press **Import selected — {n}**. **Select all** marks eligible rows in the current
+filters; **Select ready to import** marks visible ready rows. **Skip selected** saves a skip for the selected
+visible rows; skipped rows can be brought back with **Change**. On a backup, **Select all “same source as before”** marks only the exact pairs, each
 entry found on its own extension at the address the backup stored. Every import here is a *Nothing yet* add — the title lands in your library with its
 listing and no chapter downloaded — so a few hundred titles is a few minutes of look-ups, not hours of
 fetching; new chapters arrive the normal way through auto-update, or fetch older ones by hand from each
@@ -3123,14 +3507,22 @@ imported or skipped, the batch is done and drops off the open-imports list by it
 
 A title that came from a tracker is linked to its entry there the moment it is added — the ones you already
 held were linked at intake — so the first chapter you finish syncs without a visit to the series page. The
-link, and the floor below, are the list owner's: batches are shared between admins, and whoever presses
-*Import selected* on yours, the entries are linked for you, not for them. And that first chapter never
+link, and the floor below, belong to the account that imported the list: saved batches and candidates are
+account-owned, and another admin cannot open or run your import. And that first chapter never
 rewinds your tracker: the import records how far the tracker already says you are in each series, for the
 account whose list was read, and a chapter finished at or below that is skipped quietly — nothing is sent
 and nothing is marked as an error, the tracker is simply ahead, or already there. Once you pass it a push
 goes out as usual. Every **Load list** takes the tracker's current number for each entry, whatever stood
 there before, so a correction you made on the tracker itself is taken by loading the list again; nothing
 is ever lowered on the tracker by this app on its own. See section 10.
+
+Large imports retain their remaining entries on the server. Once a batch is done, **Continue with next batch**
+opens the next part; reloading or pressing again does not create duplicate continuations. Each batch preserves its
+destination. The shared/private picker is a default: tracker or backup entries marked private use your private
+library even in a mixed batch. Existing shared and private copies stay independent. Supported tracker identifiers
+and imported progress floors are kept; the import does not send a lower progress number back to a tracker.
+Skip decisions apply to your account and destination. Historic skip records without a verifiable owner and scope
+are retained without assigning them to everyone's new imports.
 
 The unreviewed import — search your sources for each title and add the first good match directly — is no
 longer offered on the page; it survives as `POST /api/admin/import` for scripts (see
@@ -3298,6 +3690,14 @@ the browser, so a target carries its own choice). A target aimed at a person is 
 libraries and age limit whatever the box says — those are permissions, not a reveal — so it never names a
 series they could not open themselves.
 
+**Only your next chapter.** **Profile → Settings → Notifications → Only tell me about my next chapter** (off by default,
+saved to your account) quiets the favourites you are behind on. A new chapter then notifies you, by web push and in a
+message sent to you by a target aimed at you, only when it is the chapter the series page's reading button would open
+for you: you are caught up, or the only thing between you and it is other chapters that arrived with it. With an older
+unread chapter after the last one you finished, or a chapter you are half way through, the new one is behind it and
+stays quiet (it still appears under Updates and in the series). A series' message to a target aimed at the whole server
+is not filtered, since no one reader's place applies to it.
+
 **The digest.** After each library update — the scheduled sweep, or **Run now** on it under **Admin →
 Tasks** — every target gets **one** message for the whole update, never one per chapter, and none when
 nothing new arrived. A series' own *Check now* sends nothing, since its result is already on your screen.
@@ -3366,6 +3766,33 @@ account for 15 minutes. Every sign-in is recorded in the admin audit feed.
 
 ---
 
+### Private libraries
+
+**Profile → General → Privacy → Add to my private library by default** sets this account's default; it starts off.
+The shared/private choice also appears when adding a series, uploading a new series or starting an import.
+Private copies use their own files and identities, so adding privately does not take over a shared copy.
+Accounts' age limits and download/upload permissions still apply. Private additions require the built-in library
+backend; delegated Komga storage does not support them.
+
+Only the owner can browse a private copy through the app, images, OPDS or content APIs. An admin's normal content
+requests follow the same rule. **My private copies → Manage** lets the owner pause updates, remove a copy while
+keeping files and progress, or restore it. Permanently deleting eligible removed copies requires typing their title;
+that operation is available only for never-shared copies whose files can safely be removed.
+
+A private copy's series page offers an explicit visibility change when its storage permits it. Sharing asks for a
+shared destination and confirmation; it keeps the series and files rather than merging with another copy. Historical
+private reading activity stays private after sharing or deleting a title. Private AniList entries remain private,
+and private writes to trackers that cannot enforce privacy are suppressed.
+
+Changing accounts or signing out loads the app afresh. Pending uploads, imports and offline activity keep their
+original owner; saved downloads are not transferred to the next account. Browser notifications display detailed
+content only for their addressed account. A browser worker from an older version receives generic notification
+text until you reopen the updated app.
+
+This protects accounts from one another in the application. Your server operator still controls the database,
+files and backups. **Do not downgrade this database to a version before v0.107.0:** those versions do not enforce
+these privacy columns. Keep a backup before upgrading and use a forward fix if an upgrade needs repair.
+
 ### API tokens
 
 A normal sign-in expires every 15 minutes, which is fine for a browser and useless for a script. Under
@@ -3381,6 +3808,39 @@ Scopes only ever restrict: a read-only token gets a 403 on anything that changes
 token on a non-admin account still can't reach the admin API. See [docs/api.md](api.md) for the endpoints.
 
 ![API tokens](shots/crop-tokens.webp)
+
+### KOReader and other external readers
+
+Under **Profile → Connections → External reader progress**, use the KOReader sync address shown there
+(`https://your-server/api/v1/kosync`) as KOReader's custom progress-sync server. Create a read/write API token;
+use that token as the sync user name, with a nonempty password. Token expiry, revocation, library access and age
+limits are checked for each sync request. A read-only token can fetch a position but cannot update it.
+
+Use the original file downloaded from Uchiyomi: KOReader's partial-file MD5 must match. Newly scanned files are
+hashed locally in bounded background batches, so a new file may need a later explicit retry. Unknown or ambiguous
+hashes are refused rather than attached to a guessed book. Fixed-page files retain their page position; EPUB
+locations remain opaque, and only explicit whole-file completion completes an EPUB archive.
+
+Two separate switches start off:
+
+- **Count completed chapters from other apps** includes small, newly reported explicit completions from KOReader and the Komga API,
+  and chapters read over OPDS page streaming (the next switch), in your personal chapter totals. Initial linking, bulk
+  reports and retries do not count as new reading. These counts add no minutes, sessions, streaks, badges or household
+  leaderboard activity.
+- **Track reading from OPDS page streaming** (named *Remember estimated OPDS positions* in v0.107.0; since v0.108.0,
+  [#377](https://github.com/AngeloSha/uchiyomi/issues/377), it also counts chapters read) is for readers that read a
+  chapter page by page over OPDS rather than downloading it: Panels, Chunky, KOReader's OPDS browser. Uchiyomi
+  remembers the page you reach, and the OPDS feed offers it as where you stopped wherever you have no other place in
+  that chapter. A chapter you page through to the end counts as read, here and on your trackers, when its last page
+  comes in a sitting (pages with no break of six hours) that reached at least half the chapter's pages going forward
+  and began at least 20 seconds before, or half a second a page before in a long chapter. So a reader that loads the
+  whole chapter at once, a jump to the last page, or a strip of thumbnails (pages asked for narrower than 600 pixels)
+  does not count, and a reader that loads a few pages ahead may count a chapter a few pages early. The pages before the
+  end only move your place, never back. Reading a finished chapter again changes nothing, and a chapter counted this
+  way keeps its file from *Delete read chapters* (section 8) until you read it here or in KOReader, or mark it read.
+
+Incognito keeps only your private position and suppresses reading events and tracker updates across readers.
+These server features require the built-in library backend.
 
 ### On a dashboard (Homepage)
 
@@ -3508,7 +3968,7 @@ from the start: chapters read to 12 plus a mark on chapter 1000 still send 12, b
 tracker cannot be taken back there. Section 4, *Marking chapters you don't have as read*, has the whole rule.
 
 **Recommended for you** (since v0.71.0, from [#248](https://github.com/AngeloSha/uchiyomi/pull/248)). With AniList or
-MyAnimeList connected, and an account that may add series, **Discover** shows a *Recommended for you* row above the wall. For each of up to eight series from your AniList list and five from your MyAnimeList list it takes the service's
+MyAnimeList connected, and an account that may add series, **Discover** shows *Recommended for you* inside the wall: since v0.99.0 a band of its own right after the first row of covers, the top pick big (a row after the first two rows in v0.98.0, above the wall before; since v0.98.0 it also holds *Because you read*, section 6). For each of up to eight series from your AniList list and five from your MyAnimeList list it takes the service's
 own readers' "if you liked this" suggestions. A series counts as a seed when you finished it, are reading it or have it
 on hold, rated it 5/10 (three stars) or more, or did not rate it (an unrated one on hold does not count), and have read
 it in earnest: a few chapters of an unfinished series say nothing about taste. Stars you give a series in Uchiyomi count
@@ -3517,7 +3977,7 @@ linked to its entry by a person or a confirmed match. Reading fades, so a series
 last week. A title several of your seeds point at ranks above one seed's pick, and the genres of what you rated high lift
 a suggestion while the genres of what you rated two stars or less pull it down. Every card says which service it came
 from and, under the title, *Because you read …*; a title both services suggest is one card naming both, and no seed
-fills more than five cards. Left out: everything on any of your connected lists under any status (read, reading, on hold,
+fills more than eight cards (five before v0.98.0). Left out: everything on any of your connected lists under any status (read, reading, on hold,
 dropped or planned) and anything the library already holds. Light novels are never suggested, and neither is adult work
 while 18+ is hidden or your account is capped below 18 (a MyAnimeList suggestion whose age rating AniList cannot confirm
 counts as adult), nor, while 18+ is hidden, a title in a genre the admin named as adult. The same goes for the series a
@@ -3619,6 +4079,13 @@ screen and it goes straight to **Offline**, with a banner naming the account it 
 needs the server (Discover, search, adding series, the admin panel) is dimmed rather than hidden, because
 there is nothing behind it until you reconnect. The moment you do, the banner clears and any reading you did
 offline is sent up.
+
+Private responses cannot enter the browser’s implicit caches, including an older worker’s image cache during an upgrade. Explicit offline downloads remain available only to their owner.
+
+Downloads and queued reading stay bound to the account that started them. Switching accounts stops an
+unfinished save or sync; completed downloads and that account’s pending reading remain available when
+they sign back in. Older browser progress entries that contain no recorded account are retained locally
+but are not sent automatically: Uchiyomi cannot safely guess who read them.
 
 Two things worth knowing about that:
 
@@ -3888,6 +4355,11 @@ posts one chapter number. Since v0.49.0 such a series is numbered by posting ord
 numbering*): one you add now is numbered as it is added, and one already in your library waits for an admin's
 review on its page. The Webtoons extension's own *Use sequential chapter numbering*, under **Settings** in its sheet in
 **Admin → Sources**, is the other way to the same numbers, and changing it asks for the same review.
+
+**Chapters after a Q&A or another special are numbered higher than their titles say.** Its source counts every post as a chapter,
+specials included (Tapas). Since v0.103.1 such a series is numbered by its chapter titles instead (section 4,
+*Chapter numbering: when a source counts its specials as chapters*): a special stays in the list just after the
+chapter before it (24.01), and one already in your library waits for an admin's review on its page.
 
 **A series says *Chapter numbers need a review* and gets no new chapters.** That is on purpose: its files still
 carry the source's old numbers, and a chapter fetched now would land under a number the plan is about to move. An

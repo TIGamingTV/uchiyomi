@@ -15,7 +15,7 @@
 // never containment, so "Tokyo Ghoul:re" stays its own card beside "Tokyo Ghoul".
 
 import { q, one } from './db';
-import { visibleToAll, visibleIds, type ViewCtx } from './visibility';
+import { visibleToAll, visibleIds, SHARED_CTX, type ViewCtx } from './visibility';
 import { nameKey, namesMatch } from './onlineMatch';
 import { namesOfMany } from './altTitles';
 import { effectiveLang } from './seriesLang';
@@ -101,13 +101,14 @@ let indexCache: { at: number; version: number; built: Promise<LibraryIndex> } | 
 
 /** Something the index is built from changed (an add, a merge): the next read builds it again. */
 export function libraryChanged(): void { indexVersion++; }
+export const libraryRevision = ():number => indexVersion;
 
 /**
  * The library, as Discover asks about it: built at most once a minute (or right after libraryChanged), shared by every
  * response meanwhile. Visible-to-all rows, as the add route's duplicate check reads them: "is this here" is a question
  * about the server, not about who asks.
  */
-export function libraryIndex(): Promise<LibraryIndex> {
+function fullLibraryIndex(): Promise<LibraryIndex> {
   const c = indexCache;
   if (c && c.version === indexVersion && Date.now() - c.at < INDEX_TTL_MS) return c.built;
   const built = buildIndex();
@@ -115,6 +116,23 @@ export function libraryIndex(): Promise<LibraryIndex> {
   indexCache = entry;
   built.catch(() => { if (indexCache === entry) indexCache = null; });
   return built;
+}
+
+/** Cached identity data never implies permission to reveal that a title is held. */
+export async function libraryIndex(ctx: ViewCtx = SHARED_CTX): Promise<LibraryIndex> {
+  const index = await fullLibraryIndex();
+  const ids = [...new Set([...index.byName.values()].flat().map(row => row.id))];
+  // Preserve the existing shared-catalog duplicate fact. Naming its ID still uses nameableFor.
+  // Private ownership is enforced before even that fact is derived.
+  const allowed = await visibleIds(ids, {...ctx,libraryIds:null,maxAgeRating:null,hideAdultLibraries:false});
+  return filterLibraryIndex(index, allowed);
+}
+export function filterLibraryIndex(index: LibraryIndex, allowed: ReadonlySet<string>): LibraryIndex {
+  const filter = (map: Map<string, Held[]>): Map<string, Held[]> => new Map([...map].flatMap(([key, rows]) => {
+    const visible = rows.filter(row => allowed.has(row.id));
+    return visible.length ? [[key, visible] as [string, Held[]]] : [];
+  }));
+  return { byName: filter(index.byName), byPair: filter(index.byPair), byWork: filter(index.byWork) };
 }
 
 async function buildIndex(): Promise<LibraryIndex> {
@@ -193,9 +211,21 @@ export function heldFor(idx: LibraryIndex, it: ItemRef): Held[] {
   const k = nameKey(it.title);
   if (!k) return [];
   const byName = idx.byName.get(k);
-  if (byName?.length) return byName;
+  if (byName?.length) return withoutConflictingPairs(idx, it, byName);
   const w = workForKey(k);
-  return (w && idx.byWork.get(w)) || [];
+  return withoutConflictingPairs(idx, it, (w && idx.byWork.get(w)) || []);
+}
+
+/** A different entry on the same source is positive evidence against a title-only match (#357). */
+function withoutConflictingPairs(idx: LibraryIndex, it: ItemRef, candidates: Held[]): Held[] {
+  if (!it.source || !it.sourceId || !candidates.length) return candidates;
+  const prefix = `${it.source}\u0001`;
+  const pair = pairKey(it.source, it.sourceId);
+  const others = new Set<string>();
+  for (const [key, held] of idx.byPair) {
+    if (key.startsWith(prefix) && key !== pair) for (const h of held) others.add(h.id);
+  }
+  return candidates.filter((h) => !others.has(h.id));
 }
 
 /**
@@ -204,6 +234,9 @@ export function heldFor(idx: LibraryIndex, it: ItemRef): Held[] {
  */
 export function workOf(idx: LibraryIndex, it: ItemRef, held: Held[] = heldFor(idx, it)): string {
   if (held.length) return held[0].work;
+  // Keep a conflicting source entry out of the owned work's card even when the names fold alike.
+  const names = idx.byName.get(nameKey(it.title)) ?? [];
+  if (withoutConflictingPairs(idx, it, names).length < names.length) return `s:${it.source}:${it.sourceId}`;
   const k = nameKey(it.title);
   if (!k) return `s:${it.source}:${it.sourceId}`;
   return workForKey(k) ?? `n:${k}`;

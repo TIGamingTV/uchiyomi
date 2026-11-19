@@ -25,11 +25,12 @@ import { languageRulesFor } from './copyLanguage';
 import { beginRun, endRun, stopRequested, type RunCard } from './downloadJobs';
 import { say } from './said';
 import { withOrigin } from './downloadActivity';
-import { decideNumbering, folderBusy, numberedChapters, renumberRunning, resumeRenumber, settleNumbering, NUMBERING_COLUMNS, type Settled } from './numbering';
+import { decideNumbering, folderBusy, numberedChapters, readsByTitles, renumberRunning, resumeRenumber, settleNumbering, NUMBERING_COLUMNS, type Settled } from './numbering';
 import { aliasParts, partRulesApply } from './partAlias';
 import { atHiddenNumber, isListedNotice } from './noticeChapters';
 import { hiddenNumbersOf } from './hiddenChapters';
 import { numKey } from './postingOrder';
+import { detectTitleNumbering, titleNumbered } from './titleNumbers';
 import { seriesHidesNotices } from './noticeSettings';
 import { heldBy, rangeEnd, rawRangeEnd } from './chapterRanges';
 import { isDue, refreshRadar } from './releaseRadar';
@@ -62,6 +63,12 @@ export type UpdateOutcome =
  * loop is sequential with a 1.5s pause, so every series behind it waited on undici's 300s default.
  */
 export const LIST_TIMEOUT = Number(process.env.UPDATER_LIST_TIMEOUT_MS) || 20_000;
+/**
+ * #413: how many of a series' followers are asked at every scheduled update (in the order they were added); the rest are
+ * its backups, asked at most once a day while it has nothing missing (BACKUP_EVERY_MS). See the follower loop.
+ */
+export const BACKUP_FRESH = 3;
+export const BACKUP_EVERY_MS = 24 * 3600_000;
 
 /**
  * Attempts (added + failed) one sweep may spend before it stops and says so.
@@ -94,7 +101,7 @@ export type SweepStop = 'budget' | 'disk' | 'shutdown' | 'cancelled' | 'yield';
  * When the first of these sources, which did not answer this run, can be asked again (v0.79.0, `finish_after`): a cooling
  * one at the end of its cooldown; one that threw, or is resting (Fix everything's run-long pause), a finishing interval on.
  */
-async function staleUntil(stale: ReadonlyMap<string, 'cooling' | 'threw'>): Promise<Date> {
+async function staleUntil(stale: ReadonlyMap<string, 'cooling' | 'threw' | 'resting'>): Promise<Date> {
   const soon = Date.now() + FINISH_MINUTES * 60_000;
   const cooling = [...stale].filter(([, why]) => why === 'cooling').map(([id]) => id);
   const rows = cooling.length
@@ -287,6 +294,7 @@ export async function updateSeries(seriesId: string, maxNew = 10, opts: UpdateOp
 
 async function visitSeries(seriesId: string, maxNew: number, opts: UpdateOpts): Promise<UpdateResult> {
   let s = await one<any>(`SELECT id,title,source_id,source_series_id,web,folder,summary,author,genres,status,chapter_floor,scanlator_prefs,source_prefs,auto_update,
+    source_checked_at,source_missing,finish_missing,finish_after,
     ${NUMBERING_COLUMNS}, ${ARCHIVE_BOUNDARY} FROM lib_series s WHERE s.id=$1 AND ${visibleToAll('s')}`, [seriesId]);
   if (!s) return nothing('', 'gone');
   // This is the common boundary for direct Check/update calls as well as background refreshes. Route-level
@@ -323,13 +331,14 @@ async function visitSeries(seriesId: string, maxNew: number, opts: UpdateOpts): 
   // Health page promises when it lists such a series as reference rather than frozen. Only a series with
   // nothing loaded at all is unrouted. A row naming the primary's own adapter would list it twice: the
   // follow route refuses one, but a row older than that rule must not double the listing.
-  const extras = await q<{ source_id: string; source_series_id: string }>(
-    'SELECT source_id, source_series_id FROM series_sources WHERE series_id = $1 ORDER BY created_at, source_id', [seriesId],
+  const extras = await q<{ source_id: string; source_series_id: string; checked_at: string | null }>(
+    'SELECT source_id, source_series_id, checked_at FROM series_sources WHERE series_id = $1 ORDER BY created_at, source_id', [seriesId],
   ).catch(() => []);
-  let followed = [
+  let followed: Array<{ source: string; ref: string; primary: boolean; checkedAt?: string | null }> = [
     ...(s.source_id && s.source_series_id && getSource(s.source_id)
       ? [{ source: s.source_id as string, ref: s.source_series_id as string, primary: true }] : []),
-    ...extras.filter((e) => e.source_id !== s.source_id && getSource(e.source_id)).map((e) => ({ source: e.source_id, ref: e.source_series_id, primary: false })),
+    ...extras.filter((e) => e.source_id !== s.source_id && getSource(e.source_id))
+      .map((e) => ({ source: e.source_id, ref: e.source_series_id, primary: false, checkedAt: e.checked_at })),
   ];
   // Numbered by posting order: the series takes its chapters from the source whose posts were numbered and from
   // nowhere else. A follower's chapter 20 is its own chapter 20 -- another site numbers these posts its own way,
@@ -337,7 +346,9 @@ async function visitSeries(seriesId: string, maxNew: number, opts: UpdateOpts): 
   // post as a version of ours. The followers stay followed; they are just not merged while this lasts.
   // Reintroduce by keeping `followed` whole: "followers are not merged under posting order" in
   // numbering.int.test.ts finds the follower asked for its list ("a follower is not even asked").
-  const numberingSource: string | null = s.numbering === 'posting_order' ? (s.numbering_source ?? s.source_id) : s.source_id;
+  // A series numbered by its chapter titles (#379) reads them on the source it was numbered by, which stays that source
+  // after another is made the main one; it keeps its followers.
+  const numberingSource: string | null = s.numbering === 'posting_order' || s.numbering === 'titles' ? (s.numbering_source ?? s.source_id) : s.source_id;
   if (s.numbering === 'posting_order') followed = followed.filter((f) => f.source === numberingSource);
   if (!followed.length) return nothing(s.title, 'unrouted');
 
@@ -377,9 +388,26 @@ async function visitSeries(seriesId: string, maxNew: number, opts: UpdateOpts): 
   // not be asked or did not answer (`stale`: cooling, resting, a throw or our own timeout). A stale source's chapters are
   // still its chapters -- see the merge after the parts rules below.
   const fresh = new Set<string>();
-  const stale = new Map<string, 'cooling' | 'threw'>();
+  const stale = new Map<string, 'cooling' | 'threw' | 'resting'>();
+  // #413 (@Wolf92s): past the first BACKUP_FRESH, a follower is a backup. A scheduled run over a series with nothing missing
+  // asks one at most once a day rather than at every update: its stored chapters stand as an unasked source's do (`stale`,
+  // 'resting'), so nothing it lists goes. A series that is behind asks every one, every time; a run in which nothing ahead
+  // answered asks the backups in turn until one does. That lets a series follow many sources without every sweep asking each.
+  // Reintroduce by asking every follower: "a caught-up series asks its backups once a day" in updater.int.test.ts finds the
+  // backup asked again.
+  const behind = !s.source_checked_at || Number(s.finish_missing ?? s.source_missing ?? 0) > 0
+    || (s.finish_after != null && new Date(s.finish_after).getTime() <= Date.now());
+  const backups = new Set<string>();
+  if (opts.unattended && !behind) {
+    for (const f of followed.filter((x) => !x.primary).slice(BACKUP_FRESH)) {
+      const at = f.checkedAt ? new Date(f.checkedAt).getTime() : NaN;
+      if (Number.isFinite(at) && Date.now() - at < BACKUP_EVERY_MS) backups.add(f.source);
+    }
+  }
   // The numbering source's own list, untouched: what the detector judges and what posting numbers are given to.
   let rawNumbering: SourceChapter[] | null = null;
+  // Every answering source's own list, untouched, in the order asked: a list read by its titles (#379) is read whole.
+  const lists = new Map<string, SourceChapter[]>();
   for (const f of followed) {
     // The queue was built from monitored rows, but Unmonitor can be pressed while earlier series/sources run.
     // Re-read immediately before every new listing request; after one source answered, stop rather than ask
@@ -387,6 +415,7 @@ async function visitSeries(seriesId: string, maxNew: number, opts: UpdateOpts): 
     if (opts.unattended && !(await seriesIsMonitored(seriesId))) {
       return { ...nothing(s.title, 'paused'), asked: askedSource };
     }
+    if (answered > 0 && backups.has(f.source)) { stale.set(f.source, 'resting'); continue; }
     if (opts.resting?.(f.source) || await blockedNow(f.source)) { blocked++; stale.set(f.source, 'cooling'); continue; }
     // Looked up again after the awaits above: an extension refresh can unregister an adapter between
     // building the list and asking it, and that is a source that did not answer, not a crash.
@@ -404,6 +433,7 @@ async function visitSeries(seriesId: string, maxNew: number, opts: UpdateOpts): 
     if (list.length) { void noteStage(f.source, 'chapters', 'ok'); fresh.add(f.source); }
     answered++;
     if (f.source === numberingSource) rawNumbering = list;
+    lists.set(f.source, list);
     // Copied, not annotated in place: an adapter may hand back the very array its detail cache holds, and
     // a `source` written onto those objects would be there for every later caller of the cache.
     for (const c of list) tagged.push({ ...c, source: f.source });
@@ -461,6 +491,22 @@ async function visitSeries(seriesId: string, maxNew: number, opts: UpdateOpts): 
     // moment ago started this run in source numbers, with the followers' copies already in hand.
     const numbered = await numberedChapters({ seriesId, sourceId: numberingSource, persist: true }, rawNumbering);
     tagged = numbered.map((c) => ({ ...c, source: numberingSource }));
+  }
+  // The lists read by their chapter titles (#379, lib/titleNumbers.ts): the numbering source of a series numbered so,
+  // and a follower that counts its specials as chapters while the series uses the chapters' own numbers -- that is,
+  // unless its main counts its specials too and the series keeps that count (an admin's "Keep the source's numbers", or
+  // a renumber still waiting for review); a main that did not answer this run is judged by its last verdict (its note).
+  // Every other list as it came. Reintroduce by reading the numbering source
+  // alone: "a follower that counts its specials" in titleNumbering.int.test.ts finds its "24. The Other Side" a version
+  // of chapter 27. By leaving the numbering source as it came: "the plan, then an admin's confirmation" finds the check
+  // after the renames listing the source's numbers again.
+  if (!posting) {
+    const sourceCounts = rawNumbering ? detectTitleNumbering(rawNumbering).verdict === 'strong' : !!s.numbering_note?.titles;
+    const read = new Map<string, SourceChapter[]>();
+    for (const [source, list] of lists) {
+      if (readsByTitles(s, list, { numberingSource: source === numberingSource, sourceCounts })) read.set(source, titleNumbered(list));
+    }
+    if (read.size) tagged = [...lists].flatMap(([source, list]) => (read.get(source) ?? list).map((c) => ({ ...c, source })));
   }
 
   // One copy per number out of everything listed, by the release preferences: the series' own over the
@@ -859,7 +905,7 @@ async function visitSeries(seriesId: string, maxNew: number, opts: UpdateOpts): 
   if (!added && !posting && refusing.size && followed.every((f) => refusing.has(f.source))) {
     await requestScout(seriesId, 'stuck', { ifBehind: true });
   }
-  if (added) notifyNewChapter(seriesId, s.title, added).catch(() => {});
+  if (added) notifyNewChapter(seriesId, s.title, added, landed.map((c) => c.number)).catch(() => {});
   // backfill release dates onto already-scanned books; freshly downloaded ones are stamped after the sweep's scan
   await setBookDates(s.folder, releases).catch(() => {});
   // Provenance goes only onto what LANDED, never onto the whole listing: the chosen copy for a number can
@@ -1049,7 +1095,7 @@ export async function runUpdateAll(opts: {
     outcomes[r.outcome] = (outcomes[r.outcome] ?? 0) + 1;
     if (r.added && r.folder && r.chapters?.length) dated.push({ id, folder: r.folder, chapters: r.chapters, landed: r.landed });
     // The throw fallback above has `added: 0` and no title, so it can never reach the digest.
-    if (r.added && (r as { title?: string }).title) newChapters.push({ id, title: (r as { title: string }).title, added: r.added });
+    if (r.added && (r as { title?: string }).title) newChapters.push({ id, title: (r as { title: string }).title, added: r.added, numbers: r.landed.map((c) => c.number) });
     if (card) { card.done = visited; card.fetched = added; card.failed = chapterFailures; }
     if (r.diskFull) { stopped = 'disk'; return; }
     if (r.outcome === 'blocked') {

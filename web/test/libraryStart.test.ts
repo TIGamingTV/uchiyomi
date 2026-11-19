@@ -43,7 +43,7 @@ test('the empty Library says how to fill it, and only when it is empty for this 
   // `narrowed` -- a filter, or a search: an empty search is "No series match", never "your library is empty".
   const lib = code(read('app/library/page.tsx'));
   assert.match(lib, /const settled = !isLoading && !isPlaceholderData && !isError;/, 'an empty grid is read from a placeholder or a failure');
-  assert.match(lib, /const narrowed = activeCount > 0 \|\| !!q;/, 'a search is not a narrowing');
+  assert.match(lib, /const narrowed = activeCount > 0 \|\| !!q \|\| !!author;/, 'a search (or, v0.100.0, an author) is not a narrowing');
   assert.match(lib, /\{settled && total === 0 && !narrowed && \(\s*<EmptyState art=\{ART\.emptyLibrary\} title=\{tr\('Your library is empty\.'\)\}>\s*<LibraryStart \/>\s*<\/EmptyState>/,
     'the empty library offers no way to fill it');
   assert.equal((lib.match(/tr\('Your library is empty\.'\)/g) ?? []).length, 1, 'a second, bare "Your library is empty." is back');
@@ -83,7 +83,7 @@ test('Home\'s welcome offers the same keys, and is never shown for the second be
   // shows while /api/featured is on its way" fails.
   const home = code(read('app/page.tsx'));
   const hero = slice(home, '{(featured?.content?.length ?? 0) > 0 ? (', '<div className="flex items-center justify-between gap-3 px-4 pt-6">');
-  assert.match(hero, /\) : isLoading \|\| featuredPending \? \(\s*<div className="skeleton/, 'the welcome shows while /api/featured is on its way');
+  assert.match(hero, /\) : isLoading \|\| featuredPending \? \(\s*<div\b[^>]*className="skeleton/, 'the welcome shows while /api/featured is on its way');
   assert.match(home, /const \{ data: featured, isPending: featuredPending \} = useQuery\(\{ queryKey: \['featured'\]/);
   const welcome = slice(hero, "{tr('Welcome to Uchiyomi')}", '</div>');
   assert.match(welcome, /<LibraryStart align="start" \/>/, 'Home\'s welcome does not offer the import');

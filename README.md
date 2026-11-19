@@ -39,8 +39,9 @@ of both that installs as an app on any phone, tablet or computer. Free and open 
   checks ask quiet series less often: about half the requests a day on the library they were tested on.
 - **It reads where you read.** The browser, the installed app, a Windows and Mac app, Mihon (with its own extension,
   or Mihon's Komga extension and tracker), OPDS readers such as KOReader and Panels, and a Homepage dashboard tile.
+  KOReader can sync explicit progress against the original downloaded file.
 - **It is built for a household.** Accounts with their own progress, libraries and age limits, an 18+ library
-  that stays hidden until someone asks for it, smart and shared lists, 2FA and single sign-on.
+  that stays hidden until someone asks for it, owner-only private copies, smart and shared lists, 2FA and single sign-on.
 - **It is safe to try beside Komga or Kavita.** Unless you give it the library's owner (`PUID`/`PGID`), it cannot
   write to your files at all, and what it downloads goes to its own folder.
 
@@ -55,10 +56,12 @@ of both that installs as an app on any phone, tablet or computer. Free and open 
 | Prefers or blocks scanlation groups | ✅ | – | – | ◐ per series | ◐ per series |
 | Two-factor sign-in | ✅ | ❌ | ❌ | ❌ | – |
 | Reads text ebooks (reflowable EPUB) | ❌ | ✅ | ✅ | ❌ | ❌ |
-| Kobo or KOReader progress sync | ❌ | ✅ | ◐ KOReader only | ◐ KOReader only | ❌ |
+| KOReader progress sync | ✅ original-file matching | ✅ | ✅ | ✅ | ❌ |
+| Kobo device sync | ❌ | ✅ | ❌ | ❌ | ❌ |
 
 <sub>Checked 2026-10-14 against Uchiyomi v0.61.2, Komga 1.29.0, Kavita 0.9.1.4, Suwayomi v2.4.2366 and Mihon 0.21.2.
-◐ partly · – doesn't apply. All 26 rows, what each ◐ means and the sources are in
+◐ partly · – doesn't apply. The Uchiyomi KOReader row was updated for v0.107.0 on 2026-11-10; other comparison dates above are unchanged.
+All rows, what each ◐ means and the sources are in
 [docs/COMPARISON.md](docs/COMPARISON.md); [uchiyomi.com/vs](https://uchiyomi.com/vs) adds a paragraph on each project.</sub>
 
 **If you already run Sonarr for TV and Radarr for films**, this is the same idea for manga, except the reader is
@@ -113,11 +116,15 @@ sites' terms and your local law.
 
 **Your library**
 
+- **Manga title artwork** — Home and series heroes show matching title logos or styled lettering. Admins can
+  upload their own artwork, find verified Wikimedia logos, or review lettering cut from a cover with the
+  [optional local CPU service](services/title-extractor/README.md). Restore/Erase brushes repair a private preview
+  before Apply; automatic work is opt-in and preserves manual choices.
 - **Files you already own** — CBZ, CBR, PDF, image EPUB or a folder of images, in any folder layout.
-- **A Library you can find things in** — search it, one **Sort** menu where every order runs both ways (newest,
-  recently read, most popular and top rated on AniList, your own stars, most chapters, A–Z), **Comfortable,
-  Compact or List**, covers that show how far you are, and filters (read state, status, source, format, genres)
-  in rows that fold.
+- **A Library you can find things in** — search it by title or author, one **Sort** menu where every order runs
+  both ways (newest, recently read, most popular and top rated on AniList, your own stars, most chapters, A–Z),
+  **Comfortable, Compact or List**, covers that show how far you are, and filters (read state, status, source,
+  format, genres) in rows that fold. Tap an author on a series page to see everything of theirs you have.
 - **Library management** — several libraries, each over as many folders as you like, *Select all* with bulk
   fetch and removal, editable metadata that survives a rescan, merge (each chapter kept once), delete, restore
   and forget, and *Rescan everything* for files changed behind its back. Optionally, a series with no description,
@@ -156,8 +163,9 @@ sites' terms and your local law.
 - **Discover** — what your sources just published, **one card per series** with each source's icon, leaving
   out what you already own, from every source at once; and a search that **answers progressively**: results
   appear as each source replies instead of waiting for the slowest, and every source says whether it answered,
-  failed or timed out. *Because you read* and trending manhwa, manga and manhua rails come from AniList, and any
-  chapter can be **read before you add the series**.
+  failed or timed out. Picks for you (*Recommended for you* and *Because you read*) get a band of their own, the top
+  pick big with its art glowing behind it; they and the trending manhwa, manga and manhua rows, with their Top 10, sit
+  inside the wall, and any chapter can be **read before you add the series**.
 - **Follows a series on more than one source** (three besides its main one, or up to ten if you allow it), and when a
   chapter will not come down it tries the other copies, then other sources, before giving up. When a site dies for good, *Find other sources* and **Replace
   a source** move its series to sources that work, after you have looked at each match.

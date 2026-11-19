@@ -391,7 +391,7 @@ export async function replaceListing(seriesId: string, rows: ListingRow[]): Prom
      * (library.ts setBookMeta) is the file's own and clears the mark; the borrowed-name cleanup leaves it alone.
      * Reintroduce by writing NULL: "the chapter's own name is never replaced" in borrowNames.int.test.ts finds no
      * mark on the healed name.
-     * The number is the override-aware one under posting order, as setBookMeta's (lib/library.ts BOOK_NUMBER):
+     * The number is the override-aware one under posting order and the titles (#379), as setBookMeta's (lib/library.ts BOOK_NUMBER):
      * the listing's numbers are posts' there, and a book the renumber could not rename keeps another post's
      * number as its raw one.
      * ⚠️ Nothing is healed while the series' numbering is in question (a change pending, or a renumber's journal):
@@ -417,7 +417,7 @@ export async function replaceListing(seriesId: string, rows: ListingRow[]): Prom
         `UPDATE lib_books b SET chapter_name = v.name, chapter_name_source = $2, updated_at = now()
            FROM (VALUES ${values.join(',')}) AS v(n, name), lib_series s
           WHERE b.series_id = $1 AND s.id = b.series_id
-            AND (CASE WHEN s.numbering = 'posting_order'
+            AND (CASE WHEN s.numbering IN ('posting_order', 'titles')
                       THEN COALESCE((SELECT o.number FROM book_overrides o WHERE o.book_id = b.id), b.number) ELSE b.number END) = v.n
             -- A file holding a range (lib/chapterRanges.ts) is not the chapter its start lists: no name of one
             -- (chapterRanges.int.test.ts: "a range file took the name of the chapter its start lists").
@@ -804,7 +804,7 @@ export function waitDaysLeftOf(copies: ListingCopy[], patienceMs: number, now = 
  *
  * `userId` names whose marks set `read`; without it no row is marked.
  */
-export async function listingFor(seriesId: string, opts: { floor: number | null; admin: boolean; userId?: string; archiveBoundary?: number | null }): Promise<{ checkedAt: string | null; content: Ghost[] }> {
+export async function listingFor(seriesId: string, opts: { floor: number | null; admin: boolean; userId?: string; archiveBoundary?: number | null }): Promise<{ checkedAt: string | null; content: Ghost[]; blockedDeletedBookIds: string[] }> {
   const s = await one<{ source_checked_at: Date | null }>('SELECT source_checked_at FROM lib_series WHERE id = $1', [seriesId]);
   const rows = await q<GhostRow>(
     `SELECT l.number, l.title, l.published_at, l.scanlator, l.groups, l.source_id, l.status, l.copies, f.attempts, f.reason,
@@ -834,6 +834,15 @@ export async function listingFor(seriesId: string, opts: { floor: number | null;
   // group the sweep will never take). Read NOW rather than stored with the row, because a preference
   // change should show on the page at once and the row's `held` was decided at the last sweep. Absent
   // when nothing survives, and the page falls back to "waiting for a preferred group".
+  // Deleted bytes stay deleted, and their history/anti-redownload tombstones stay in place.
+  // Only the series-page display hides a single deleted chapter for which every listed copy
+  // is blocked. Unknown listings and range files remain visible rather than guessing.
+  const blockedDeleted = await q<{ id: string }>(
+    `SELECT b.id FROM lib_books b LEFT JOIN book_overrides ov ON ov.book_id = b.id
+       JOIN series_listing l ON l.series_id = b.series_id AND l.number = COALESCE(ov.number, b.number)
+      WHERE b.series_id = $1 AND b.pruned_at IS NOT NULL AND b.number_end IS NULL AND l.status = 'blocked'`,
+    [seriesId],
+  );
   const prefs = await effectivePrefsFor(await readSeriesPrefs(seriesId));
   const blocked = new Set(prefs.blocked.map(normGroup).filter(Boolean));
   const waitingFor = prefs.priority.find((p) => normGroup(p) && !blocked.has(normGroup(p)));
@@ -842,6 +851,7 @@ export async function listingFor(seriesId: string, opts: { floor: number | null;
   const finish = await finishDownloadsOn();
   return {
     checkedAt: iso(s?.source_checked_at ?? null),
+    blockedDeletedBookIds: blockedDeleted.map(b => b.id),
     content: rows.map((r) => {
       const attempts = Number(r.attempts ?? 0);
       const cap = retryCapFor(r.fail_status, finish, CHAPTER_RETRY_CAP);

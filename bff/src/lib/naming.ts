@@ -188,12 +188,46 @@ export function naturalCmp(a: string, b: string): number {
   return numFromName(a) - numFromName(b) || a.localeCompare(b);
 }
 
+const PAGE_TEXT = new Intl.Collator('en', { numeric: true });
+/**
+ * The order of the pages in one chapter: an archive's image entries, or a folder's images. The reader, the page server
+ * and page cleanup all sort by this, because cleanup keeps its removed pages by number and the reader shows them by
+ * number: two orders would hide the wrong page.
+ *
+ * Folder by folder, so a folder every page shares never decides the order inside it: `Series [3948394]/10.png` read by
+ * its first number is 3948394 like every other page, and the text then put 10 before 2 (#436). Inside one name the
+ * first number still decides, as naturalCmp always has, so `cover.jpg` (no number) stays first and `1.5.jpg` stays
+ * between 1 and 2; a tie goes to the numbers after it (`ch1_p2` before `ch1_p10`), then to the text. A flat archive
+ * whose pages differ in their first number keeps exactly the order it always had.
+ */
+export function pageCmp(a: string, b: string): number {
+  const A = a.split(/[\\/]/), B = b.split(/[\\/]/);
+  for (let i = 0; i < A.length && i < B.length; i++) {
+    if (A[i] !== B[i]) return numFromName(A[i]) - numFromName(B[i]) || PAGE_TEXT.compare(A[i], B[i]) || A[i].localeCompare(B[i]);
+  }
+  return A.length - B.length;
+}
+
 // A volume marker in front of the chapter: "Vol.3", "Volume 3 -", "Tome 3,".
 const VOLUME = String.raw`(?:${VOLUME_WORD}\.?\s*\d+(?:\.\d+)?\s*[,:.\-–—]?\s*)?`;
 // The word a source puts before the number, in the languages sources are written in.
 const CHAPTER_WORD = String.raw`(?:(?:ch(?:apter|ap)?|episode|ep|capítulo|capitulo|cap|chapitre|kapitel|глава|розділ|chương|bölüm|bab|rozdział)\.?\s*)?`;
 // After the number, the separators between it and a real name.
 const SEPARATOR = String.raw`\s*(?:[:.\-–—|~]+\s*)?`;
+
+// The number a title starts with, after an optional chapter word ("24. The Other Side", "Ep. 24", "第24話"), and only
+// when it stands alone: "1st Anniversary", "3D Special" and "10k Followers" start with no chapter number.
+const LEADING = new RegExp(String.raw`^${CHAPTER_WORD}(?:第\s*)?#?\s*(\d+(?:\.\d+)?)(?:\s*(?:話|话|章|回|화|편))?(?=$|[\s.,:;!?\-–—|~)\]])`, 'iu');
+
+/**
+ * The chapter number a title starts with, as its creator wrote it -- "24. The Other Side" is 24, "Episode 7: Rain" 7 --
+ * or null when it starts with none ("Caption Contest!", "Q&A Announcement!"). lib/titleNumbers.ts reads a series by
+ * it when its source counts every post, specials included (#379).
+ */
+export function leadingNumber(title: string | undefined | null): number | null {
+  const m = LEADING.exec((title ?? '').trim());
+  return m ? parseFloat(m[1]) : null;
+}
 
 /**
  * The chapter's own name, when the source gave one: what is left once the volume, the chapter word and the

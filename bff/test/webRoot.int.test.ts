@@ -30,6 +30,10 @@ async function buildExport(): Promise<string> {
   await writeFile(join(root, 'index.html'), '<!doctype html><title>shell</title>');
   await writeFile(join(root, 'sw.js'), '// service worker');
   await writeFile(join(root, 'manifest.webmanifest'), '{"name":"Uchiyomi"}');
+  await writeFile(join(root, 'mobile-assets.json'), '{"schemaVersion":1,"buildId":"fixture"}');
+  await mkdir(join(root, 'reader'), { recursive: true });
+  await writeFile(join(root, 'reader/index.html'), '<!doctype html><title>reader</title>');
+  await writeFile(join(root, 'reader/index.txt'), 'fixture next route payload');
   await mkdir(join(root, '_next/static/chunks'), { recursive: true });
   await writeFile(join(root, '_next/static/chunks/app.js'), 'console.log(1)');
   // Two sizes on purpose: compression has a 1 KB threshold, so a fixture that only has tiny files would
@@ -105,22 +109,18 @@ test('the static export is compressed, as nginx compressed it', async (t) => {
       assert.ok(r.body.length > 8000, 'the identity response should be the full file');
     });
 
-    await t.test('the 1 KB threshold does NOT apply to static files, and that is fine', async () => {
-      // Worth pinning because it is surprising and I got it wrong first: @fastify/static streams, so there
-      // is no Content-Length for @fastify/compress to compare the threshold against, and it compresses
-      // regardless of size. nginx's `gzip_min_length 1024` did skip small files. A 14-byte chunk comes back
-      // as 34 bytes of gzip framing -- worse than sending it raw, and completely immaterial.
-      //
-      // The threshold is not pointless: buffered JSON replies DO carry a Content-Length, so it still keeps
-      // small API responses uncompressed. This asserts the real behaviour so nobody "fixes" a passing test
-      // into a false one later.
+    await t.test('the 1 KB threshold keeps small static files uncompressed', async () => {
+      // @fastify/send 4.2 supplies the file length before compression, so static files now honor the same
+      // threshold as buffered responses. Keep the exact body and length: compression framing would make
+      // this tiny chunk larger. The large-file test above still requires gzip when it is useful.
       const r = await app.inject({
         method: 'GET', url: '/_next/static/chunks/app.js',
         headers: { 'accept-encoding': 'gzip' },
       });
       assert.equal(r.statusCode, 200);
-      assert.equal(r.headers['content-length'], undefined, 'static is streamed; if this ever gains a length, the threshold starts applying');
-      assert.equal(r.headers['content-encoding'], 'gzip');
+      assert.equal(r.body, 'console.log(1)');
+      assert.equal(r.headers['content-length'], String(Buffer.byteLength(r.body)));
+      assert.equal(r.headers['content-encoding'], undefined);
     });
 
     await t.test('the cache-control contract survives compression', async () => {
@@ -239,6 +239,22 @@ test('the web app served from the API process', async (t) => {
         'browsers ignore a manifest served as the wrong type, and the PWA stops being installable');
     });
 
+    await t.test('native asset inventory is JSON and supports cache revalidation', async () => {
+      const r = await app.inject({ method: 'GET', url: '/mobile-assets.json' });
+      assert.equal(r.statusCode, 200);
+      assert.match(String(r.headers['content-type']), /application\/json/);
+      assert.equal(r.headers['cache-control'], 'no-cache');
+      assert.equal(r.json().schemaVersion, 1);
+      assert.ok(r.headers.etag);
+      const unchanged = await app.inject({ method: 'GET', url: '/mobile-assets.json', headers: { 'if-none-match': String(r.headers.etag) } });
+      assert.equal(unchanged.statusCode, 304);
+      const reader = await app.inject({ method: 'GET', url: '/reader/?book=fixture' });
+      assert.match(reader.body, /<title>reader<\/title>/);
+      const payload = await app.inject({ method: 'GET', url: '/reader/index.txt?_rsc=fixture' });
+      assert.match(String(payload.headers['content-type']), /text\/plain/);
+      assert.equal(payload.body, 'fixture next route payload');
+    });
+
     await t.test('a write to an unknown path is not answered with a page', async () => {
       const r = await app.inject({ method: 'POST', url: '/whatever' });
       assert.equal(r.statusCode, 404);
@@ -268,5 +284,21 @@ test('with WEB_ROOT unset the API is unchanged', async () => {
     assert.equal(ok.statusCode, 200);
   } finally {
     await app.close();
+  }
+});
+
+
+test('a missing native inventory never becomes a successful HTML shell', async () => {
+  const root = await buildExport();
+  await rm(join(root, 'mobile-assets.json'));
+  const app = await makeApp(root);
+  try {
+    const r = await app.inject({ method: 'GET', url: '/mobile-assets.json' });
+    assert.equal(r.statusCode, 404);
+    assert.deepEqual(r.json(), { error: 'not_found' });
+  } finally {
+    await app.close();
+    await rm(root, { recursive: true, force: true });
+    delete process.env.WEB_ROOT;
   }
 });

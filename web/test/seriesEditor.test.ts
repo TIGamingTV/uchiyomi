@@ -64,6 +64,22 @@ function elementWith(html: string, attr: string): string {
 
 const tick = () => new Promise((r) => setTimeout(r, 0));
 
+test('cover-derived title artwork retains a readable source without inventing an external attribution link', () => {
+  const html = render('art', series({ titleArt: { mode: 'custom', style: 'auto', status: 'ready', version: 1,
+    logoUrl: '/img/series/s_1/logo?v=1', language: null, showReadableTitle: true,
+    attribution: { source: 'Cover lettering', sourceUrl: null, artist: null, license: null, licenseUrl: null } } }));
+  assert.match(html, />From the cover<\/p>/);
+  assert.doesNotMatch(html, /href="null"/);
+});
+
+test('a logo from the Uchiyomi logo library names the library and links to it (v0.103.0)', () => {
+  // Reintroduce by rendering the source without its link (the `<p>` branch for every source): the name stops linking.
+  const html = render('art', series({ titleArt: { mode: 'automatic', style: 'auto', status: 'ready', version: 1,
+    logoUrl: '/img/series/s_1/logo?v=1', language: 'original', showReadableTitle: true,
+    attribution: { source: 'Uchiyomi logo library', sourceUrl: 'https://github.com/AngeloSha/uchiyomi-title-logos', artist: null, license: null, licenseUrl: null } } }));
+  assert.match(html, /<a href="https:\/\/github\.com\/AngeloSha\/uchiyomi-title-logos"[^>]*>Uchiyomi logo library<\/a>/);
+});
+
 test('there is no Save details key: every field saves on its own', () => {
   // The key sat in the middle of the scroll and an edit left above it was lost on close. Reintroduce it (a
   // `<button>{tr('Save details')}</button>` in any tab): "the dialog has a Save details key again" fails.

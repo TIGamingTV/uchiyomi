@@ -12,7 +12,7 @@ import * as React from 'react';
 import { createElement } from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
 import {
-  answerView, evidenceView, healthRowEvidence, testClock, testStep, checkAllLabel, sweepToast, STAGE_LABELS, BY_LABELS, GLYPH_WORDS,
+  answerView, evidenceView, healthRowEvidence, sourceTestOutcome, testClock, testStep, checkAllLabel, sweepToast, STAGE_LABELS, BY_LABELS, GLYPH_WORDS,
   type StageLine, type TestAnswer,
 } from '../lib/sourceEvidence';
 import { SourceEvidence } from '../components/SourceEvidence';
@@ -66,8 +66,8 @@ test('#115 itself: a failed Test whose diagnosis has no reason is still not "Wor
     'a known code without its sentence is not worded by its code');
 });
 
-test('"Working normally." only under a pass with no ✗ on screen', () => {
-  assert.deepEqual(answerView(passing).head, { tone: 'ok', text: 'Working normally.' });
+test('a passing Test speaks only for its checked steps and no failed line', () => {
+  assert.deepEqual(answerView(passing).head, { tone: 'ok', text: 'The checked steps passed.' });
   assert.equal(answerView(passing).fix, null, 'a pass carries no fix');
   assert.deepEqual(answerView(passing).rows[1], { key: 'chapters', glyph: 'ok', label: 'Chapter list', detail: 'Walk Tale · 14 chapter(s)', error: null, when: null });
   // Covers do not vote, so the Test passes -- but a ✗ Covers line under "Working normally." is the same lie.
@@ -98,6 +98,75 @@ const stored: StageLine[] = [
   { stage: 'pages', state: 'ok', at: new Date(Date.now() - 3 * 3600_000).toISOString(), by: 'traffic', kind: null, error: null },
   { stage: 'images', state: 'ok', at: new Date(Date.now() - 26 * 3600_000).toISOString(), by: 'sweep', kind: null, error: null },
 ];
+
+test('#426: a passing list Test retains an unresolved image failure with its date and cause', () => {
+  const images: StageLine = { stage: 'images', state: 'fail', at: new Date(Date.now() - 420_000).toISOString(),
+    by: 'traffic', kind: 'error', error: '0/12 pages downloaded (HTTP 404)' };
+  const recorded = [...stored.slice(0, 3), images];
+  const before = JSON.stringify(recorded);
+  const view = answerView(passing, recorded);
+  assert.deepEqual(view.head, { tone: 'warn', text: 'The checked steps passed; earlier failures are shown below.' });
+  assert.deepEqual(view.rows.map((r) => [r.key, r.glyph]), [
+    ['search', 'ok'], ['chapters', 'ok'], ['pages', 'ok'], ['images', 'fail'],
+  ]);
+  assert.deepEqual(view.rows.at(-1), { key: 'images', glyph: 'fail', label: 'Images',
+    detail: 'not checked by this test', error: images.error, when: '7m ago · in normal use' });
+  assert.equal(JSON.stringify(recorded), before, 'presenting a new Test must never mutate stored evidence');
+  const html = renderToStaticMarkup(createElement(SourceEvidence, { answer: passing, lines: recorded }));
+  assert.match(html, /data-evidence-stage="images" data-evidence-state="fail"/);
+  assert.match(html, /not checked by this test/); assert.match(html, /7m ago · in normal use/);
+  assert.match(html, /0\/12 pages downloaded \(HTTP 404\)/); assert.doesNotMatch(html, /Working normally/);
+});
+
+test('a new success supersedes only the same checked stage; unreached failures remain recorded', () => {
+  assert.equal(answerView(passing, stored).rows[0].glyph, 'ok', 'the current passing search replaces an older failed search');
+  assert.equal(answerView(passing, stored).head?.tone, 'ok', 'the old search must not make the new passing search look bad');
+  const partial = answerView({ ...passing, checks: passing.checks.filter((c) => c.stage !== 'search') }, stored);
+  assert.equal(partial.rows[0].glyph, 'fail'); assert.equal(partial.rows[0].error, ENGINE);
+  assert.equal(partial.rows[0].detail, 'not checked by this test');
+  assert.equal(partial.head?.tone, 'warn');
+  assert.match(readFileSync(join(ROOT, 'components/SourceSheet.tsx'), 'utf8'), /<SourceEvidence answer=\{answer\} lines=\{row\?\.evidence\}/,
+    'the source sheet must combine the fresh Test with recorded download evidence');
+});
+
+test('#426: history is not a failure: only a recorded failure that counts now is lifted into a passing Test', () => {
+  // The server leaves these out of `failing`: one failure in ordinary use, a week-old one, a 429 cooldown.
+  const images: StageLine = { stage: 'images', state: 'fail', at: new Date(Date.now() - 8 * 86400_000).toISOString(),
+    by: 'traffic', kind: 'error', error: '0/12 pages downloaded (HTTP 404)', current: false };
+  const quiet = answerView(passing, [...stored.slice(1, 3), images]);
+  assert.deepEqual(quiet.head, { tone: 'ok', text: 'The checked steps passed.' }, 'history read as a failure');
+  assert.notEqual(quiet.rows.find((r) => r.key === 'images')?.glyph, 'fail');
+  // The same line from a server that does not say (an older one) still counts, as before.
+  const { current: _c, ...older } = images;
+  assert.equal(answerView(passing, [...stored.slice(1, 3), older]).head?.tone, 'warn');
+});
+
+test('#426: a Test that fetched an image draws its own images row', () => {
+  const withImage = { ...passing, checks: [...passing.checks, { name: 'Images', ok: true, detail: 'first page loaded (chapter 12)', stage: 'images' as const }] };
+  const images: StageLine = { stage: 'images', state: 'fail', at: new Date().toISOString(), by: 'traffic', kind: 'error', error: 'HTTP 404', current: true };
+  const view = answerView(withImage, [...stored.slice(1, 3), images]);
+  const row = view.rows.find((r) => r.key === 'images');
+  assert.equal(row?.glyph, 'ok', 'the image this Test loaded was drawn as the recorded failure');
+  assert.equal(view.rows.filter((r) => r.key === 'images').length, 1);
+  assert.deepEqual(view.head, { tone: 'ok', text: 'The checked steps passed.' });
+});
+
+test('#426: source Test notices and Health actions use Details’ scoped result and severity', () => {
+  const images: StageLine = { stage: 'images', state: 'fail', at: new Date().toISOString(), by: 'traffic', kind: 'error', error: 'HTTP 404' };
+  assert.deepEqual(sourceTestOutcome(passing), { text: 'The checked steps passed.', ok: true, partial: false });
+  assert.deepEqual(sourceTestOutcome(passing, [images]), {
+    text: 'The checked steps passed; earlier failures are shown below.', ok: true, partial: true,
+  });
+  const covers = { ...passing, checks: [...passing.checks, { name: 'Covers', ok: false, detail: 'No usable cover URL' }] };
+  assert.deepEqual(sourceTestOutcome(covers, [images]), { text: 'Works, but not everything checked out', ok: true, partial: true });
+  assert.equal(sourceTestOutcome(ballTest(), [images]).ok, false);
+  const sheet = readFileSync(join(ROOT, 'components/SourceSheet.tsx'), 'utf8');
+  const actions = readFileSync(join(ROOT, 'components/HealthActions.tsx'), 'utf8');
+  assert.match(sheet, /sourceTestOutcome\(r, row\?\.evidence\)/);
+  assert.match(sheet, /outcome\.partial \? 'info' : 'success'/);
+  assert.match(actions, /return sourceTestOutcome\(r, item\.evidence\)/);
+  assert.doesNotMatch(sheet + actions, /That source is working/);
+});
 
 test('stored evidence: one line per stage, with when and by what', () => {
   const v = evidenceView(stored, { at: new Date(Date.now() - 120_000).toISOString(), by: 'test', state: 'fail', stage: 'search' }, 'Update the extension.');
@@ -218,6 +287,7 @@ test('every word this says is in all eight languages, the counted pairs included
   // Reintroduce by deleting "Chapter list" from one locale: that language fails by name.
   const words = [
     ...STAGE_LABELS, ...BY_LABELS, ...GLYPH_WORDS, 'Failing',
+    'The checked steps passed.', 'The checked steps passed; earlier failures are shown below.', 'not checked by this test',
     '1 source needs attention', '{n} sources need attention', '1 source could not finish in time', '{n} sources could not finish in time',
     'Testing… {elapsed} of up to {max}', 'Checking {done} of {total}', 'Last tested {when} with the Test button',
   ];
