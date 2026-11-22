@@ -21,6 +21,8 @@ name: Dev Build
 on:
   push:
     branches: [develop]
+  # Rebuild by hand, e.g. for pushes that landed while Actions was off.
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -34,6 +36,8 @@ concurrency:
 jobs:
   build:
     name: Build & push aio (amd64)
+    # A dispatch from another branch would overwrite the :develop tag.
+    if: github.ref == 'refs/heads/develop'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
